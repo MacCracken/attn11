@@ -4,6 +4,61 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-06-08
+
+Data & persistence (roadmap M2).
+
+### Added
+- **Corpus loading** from a file (`--corpus PATH`) or stdin (`--stdin`), with a
+  byte-level tokenizer that adapts its vocab to whatever bytes occur. Opens with
+  `O_NOFOLLOW` and caps size via `fstat` (4 MB) before reading. Falls back to
+  the embedded corpus when no source is given. (`src/fileio.cyr`,
+  `corpus_set`/`corpus_load_file`/`corpus_load_stdin` in `src/train.cyr`.)
+- **Checkpoints** (`src/persist.cyr`): `--save PATH` writes magic + version +
+  config + vocab + params + Adam moments + PRNG state + step; `--load PATH`
+  validates and restores. Validation (magic, version, config ranges, recomputed
+  param count, exact size) happens **before any allocation** — hostile inputs
+  are rejected, not crashed.
+- **Deterministic resume**: resumable training via a global step counter and a
+  fixed schedule horizon, so `train(N)` == `train(K)` → checkpoint → `train(N)`
+  **bit-for-bit**. Verified by `test_resume_determinism`.
+- **CLI flags**: `--corpus`, `--stdin`, `--load`, `--save`, `--steps`,
+  `--gen-only` (argv parsing via stdlib `args`).
+- **Fuzz harness** (`tests/attn11.fcyr`): 500 mutated-checkpoint rounds
+  (truncated / bit-flipped / wild-config / random) + 100 random corpora; loaders
+  must reject without crashing. Plus a `test_ckpt_reject` smoke in the suite.
+- `SECURITY.md` updated for the new file surfaces.
+
+### Changed
+- Toolchain pin `6.1.5`.
+- `train` is now `train(run_until, total, batch, base_lr, min_lr, warmup, clip,
+  log_every)` and advances the global `g_step` (enables resume); the LR
+  schedule uses the fixed `total` horizon.
+- `stdlib` deps gain `args`.
+
+### Fixed
+- `ckpt_load_file` allocates the exact (capped) file size instead of the 2 GB
+  max bound, which the bump allocator couldn't satisfy.
+- Generation prompts containing bytes absent from the vocab no longer produce a
+  negative token id (out-of-bounds embedding lookup) — they fall back to id 0.
+
+### Hardened (adversarial review)
+- **Resume corpus/vocab consistency**: loading a checkpoint with a corpus whose
+  byte-level vocab differs from the checkpoint's is now a hard error (`-15`)
+  instead of silently mis-indexing the encoded corpus against the restored
+  embeddings.
+- **Dropout validation**: the checkpoint's dropout field is bit-pattern-checked
+  to a finite `[0,1)` before use (rejects `NaN`, `±Inf`, `>=1.0`, negatives →
+  `-14`). Validated against the bit pattern because this toolchain's f64
+  comparisons are not NaN-correct.
+- **I/O errors vs EOF**: `secure_read_file` / `ckpt_load_file` / `read_stdin`
+  now propagate a negative `read(2)` error instead of treating it as a clean
+  short read; oversize stdin (> cap) is rejected (`-2`) like the file path.
+- **Sampler index**: `sample_window` masks the sign bit instead of negating
+  (negating `INT64_MIN` stayed negative → potential OOB corpus read).
+- A note is printed when sampling from an untrained model.
+- Documented that checkpoint save is non-atomic (atomic save deferred to M4).
+
 ## [0.2.0] - 2026-06-08
 
 Depth & training quality (roadmap M1).

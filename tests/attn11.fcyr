@@ -1,14 +1,91 @@
-# attn11 fuzz harness
+# attn11 fuzz harness — hostile inputs to the loaders must never crash.
+#
+# Covers the two untrusted-input paths added in M2:
+#   * ckpt_load_buf  — fed truncated / bit-flipped / wild-config / random bytes
+#   * corpus_set     — fed random byte buffers of random length
+# Property: the loader always returns (a negative error or a sane success),
+# never reads out of bounds or over-allocates. Validation happens before any
+# allocation/copy, so a malformed buffer is rejected, not trusted.
+#
+# Uses its OWN PRNG (model_init reseeds the global _rng_state, so we can't
+# share it). Deterministic seed -> reproducible. Run by `cyrius test`.
 
-fn fuzz_main(data, len) {
-    if (len == 0) { return 0; }
-    return 0;
+include "src/tensor.cyr"
+include "src/fileio.cyr"
+include "src/ops.cyr"
+include "src/attn.cyr"
+include "src/model.cyr"
+include "src/train.cyr"
+include "src/persist.cyr"
+
+var _fz = 0;
+fn fz_seed(s): i64 { _fz = s; return 0; }
+fn fz_next(): i64 {
+    var x = _fz;
+    x = x ^ (x << 13);
+    x = x ^ (x >> 7);
+    x = x ^ (x << 17);
+    _fz = x;
+    return x;
 }
+fn fz_pos(): i64 { var v = fz_next(); if (v < 0) { return 0 - v - 1; } return v; }
 
-fn main() {
+fn main(): i64 {
     alloc_init();
-    fuzz_main("test", 4);
-    println("fuzz: ok");
+    fz_seed(0x00C0FFEE);
+
+    # ---- a valid reference checkpoint (tiny model) ----
+    var V = build_corpus();
+    model_init(V, 8, 4, 2, 1, 0, f64_from(0), 5);
+    var sz = ckpt_size();
+    var good = alloc(sz);
+    ckpt_serialize(good);
+    var work = alloc(sz);
+
+    var rounds = 0; var rejected = 0; var accepted = 0;
+    while (rounds < 500) {
+        t_copy(work, good, sz / 8);          # fresh copy of the valid checkpoint
+        var mode = fz_pos() % 5;
+        var mlen = sz;
+        if (mode == 0) {                      # flip a random byte
+            var off = fz_pos() % sz;
+            store8(work + off, (load8(work + off) ^ (fz_pos() & 0xFF)) & 0xFF);
+        } elif (mode == 1) {                  # truncate to a random length
+            mlen = fz_pos() % (sz + 1);
+        } elif (mode == 2) {                  # wild value into a config field (2..9)
+            var fld = 2 + (fz_pos() % 8);
+            store64(work + fld * 8, fz_next());
+        } elif (mode == 3) {                  # clobber the magic
+            store64(work, fz_next());
+        } else {                              # fully random header
+            var k = 0;
+            while (k < 12) { store64(work + k * 8, fz_next()); k = k + 1; }
+        }
+        var rc = ckpt_load_buf(work, mlen);
+        if (rc < 0) { rejected = rejected + 1; }
+        else { accepted = accepted + 1; }     # valid by format (e.g. payload-only flip)
+        rounds = rounds + 1;
+    }
+
+    # ---- corpus tokenizer on random byte buffers ----
+    var cb = alloc(2048);
+    var cr = 0;
+    while (cr < 100) {
+        var clen = 1 + (fz_pos() % 2048);
+        var j = 0;
+        while (j < clen) { store8(cb + j, fz_pos() & 0xFF); j = j + 1; }
+        var vv = corpus_set(cb, clen);
+        if (vv < 1) { syscall(1, 2, "FAIL: corpus vocab < 1\n", 23); syscall(60, 1); }
+        if (vv > 256) { syscall(1, 2, "FAIL: corpus vocab > 256\n", 25); syscall(60, 2); }
+        cr = cr + 1;
+    }
+
+    # ensure the malformed inputs were actually exercised (most must reject)
+    if (rejected < 1) { syscall(1, 2, "FAIL: nothing rejected\n", 23); syscall(60, 3); }
+
+    puts("fuzz: ok  ("); fmt_int(rounds); puts(" ckpt rounds, ");
+    fmt_int(rejected); puts(" rejected / "); fmt_int(accepted);
+    puts(" accepted; 100 random corpora)\n");
     return 0;
 }
 

@@ -5,13 +5,14 @@
 
 ## Version
 
-**0.2.0** — depth & training quality (roadmap M1). Stacked `n_layers` blocks,
-GPT-2 residual-init scaling, gradient clipping, LR warmup+cosine schedule.
-Built 2026-06-08.
+**0.3.0** — data & persistence (roadmap M2). File/stdin corpus loading
+(`O_NOFOLLOW`, size-capped), byte-level tokenizer, validated checkpoints with
+bit-for-bit deterministic resume, loader fuzzing. Built 2026-06-08.
+(0.2.0: stacked layers, residual-init scaling, grad clipping, LR schedule.)
 
 ## Toolchain
 
-- **Cyrius pin**: `6.1.4` (in `cyrius.cyml [package].cyrius`)
+- **Cyrius pin**: `6.1.5` (in `cyrius.cyml [package].cyrius`)
 
 ## What works
 
@@ -29,6 +30,12 @@ End-to-end, on x86_64 Linux:
   auto-disabled in eval/generation)
 - Mini-batch grad accumulation; training logs loss / lr / grad-norm
 - Autoregressive generation (greedy + temperature sampling)
+- **Corpus from file/stdin** (`--corpus`/`--stdin`): `O_NOFOLLOW`, `fstat`
+  size-cap, byte-level adaptive vocab
+- **Checkpoints** (`--save`/`--load`): validated header (magic/version/config/
+  size, all checked before allocation) + bit-for-bit **deterministic resume**
+  (weights, Adam moments, step, PRNG state)
+- CLI: `--corpus --stdin --load --save --steps --gen-only`
 
 Default run (`./build/attn11`, 3 layers): loss `~3.2 → ~0.13` over 2000 steps;
 sampled output reproduces real corpus phrases.
@@ -58,26 +65,35 @@ sampled output reproduces real corpus phrases.
   (forward + backward)
 - `attn.cyr` — causal multi-head self-attention (forward + backward), one
   pre-allocated arena for caches + temporaries
+- `fileio.cyr` — secure file I/O (`O_NOFOLLOW`, `fstat` size, looped read/write),
+  stdin reader
 - `model.cyr` — per-layer packed parameters (block stride + `_o_*`/`PL`/`GL`
   helpers), per-layer activation caches (residual-stream array), embeddings,
   tied head, full N-layer forward/backward, grad clipping, Adam
-- `train.cyr` — corpus, tokenizer, batch sampling, LR schedule, training loop,
-  generation
-- `main.cyr` — config + orchestration
+- `train.cyr` — byte-level tokenizer, corpus (embedded/file/stdin), batch
+  sampling, LR schedule, resumable training loop, generation
+- `persist.cyr` — validated checkpoint serialize/load (in-memory + file)
+- `main.cyr` — CLI arg parsing + orchestration
 
 ## Tests
 
-- `tests/attn11.tcyr` — **20 finite-difference gradient checks**: every op
-  (linear, layernorm, GELU, softmax-xent, dropout), attention (incl. biases),
-  and a **2-layer** full model with biases (both blocks, shared embeddings,
-  head, final LayerNorm). All pass (`cyrius test`).
+- `tests/attn11.tcyr` — **36 checks**: 20 finite-difference gradient checks
+  (every op incl. dropout, attention incl. biases, 2-layer full model), plus
+  **bit-for-bit resume-determinism** with dropout off AND on, and checkpoint
+  rejection smokes (truncated / bad magic / absurd config / NaN+1.0 dropout /
+  vocab-mismatch). All pass (`cyrius test`).
+- `tests/attn11.fcyr` — fuzz harness: 500 mutated-checkpoint rounds + 100 random
+  corpora; loaders reject malformed input without crashing.
+- The M2 data/persistence code passed an adversarial multi-agent review; all 9
+  confirmed findings (1 high vocab-mismatch + 8 low) are fixed and regression-
+  tested. See CHANGELOG 0.3.0 "Hardened".
 
 ## Dependencies
 
 Direct (declared in `cyrius.cyml`):
 
 - stdlib — string, fmt, alloc, io, vec, str, syscalls, assert, bench, math,
-  matrix, random
+  matrix, random, args
 
 ## Consumers
 
@@ -85,6 +101,7 @@ _None yet._
 
 ## Next
 
-See [`roadmap.md`](roadmap.md). M1 (0.2.0) is complete: stacked layers,
-residual-init scaling, grad clipping, LR schedule, attention biases, dropout.
-Next is M2 (0.3.0): file/stdin corpus, larger vocab / BPE, checkpoint save/load.
+See [`roadmap.md`](roadmap.md). M2 (0.3.0) is complete: file/stdin corpus,
+byte-level tokenizer, validated checkpoints + deterministic resume, loader
+fuzzing. Next is M3 (0.4.0): SIMD hot paths + benchmarks (`benchmarks.md`).
+Optional BPE tokenizer remains deferred (byte-level covers the M2 gate).

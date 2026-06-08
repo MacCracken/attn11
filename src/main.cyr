@@ -1,12 +1,24 @@
 # attn11 — main entry point.
 # A from-scratch GPT-style transformer, trained, in Cyrius.
-# Stdlib (alloc/fmt/string/math/...) auto-included via cyrius.cyml.
+# Stdlib (alloc/fmt/string/io/args/math/...) auto-included via cyrius.cyml.
+#
+# Usage:
+#   attn11                          train on the embedded corpus, then sample
+#   attn11 --corpus PATH            train on a corpus file (O_NOFOLLOW, capped)
+#   attn11 --stdin                  train on a corpus read from stdin
+#   attn11 --steps N                set total training steps (schedule horizon)
+#   attn11 --save PATH              write a checkpoint after training
+#   attn11 --load PATH              resume from a checkpoint (with --corpus to
+#                                   continue training; alone for --gen-only)
+#   attn11 --gen-only               skip training, just sample from the model
 
 include "src/tensor.cyr"
+include "src/fileio.cyr"
 include "src/ops.cyr"
 include "src/attn.cyr"
 include "src/model.cyr"
 include "src/train.cyr"
+include "src/persist.cyr"
 
 # ---- hyperparameters -------------------------------------------------------
 fn CFG_C(): i64 { return 32; }       # d_model
@@ -24,14 +36,57 @@ fn CFG_CLIP(): i64 { return f64_from(1); }                            # global-n
 fn CFG_ATTN_BIAS(): i64 { return 1; }                                 # Q/K/V/O biases
 fn CFG_DROPOUT(): i64 { return f64_from(0); }                         # residual dropout (off; tiny corpus)
 
+fn _atoi(s): i64 {
+    var v = 0; var i = 0; var neg = 0;
+    if (load8(s) == 45) { neg = 1; i = 1; }
+    while (load8(s + i) != 0) {
+        var c = load8(s + i);
+        if ((c >= 48) && (c <= 57)) { v = v * 10 + (c - 48); }
+        i = i + 1;
+    }
+    if (neg == 1) { return 0 - v; }
+    return v;
+}
+
 fn main(): i64 {
     alloc_init();
+    args_init();
 
-    var V = build_corpus();
-    model_init(V, CFG_C(), CFG_T(), CFG_NH(), CFG_NL(), CFG_ATTN_BIAS(), CFG_DROPOUT(), CFG_SEED());
+    # ---- parse args ----
+    var corpus_path = 0; var use_stdin = 0; var load_path = 0; var save_path = 0;
+    var steps = CFG_STEPS(); var gen_only = 0;
+    var i = 1;
+    while (i < argc()) {
+        var a = argv(i);
+        if (streq(a, "--corpus") == 1) { i = i + 1; corpus_path = argv(i); }
+        elif (streq(a, "--stdin") == 1) { use_stdin = 1; }
+        elif (streq(a, "--load") == 1) { i = i + 1; load_path = argv(i); }
+        elif (streq(a, "--save") == 1) { i = i + 1; save_path = argv(i); }
+        elif (streq(a, "--steps") == 1) { i = i + 1; steps = _atoi(argv(i)); }
+        elif (streq(a, "--gen-only") == 1) { gen_only = 1; }
+        i = i + 1;
+    }
+
+    # ---- corpus ----
+    var V = 0;
+    if (use_stdin == 1) { V = corpus_load_stdin(); }
+    elif (corpus_path != 0) { V = corpus_load_file(corpus_path); }
+    elif (load_path == 0) { V = build_corpus(); }    # default embedded corpus
+    if (V < 0) { puts("attn11: corpus load failed (code "); fmt_int(V); puts(")\n"); return 1; }
+
+    # ---- model: fresh or resumed ----
+    if (load_path != 0) {
+        # ckpt_load_file hard-rejects (code -15) if a loaded corpus's vocab
+        # doesn't match the checkpoint's, so a successful load is consistent.
+        var rc = ckpt_load_file(load_path);
+        if (rc < 0) { puts("attn11: checkpoint load failed (code "); fmt_int(rc); puts(")\n"); return 1; }
+        puts("attn11: resumed from checkpoint at step "); fmt_int(g_step); _putc(10);
+    } else {
+        model_init(V, CFG_C(), CFG_T(), CFG_NH(), CFG_NL(), CFG_ATTN_BIAS(), CFG_DROPOUT(), CFG_SEED());
+    }
 
     puts("attn11 — transformer training in Cyrius\n");
-    puts("  vocab="); fmt_int(V);
+    puts("  vocab="); fmt_int(g_V);
     puts(" d_model="); fmt_int(g_C);
     puts(" ctx="); fmt_int(g_T);
     puts(" heads="); fmt_int(g_nh);
@@ -40,13 +95,28 @@ fn main(): i64 {
     puts("  corpus chars="); fmt_int(g_datalen); _putc(10);
     _putc(10);
 
-    puts("training:\n");
-    train(CFG_STEPS(), CFG_BATCH(), CFG_LR(), CFG_MINLR(), CFG_WARMUP(), CFG_CLIP(), CFG_LOG());
+    # ---- train ----
+    if (gen_only == 0) {
+        if ((g_data == 0) || (g_datalen < g_T + 1)) {
+            puts("attn11: no/short corpus (need >= ctx+1 bytes); skipping training\n");
+        } else {
+            puts("training:\n");
+            train(steps, steps, CFG_BATCH(), CFG_LR(), CFG_MINLR(), CFG_WARMUP(), CFG_CLIP(), CFG_LOG());
+        }
+    }
 
+    # ---- save ----
+    if (save_path != 0) {
+        var sv = ckpt_save_file(save_path);
+        if (sv < 0) { puts("attn11: checkpoint save failed (code "); fmt_int(sv); puts(")\n"); }
+        else { puts("attn11: saved checkpoint ("); fmt_int(ckpt_size()); puts(" bytes)\n"); }
+    }
+
+    # ---- sample ----
     _putc(10);
+    if (g_step == 0) { puts("attn11: NOTE model is untrained; sample output is random\n"); }
     puts("greedy sample:\n");
     generate("cyrius ", 7, 120, f64_from(0));
-
     puts("\nsampled (temp 0.8):\n");
     var temp = f64_div(f64_from(8), f64_from(10));
     generate("a transformer ", 14, 120, temp);

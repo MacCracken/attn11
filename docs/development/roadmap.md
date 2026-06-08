@@ -56,15 +56,17 @@ v1.0.0 ships when **all** of these hold:
   `n_layers = 2` with biases; 20 grad checks total; the 3-layer default trains
   to ~0.11 loss, below M0's single-layer ~0.15.
 
-### M2 — Data & persistence (v0.3.0)
+### M2 — Data & persistence (v0.3.0) — ✅ shipped 2026-06-08
 
-- Corpus loading from a file/stdin (validated: size cap, `O_NOFOLLOW`,
-  bounds-checked reads) instead of only the embedded string.
-- Larger vocab; optional byte-level / simple BPE tokenizer.
-- **Checkpoint save/load** of the flat parameter vector (+ optimizer moments +
-  RNG state) for deterministic resume.
-- **Gates**: train→save→load→resume reproduces the loss curve bit-for-bit;
-  every loader has a fuzz harness; `SECURITY.md` updated for the new surface.
+- ✅ Corpus loading from a file/stdin (`O_NOFOLLOW`, `fstat` size cap, looped
+  reads) with fallback to the embedded string.
+- ✅ Byte-level tokenizer with an adaptive vocab. (Simple BPE remains optional
+  / deferred — byte-level covers the gate.)
+- ✅ **Checkpoint save/load** of the flat parameter vector + Adam moments + RNG
+  state + step, with header validation before any allocation.
+- **Gates met**: `train(N)`→save→load→`train` reproduces params bit-for-bit
+  (`test_resume_determinism`); the loaders have a fuzz harness (500 mutated
+  checkpoints + 100 random corpora); `SECURITY.md` updated for the new surface.
 
 ### M3 — Performance (v0.4.0)
 

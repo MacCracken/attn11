@@ -1,13 +1,17 @@
-# attn11 test suite — finite-difference gradient checks.
+# attn11 test suite — finite-difference gradient checks + resume determinism.
 #
 # Hand-derived backward passes are only as trustworthy as their grad checks.
 # Every op (and the full model) is verified against central finite differences.
+# The checkpoint round-trip is verified to reproduce training bit-for-bit.
 # Stdlib (assert/math/...) auto-included via cyrius.cyml.
 
 include "src/tensor.cyr"
+include "src/fileio.cyr"
 include "src/ops.cyr"
 include "src/attn.cyr"
 include "src/model.cyr"
+include "src/train.cyr"
+include "src/persist.cyr"
 
 fn _eps(): i64 { return f64_div(f64_from(1), f64_from(10000)); }     # 1e-4
 fn dotsum(a, b, n): i64 {
@@ -265,6 +269,90 @@ fn test_model(): i64 {
     return 0;
 }
 
+# Resume determinism: train(K) in one go must equal train(K1) -> checkpoint
+# round-trip -> train(K). The schedule horizon `total` is held fixed across the
+# split so the LR/bias-correction match step-for-step. We compare the final
+# parameter vector BIT-FOR-BIT.
+fn _lrc(n, d): i64 { return f64_div(f64_from(n), f64_from(d)); }
+# train(K) == train(K1) -> checkpoint round-trip -> train(K), bit-for-bit.
+# `drop` exercises the path with (drop>0) and without (drop==0) the dropout
+# PRNG draws, so the save/load RNG alignment is verified for both.
+fn _resume_check(drop): i64 {
+    var V = build_corpus();                 # embedded corpus -> g_data
+    var C = 8; var T = 4; var nh = 2; var NL = 2;
+    var base = _lrc(3, 1000); var minl = _lrc(3, 10000); var clip = f64_from(1);
+    var K = 24; var K1 = 9; var B = 4; var warm = 5; var quiet = 1000000000;
+
+    # Path A: one continuous run to K (horizon = K)
+    model_init(V, C, T, nh, NL, 0, drop, 7);
+    train(K, K, B, base, minl, warm, clip, quiet);
+    var npA = g_NP;
+    var snapA = t_alloc(npA); t_copy(snapA, g_params, npA);
+
+    # Path B: run to K1, checkpoint round-trip, then continue to K (horizon = K)
+    model_init(V, C, T, nh, NL, 0, drop, 7);
+    train(K1, K, B, base, minl, warm, clip, quiet);
+    var sz = ckpt_size();
+    var buf = alloc(sz);
+    ckpt_serialize(buf);
+    # scramble model state to a different seed to prove load restores everything
+    model_init(V, C, T, nh, NL, 0, drop, 999);
+    var rc = ckpt_load_buf(buf, sz);
+    train(K, K, B, base, minl, warm, clip, quiet);
+
+    var mism = 0; var i = 0;
+    while (i < g_NP) {
+        if (load64(g_params + i * 8) != load64(snapA + i * 8)) { mism = mism + 1; }
+        i = i + 1;
+    }
+    assert(rc == 0, "ckpt_load_buf returns ok");
+    assert(g_NP == npA, "resumed param count matches");
+    assert(g_step == K, "resumed step counter reaches K");
+    assert(mism == 0, "resume reproduces params bit-for-bit");
+    return 0;
+}
+fn test_resume_determinism(): i64 { return _resume_check(f64_from(0)); }
+fn test_resume_dropout(): i64 { return _resume_check(_lrc(1, 10)); }   # p=0.1
+
+# Hostile-checkpoint smoke: a few corrupt buffers must be rejected, not crash.
+fn test_ckpt_reject(): i64 {
+    var V = build_corpus();
+    model_init(V, 8, 4, 2, 1, 0, f64_from(0), 3);
+    var sz = ckpt_size();
+    var good = alloc(sz); ckpt_serialize(good);
+    assert(ckpt_load_buf(good, sz) == 0, "valid checkpoint loads");
+    # truncated
+    assert(ckpt_load_buf(good, sz - 8) < 0, "truncated rejected");
+    assert(ckpt_load_buf(good, 8) < 0, "tiny rejected");
+    # bad magic
+    var bad = alloc(sz); t_copy(bad, good, sz / 8); store64(bad, 0);
+    assert(ckpt_load_buf(bad, sz) < 0, "bad magic rejected");
+    # absurd config (huge C)
+    var bad2 = alloc(sz); t_copy(bad2, good, sz / 8); store64(bad2 + 3 * 8, 999999);
+    assert(ckpt_load_buf(bad2, sz) < 0, "absurd config rejected");
+    # NaN dropout (field 8) — would poison training math
+    var bad3 = alloc(sz); t_copy(bad3, good, sz / 8); store64(bad3 + 8 * 8, 0x7FF8000000000000);
+    assert(ckpt_load_buf(bad3, sz) < 0, "NaN dropout rejected");
+    # dropout == 1.0 (1/(1-p) = +Inf)
+    var bad4 = alloc(sz); t_copy(bad4, good, sz / 8); store64(bad4 + 8 * 8, 0x3FF0000000000000);
+    assert(ckpt_load_buf(bad4, sz) < 0, "dropout=1.0 rejected");
+    return 0;
+}
+
+# With a corpus already loaded, a checkpoint whose vocab differs must be
+# rejected (-15) rather than silently mis-indexing g_data.
+fn test_ckpt_vocab_mismatch(): i64 {
+    var V = build_corpus();                 # sets g_data != 0 with corpus vocab
+    model_init(V, 8, 4, 2, 1, 0, f64_from(0), 3);
+    var sz = ckpt_size();
+    var ck = alloc(sz); ckpt_serialize(ck);
+    # corrupt the first vocab entry so it no longer matches the loaded corpus
+    var off = 12 * 8;                        # CKPT_HDR fields, then vocab[0]
+    store64(ck + off, (load64(ck + off) + 1) % 256);
+    assert(ckpt_load_buf(ck, sz) == (0 - 15), "vocab-mismatch rejected (-15)");
+    return 0;
+}
+
 fn main(): i64 {
     alloc_init();
     rng_seed(123);
@@ -278,6 +366,11 @@ fn main(): i64 {
     test_attention();
     test_group("full-model grad-check");
     test_model();
+    test_group("persistence");
+    test_resume_determinism();
+    test_resume_dropout();
+    test_ckpt_reject();
+    test_ckpt_vocab_mismatch();
     return assert_summary();
 }
 

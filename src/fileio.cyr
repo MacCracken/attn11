@@ -1,0 +1,70 @@
+# attn11 — secure file I/O helpers (used by corpus loading + checkpoints).
+#
+# The stdlib file_read_all opens WITHOUT O_NOFOLLOW, so for loading untrusted
+# paths we open our own fd: O_NOFOLLOW (refuse symlinks / TOCTOU), fstat the
+# size, cap it, then loop-read. Raw store64/load64 round-trips a byte blob
+# unchanged on the same architecture, so model tensors serialize directly.
+
+fn _O_RDONLY(): i64 { return 0; }
+fn _O_WRONLY(): i64 { return 1; }
+fn _O_CREAT(): i64 { return 64; }
+fn _O_TRUNC(): i64 { return 512; }
+fn _O_NOFOLLOW(): i64 { return 131072; }   # Linux x86_64/aarch64
+
+# st_size lives at byte offset 48 in struct stat (stable across linux arches).
+fn _file_size(fd): i64 {
+    var st[144];
+    var r = sys_fstat(fd, &st);
+    if (r < 0) { return r; }
+    return load64(&st + 48);
+}
+
+# Open `path` read-only refusing symlinks, fstat its size; if size > maxlen
+# reject (-2); otherwise loop-read into buf. Returns bytes read or a negative
+# error. A symlinked path fails the open (ELOOP) -> negative fd.
+fn secure_read_file(path, buf, maxlen): i64 {
+    var fd = file_open(path, _O_RDONLY() | _O_NOFOLLOW(), 0);
+    if (fd < 0) { return fd; }
+    var size = _file_size(fd);
+    if (size < 0) { file_close(fd); return size; }
+    if (size > maxlen) { file_close(fd); return 0 - 2; }
+    var total = 0;
+    while (total < size) {
+        var n = file_read(fd, buf + total, size - total);
+        if (n < 0) { file_close(fd); return n; }   # propagate I/O error
+        if (n == 0) { break; }                       # EOF
+        total = total + n;
+    }
+    file_close(fd);
+    return total;
+}
+
+# Read all of stdin (fd 0) into buf, up to maxlen. Returns bytes read, or a
+# negative errno if a read fails. Stops at EOF or when maxlen is reached (the
+# caller distinguishes "exactly maxlen" to detect oversize input).
+fn read_stdin(buf, maxlen): i64 {
+    var total = 0;
+    while (total < maxlen) {
+        var n = sys_read(0, buf + total, maxlen - total);
+        if (n < 0) { return n; }     # propagate I/O error
+        if (n == 0) { break; }       # EOF
+        total = total + n;
+    }
+    return total;
+}
+
+# Create/overwrite `path` (refusing symlinks) and write the whole buffer,
+# looping over short writes. Returns bytes written or a negative error.
+fn secure_write_file(path, buf, len): i64 {
+    var flags = _O_WRONLY() | _O_CREAT() | _O_TRUNC() | _O_NOFOLLOW();
+    var fd = file_open(path, flags, 420);   # mode 0644
+    if (fd < 0) { return fd; }
+    var total = 0;
+    while (total < len) {
+        var n = file_write(fd, buf + total, len - total);
+        if (n <= 0) { file_close(fd); return 0 - 1; }
+        total = total + n;
+    }
+    file_close(fd);
+    return total;
+}

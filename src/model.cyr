@@ -24,6 +24,7 @@ var g_NP = 0;   # total parameter count
 var g_attn_bias = 0;  # 1 = Q/K/V/O projections carry biases
 var g_dropout = 0;    # residual dropout probability (f64 bit pattern; 0 = off)
 var g_training = 1;    # dropout active only when training
+var g_step = 0;        # completed Adam update count (for resume + checkpoints)
 
 # ---- packed parameter vectors ----------------------------------------------
 var g_params = 0;
@@ -125,7 +126,7 @@ var D_drop = 0;   # T x C (dropout-adjusted branch gradient)
 # attn_bias: 1 to give Q/K/V/O biases. dropout: residual dropout prob (f64).
 fn model_init(V, C, T, nh, NL, attn_bias, dropout, seed): i64 {
     g_V = V; g_C = C; g_T = T; g_nh = nh; g_NL = NL; g_F = 4 * C;
-    g_attn_bias = attn_bias; g_dropout = dropout; g_training = 1;
+    g_attn_bias = attn_bias; g_dropout = dropout; g_training = 1; g_step = 0;
     var F = g_F;
     g_NP = _emb_end() + NL * _blk() + 2 * C;
 

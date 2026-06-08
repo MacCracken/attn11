@@ -23,16 +23,19 @@ fn corpus_build(buf): i64 {
     return p;
 }
 
-# ---- tokenizer -------------------------------------------------------------
-var g_vocab = 0;     # id -> char code  (length g_V)
-var g_char2id = 0;   # char code -> id  (256 entries, -1 if absent)
+# ---- tokenizer (byte-level) ------------------------------------------------
+var g_vocab = 0;     # id -> byte value  (length g_V, <= 256)
+var g_char2id = 0;   # byte value -> id  (256 entries, -1 if absent)
 var g_data = 0;      # encoded corpus (ids), length g_datalen
 var g_datalen = 0;
+var g_corpus_vlen = 0;  # vocab size of the loaded corpus (NOT g_V, which is the model's)
 
-# Build the vocabulary and encode the corpus. Returns vocab size.
-fn build_corpus(): i64 {
-    var text = alloc(1024);
-    var len = corpus_build(text);
+fn MAX_CORPUS_BYTES(): i64 { return 4194304; }   # 4 MB cap on loaded corpora
+
+# Byte-level tokenize+encode of an arbitrary `len`-byte buffer. Builds the
+# adaptive vocab (only the byte values that actually occur) and the encoded
+# id stream. Handles any of the 256 byte values. Returns vocab size.
+fn corpus_set(text, len): i64 {
     g_datalen = len;
     g_char2id = t_alloc(256);
     var i = 0;
@@ -49,14 +52,44 @@ fn build_corpus(): i64 {
         }
         i = i + 1;
     }
-    # encode
     g_data = t_alloc(len);
     i = 0;
     while (i < len) {
         store64(g_data + i * 8, load64(g_char2id + load8(text + i) * 8));
         i = i + 1;
     }
+    g_corpus_vlen = V;
     return V;
+}
+
+# Default: the embedded corpus. Returns vocab size.
+fn build_corpus(): i64 {
+    var text = alloc(1024);
+    var len = corpus_build(text);
+    return corpus_set(text, len);
+}
+
+# Load a corpus from a file (O_NOFOLLOW, size-capped). Returns vocab size, or a
+# negative error (open/read error, or 0-2 if larger than MAX_CORPUS_BYTES).
+fn corpus_load_file(path): i64 {
+    var buf = alloc(MAX_CORPUS_BYTES());
+    var len = secure_read_file(path, buf, MAX_CORPUS_BYTES());
+    if (len < 0) { return len; }
+    if (len < 1) { return 0 - 3; }
+    return corpus_set(buf, len);
+}
+
+# Load a corpus from stdin (size-capped). Returns vocab size or a negative
+# error. Reads up to MAX+1 bytes so an input larger than the cap is rejected
+# (0-2) rather than silently truncated — matching the file path's behaviour.
+fn corpus_load_stdin(): i64 {
+    var cap = MAX_CORPUS_BYTES();
+    var buf = alloc(cap + 1);
+    var len = read_stdin(buf, cap + 1);
+    if (len < 0) { return len; }
+    if (len > cap) { return 0 - 2; }
+    if (len < 1) { return 0 - 3; }
+    return corpus_set(buf, len);
 }
 
 fn decode_char(id): i64 { return load64(g_vocab + id * 8); }
@@ -66,9 +99,12 @@ fn decode_char(id): i64 { return load64(g_vocab + id * 8); }
 fn sample_window(): i64 {
     var T = g_T;
     var span = g_datalen - T - 1;
-    var s = rng_u64();
-    if (s < 0) { s = 0 - s; }
-    s = s % span;
+    # mask the sign bit rather than negating: negating INT64_MIN overflows back
+    # to INT64_MIN (still negative), which would make s % span negative and
+    # index out of bounds. Masking always yields a non-negative value.
+    var s = rng_u64() & 0x7FFFFFFFFFFFFFFF;
+    if (span < 1) { s = 0; }      # corpus barely long enough; start at 0
+    else { s = s % span; }
     var t = 0;
     while (t < T) {
         store64(A_tokens + t * 8, load64(g_data + (s + t) * 8));
@@ -111,14 +147,16 @@ fn lr_at(step, total, warmup, base_lr, min_lr): i64 {
 }
 
 # ---- training loop ---------------------------------------------------------
-# base_lr/min_lr/clip are f64 bit patterns. Accumulates grads over `batch`
-# windows per step, clips the global grad norm, then steps Adam on the
-# scheduled lr.
-fn train(steps, batch, base_lr, min_lr, warmup, clip, log_every): i64 {
+# Resumable: advances the global step counter g_step from its current value up
+# to `run_until`, while the LR schedule uses the fixed horizon `total`. A fresh
+# run passes run_until == total; a resumed run (g_step restored from a
+# checkpoint) passes the SAME `total` so the schedule — and thus the loss curve
+# — continues bit-for-bit. base_lr/min_lr/clip are f64 bit patterns.
+fn train(run_until, total, batch, base_lr, min_lr, warmup, clip, log_every): i64 {
     g_training = 1;
     var invB = f64_div(f64_from(1), f64_from(batch));
-    var step = 1;
-    while (step <= steps) {
+    while (g_step < run_until) {
+        g_step = g_step + 1;
         model_zero_grads();
         var loss = f64_from(0);
         var bi = 0;
@@ -132,15 +170,14 @@ fn train(steps, batch, base_lr, min_lr, warmup, clip, log_every): i64 {
         t_scale(g_grads, g_NP, invB);
         loss = f64_mul(loss, invB);
         var gnorm = model_clip_grads(clip);
-        var lr = lr_at(step, steps, warmup, base_lr, min_lr);
-        model_adam_step(lr, step);
-        if ((step % log_every) == 0) {
-            print("step ", 5); fmt_int(step);
+        var lr = lr_at(g_step, total, warmup, base_lr, min_lr);
+        model_adam_step(lr, g_step);
+        if ((g_step % log_every) == 0) {
+            print("step ", 5); fmt_int(g_step);
             print("  loss ", 7); f_print(loss, 5);
             print("  lr ", 5); f_print(lr, 6);
             print("  |g| ", 6); f_print(gnorm, 4); _putc(10);
         }
-        step = step + 1;
     }
     return 0;
 }
@@ -192,7 +229,11 @@ fn generate(prompt, plen, ngen, temp): i64 {
     while (t < T) {
         var src = plen - T + t;
         if (src < 0) { store64(A_tokens + t * 8, 0); }
-        else { store64(A_tokens + t * 8, load64(g_char2id + load8(prompt + src) * 8)); }
+        else {
+            var id = load64(g_char2id + load8(prompt + src) * 8);
+            if (id < 0) { id = 0; }   # byte not in vocab -> fall back to id 0
+            store64(A_tokens + t * 8, id);
+        }
         t = t + 1;
     }
     print(prompt, plen);
