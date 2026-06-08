@@ -25,8 +25,8 @@ v1.0.0 ships when **all** of these hold:
       fuzz harnesses for every external input path.
 - [ ] **Benchmarks** — step time + tokens/sec captured in
       [`benchmarks.md`](benchmarks.md), with a tracked history.
-- [ ] **Portability** — builds and trains on x86_64 **and** aarch64; results
-      match within tolerance.
+- [ ] **Portability** — builds and trains on Linux x86_64 **and** aarch64, and
+      runs under the **AGNOS kernel** (`--agnos`); results match within tolerance.
 - [ ] **One consumer green** — at least one downstream user (or a documented
       example pipeline) builds against a tagged attn11.
 - [ ] **CHANGELOG complete** from 0.1.0 onward; **security audit** recorded in
@@ -44,15 +44,17 @@ v1.0.0 ships when **all** of these hold:
 - 16 finite-difference gradient checks (every op, attention, full model), green.
 - CI/release process aligned to the patra/sigil model.
 
-### M1 — Depth & training quality (v0.2.0)
+### M1 — Depth & training quality (v0.2.0) — ✅ shipped 2026-06-08
 
-- **Stacked blocks**: configurable `n_layers`; refactor the block into a
-  reusable forward/backward over a per-layer cache stack.
-- GPT-2 residual-projection init scaling (`1/sqrt(2·n_layers)`).
-- Attention + MLP biases (optional, config-gated).
-- Gradient clipping (global-norm); LR warmup + cosine decay.
-- **Gates**: per-op grad checks unchanged; full-model grad check green with
-  `n_layers ≥ 2`; deeper model trains to lower loss than M0 on the same corpus.
+- ✅ **Stacked blocks**: configurable `n_layers`; the block became a reusable
+  forward/backward over a per-layer cache stack (residual stream array).
+- ✅ GPT-2 residual-projection init scaling (`1/sqrt(2·n_layers)`).
+- ✅ Attention biases (config-gated; MLP biases already present); residual
+  dropout (config-gated, auto-disabled in eval).
+- ✅ Gradient clipping (global-norm); LR warmup + cosine decay.
+- **Gates met**: per-op grad checks unchanged; full-model grad check green at
+  `n_layers = 2` with biases; 20 grad checks total; the 3-layer default trains
+  to ~0.11 loss, below M0's single-layer ~0.15.
 
 ### M2 — Data & persistence (v0.3.0)
 
@@ -79,7 +81,26 @@ v1.0.0 ships when **all** of these hold:
 - NaN/inf guards on loss; a soak target (long run) proving no leak / no blowup.
 - **Gates**: cross-build + native aarch64 CI lane green; soak run clean.
 
-### M5 — Freeze & consumer (v0.9.0 → v1.0.0)
+### M5 — Portability: AGNOS kernel (v0.6.0)
+
+Adapt attn11 to run as a ring-3 application under the **AGNOS kernel** (the
+sovereign OS Cyrius writes), not just Linux. The stdlib already ships the target
+layer (`syscalls_x86_64_agnos.cyr`, `alloc_agnos.cyr`, …); `cyrius build --agnos`
+selects it via `CYRIUS_TARGET_AGNOS`.
+
+- **De-Linux the syscalls**: replace the raw Linux syscall numbers baked into
+  the source (`syscall(60)` exit, `syscall(1, 1, …)` write in `_putc`/`fmt`
+  paths) with the portable stdlib wrappers that dispatch per target — so the
+  same source compiles for Linux, aarch64, and AGNOS.
+- Build `cyrius build --agnos src/main.cyr` clean; resolve any
+  AGNOS-userland-ABI gaps (see `agnos/docs/development/agnos-userland-abi.md`).
+- Confirm the AGNOS allocator path (`alloc_agnos.cyr`) backs the one-shot
+  arena allocation the training loop relies on.
+- **Gates**: `--agnos` build is green in CI; the binary trains + samples under
+  AGNOS and reproduces the Linux run bit-for-bit for a fixed seed; grad-check
+  suite builds for AGNOS. Document the AGNOS build/run in a guide.
+
+### M6 — Freeze & consumer (v0.9.0 → v1.0.0)
 
 - Freeze the config/CLI surface; finalize docs (guides + a runnable example).
 - Land one downstream consumer or example pipeline against a tagged build.

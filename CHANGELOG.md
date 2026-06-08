@@ -4,6 +4,37 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-06-08
+
+Depth & training quality (roadmap M1).
+
+### Added
+- **Stacked transformer blocks** — configurable `n_layers`. The model now runs
+  a residual stream through `N` pre-norm blocks; parameters are packed per-layer
+  at a computed block stride, and forward/backward generalize over the stack.
+- GPT-2 **residual-projection init scaling** (`1/sqrt(2·n_layers)`) on the
+  attention output and MLP projection weights.
+- **Gradient clipping** by global L2 norm (`model_clip_grads`).
+- **LR schedule** — linear warmup then cosine decay to a floor (`lr_at`, with a
+  Taylor cosine since Cyrius has no `f64_cos`).
+- **Config-gated attention biases** (`bq/bk/bv/bo`) threaded through
+  `attn_fwd`/`attn_bwd`; appended to the block layout only when enabled
+  (default on). The MLP already carried biases.
+- **Config-gated residual dropout** (inverted, per-branch masks) on the
+  attention and MLP outputs; auto-disabled outside training (`g_training`) so
+  generation and grad checks stay deterministic. Default off (tiny corpus).
+- Full-model gradient check extended to a 2-layer model with biases (both
+  blocks, attention bias, shared embeddings, head, final LayerNorm); added
+  standalone dropout and attention-bias grad checks. **20 checks total.**
+
+### Changed
+- `model_init` now takes `n_layers`; `train` takes `(steps, batch, base_lr,
+  min_lr, warmup, clip, log_every)`. Per-layer weights/grads are addressed via
+  `PL`/`GL` + `_o_*` offset helpers (replacing the single-block `P_*`/`G_*`
+  globals); shared weights via `P_tokemb()`/`P_posemb()`/`P_lnfg()`/`P_lnfb()`.
+- Default config is now 3 layers; training logs `lr` and grad-norm per checkpoint.
+- Toolchain pin `6.1.3` → `6.1.4`.
+
 ## [0.1.0]
 
 ### Added

@@ -214,6 +214,40 @@ fn gelu_bwd(x, dy, dx, n): i64 {
 }
 
 # ===========================================================================
+# Dropout (inverted). A mask holds 0 (dropped) or 1/(1-p) (kept) per element,
+# generated once per forward and reused in backward. Disabled (mask all 1) when
+# not training or p == 0, so eval/generation and grad checks stay deterministic.
+# p is an f64 bit pattern in [0,1).
+# ===========================================================================
+fn dropout_gen_mask(mask, n, p, training): i64 {
+    var one = f64_from(1);
+    if ((training == 0) || (f64_le(p, f64_from(0)) == 1)) {
+        t_fill(mask, n, one);
+        return 0;
+    }
+    var scale = f64_div(one, f64_sub(one, p));
+    var i = 0;
+    while (i < n) {
+        if (f64_lt(rng_uniform(), p) == 1) { store64(mask + i * 8, f64_from(0)); }
+        else { store64(mask + i * 8, scale); }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn dropout_apply(x, mask, y, n): i64 {
+    var i = 0;
+    while (i < n) { store64(y + i * 8, f64_mul(load64(x + i * 8), load64(mask + i * 8))); i = i + 1; }
+    return 0;
+}
+
+fn dropout_bwd(mask, dy, dx, n): i64 {
+    var i = 0;
+    while (i < n) { store64(dx + i * 8, f64_mul(load64(dy + i * 8), load64(mask + i * 8))); i = i + 1; }
+    return 0;
+}
+
+# ===========================================================================
 # Softmax cross-entropy over rows. logits(M,V), targets(M) integer classes.
 # Writes per-row probabilities into `probs` (M,V); returns mean loss (f64).
 # ===========================================================================

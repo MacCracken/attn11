@@ -12,29 +12,36 @@ include "src/train.cyr"
 fn CFG_C(): i64 { return 32; }       # d_model
 fn CFG_T(): i64 { return 16; }       # context length
 fn CFG_NH(): i64 { return 4; }       # attention heads (head dim = C/NH)
+fn CFG_NL(): i64 { return 3; }       # transformer blocks
 fn CFG_SEED(): i64 { return 1337; }
 fn CFG_STEPS(): i64 { return 2000; }
 fn CFG_BATCH(): i64 { return 16; }
 fn CFG_LOG(): i64 { return 250; }
-fn CFG_LR(): i64 { return f64_div(f64_from(3), f64_from(1000)); }   # 3e-3
+fn CFG_WARMUP(): i64 { return 100; }
+fn CFG_LR(): i64 { return f64_div(f64_from(3), f64_from(1000)); }      # base 3e-3
+fn CFG_MINLR(): i64 { return f64_div(f64_from(3), f64_from(10000)); }  # min 3e-4
+fn CFG_CLIP(): i64 { return f64_from(1); }                            # global-norm 1.0
+fn CFG_ATTN_BIAS(): i64 { return 1; }                                 # Q/K/V/O biases
+fn CFG_DROPOUT(): i64 { return f64_from(0); }                         # residual dropout (off; tiny corpus)
 
 fn main(): i64 {
     alloc_init();
 
     var V = build_corpus();
-    model_init(V, CFG_C(), CFG_T(), CFG_NH(), CFG_SEED());
+    model_init(V, CFG_C(), CFG_T(), CFG_NH(), CFG_NL(), CFG_ATTN_BIAS(), CFG_DROPOUT(), CFG_SEED());
 
     puts("attn11 — transformer training in Cyrius\n");
     puts("  vocab="); fmt_int(V);
     puts(" d_model="); fmt_int(g_C);
     puts(" ctx="); fmt_int(g_T);
     puts(" heads="); fmt_int(g_nh);
+    puts(" layers="); fmt_int(g_NL);
     puts(" params="); fmt_int(g_NP); _putc(10);
     puts("  corpus chars="); fmt_int(g_datalen); _putc(10);
     _putc(10);
 
     puts("training:\n");
-    train(CFG_STEPS(), CFG_BATCH(), CFG_LR(), CFG_LOG());
+    train(CFG_STEPS(), CFG_BATCH(), CFG_LR(), CFG_MINLR(), CFG_WARMUP(), CFG_CLIP(), CFG_LOG());
 
     _putc(10);
     puts("greedy sample:\n");

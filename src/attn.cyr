@@ -31,7 +31,8 @@ fn _at_dprow(ar, T, C, nh): i64 { return ar + (11 * T * C + nh * T * T) * 8; }
 
 # ---- forward ----------------------------------------------------------------
 # x(T,C) -> out(T,C). Fills caches in `ar` for the backward pass.
-fn attn_fwd(Wq, Wk, Wv, Wo, x, out, ar, T, C, nh): i64 {
+# Bias pointers bq/bk/bv/bo may be 0 (no bias).
+fn attn_fwd(Wq, bq, Wk, bk, Wv, bv, Wo, bo, x, out, ar, T, C, nh): i64 {
     var hd = C / nh;
     var scale = f64_div(f64_from(1), f64_sqrt(f64_from(hd)));
     var Qc = _at_Qc(ar);
@@ -40,9 +41,9 @@ fn attn_fwd(Wq, Wk, Wv, Wo, x, out, ar, T, C, nh): i64 {
     var Pc = _at_Pc(ar, T, C);
     var concat = _at_concat(ar, T, C, nh);
 
-    linear_fwd(x, Wq, 0, Qc, T, C, C);
-    linear_fwd(x, Wk, 0, Kc, T, C, C);
-    linear_fwd(x, Wv, 0, Vc, T, C, C);
+    linear_fwd(x, Wq, bq, Qc, T, C, C);
+    linear_fwd(x, Wk, bk, Kc, T, C, C);
+    linear_fwd(x, Wv, bv, Vc, T, C, C);
 
     # zero the full probability buffer (upper triangle stays 0)
     t_zero(Pc, nh * T * T);
@@ -102,13 +103,15 @@ fn attn_fwd(Wq, Wk, Wv, Wo, x, out, ar, T, C, nh): i64 {
         }
         h = h + 1;
     }
-    linear_fwd(concat, Wo, 0, out, T, C, C);
+    linear_fwd(concat, Wo, bo, out, T, C, C);
     return 0;
 }
 
 # ---- backward ---------------------------------------------------------------
-# dout(T,C) -> dx(T,C); accumulate dWq,dWk,dWv,dWo. Uses caches from attn_fwd.
-fn attn_bwd(Wq, Wk, Wv, Wo, x, dout, dx, dWq, dWk, dWv, dWo, ar, T, C, nh): i64 {
+# dout(T,C) -> dx(T,C); accumulate dWq..dWo and (if non-0) dbq..dbo.
+# Uses caches from attn_fwd.
+fn attn_bwd(Wq, Wk, Wv, Wo, x, dout, dx,
+            dWq, dbq, dWk, dbk, dWv, dbv, dWo, dbo, ar, T, C, nh): i64 {
     var hd = C / nh;
     var scale = f64_div(f64_from(1), f64_sqrt(f64_from(hd)));
     var Qc = _at_Qc(ar);
@@ -126,7 +129,7 @@ fn attn_bwd(Wq, Wk, Wv, Wo, x, dout, dx, dWq, dWk, dWv, dWo, ar, T, C, nh): i64 
     var dprow = _at_dprow(ar, T, C, nh);
 
     # 1. out = concat @ Wo
-    linear_bwd(concat, Wo, dout, dconcat, dWo, 0, T, C, C);
+    linear_bwd(concat, Wo, dout, dconcat, dWo, dbo, T, C, C);
 
     t_zero(dQ, T * C);
     t_zero(dK, T * C);
@@ -184,9 +187,9 @@ fn attn_bwd(Wq, Wk, Wv, Wo, x, dout, dx, dWq, dWk, dWv, dWo, ar, T, C, nh): i64 
     }
 
     # 5. back through Q=x@Wq, K=x@Wk, V=x@Wv; accumulate dx
-    linear_bwd(x, Wq, dQ, dxq, dWq, 0, T, C, C);
-    linear_bwd(x, Wk, dK, dxk, dWk, 0, T, C, C);
-    linear_bwd(x, Wv, dV, dxv, dWv, 0, T, C, C);
+    linear_bwd(x, Wq, dQ, dxq, dWq, dbq, T, C, C);
+    linear_bwd(x, Wk, dK, dxk, dWk, dbk, T, C, C);
+    linear_bwd(x, Wv, dV, dxv, dWv, dbv, T, C, C);
     var idx = 0;
     while (idx < T * C) {
         store64(dx + idx * 8, f64_add(f64_add(load64(dxq + idx * 8), load64(dxk + idx * 8)),

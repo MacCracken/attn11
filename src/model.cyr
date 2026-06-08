@@ -1,13 +1,17 @@
-# attn11 — the model: a one-block GPT with a weight-tied LM head.
+# attn11 — the model: an N-block GPT with a weight-tied LM head.
 #
 # The model is a singleton, so its tensors live in module globals (far cleaner
-# than threading a 50-field struct through every call in a language where
-# everything is i64).
+# than threading a struct through every call in a language where everything is
+# i64).
 #
-# All trainable parameters are packed into ONE flat vector `g_params`; parallel
-# vectors `g_grads`, `g_adam_m`, `g_adam_v` share the exact same layout. Each
-# logical weight is just a sub-pointer (params/grads + offset). Adam then
-# updates the whole vector in a single loop — the way real frameworks flatten.
+# PARAMETERS are packed into ONE flat vector `g_params`; `g_grads`, `g_adam_m`,
+# `g_adam_v` share the identical layout. Layout:
+#
+#   [ tok_emb (V*C) ][ pos_emb (T*C) ][ block_0 ]...[ block_{NL-1} ][ lnf_g (C) ][ lnf_b (C) ]
+#
+# Each block is a fixed-size group repeated NL times; layer L's weights are at a
+# computed offset (see _blk_base / _o_* helpers). The token embedding is
+# weight-tied: it is both the input embedding and the output LM head.
 
 # ---- config ----------------------------------------------------------------
 var g_V = 0;    # vocab size
@@ -15,7 +19,11 @@ var g_C = 0;    # embedding width (d_model)
 var g_T = 0;    # context length
 var g_nh = 0;   # number of heads
 var g_F = 0;    # MLP hidden width (= 4*C)
+var g_NL = 0;   # number of transformer blocks
 var g_NP = 0;   # total parameter count
+var g_attn_bias = 0;  # 1 = Q/K/V/O projections carry biases
+var g_dropout = 0;    # residual dropout probability (f64 bit pattern; 0 = off)
+var g_training = 1;    # dropout active only when training
 
 # ---- packed parameter vectors ----------------------------------------------
 var g_params = 0;
@@ -23,125 +31,170 @@ var g_grads = 0;
 var g_adam_m = 0;
 var g_adam_v = 0;
 
-# ---- weight sub-pointers (params) and grad sub-pointers (grads) ------------
-var P_tokemb = 0; var G_tokemb = 0;   # V x C  (also the tied LM head)
-var P_posemb = 0; var G_posemb = 0;   # T x C
-var P_ln1g = 0;   var G_ln1g = 0;     # C
-var P_ln1b = 0;   var G_ln1b = 0;     # C
-var P_Wq = 0;     var G_Wq = 0;       # C x C
-var P_Wk = 0;     var G_Wk = 0;
-var P_Wv = 0;     var G_Wv = 0;
-var P_Wo = 0;     var G_Wo = 0;
-var P_ln2g = 0;   var G_ln2g = 0;     # C
-var P_ln2b = 0;   var G_ln2b = 0;     # C
-var P_Wfc = 0;    var G_Wfc = 0;      # C x F
-var P_bfc = 0;    var G_bfc = 0;      # F
-var P_Wproj = 0;  var G_Wproj = 0;    # F x C
-var P_bproj = 0;  var G_bproj = 0;    # C
-var P_lnfg = 0;   var G_lnfg = 0;     # C
-var P_lnfb = 0;   var G_lnfb = 0;     # C
+# ---- parameter layout (element offsets) ------------------------------------
+fn _emb_end(): i64 { return g_V * g_C + g_T * g_C; }
+# one block, in elements: ln1(2C) + attn(4C^2) + ln2(2C) + Wfc(CF) + bfc(F) +
+# Wproj(FC) + bproj(C); plus 4C for attention biases (bq,bk,bv,bo) when enabled,
+# appended after bproj so the weight offsets below are unaffected.
+fn _blk_base_size(): i64 { return 5 * g_C + 4 * g_C * g_C + 2 * g_C * g_F + g_F; }
+fn _blk(): i64 {
+    if (g_attn_bias == 1) { return _blk_base_size() + 4 * g_C; }
+    return _blk_base_size();
+}
+fn _blk_base(L): i64 { return _emb_end() + L * _blk(); }
 
-# ---- activation caches (forward) -------------------------------------------
+# within-block offsets
+fn _o_ln1g(): i64 { return 0; }
+fn _o_ln1b(): i64 { return g_C; }
+fn _o_Wq(): i64 { return 2 * g_C; }
+fn _o_Wk(): i64 { return 2 * g_C + g_C * g_C; }
+fn _o_Wv(): i64 { return 2 * g_C + 2 * g_C * g_C; }
+fn _o_Wo(): i64 { return 2 * g_C + 3 * g_C * g_C; }
+fn _o_ln2g(): i64 { return 2 * g_C + 4 * g_C * g_C; }
+fn _o_ln2b(): i64 { return 3 * g_C + 4 * g_C * g_C; }
+fn _o_Wfc(): i64 { return 4 * g_C + 4 * g_C * g_C; }
+fn _o_bfc(): i64 { return 4 * g_C + 4 * g_C * g_C + g_C * g_F; }
+fn _o_Wproj(): i64 { return 4 * g_C + 4 * g_C * g_C + g_C * g_F + g_F; }
+fn _o_bproj(): i64 { return 4 * g_C + 4 * g_C * g_C + g_C * g_F + g_F + g_F * g_C; }
+# attention biases, appended after the base block (only present when enabled)
+fn _o_bq(): i64 { return _blk_base_size(); }
+fn _o_bk(): i64 { return _blk_base_size() + g_C; }
+fn _o_bv(): i64 { return _blk_base_size() + 2 * g_C; }
+fn _o_bo(): i64 { return _blk_base_size() + 3 * g_C; }
+
+# per-layer param / grad sub-pointers
+fn PL(L, off): i64 { return g_params + (_blk_base(L) + off) * 8; }
+fn GL(L, off): i64 { return g_grads + (_blk_base(L) + off) * 8; }
+# attention-bias sub-pointers — return 0 (no bias) when disabled
+fn P_bq(L): i64 { if (g_attn_bias == 0) { return 0; } return PL(L, _o_bq()); }
+fn P_bk(L): i64 { if (g_attn_bias == 0) { return 0; } return PL(L, _o_bk()); }
+fn P_bv(L): i64 { if (g_attn_bias == 0) { return 0; } return PL(L, _o_bv()); }
+fn P_bo(L): i64 { if (g_attn_bias == 0) { return 0; } return PL(L, _o_bo()); }
+fn G_bq(L): i64 { if (g_attn_bias == 0) { return 0; } return GL(L, _o_bq()); }
+fn G_bk(L): i64 { if (g_attn_bias == 0) { return 0; } return GL(L, _o_bk()); }
+fn G_bv(L): i64 { if (g_attn_bias == 0) { return 0; } return GL(L, _o_bv()); }
+fn G_bo(L): i64 { if (g_attn_bias == 0) { return 0; } return GL(L, _o_bo()); }
+
+# shared param / grad sub-pointers
+fn P_tokemb(): i64 { return g_params; }
+fn G_tokemb(): i64 { return g_grads; }
+fn P_posemb(): i64 { return g_params + (g_V * g_C) * 8; }
+fn G_posemb(): i64 { return g_grads + (g_V * g_C) * 8; }
+fn P_lnfg(): i64 { return g_params + (_emb_end() + g_NL * _blk()) * 8; }
+fn G_lnfg(): i64 { return g_grads + (_emb_end() + g_NL * _blk()) * 8; }
+fn P_lnfb(): i64 { return P_lnfg() + g_C * 8; }
+fn G_lnfb(): i64 { return G_lnfg() + g_C * 8; }
+
+# ---- shared activation caches ----------------------------------------------
 var A_tokens = 0; var A_targets = 0;  # T (integer ids)
-var A_x0 = 0;     # T x C  embedding sum (input to ln1 and residual1)
-var A_a = 0;      # T x C  ln1 output (attention input)
-var A_attn = 0;   # T x C  attention output
-var A_x1 = 0;     # T x C  residual1 (input to ln2 and residual2)
-var A_b = 0;      # T x C  ln2 output (MLP input)
-var A_fc = 0;     # T x F  first MLP linear (pre-GELU)
-var A_g = 0;      # T x F  GELU output
-var A_x2 = 0;     # T x C  residual2 (input to lnf)
-var A_f = 0;      # T x C  lnf output (head input)
+var A_attn = 0;   # T x C  attention output (forward temp)
+var A_mlp = 0;    # T x C  MLP output       (forward temp)
+var A_f = 0;      # T x C  final-LN output (head input)
 var A_logits = 0; # T x V
 var A_probs = 0;  # T x V
-var A_mean1 = 0; var A_rstd1 = 0;     # T
-var A_mean2 = 0; var A_rstd2 = 0;     # T
 var A_meanf = 0; var A_rstdf = 0;     # T
-var A_arena = 0;  # attention arena
 
-# ---- gradient temporaries (backward) ---------------------------------------
+# ---- per-layer activation caches (arrays of pointers) ----------------------
+var LA_resid = 0; # (NL+1) pointers, each T*C  (residual stream; [0]=embeddings)
+var LA_a = 0;     # NL pointers, each T*C  (ln1 out / attn in)
+var LA_xmid = 0;  # NL pointers, each T*C  (xin + attn)
+var LA_b = 0;     # NL pointers, each T*C  (ln2 out / mlp in)
+var LA_fc = 0;    # NL pointers, each T*F  (pre-GELU)
+var LA_g = 0;     # NL pointers, each T*F  (GELU out)
+var LA_m1 = 0; var LA_r1 = 0;         # NL pointers, each T
+var LA_m2 = 0; var LA_r2 = 0;         # NL pointers, each T
+var LA_arena = 0; # NL pointers, each attn_arena_size
+var LA_dmask_attn = 0;  # NL pointers, each T*C  (residual dropout mask, attn branch)
+var LA_dmask_mlp = 0;   # NL pointers, each T*C  (residual dropout mask, mlp branch)
+
+fn La(arr, L): i64 { return load64(arr + L * 8); }
+
+# ---- gradient temporaries (shared, reused across layers) -------------------
 var D_logits = 0; # T x V
 var D_f = 0;      # T x C
-var D_x2 = 0;     # T x C
+var D_resid = 0;  # T x C (rolling residual-stream gradient)
+var D_xmid = 0;   # T x C
+var D_a = 0;      # T x C
+var D_b = 0;      # T x C
 var D_g = 0;      # T x F
 var D_fc = 0;     # T x F
-var D_bln2 = 0;   # T x C (grad wrt ln2 output)
-var D_x1 = 0;     # T x C (accumulator)
-var D_attn = 0;   # T x C
-var D_a = 0;      # T x C
-var D_x0 = 0;     # T x C (accumulator)
-var D_tmp = 0;    # T x C (scratch for ln residual contributions)
-
-# total parameter count for the given dims
-fn param_total(V, C, T, nh, F): i64 {
-    return V * C + T * C + C + C
-         + 4 * (C * C)
-         + C + C
-         + (C * F) + F + (F * C) + C
-         + C + C;
-}
+var D_tmp = 0;    # T x C (ln residual-path scratch)
+var D_drop = 0;   # T x C (dropout-adjusted branch gradient)
 
 # ---- init ------------------------------------------------------------------
-fn model_init(V, C, T, nh, seed): i64 {
-    g_V = V; g_C = C; g_T = T; g_nh = nh; g_F = 4 * C;
+# attn_bias: 1 to give Q/K/V/O biases. dropout: residual dropout prob (f64).
+fn model_init(V, C, T, nh, NL, attn_bias, dropout, seed): i64 {
+    g_V = V; g_C = C; g_T = T; g_nh = nh; g_NL = NL; g_F = 4 * C;
+    g_attn_bias = attn_bias; g_dropout = dropout; g_training = 1;
     var F = g_F;
-    g_NP = param_total(V, C, T, nh, F);
+    g_NP = _emb_end() + NL * _blk() + 2 * C;
 
     g_params = t_alloc(g_NP);
     g_grads = t_alloc(g_NP);
     g_adam_m = t_alloc(g_NP);
     g_adam_v = t_alloc(g_NP);
 
-    # carve params and grads at identical offsets
-    var off = 0;
-    P_tokemb = g_params + off * 8; G_tokemb = g_grads + off * 8; off = off + V * C;
-    P_posemb = g_params + off * 8; G_posemb = g_grads + off * 8; off = off + T * C;
-    P_ln1g = g_params + off * 8;   G_ln1g = g_grads + off * 8;   off = off + C;
-    P_ln1b = g_params + off * 8;   G_ln1b = g_grads + off * 8;   off = off + C;
-    P_Wq = g_params + off * 8;     G_Wq = g_grads + off * 8;     off = off + C * C;
-    P_Wk = g_params + off * 8;     G_Wk = g_grads + off * 8;     off = off + C * C;
-    P_Wv = g_params + off * 8;     G_Wv = g_grads + off * 8;     off = off + C * C;
-    P_Wo = g_params + off * 8;     G_Wo = g_grads + off * 8;     off = off + C * C;
-    P_ln2g = g_params + off * 8;   G_ln2g = g_grads + off * 8;   off = off + C;
-    P_ln2b = g_params + off * 8;   G_ln2b = g_grads + off * 8;   off = off + C;
-    P_Wfc = g_params + off * 8;    G_Wfc = g_grads + off * 8;    off = off + C * F;
-    P_bfc = g_params + off * 8;    G_bfc = g_grads + off * 8;    off = off + F;
-    P_Wproj = g_params + off * 8;  G_Wproj = g_grads + off * 8;  off = off + F * C;
-    P_bproj = g_params + off * 8;  G_bproj = g_grads + off * 8;  off = off + C;
-    P_lnfg = g_params + off * 8;   G_lnfg = g_grads + off * 8;   off = off + C;
-    P_lnfb = g_params + off * 8;   G_lnfb = g_grads + off * 8;   off = off + C;
-
     # initialise weights
     rng_seed(seed);
     var std = f64_div(f64_from(2), f64_from(100));   # 0.02
-    t_randn(P_tokemb, V * C, std);
-    t_randn(P_posemb, T * C, std);
-    t_randn(P_Wq, C * C, std); t_randn(P_Wk, C * C, std);
-    t_randn(P_Wv, C * C, std); t_randn(P_Wo, C * C, std);
-    t_randn(P_Wfc, C * F, std); t_randn(P_Wproj, F * C, std);
-    # layernorm: gamma = 1, beta = 0 (already 0)
-    t_fill(P_ln1g, C, f64_from(1));
-    t_fill(P_ln2g, C, f64_from(1));
-    t_fill(P_lnfg, C, f64_from(1));
-    # biases bfc, bproj already 0
+    # GPT-2 residual-projection scaling: 1/sqrt(2*NL)
+    var rstd = f64_div(std, f64_sqrt(f64_from(2 * NL)));
+    t_randn(P_tokemb(), V * C, std);
+    t_randn(P_posemb(), T * C, std);
+    var L = 0;
+    while (L < NL) {
+        t_fill(PL(L, _o_ln1g()), C, f64_from(1));
+        t_fill(PL(L, _o_ln2g()), C, f64_from(1));
+        t_randn(PL(L, _o_Wq()), C * C, std);
+        t_randn(PL(L, _o_Wk()), C * C, std);
+        t_randn(PL(L, _o_Wv()), C * C, std);
+        t_randn(PL(L, _o_Wo()), C * C, rstd);     # residual projection
+        t_randn(PL(L, _o_Wfc()), C * F, std);
+        t_randn(PL(L, _o_Wproj()), F * C, rstd);  # residual projection
+        # biases (bfc, bproj) and ln betas already zero
+        L = L + 1;
+    }
+    t_fill(P_lnfg(), C, f64_from(1));
 
-    # activation caches
-    var TC = T * C; var TF = T * F; var TV = T * V;
+    # shared caches
+    var TC = T * C; var TV = T * V;
     A_tokens = t_alloc(T); A_targets = t_alloc(T);
-    A_x0 = t_alloc(TC); A_a = t_alloc(TC); A_attn = t_alloc(TC);
-    A_x1 = t_alloc(TC); A_b = t_alloc(TC); A_fc = t_alloc(TF);
-    A_g = t_alloc(TF); A_x2 = t_alloc(TC); A_f = t_alloc(TC);
+    A_attn = t_alloc(TC); A_mlp = t_alloc(TC); A_f = t_alloc(TC);
     A_logits = t_alloc(TV); A_probs = t_alloc(TV);
-    A_mean1 = t_alloc(T); A_rstd1 = t_alloc(T);
-    A_mean2 = t_alloc(T); A_rstd2 = t_alloc(T);
     A_meanf = t_alloc(T); A_rstdf = t_alloc(T);
-    A_arena = t_alloc(attn_arena_size(T, C, nh));
+
+    # per-layer cache arrays
+    LA_resid = t_alloc(NL + 1);
+    LA_a = t_alloc(NL); LA_xmid = t_alloc(NL); LA_b = t_alloc(NL);
+    LA_fc = t_alloc(NL); LA_g = t_alloc(NL);
+    LA_m1 = t_alloc(NL); LA_r1 = t_alloc(NL);
+    LA_m2 = t_alloc(NL); LA_r2 = t_alloc(NL);
+    LA_arena = t_alloc(NL);
+    LA_dmask_attn = t_alloc(NL); LA_dmask_mlp = t_alloc(NL);
+    var i = 0;
+    while (i < NL + 1) { store64(LA_resid + i * 8, t_alloc(TC)); i = i + 1; }
+    var TF = T * F; var asz = attn_arena_size(T, C, nh);
+    L = 0;
+    while (L < NL) {
+        store64(LA_a + L * 8, t_alloc(TC));
+        store64(LA_xmid + L * 8, t_alloc(TC));
+        store64(LA_b + L * 8, t_alloc(TC));
+        store64(LA_fc + L * 8, t_alloc(TF));
+        store64(LA_g + L * 8, t_alloc(TF));
+        store64(LA_m1 + L * 8, t_alloc(T));
+        store64(LA_r1 + L * 8, t_alloc(T));
+        store64(LA_m2 + L * 8, t_alloc(T));
+        store64(LA_r2 + L * 8, t_alloc(T));
+        store64(LA_arena + L * 8, t_alloc(asz));
+        store64(LA_dmask_attn + L * 8, t_alloc(TC));
+        store64(LA_dmask_mlp + L * 8, t_alloc(TC));
+        L = L + 1;
+    }
 
     # gradient temporaries
-    D_logits = t_alloc(TV); D_f = t_alloc(TC); D_x2 = t_alloc(TC);
-    D_g = t_alloc(TF); D_fc = t_alloc(TF); D_bln2 = t_alloc(TC);
-    D_x1 = t_alloc(TC); D_attn = t_alloc(TC); D_a = t_alloc(TC);
-    D_x0 = t_alloc(TC); D_tmp = t_alloc(TC);
+    D_logits = t_alloc(TV); D_f = t_alloc(TC); D_resid = t_alloc(TC);
+    D_xmid = t_alloc(TC); D_a = t_alloc(TC); D_b = t_alloc(TC);
+    D_g = t_alloc(TF); D_fc = t_alloc(TF); D_tmp = t_alloc(TC); D_drop = t_alloc(TC);
     return 0;
 }
 
@@ -149,6 +202,7 @@ fn model_init(V, C, T, nh, seed): i64 {
 # logits(T,V) = f(T,C) @ tokemb^T
 fn head_fwd(): i64 {
     var T = g_T; var C = g_C; var V = g_V;
+    var emb = P_tokemb();
     var t = 0;
     while (t < T) {
         var v = 0;
@@ -157,7 +211,7 @@ fn head_fwd(): i64 {
             var c = 0;
             while (c < C) {
                 acc = f64_add(acc, f64_mul(load64(A_f + (t * C + c) * 8),
-                                           load64(P_tokemb + (v * C + c) * 8)));
+                                           load64(emb + (v * C + c) * 8)));
                 c = c + 1;
             }
             store64(A_logits + (t * V + v) * 8, acc);
@@ -171,7 +225,7 @@ fn head_fwd(): i64 {
 # dlogits(T,V) -> df(T,C); accumulate dtokemb (head part)
 fn head_bwd(): i64 {
     var T = g_T; var C = g_C; var V = g_V;
-    # df[t,c] = sum_v dlogits[t,v]*tokemb[v,c]
+    var emb = P_tokemb(); var gemb = G_tokemb();
     var t = 0;
     while (t < T) {
         var c = 0;
@@ -180,7 +234,7 @@ fn head_bwd(): i64 {
             var v = 0;
             while (v < V) {
                 acc = f64_add(acc, f64_mul(load64(D_logits + (t * V + v) * 8),
-                                           load64(P_tokemb + (v * C + c) * 8)));
+                                           load64(emb + (v * C + c) * 8)));
                 v = v + 1;
             }
             store64(D_f + (t * C + c) * 8, acc);
@@ -188,7 +242,6 @@ fn head_bwd(): i64 {
         }
         t = t + 1;
     }
-    # dtokemb[v,c] += sum_t dlogits[t,v]*f[t,c]
     var v2 = 0;
     while (v2 < V) {
         var c = 0;
@@ -200,7 +253,7 @@ fn head_bwd(): i64 {
                                            load64(A_f + (tt * C + c) * 8)));
                 tt = tt + 1;
             }
-            var gi = G_tokemb + (v2 * C + c) * 8;
+            var gi = gemb + (v2 * C + c) * 8;
             store64(gi, f64_add(load64(gi), acc));
             c = c + 1;
         }
@@ -212,14 +265,14 @@ fn head_bwd(): i64 {
 # ---- embedding -------------------------------------------------------------
 fn embed_fwd(): i64 {
     var T = g_T; var C = g_C;
+    var emb = P_tokemb(); var pos = P_posemb(); var x0 = La(LA_resid, 0);
     var t = 0;
     while (t < T) {
         var tok = load64(A_tokens + t * 8);
         var c = 0;
         while (c < C) {
-            var e = f64_add(load64(P_tokemb + (tok * C + c) * 8),
-                            load64(P_posemb + (t * C + c) * 8));
-            store64(A_x0 + (t * C + c) * 8, e);
+            store64(x0 + (t * C + c) * 8, f64_add(load64(emb + (tok * C + c) * 8),
+                                                  load64(pos + (t * C + c) * 8)));
             c = c + 1;
         }
         t = t + 1;
@@ -227,18 +280,19 @@ fn embed_fwd(): i64 {
     return 0;
 }
 
-# given dx0 -> accumulate dtokemb (lookup part) and dposemb
+# d(resid[0]) -> accumulate dtokemb (lookup part) and dposemb
 fn embed_bwd(dx0): i64 {
     var T = g_T; var C = g_C;
+    var gemb = G_tokemb(); var gpos = G_posemb();
     var t = 0;
     while (t < T) {
         var tok = load64(A_tokens + t * 8);
         var c = 0;
         while (c < C) {
             var d = load64(dx0 + (t * C + c) * 8);
-            var te = G_tokemb + (tok * C + c) * 8;
+            var te = gemb + (tok * C + c) * 8;
             store64(te, f64_add(load64(te), d));
-            var pe = G_posemb + (t * C + c) * 8;
+            var pe = gpos + (t * C + c) * 8;
             store64(pe, f64_add(load64(pe), d));
             c = c + 1;
         }
@@ -250,26 +304,37 @@ fn embed_bwd(dx0): i64 {
 # ---- full forward: returns mean loss (f64) ---------------------------------
 fn model_forward(): i64 {
     var T = g_T; var C = g_C; var F = g_F; var V = g_V; var nh = g_nh;
+    var TC = T * C;
     embed_fwd();
-    ln_fwd(A_x0, P_ln1g, P_ln1b, A_a, A_mean1, A_rstd1, T, C);
-    attn_fwd(P_Wq, P_Wk, P_Wv, P_Wo, A_a, A_attn, A_arena, T, C, nh);
-    # x1 = x0 + attn
-    var i = 0;
-    while (i < T * C) {
-        store64(A_x1 + i * 8, f64_add(load64(A_x0 + i * 8), load64(A_attn + i * 8)));
-        i = i + 1;
+    var L = 0;
+    while (L < g_NL) {
+        var xin = La(LA_resid, L);
+        var a = La(LA_a, L);
+        ln_fwd(xin, PL(L, _o_ln1g()), PL(L, _o_ln1b()), a, La(LA_m1, L), La(LA_r1, L), T, C);
+        attn_fwd(PL(L, _o_Wq()), P_bq(L), PL(L, _o_Wk()), P_bk(L),
+                 PL(L, _o_Wv()), P_bv(L), PL(L, _o_Wo()), P_bo(L),
+                 a, A_attn, La(LA_arena, L), T, C, nh);
+        # residual dropout on the attention branch
+        dropout_gen_mask(La(LA_dmask_attn, L), TC, g_dropout, g_training);
+        dropout_apply(A_attn, La(LA_dmask_attn, L), A_attn, TC);
+        var xmid = La(LA_xmid, L);
+        var i = 0;
+        while (i < TC) { store64(xmid + i * 8, f64_add(load64(xin + i * 8), load64(A_attn + i * 8))); i = i + 1; }
+        var b = La(LA_b, L);
+        ln_fwd(xmid, PL(L, _o_ln2g()), PL(L, _o_ln2b()), b, La(LA_m2, L), La(LA_r2, L), T, C);
+        var fc = La(LA_fc, L); var gg = La(LA_g, L);
+        linear_fwd(b, PL(L, _o_Wfc()), PL(L, _o_bfc()), fc, T, C, F);
+        gelu_fwd(fc, gg, T * F);
+        linear_fwd(gg, PL(L, _o_Wproj()), PL(L, _o_bproj()), A_mlp, T, F, C);
+        # residual dropout on the MLP branch
+        dropout_gen_mask(La(LA_dmask_mlp, L), TC, g_dropout, g_training);
+        dropout_apply(A_mlp, La(LA_dmask_mlp, L), A_mlp, TC);
+        var xout = La(LA_resid, L + 1);
+        i = 0;
+        while (i < TC) { store64(xout + i * 8, f64_add(load64(xmid + i * 8), load64(A_mlp + i * 8))); i = i + 1; }
+        L = L + 1;
     }
-    ln_fwd(A_x1, P_ln2g, P_ln2b, A_b, A_mean2, A_rstd2, T, C);
-    linear_fwd(A_b, P_Wfc, P_bfc, A_fc, T, C, F);
-    gelu_fwd(A_fc, A_g, T * F);
-    # proj into x2 temporarily, then add residual
-    linear_fwd(A_g, P_Wproj, P_bproj, A_x2, T, F, C);   # A_x2 = proj
-    i = 0;
-    while (i < T * C) {
-        store64(A_x2 + i * 8, f64_add(load64(A_x1 + i * 8), load64(A_x2 + i * 8)));
-        i = i + 1;
-    }
-    ln_fwd(A_x2, P_lnfg, P_lnfb, A_f, A_meanf, A_rstdf, T, C);
+    ln_fwd(La(LA_resid, g_NL), P_lnfg(), P_lnfb(), A_f, A_meanf, A_rstdf, T, C);
     head_fwd();
     return softmax_xent_fwd(A_logits, A_targets, A_probs, T, V);
 }
@@ -277,42 +342,69 @@ fn model_forward(): i64 {
 # ---- full backward: fills g_grads (assumes grads already zeroed) -----------
 fn model_backward(): i64 {
     var T = g_T; var C = g_C; var F = g_F; var V = g_V; var nh = g_nh;
+    var TC = T * C;
     softmax_xent_bwd(A_probs, A_targets, D_logits, T, V);
     head_bwd();                                   # -> D_f ; accum G_tokemb (head)
-    # through lnf: D_f -> D_x2
-    ln_bwd(A_x2, P_lnfg, D_f, A_meanf, A_rstdf, D_x2, G_lnfg, G_lnfb, T, C);
-    # residual2: x2 = x1 + proj  => dproj = D_x2, dx1 starts as D_x2
-    t_copy(D_x1, D_x2, T * C);
-    # MLP backward: proj = g@Wproj+bproj ; g=gelu(fc) ; fc=b@Wfc+bfc
-    linear_bwd(A_g, P_Wproj, D_x2, D_g, G_Wproj, G_bproj, T, F, C);   # D_x2 is dproj
-    gelu_bwd(A_fc, D_g, D_fc, T * F);
-    linear_bwd(A_b, P_Wfc, D_fc, D_bln2, G_Wfc, G_bfc, T, C, F);      # -> D_bln2
-    # through ln2: D_bln2 -> D_tmp ; add into D_x1
-    ln_bwd(A_x1, P_ln2g, D_bln2, A_mean2, A_rstd2, D_tmp, G_ln2g, G_ln2b, T, C);
-    t_add_into(D_x1, D_tmp, T * C);
-    # residual1: x1 = x0 + attn => dattn = D_x1, dx0 starts as D_x1
-    t_copy(D_attn, D_x1, T * C);
-    t_copy(D_x0, D_x1, T * C);
-    # attention backward: D_attn -> D_a ; accum G_Wq..G_Wo
-    attn_bwd(P_Wq, P_Wk, P_Wv, P_Wo, A_a, D_attn, D_a,
-             G_Wq, G_Wk, G_Wv, G_Wo, A_arena, T, C, nh);
-    # through ln1: D_a -> D_tmp ; add into D_x0
-    ln_bwd(A_x0, P_ln1g, D_a, A_mean1, A_rstd1, D_tmp, G_ln1g, G_ln1b, T, C);
-    t_add_into(D_x0, D_tmp, T * C);
-    # embedding backward
-    embed_bwd(D_x0);
+    # through final LN: D_f -> D_resid (= d resid[NL])
+    ln_bwd(La(LA_resid, g_NL), P_lnfg(), D_f, A_meanf, A_rstdf, D_resid, G_lnfg(), G_lnfb(), T, C);
+    var L = g_NL - 1;
+    while (L >= 0) {
+        var xin = La(LA_resid, L);
+        var xmid = La(LA_xmid, L);
+        # D_resid currently holds d_xout for layer L.
+        # MLP: d(mlp branch output) = D_resid; back through its dropout first.
+        dropout_bwd(La(LA_dmask_mlp, L), D_resid, D_drop, TC);
+        linear_bwd(La(LA_g, L), PL(L, _o_Wproj()), D_drop, D_g, GL(L, _o_Wproj()), GL(L, _o_bproj()), T, F, C);
+        gelu_bwd(La(LA_fc, L), D_g, D_fc, T * F);
+        linear_bwd(La(LA_b, L), PL(L, _o_Wfc()), D_fc, D_b, GL(L, _o_Wfc()), GL(L, _o_bfc()), T, C, F);
+        ln_bwd(xmid, PL(L, _o_ln2g()), D_b, La(LA_m2, L), La(LA_r2, L), D_tmp,
+               GL(L, _o_ln2g()), GL(L, _o_ln2b()), T, C);
+        # d_xmid = D_resid (residual) + D_tmp (ln2 path)
+        t_copy(D_xmid, D_resid, TC);
+        t_add_into(D_xmid, D_tmp, TC);
+        # attention: d(attn branch output) = D_xmid; back through its dropout, then attn.
+        dropout_bwd(La(LA_dmask_attn, L), D_xmid, D_drop, TC);
+        attn_bwd(PL(L, _o_Wq()), PL(L, _o_Wk()), PL(L, _o_Wv()), PL(L, _o_Wo()),
+                 La(LA_a, L), D_drop, D_a,
+                 GL(L, _o_Wq()), G_bq(L), GL(L, _o_Wk()), G_bk(L),
+                 GL(L, _o_Wv()), G_bv(L), GL(L, _o_Wo()), G_bo(L),
+                 La(LA_arena, L), T, C, nh);
+        ln_bwd(xin, PL(L, _o_ln1g()), D_a, La(LA_m1, L), La(LA_r1, L), D_tmp, GL(L, _o_ln1g()), GL(L, _o_ln1b()), T, C);
+        # d_xin = d_xmid (residual) + D_tmp (ln1 path) ; becomes next D_resid
+        t_copy(D_resid, D_xmid, TC);
+        t_add_into(D_resid, D_tmp, TC);
+        L = L - 1;
+    }
+    embed_bwd(D_resid);
     return 0;
 }
 
 fn model_zero_grads(): i64 { t_zero(g_grads, g_NP); return 0; }
+
+# ---- gradient clipping (global L2 norm) ------------------------------------
+# If ||grads|| > clip, scale all grads by clip/||grads||. Returns the norm (f64).
+fn model_clip_grads(clip): i64 {
+    var n2 = f64_from(0);
+    var i = 0;
+    while (i < g_NP) {
+        var g = load64(g_grads + i * 8);
+        n2 = f64_add(n2, f64_mul(g, g));
+        i = i + 1;
+    }
+    var norm = f64_sqrt(n2);
+    if (f64_gt(norm, clip) == 1) {
+        t_scale(g_grads, g_NP, f64_div(clip, norm));
+    }
+    return norm;
+}
 
 # ---- Adam ------------------------------------------------------------------
 # lr is an f64 bit pattern; step is the 1-based update count.
 fn model_adam_step(lr, step): i64 {
     var b1 = f64_div(f64_from(9), f64_from(10));        # 0.9
     var b2 = f64_div(f64_from(999), f64_from(1000));    # 0.999
-    var om1 = f64_div(f64_from(1), f64_from(10));       # 1-b1 = 0.1
-    var om2 = f64_div(f64_from(1), f64_from(1000));     # 1-b2 = 0.001
+    var om1 = f64_div(f64_from(1), f64_from(10));       # 1-b1
+    var om2 = f64_div(f64_from(1), f64_from(1000));     # 1-b2
     var eps = f64_div(f64_from(1), f64_from(100000000)); # 1e-8
     var one = f64_from(1);
     var bc1 = f64_sub(one, f64_pow(b1, f64_from(step)));

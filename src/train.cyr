@@ -78,9 +78,44 @@ fn sample_window(): i64 {
     return 0;
 }
 
+# ---- learning-rate schedule ------------------------------------------------
+# cos(pi*p) for p in [0,1] via Taylor series (no f64_cos builtin). 12 terms is
+# ample on [0,pi]; this runs once per step, so cost is irrelevant.
+fn _cos_unit(p): i64 {
+    var x = f64_mul(F64_PI, p);
+    var x2 = f64_mul(x, x);
+    var term = f64_from(1);
+    var sum = term;
+    var k = 1;
+    while (k <= 12) {
+        var denom = f64_from((2 * k - 1) * (2 * k));
+        term = f64_div(f64_mul(term, f64_neg(x2)), denom);
+        sum = f64_add(sum, term);
+        k = k + 1;
+    }
+    return sum;
+}
+
+# Linear warmup over [1, warmup], then cosine decay base_lr -> min_lr over
+# [warmup, total]. All lr values are f64 bit patterns.
+fn lr_at(step, total, warmup, base_lr, min_lr): i64 {
+    if (step < warmup) {
+        return f64_mul(base_lr, f64_div(f64_from(step), f64_from(warmup)));
+    }
+    var denom = total - warmup;
+    if (denom < 1) { denom = 1; }
+    var p = f64_div(f64_from(step - warmup), f64_from(denom));
+    if (f64_gt(p, f64_from(1)) == 1) { p = f64_from(1); }
+    var mult = f64_mul(f64_div(f64_from(1), f64_from(2)), f64_add(f64_from(1), _cos_unit(p)));
+    return f64_add(min_lr, f64_mul(f64_sub(base_lr, min_lr), mult));
+}
+
 # ---- training loop ---------------------------------------------------------
-# lr is an f64 bit pattern. Accumulates grads over `batch` windows per step.
-fn train(steps, batch, lr, log_every): i64 {
+# base_lr/min_lr/clip are f64 bit patterns. Accumulates grads over `batch`
+# windows per step, clips the global grad norm, then steps Adam on the
+# scheduled lr.
+fn train(steps, batch, base_lr, min_lr, warmup, clip, log_every): i64 {
+    g_training = 1;
     var invB = f64_div(f64_from(1), f64_from(batch));
     var step = 1;
     while (step <= steps) {
@@ -96,10 +131,14 @@ fn train(steps, batch, lr, log_every): i64 {
         # average grads and loss over the batch
         t_scale(g_grads, g_NP, invB);
         loss = f64_mul(loss, invB);
+        var gnorm = model_clip_grads(clip);
+        var lr = lr_at(step, steps, warmup, base_lr, min_lr);
         model_adam_step(lr, step);
         if ((step % log_every) == 0) {
             print("step ", 5); fmt_int(step);
-            print("  loss ", 7); f_print(loss, 5); _putc(10);
+            print("  loss ", 7); f_print(loss, 5);
+            print("  lr ", 5); f_print(lr, 6);
+            print("  |g| ", 6); f_print(gnorm, 4); _putc(10);
         }
         step = step + 1;
     }
@@ -146,6 +185,7 @@ fn sample_logits_row(row, V, temp): i64 {
 
 # Seed the context with `prompt` (plen chars), then emit `ngen` more chars.
 fn generate(prompt, plen, ngen, temp): i64 {
+    g_training = 0;   # disable dropout for eval
     var T = g_T; var V = g_V;
     # init context window: last T chars of prompt, left-padded with id 0
     var t = 0;
