@@ -1,0 +1,51 @@
+# attn11 — main entry point.
+# A from-scratch GPT-style transformer, trained, in Cyrius.
+# Stdlib (alloc/fmt/string/math/...) auto-included via cyrius.cyml.
+
+include "src/tensor.cyr"
+include "src/ops.cyr"
+include "src/attn.cyr"
+include "src/model.cyr"
+include "src/train.cyr"
+
+# ---- hyperparameters -------------------------------------------------------
+fn CFG_C(): i64 { return 32; }       # d_model
+fn CFG_T(): i64 { return 16; }       # context length
+fn CFG_NH(): i64 { return 4; }       # attention heads (head dim = C/NH)
+fn CFG_SEED(): i64 { return 1337; }
+fn CFG_STEPS(): i64 { return 2000; }
+fn CFG_BATCH(): i64 { return 16; }
+fn CFG_LOG(): i64 { return 250; }
+fn CFG_LR(): i64 { return f64_div(f64_from(3), f64_from(1000)); }   # 3e-3
+
+fn main(): i64 {
+    alloc_init();
+
+    var V = build_corpus();
+    model_init(V, CFG_C(), CFG_T(), CFG_NH(), CFG_SEED());
+
+    puts("attn11 — transformer training in Cyrius\n");
+    puts("  vocab="); fmt_int(V);
+    puts(" d_model="); fmt_int(g_C);
+    puts(" ctx="); fmt_int(g_T);
+    puts(" heads="); fmt_int(g_nh);
+    puts(" params="); fmt_int(g_NP); _putc(10);
+    puts("  corpus chars="); fmt_int(g_datalen); _putc(10);
+    _putc(10);
+
+    puts("training:\n");
+    train(CFG_STEPS(), CFG_BATCH(), CFG_LR(), CFG_LOG());
+
+    _putc(10);
+    puts("greedy sample:\n");
+    generate("cyrius ", 7, 120, f64_from(0));
+
+    puts("\nsampled (temp 0.8):\n");
+    var temp = f64_div(f64_from(8), f64_from(10));
+    generate("a transformer ", 14, 120, temp);
+
+    return 0;
+}
+
+var r = main();
+syscall(SYS_EXIT, r);

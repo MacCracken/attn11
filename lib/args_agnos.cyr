@@ -1,0 +1,92 @@
+# args_agnos.cyr — command-line argument access on agnos (ring-3 x86_64)
+# Usage: include "lib/args.cyr" (dispatches here under CYRIUS_TARGET_AGNOS)
+#
+# agnos has no /proc/self/cmdline (the Linux source). Its kernel
+# (agnos/kernel/core/elf.cyr `elf_load_from_file`) builds a SysV init stack
+# at exec: [rsp]=argc, [rsp+8+i*8]=argv[i], then a NULL, an empty envp
+# (immediate NULL), and AT_NULL-only auxv; rsp lands exactly at argc,
+# 16-byte aligned, argc capped at 8.
+#
+# Like lib/args_macos.cyr (which reads the arm64 entry's x28), the init rsp
+# is captured by the cycc-emitted entry — NOT here. On the agnos executable
+# path (km==0) nothing moves rsp between e_entry and the auto-call to main,
+# so src/main.cyr emits `call _agnos_capture_rsp` (gated _TARGET_AGNOS) at
+# the epilogue, just before `call main`, while rsp still = the init rsp.
+# That records it into _agnos_init_rsp; argc()/argv() read from there.
+
+var _agnos_init_rsp = 0;
+
+# Record the agnos init-stack pointer. cycc emits the `call` to this from
+# the entry epilogue while rsp = init rsp. The `call` pushed the return
+# address (8 bytes) and EFNPRO pushed rbp (8 bytes), so the init rsp is
+# rbp + 16. (rbp+16 is read via inline asm into the first local, then
+# stored to the global through the normal compiler path — same shape as
+# lib/args_macos.cyr's x28 read.)
+fn _agnos_capture_rsp() {
+    var ir = 0;
+    asm {
+        0x48; 0x8D; 0x45; 0x10;   # lea rax, [rbp+16]   (init rsp)
+        0x48; 0x89; 0x45; 0xF8;   # mov [rbp-8], rax    (-> ir, the first local)
+    }
+    _agnos_init_rsp = ir;
+    return 0;
+}
+
+# args_init is a no-op on agnos — the capture above already ran (kept in
+# the public API so consumer code stays portable across targets).
+fn args_init() {
+    return 0;
+}
+
+# argc = the qword the kernel placed at the init rsp.
+fn argc() {
+    if (_agnos_init_rsp == 0) { return 0; }
+    return load64(_agnos_init_rsp);
+}
+
+# argv(n) = the nth pointer above argc (n=0 is the program name). Bounded by
+# the kernel-supplied argc (argv[argc] is the NULL terminator).
+fn argv(n) {
+    if (n < 0) { return 0; }
+    if (_agnos_init_rsp == 0) { return 0; }
+    var cnt = load64(_agnos_init_rsp);
+    if (n >= cnt) { return 0; }
+    return load64(_agnos_init_rsp + 8 + n * 8);
+}
+
+# v6.0.87: getenv on agnos. agnos has no /proc; the kernel stages envp on the
+# exec init stack (agnos 1.43.2, ABI §4.6): argc=[rsp], the argv NULL is at
+# [rsp+8+argc*8], then envp[j] = [rsp+8+(argc+1+j)*8] (NUL-terminated), each a
+# "KEY=VALUE" cstr (default env HOME=/, PWD=/). lib/io.cyr getenv() delegates
+# here under CYRIUS_TARGET_AGNOS — the _agnos_init_rsp global lives here and
+# io.cyr is included BEFORE args, so the delegation is a forward fn ref (REGFN),
+# not a forward global ref. Returns a heap copy of VALUE, or 0 if unset. envc
+# is bounded (256) so a malformed/unterminated envp can't spin.
+fn _agnos_getenv(name) {
+    if (_agnos_init_rsp == 0) { return 0; }
+    var acnt = load64(_agnos_init_rsp);
+    var nlen = strlen(name);
+    var base = _agnos_init_rsp + 8 + (acnt + 1) * 8;   # &envp[0]
+    var j = 0;
+    while (j < 256) {
+        var ep = load64(base + j * 8);
+        if (ep == 0) { return 0; }                     # envp NULL terminator
+        var eq = 1;
+        var ci = 0;
+        while (ci < nlen) {
+            if (load8(ep + ci) != load8(name + ci)) { eq = 0; break; }
+            ci = ci + 1;
+        }
+        if (eq == 1) { if (load8(ep + nlen) == 61) {   # 61 = '='
+                var vs = ep + nlen + 1;
+                var vl = 0;
+                while (load8(vs + vl) != 0) { vl = vl + 1; }
+                var res = alloc(vl + 1);
+                memcpy(res, vs, vl);
+                store8(res + vl, 0);
+                return res;
+            } }
+        j = j + 1;
+    }
+    return 0;
+}

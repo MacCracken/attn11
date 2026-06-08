@@ -1,0 +1,244 @@
+# attn11 test suite — finite-difference gradient checks.
+#
+# Hand-derived backward passes are only as trustworthy as their grad checks.
+# Every op (and the full model) is verified against central finite differences.
+# Stdlib (assert/math/...) auto-included via cyrius.cyml.
+
+include "src/tensor.cyr"
+include "src/ops.cyr"
+include "src/attn.cyr"
+include "src/model.cyr"
+
+fn _eps(): i64 { return f64_div(f64_from(1), f64_from(10000)); }     # 1e-4
+fn dotsum(a, b, n): i64 {
+    var acc = f64_from(0); var i = 0;
+    while (i < n) { acc = f64_add(acc, f64_mul(load64(a + i * 8), load64(b + i * 8))); i = i + 1; }
+    return acc;
+}
+
+# max relative error between analytic and numeric gradient arrays
+fn maxrel(analytic, numeric, n): i64 {
+    var mr = f64_from(0);
+    var tiny = f64_div(f64_from(1), f64_from(1000000000));
+    var i = 0;
+    while (i < n) {
+        var a = load64(analytic + i * 8); var b = load64(numeric + i * 8);
+        var rel = f64_div(f64_abs(f64_sub(a, b)),
+                          f64_add(f64_add(f64_abs(a), f64_abs(b)), tiny));
+        if (f64_gt(rel, mr) == 1) { mr = rel; }
+        i = i + 1;
+    }
+    return mr;
+}
+
+# assert max-rel-err < tol; tol = 1/tol_inv
+fn check(name, analytic, numeric, n, tol_inv): i64 {
+    var mr = maxrel(analytic, numeric, n);
+    assert(f64_lt(mr, f64_div(f64_from(1), f64_from(tol_inv))) == 1, name);
+    return 0;
+}
+
+# ===========================================================================
+fn lin_loss(x, W, b, y, dy, M, K, N): i64 { linear_fwd(x, W, b, y, M, K, N); return dotsum(dy, y, M * N); }
+
+fn test_linear(): i64 {
+    var M = 3; var K = 4; var N = 5;
+    var x = t_alloc(M * K); var W = t_alloc(K * N); var b = t_alloc(N);
+    var y = t_alloc(M * N); var dy = t_alloc(M * N);
+    t_randn(x, M * K, f64_from(1)); t_randn(W, K * N, f64_from(1));
+    t_randn(b, N, f64_from(1)); t_randn(dy, M * N, f64_from(1));
+    var dx = t_alloc(M * K); var dW = t_alloc(K * N); var db = t_alloc(N);
+    linear_fwd(x, W, b, y, M, K, N);
+    linear_bwd(x, W, dy, dx, dW, db, M, K, N);
+    var eps = _eps(); var te = f64_mul(f64_from(2), eps);
+    var ndx = t_alloc(M * K); var i = 0;
+    while (i < M * K) {
+        var o = load64(x + i * 8);
+        store64(x + i * 8, f64_add(o, eps)); var lp = lin_loss(x, W, b, y, dy, M, K, N);
+        store64(x + i * 8, f64_sub(o, eps)); var lm = lin_loss(x, W, b, y, dy, M, K, N);
+        store64(x + i * 8, o); store64(ndx + i * 8, f64_div(f64_sub(lp, lm), te)); i = i + 1;
+    }
+    var ndW = t_alloc(K * N); i = 0;
+    while (i < K * N) {
+        var o = load64(W + i * 8);
+        store64(W + i * 8, f64_add(o, eps)); var lp = lin_loss(x, W, b, y, dy, M, K, N);
+        store64(W + i * 8, f64_sub(o, eps)); var lm = lin_loss(x, W, b, y, dy, M, K, N);
+        store64(W + i * 8, o); store64(ndW + i * 8, f64_div(f64_sub(lp, lm), te)); i = i + 1;
+    }
+    var ndb = t_alloc(N); i = 0;
+    while (i < N) {
+        var o = load64(b + i * 8);
+        store64(b + i * 8, f64_add(o, eps)); var lp = lin_loss(x, W, b, y, dy, M, K, N);
+        store64(b + i * 8, f64_sub(o, eps)); var lm = lin_loss(x, W, b, y, dy, M, K, N);
+        store64(b + i * 8, o); store64(ndb + i * 8, f64_div(f64_sub(lp, lm), te)); i = i + 1;
+    }
+    check("linear dx", dx, ndx, M * K, 100000);
+    check("linear dW", dW, ndW, K * N, 100000);
+    check("linear db", db, ndb, N, 100000);
+    return 0;
+}
+
+fn ln_loss(x, g, be, y, mean, rstd, dy, M, C): i64 { ln_fwd(x, g, be, y, mean, rstd, M, C); return dotsum(dy, y, M * C); }
+fn test_layernorm(): i64 {
+    var M = 3; var C = 6;
+    var x = t_alloc(M * C); var g = t_alloc(C); var be = t_alloc(C);
+    var y = t_alloc(M * C); var dy = t_alloc(M * C);
+    var mean = t_alloc(M); var rstd = t_alloc(M);
+    t_randn(x, M * C, f64_from(1)); t_randn(g, C, f64_from(1));
+    t_randn(be, C, f64_from(1)); t_randn(dy, M * C, f64_from(1));
+    var dx = t_alloc(M * C); var dg = t_alloc(C); var dbe = t_alloc(C);
+    ln_fwd(x, g, be, y, mean, rstd, M, C);
+    ln_bwd(x, g, dy, mean, rstd, dx, dg, dbe, M, C);
+    var eps = _eps(); var te = f64_mul(f64_from(2), eps);
+    var ndx = t_alloc(M * C); var i = 0;
+    while (i < M * C) {
+        var o = load64(x + i * 8);
+        store64(x + i * 8, f64_add(o, eps)); var lp = ln_loss(x, g, be, y, mean, rstd, dy, M, C);
+        store64(x + i * 8, f64_sub(o, eps)); var lm = ln_loss(x, g, be, y, mean, rstd, dy, M, C);
+        store64(x + i * 8, o); store64(ndx + i * 8, f64_div(f64_sub(lp, lm), te)); i = i + 1;
+    }
+    var ndg = t_alloc(C); i = 0;
+    while (i < C) {
+        var o = load64(g + i * 8);
+        store64(g + i * 8, f64_add(o, eps)); var lp = ln_loss(x, g, be, y, mean, rstd, dy, M, C);
+        store64(g + i * 8, f64_sub(o, eps)); var lm = ln_loss(x, g, be, y, mean, rstd, dy, M, C);
+        store64(g + i * 8, o); store64(ndg + i * 8, f64_div(f64_sub(lp, lm), te)); i = i + 1;
+    }
+    var ndbe = t_alloc(C); i = 0;
+    while (i < C) {
+        var o = load64(be + i * 8);
+        store64(be + i * 8, f64_add(o, eps)); var lp = ln_loss(x, g, be, y, mean, rstd, dy, M, C);
+        store64(be + i * 8, f64_sub(o, eps)); var lm = ln_loss(x, g, be, y, mean, rstd, dy, M, C);
+        store64(be + i * 8, o); store64(ndbe + i * 8, f64_div(f64_sub(lp, lm), te)); i = i + 1;
+    }
+    check("layernorm dx", dx, ndx, M * C, 100000);
+    check("layernorm dgamma", dg, ndg, C, 100000);
+    check("layernorm dbeta", dbe, ndbe, C, 100000);
+    return 0;
+}
+
+fn gelu_loss(x, y, dy, n): i64 { gelu_fwd(x, y, n); return dotsum(dy, y, n); }
+fn test_gelu(): i64 {
+    var n = 12;
+    var x = t_alloc(n); var y = t_alloc(n); var dy = t_alloc(n);
+    t_randn(x, n, f64_from(1)); t_randn(dy, n, f64_from(1));
+    var dx = t_alloc(n);
+    gelu_fwd(x, y, n); gelu_bwd(x, dy, dx, n);
+    var eps = _eps(); var te = f64_mul(f64_from(2), eps);
+    var ndx = t_alloc(n); var i = 0;
+    while (i < n) {
+        var o = load64(x + i * 8);
+        store64(x + i * 8, f64_add(o, eps)); var lp = gelu_loss(x, y, dy, n);
+        store64(x + i * 8, f64_sub(o, eps)); var lm = gelu_loss(x, y, dy, n);
+        store64(x + i * 8, o); store64(ndx + i * 8, f64_div(f64_sub(lp, lm), te)); i = i + 1;
+    }
+    check("gelu dx", dx, ndx, n, 100000);
+    return 0;
+}
+
+fn test_softmax_xent(): i64 {
+    var M = 4; var V = 5;
+    var logits = t_alloc(M * V); var probs = t_alloc(M * V); var targets = t_alloc(M);
+    t_randn(logits, M * V, f64_from(1));
+    store64(targets + 0, 2); store64(targets + 8, 0); store64(targets + 16, 4); store64(targets + 24, 1);
+    var dlogits = t_alloc(M * V);
+    softmax_xent_fwd(logits, targets, probs, M, V);
+    softmax_xent_bwd(probs, targets, dlogits, M, V);
+    var eps = _eps(); var te = f64_mul(f64_from(2), eps);
+    var nd = t_alloc(M * V); var i = 0;
+    while (i < M * V) {
+        var o = load64(logits + i * 8);
+        store64(logits + i * 8, f64_add(o, eps)); var lp = softmax_xent_fwd(logits, targets, probs, M, V);
+        store64(logits + i * 8, f64_sub(o, eps)); var lm = softmax_xent_fwd(logits, targets, probs, M, V);
+        store64(logits + i * 8, o); store64(nd + i * 8, f64_div(f64_sub(lp, lm), te)); i = i + 1;
+    }
+    check("softmax_xent dlogits", dlogits, nd, M * V, 100000);
+    return 0;
+}
+
+fn attn_loss(Wq, Wk, Wv, Wo, x, out, dout, ar, T, C, nh): i64 {
+    attn_fwd(Wq, Wk, Wv, Wo, x, out, ar, T, C, nh); return dotsum(dout, out, T * C);
+}
+fn attn_ng(p, np, n, Wq, Wk, Wv, Wo, x, out, dout, ar, T, C, nh): i64 {
+    var eps = _eps(); var te = f64_mul(f64_from(2), eps); var i = 0;
+    while (i < n) {
+        var o = load64(p + i * 8);
+        store64(p + i * 8, f64_add(o, eps)); var lp = attn_loss(Wq, Wk, Wv, Wo, x, out, dout, ar, T, C, nh);
+        store64(p + i * 8, f64_sub(o, eps)); var lm = attn_loss(Wq, Wk, Wv, Wo, x, out, dout, ar, T, C, nh);
+        store64(p + i * 8, o); store64(np + i * 8, f64_div(f64_sub(lp, lm), te)); i = i + 1;
+    }
+    return 0;
+}
+fn test_attention(): i64 {
+    var T = 3; var C = 4; var nh = 2; var CC = C * C; var TC = T * C;
+    var Wq = t_alloc(CC); var Wk = t_alloc(CC); var Wv = t_alloc(CC); var Wo = t_alloc(CC);
+    var x = t_alloc(TC); var out = t_alloc(TC); var dout = t_alloc(TC);
+    var std = f64_div(f64_from(1), f64_from(2));
+    t_randn(Wq, CC, std); t_randn(Wk, CC, std); t_randn(Wv, CC, std); t_randn(Wo, CC, std);
+    t_randn(x, TC, f64_from(1)); t_randn(dout, TC, f64_from(1));
+    var ar = t_alloc(attn_arena_size(T, C, nh));
+    var dx = t_alloc(TC);
+    var dWq = t_alloc(CC); var dWk = t_alloc(CC); var dWv = t_alloc(CC); var dWo = t_alloc(CC);
+    attn_fwd(Wq, Wk, Wv, Wo, x, out, ar, T, C, nh);
+    attn_bwd(Wq, Wk, Wv, Wo, x, dout, dx, dWq, dWk, dWv, dWo, ar, T, C, nh);
+    var ndx = t_alloc(TC); attn_ng(x, ndx, TC, Wq, Wk, Wv, Wo, x, out, dout, ar, T, C, nh);
+    var nWq = t_alloc(CC); attn_ng(Wq, nWq, CC, Wq, Wk, Wv, Wo, x, out, dout, ar, T, C, nh);
+    var nWv = t_alloc(CC); attn_ng(Wv, nWv, CC, Wq, Wk, Wv, Wo, x, out, dout, ar, T, C, nh);
+    var nWo = t_alloc(CC); attn_ng(Wo, nWo, CC, Wq, Wk, Wv, Wo, x, out, dout, ar, T, C, nh);
+    check("attn dx", dx, ndx, TC, 100000);
+    check("attn dWq", dWq, nWq, CC, 100000);
+    check("attn dWv", dWv, nWv, CC, 100000);
+    check("attn dWo", dWo, nWo, CC, 100000);
+    return 0;
+}
+
+fn model_ng(p, np, n): i64 {
+    var eps = _eps(); var te = f64_mul(f64_from(2), eps); var i = 0;
+    while (i < n) {
+        var o = load64(p + i * 8);
+        store64(p + i * 8, f64_add(o, eps)); var lp = model_forward();
+        store64(p + i * 8, f64_sub(o, eps)); var lm = model_forward();
+        store64(p + i * 8, o); store64(np + i * 8, f64_div(f64_sub(lp, lm), te)); i = i + 1;
+    }
+    return 0;
+}
+fn test_model(): i64 {
+    var V = 5; var C = 4; var T = 3; var nh = 2;
+    model_init(V, C, T, nh, 1);
+    store64(A_tokens + 0, 1); store64(A_tokens + 8, 3); store64(A_tokens + 16, 0);
+    store64(A_targets + 0, 3); store64(A_targets + 8, 0); store64(A_targets + 16, 4);
+    model_forward(); model_zero_grads(); model_backward();
+    var Cc = C * C; var n_tok = V * C;
+    # full-model finite differences are noisier; tol = 1e-4
+    var aWq = t_alloc(Cc); t_copy(aWq, G_Wq, Cc);
+    var aWo = t_alloc(Cc); t_copy(aWo, G_Wo, Cc);
+    var aTok = t_alloc(n_tok); t_copy(aTok, G_tokemb, n_tok);
+    var aPos = t_alloc(T * C); t_copy(aPos, G_posemb, T * C);
+    var nWq = t_alloc(Cc); model_ng(P_Wq, nWq, Cc);
+    var nWo = t_alloc(Cc); model_ng(P_Wo, nWo, Cc);
+    var nTok = t_alloc(n_tok); model_ng(P_tokemb, nTok, n_tok);
+    var nPos = t_alloc(T * C); model_ng(P_posemb, nPos, T * C);
+    check("model dWq", aWq, nWq, Cc, 10000);
+    check("model dWo", aWo, nWo, Cc, 10000);
+    check("model dtokemb", aTok, nTok, n_tok, 10000);
+    check("model dposemb", aPos, nPos, T * C, 10000);
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    rng_seed(123);
+    test_group("ops grad-check");
+    test_linear();
+    test_layernorm();
+    test_gelu();
+    test_softmax_xent();
+    test_group("attention grad-check");
+    test_attention();
+    test_group("full-model grad-check");
+    test_model();
+    return assert_summary();
+}
+
+var exit_code = main();
+syscall(60, exit_code);

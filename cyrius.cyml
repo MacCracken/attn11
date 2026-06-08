@@ -1,0 +1,17 @@
+[package]
+name = "attn11"
+version = "${file:VERSION}"
+description = "attn11 — a from-scratch GPT-style transformer, trained, in Cyrius"
+license = "GPL-3.0-only"
+language = "cyrius"
+cyrius = "6.1.3"
+repository = "https://github.com/MacCracken/attn11"
+
+[build]
+entry = "src/main.cyr"
+test = "src/test.cyr"
+output = "attn11"
+
+[deps]
+stdlib = ["string", "fmt", "alloc", "io", "vec", "str", "syscalls", "assert", "bench", "math", "matrix", "random"]
+---
