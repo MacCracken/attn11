@@ -101,10 +101,14 @@ fn f64_is_finite(x): i64 {
 # ---- deterministic PRNG (xorshift64) ---------------------------------------
 # Seedable so training runs are reproducible. getrandom (lib/random.cyr) is
 # available but non-deterministic, so we use our own stream here.
+# Source: Marsaglia, G. (2003), "Xorshift RNGs", J. Stat. Soft. 8(14) — the
+# (13, 7, 17) shift triple below. See docs/sources.md.
 var _rng_state = 88172645463325252;
 
 # Scramble the seed with a splitmix64 finalizer so small/sequential seeds don't
 # produce correlated or near-zero first outputs. Integer multiply wraps mod 2^64.
+# Source: Steele, Lea, Flood (2014), "Fast Splittable PRNGs", OOPSLA 2014 — the
+# finalizer constants below. See docs/sources.md.
 fn rng_seed(s): i64 {
     s = s + 0x9E3779B97F4A7C15;
     var z = s;
@@ -133,6 +137,8 @@ fn rng_uniform(): i64 {
 }
 
 # Standard normal via the Marsaglia polar method (no trig needed).
+# Source: Marsaglia & Bray (1964), "A Convenient Method for Generating Normal
+# Variables", SIAM Review 6(3). Chosen over Box-Muller: no sin/cos required.
 fn rng_normal(): i64 {
     var s = f64_from(0);
     var v1 = f64_from(0);

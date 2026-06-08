@@ -115,6 +115,8 @@ fn sample_window(): i64 {
 }
 
 # ---- learning-rate schedule ------------------------------------------------
+# Linear warmup (Vaswani et al. 2017) then cosine decay (Loshchilov & Hutter
+# 2017, "SGDR", arXiv:1608.03983). See docs/sources.md.
 # cos(pi*p) for p in [0,1] via Taylor series (no f64_cos builtin). 12 terms is
 # ample on [0,pi]; this runs once per step, so cost is irrelevant.
 fn _cos_unit(p): i64 {

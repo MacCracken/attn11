@@ -1,0 +1,44 @@
+# minimal_train — the smallest end-to-end attn11 use.
+#
+# WHY: attn11's public surface is three calls — build a corpus, init a model,
+# train — plus generate(). main.cyr wraps these with CLI parsing and the default
+# 3-layer config; this example strips all of that to show the bare API a reader
+# (or a downstream embedder) actually needs. It trains a 1-layer model on the
+# embedded corpus for a few hundred steps and samples, so the whole thing runs
+# in a second or two.
+#
+# Run:  cyrius build docs/examples/minimal_train.cyr build/minimal_train
+#       ./build/minimal_train
+
+include "src/tensor.cyr"
+include "src/fileio.cyr"
+include "src/ops.cyr"
+include "src/attn.cyr"
+include "src/model.cyr"
+include "src/train.cyr"
+include "src/persist.cyr"
+
+fn main(): i64 {
+    alloc_init();
+
+    # 1. build a vocab + encoded id stream from the embedded corpus
+    var V = build_corpus();
+
+    # 2. init a tiny model: V vocab, C=32, ctx=16, 2 heads, 1 layer, biases on,
+    #    no dropout, fixed seed for reproducibility
+    model_init(V, 32, 16, 2, 1, 1, f64_from(0), 1234);
+
+    # 3. train: run_until=300, total=300 (schedule horizon), batch 8,
+    #    base_lr 3e-3, min_lr 3e-4, warmup 30, grad-clip 1.0, log every 100
+    var base = f64_div(f64_from(3), f64_from(1000));
+    var minlr = f64_div(f64_from(3), f64_from(10000));
+    train(300, 300, 8, base, minlr, 30, f64_from(1), 100);
+
+    # 4. sample greedily from a seed prompt
+    puts("\nsample: ");
+    generate("cyrius ", 7, 80, f64_from(0));
+    return 0;
+}
+
+var r = main();
+syscall(SYS_EXIT, r);

@@ -6,4 +6,8 @@ Not decisions (those live in [`../adr/`](../adr/)) and not guides (those live in
 
 ## Items
 
-_Empty. Add a numbered entry (`001-kebab-case-title.md`) the first time the code has a non-obvious invariant a reader can't derive. Do not write entries for decisions — those are ADRs._
+- [001 — Tensors and floats](001-tensors-and-floats.md) — everything is i64; an
+  `f64` is its bit pattern; tensors are flat row-major f64 arrays; the SIMD
+  matmul convention (memory accumulators, never reassign a SIMD var); and the
+  toolchain gotchas (long-literal mis-parse, byte-counting `print`, f64
+  comparisons not being NaN-correct). **Affects**: all numeric code in `src/`.

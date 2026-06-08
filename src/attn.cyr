@@ -1,5 +1,9 @@
 # attn11 — causal multi-head self-attention (forward + backward)
 #
+# Source: Vaswani et al. (2017), "Attention Is All You Need", arXiv:1706.03762 —
+# scaled dot-product attention score = (Q·K)/sqrt(hd), softmax, multi-head split.
+# See docs/sources.md.
+#
 # Single sequence of length T, embedding width C, nh heads, head dim hd = C/nh.
 # Q/K/V/O projections are C x C, no bias (GPT style). Heads occupy contiguous
 # column blocks [h*hd, (h+1)*hd) of the (T,C) Q/K/V/concat tensors.

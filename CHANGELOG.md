@@ -4,6 +4,32 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-06-08
+
+First-party standards conformance (docs/process; no model behavior change).
+
+### Added
+- `CODE_OF_CONDUCT.md` (required root file) and a `Makefile` convenience wrapper.
+- `docs/sources.md` — academic citation map for every algorithm (Transformer,
+  LayerNorm, GELU, Adam, weight tying, GPT-2 init scaling, cosine LR, grad
+  clipping, xorshift64, splitmix64, Marsaglia polar, finite-difference checks),
+  plus inline citation comments on the declaring functions.
+- `docs/audit/2026-06-08-audit.md` — consolidated security/correctness audit
+  (the M2/M3/M4 adversarial-review findings, by severity, all fixed).
+- ADRs `0001`–`0004` (hand-derived backprop, byte-level tokenizer, SIMD memory
+  accumulators, native-endian checkpoint) + index.
+- `scripts/bench-history.sh` — commit-stamped CSV + Markdown bench trail.
+- `docs/examples/minimal_train.cyr` — runnable minimal-API example.
+
+### Changed
+- Toolchain pin `6.1.5` → `6.1.6`.
+- `CLAUDE.md` restructured to the first-party template (genesis + shared-crates
+  links, fixed the stale `applications/` standards path → `first-party/`,
+  standard Rules block, Cyrius Conventions, CI/Release, P(-1)/work-loop process).
+- Architecture note renumbered to `docs/architecture/001-tensors-and-floats.md`
+  and indexed; `.gitignore` aligned to the standard (release artifacts).
+- `bench-history.csv` schema is now a commit-stamped trail (date/commit/branch).
+
 ## [0.5.0] - 2026-06-08
 
 Portability & robustness (roadmap M4).
@@ -163,7 +189,7 @@ Depth & training quality (roadmap M1).
   loop, autoregressive generation (greedy + temperature sampling).
 - `tests/attn11.tcyr` — 16 finite-difference gradient checks (every op,
   attention, and the full model); all passing.
-- Architecture notes in `docs/architecture/tensors-and-floats.md`.
+- Architecture notes in `docs/architecture/001-tensors-and-floats.md`.
 - Roadmap to v1.0 with versioned milestones and acceptance gates
   (`docs/development/roadmap.md`).
 - CI/release process aligned to the patra/sigil model: lint warn-gate, DCE

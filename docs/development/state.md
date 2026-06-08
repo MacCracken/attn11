@@ -5,22 +5,23 @@
 
 ## Version
 
-**0.5.0** — portability & robustness (roadmap M4). aarch64 cross-build + qemu
-validation (grad checks pass; 250-step run matches x86 to display precision),
-NaN/inf training guard, soak/leak test, crash-atomic checkpoint save. Built
-2026-06-08.
+**0.5.1** — first-party standards conformance (docs/process; no model behavior
+change): `docs/sources.md` + inline citations, consolidated `docs/audit/`,
+ADRs 0001–0004, `CODE_OF_CONDUCT.md`, `scripts/bench-history.sh`, a runnable
+example, CLAUDE.md aligned to the template. (0.5.0 — portability & robustness:
+aarch64 validation, NaN/inf guard, soak/leak test, crash-atomic save.)
 (0.4.0: 4-wide SIMD matmul, ~2.27× faster. 0.3.0: corpus loading, checkpoints +
 deterministic resume. 0.2.0: stacked layers, grad clipping, LR schedule.)
 
 ## Toolchain
 
-- **Cyrius pin**: `6.1.5` (in `cyrius.cyml [package].cyrius`)
+- **Cyrius pin**: `6.1.6` (in `cyrius.cyml [package].cyrius`)
 
 ## Performance
 
 4-wide SIMD (`f64v_fmadd`) matmul. Default config, x86_64:
 fwd+bwd step 8.25ms → 3.64ms, **tokens/sec 1939 → 4396 (2.27×)**. See
-[`benchmarks.md`](benchmarks.md) + [`../../bench-history.csv`](../../bench-history.csv).
+[`benchmarks.md`](../benchmarks.md) + [`../../bench-history.csv`](../../bench-history.csv).
 
 ## What works
 

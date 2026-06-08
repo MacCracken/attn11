@@ -13,7 +13,7 @@
 6. `cyrius build tests/attn11.bcyr build/bench && ./build/bench` — benchmarks.
 
 See [`CLAUDE.md`](CLAUDE.md) for the full development loop and
-[`docs/architecture/tensors-and-floats.md`](docs/architecture/tensors-and-floats.md)
+[`docs/architecture/001-tensors-and-floats.md`](docs/architecture/001-tensors-and-floats.md)
 for the numeric conventions.
 
 ## Gradient checks are the contract

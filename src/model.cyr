@@ -1,5 +1,9 @@
 # attn11 — the model: an N-block GPT with a weight-tied LM head.
 #
+# Architecture: a pre-norm decoder-only Transformer (Vaswani et al. 2017,
+# arXiv:1706.03762; pre-norm placement per Xiong et al. 2020, arXiv:2002.04745;
+# GPT-2, Radford et al. 2019). See docs/sources.md for the full citation map.
+#
 # The model is a singleton, so its tensors live in module globals (far cleaner
 # than threading a struct through every call in a language where everything is
 # i64).
@@ -138,7 +142,7 @@ fn model_init(V, C, T, nh, NL, attn_bias, dropout, seed): i64 {
     # initialise weights
     rng_seed(seed);
     var std = f64_div(f64_from(2), f64_from(100));   # 0.02
-    # GPT-2 residual-projection scaling: 1/sqrt(2*NL)
+    # GPT-2 residual-projection scaling: 1/sqrt(2*NL) (Radford et al. 2019, §2.3)
     var rstd = f64_div(std, f64_sqrt(f64_from(2 * NL)));
     t_randn(P_tokemb(), V * C, std);
     t_randn(P_posemb(), T * C, std);
@@ -200,6 +204,8 @@ fn model_init(V, C, T, nh, NL, attn_bias, dropout, seed): i64 {
 }
 
 # ---- tied LM head ----------------------------------------------------------
+# Weight tying — the token embedding is reused as the output projection:
+# Press & Wolf (2017) arXiv:1608.05859; Inan et al. (2017) arXiv:1611.01462.
 # logits(T,V) = f(T,C) @ tokemb^T
 fn head_fwd(): i64 {
     var T = g_T; var C = g_C; var V = g_V;
@@ -384,6 +390,7 @@ fn model_zero_grads(): i64 { t_zero(g_grads, g_NP); return 0; }
 
 # ---- gradient clipping (global L2 norm) ------------------------------------
 # If ||grads|| > clip, scale all grads by clip/||grads||. Returns the norm (f64).
+# Source: Pascanu, Mikolov, Bengio (2013), arXiv:1211.5063.
 fn model_clip_grads(clip): i64 {
     var n2 = f64_from(0);
     var i = 0;
@@ -400,6 +407,8 @@ fn model_clip_grads(clip): i64 {
 }
 
 # ---- Adam ------------------------------------------------------------------
+# Source: Kingma & Ba (2015), "Adam", arXiv:1412.6980 — bias-corrected 1st/2nd
+# moments; defaults b1=0.9, b2=0.999, eps=1e-8 are the paper's.
 # lr is an f64 bit pattern; step is the 1-based update count.
 fn model_adam_step(lr, step): i64 {
     var b1 = f64_div(f64_from(9), f64_from(10));        # 0.9

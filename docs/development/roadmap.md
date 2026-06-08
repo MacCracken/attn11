@@ -24,7 +24,7 @@ v1.0.0 ships when **all** of these hold:
 - [ ] **Coverage** — tests for tokenizer, checkpoint round-trip, and each op;
       fuzz harnesses for every external input path.
 - [ ] **Benchmarks** — step time + tokens/sec captured in
-      [`benchmarks.md`](benchmarks.md), with a tracked history.
+      [`benchmarks.md`](../benchmarks.md), with a tracked history.
 - [ ] **Portability** — builds and trains on Linux x86_64 **and** aarch64, and
       runs under the **AGNOS kernel** (`--agnos`); results match within tolerance.
 - [ ] **One consumer green** — at least one downstream user (or a documented
@@ -73,7 +73,7 @@ v1.0.0 ships when **all** of these hold:
 - ✅ 4-wide SIMD (`f64v_fmadd`) on the matmul hot paths — `linear_fwd`/
   `linear_bwd` and the attention per-head score/AV/`dQ`/`dK`/`dV` loops. (Adam
   is <1% of a step; GELU's `f64_tanh` has no packed form — both left scalar.)
-- ✅ Benchmarks in [`benchmarks.md`](benchmarks.md) + [`bench-history.csv`](../../bench-history.csv).
+- ✅ Benchmarks in [`benchmarks.md`](../benchmarks.md) + [`bench-history.csv`](../../bench-history.csv).
 - **Gates met**: documented `before → after` — `linear_fwd` 3.88×, fwd+bwd step
   2.27×, **tokens/sec 1939 → 4396**; grad checks unchanged (47 pass, incl. the
   production `hd=8` path) and the SIMD is bit-identical (axpy) / within-rounding

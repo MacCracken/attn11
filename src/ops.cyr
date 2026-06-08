@@ -142,6 +142,7 @@ fn linear_bwd(x, W, dy, dx, dW, db, M, K, N): i64 {
 # ===========================================================================
 # LayerNorm over the last dim. x,y: (M,C). gamma,beta: (C).
 # Caches mean(M) and rstd(M) = 1/sqrt(var+eps) for backward.
+# Source: Ba, Kiros, Hinton (2016), "Layer Normalization", arXiv:1607.06450.
 # ===========================================================================
 fn ln_fwd(x, gamma, beta, y, mean, rstd, M, C): i64 {
     var eps = _eps_ln();
@@ -219,6 +220,8 @@ fn ln_bwd(x, gamma, dy, mean, rstd, dx, dgamma, dbeta, M, C): i64 {
 # ===========================================================================
 # GELU (tanh approximation, as in GPT-2). x,y: length n.
 #   g(x) = 0.5*x*(1 + tanh( c*(x + a*x^3) )),  c=sqrt(2/pi), a=0.044715
+# Source: Hendrycks & Gimpel (2016), "Gaussian Error Linear Units (GELUs)",
+# arXiv:1606.08415 — the tanh form and the constant 0.044715.
 # ===========================================================================
 fn gelu_fwd(x, y, n): i64 {
     var c = _gelu_c();
@@ -300,6 +303,8 @@ fn dropout_bwd(mask, dy, dx, n): i64 {
 # ===========================================================================
 # Softmax cross-entropy over rows. logits(M,V), targets(M) integer classes.
 # Writes per-row probabilities into `probs` (M,V); returns mean loss (f64).
+# Max-subtraction for numerical stability + the combined (softmax - onehot)
+# backward: Goodfellow, Bengio, Courville, "Deep Learning" (2016), §4.1/§6.2.
 # ===========================================================================
 fn softmax_xent_fwd(logits, targets, probs, M, V): i64 {
     var total = f64_from(0);

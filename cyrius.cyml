@@ -4,13 +4,13 @@ version = "${file:VERSION}"
 description = "attn11 — a from-scratch GPT-style transformer, trained, in Cyrius"
 license = "GPL-3.0-only"
 language = "cyrius"
-cyrius = "6.1.5"
+cyrius = "6.1.6"
 repository = "https://github.com/MacCracken/attn11"
 
 [build]
 entry = "src/main.cyr"
 test = "src/test.cyr"
-output = "attn11"
+output = "build/attn11"
 
 [deps]
 stdlib = ["string", "fmt", "alloc", "io", "vec", "str", "syscalls", "assert", "bench", "math", "matrix", "random", "args"]

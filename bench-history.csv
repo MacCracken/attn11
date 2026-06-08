@@ -1,3 +1,4 @@
-version,date,tokens_per_sec,step_ns,forward_ns,backward_ns,linear_fwd_ns,adam_ns,notes
-0.3.0,2026-06-08,1939,8251254,2829841,5387111,242719,773842,scalar baseline (default C32 F128 T16 nh4 NL3)
-0.4.0,2026-06-08,4396,3639374,1355030,2230614,62517,776688,SIMD f64v4 linear + attention (2.27x step)
+date,commit,branch,tokens_per_sec,step_ns,forward_ns,backward_ns,linear_fwd_ns,adam_ns
+2026-06-08,0.3.0,main,1939,8251254,2829841,5387111,242719,773842
+2026-06-08,0.4.0,main,4396,3639374,1355030,2230614,62517,776688
+2026-06-08T18:46:26Z,f814b93,main,4415,3623254,1429319,2177320,63248,741547
