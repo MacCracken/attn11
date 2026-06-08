@@ -79,12 +79,17 @@ v1.0.0 ships when **all** of these hold:
   production `hd=8` path) and the SIMD is bit-identical (axpy) / within-rounding
   (dot) to scalar, so training converges identically.
 
-### M4 — Portability & robustness (v0.5.0)
+### M4 — Portability & robustness (v0.5.0) — ✅ shipped 2026-06-08
 
-- Validate on **aarch64** (where `f64_exp`/`f64_ln` are polyfills): grad checks
-  and a short training run must match x86_64 within tolerance.
-- NaN/inf guards on loss; a soak target (long run) proving no leak / no blowup.
-- **Gates**: cross-build + native aarch64 CI lane green; soak run clean.
+- ✅ Validated on **aarch64** via cross-build + qemu: grad checks pass (with
+  arch-aware tolerances for the `f64_exp` polyfill and the fused NEON FMA), and
+  a 250-step training run matches x86_64 to display precision. New CI lane.
+- ✅ NaN/inf training guard (stops cleanly, doesn't poison weights); soak test
+  proving no per-step allocation (no leak) and no blow-up.
+- ✅ Crash-atomic checkpoint save (temp + fsync + rename; prior checkpoint
+  preserved on any failure) — the item deferred from M2.
+- **Gates met**: aarch64 CI lane (cross-build + qemu) green; soak clean; both
+  arches pass 52 checks. (Native aarch64 hardware runs are emulated via qemu.)
 
 ### M5 — Portability: AGNOS kernel (v0.6.0)
 

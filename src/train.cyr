@@ -170,6 +170,14 @@ fn train(run_until, total, batch, base_lr, min_lr, warmup, clip, log_every): i64
         t_scale(g_grads, g_NP, invB);
         loss = f64_mul(loss, invB);
         var gnorm = model_clip_grads(clip);
+        # robustness: refuse to step on a non-finite loss or grad norm (NaN/Inf)
+        # — stop cleanly rather than poison the weights.
+        if ((f64_is_finite(loss) == 0) || (f64_is_finite(gnorm) == 0)) {
+            puts("attn11: non-finite loss/grad at step "); fmt_int(g_step);
+            puts(" -- stopping\n");
+            g_step = g_step - 1;   # this step did not complete
+            return 0 - 1;
+        }
         var lr = lr_at(g_step, total, warmup, base_lr, min_lr);
         model_adam_step(lr, g_step);
         if ((g_step % log_every) == 0) {

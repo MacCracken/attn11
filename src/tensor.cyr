@@ -89,6 +89,15 @@ fn t_sum(p, n): i64 {
     return acc;
 }
 
+# 1 if x is a finite f64, 0 if it is NaN or +-Inf. Checked on the bit pattern
+# (exponent all-ones == Inf/NaN), since this toolchain's f64 comparisons are not
+# NaN-correct. Robustness guard: training should stop, not silently corrupt, if
+# the loss/gradients blow up.
+fn f64_is_finite(x): i64 {
+    if (((x >> 52) & 0x7FF) == 0x7FF) { return 0; }
+    return 1;
+}
+
 # ---- deterministic PRNG (xorshift64) ---------------------------------------
 # Seedable so training runs are reproducible. getrandom (lib/random.cyr) is
 # available but non-deterministic, so we use our own stream here.

@@ -38,6 +38,7 @@ fn maxrel(analytic, numeric, n): i64 {
 # assert max-rel-err < tol; tol = 1/tol_inv
 fn check(name, analytic, numeric, n, tol_inv): i64 {
     var mr = maxrel(analytic, numeric, n);
+    print(name, strlen(name)); print(" maxrel=", 8); f_print(mr, 9); _putc(10);
     assert(f64_lt(mr, f64_div(f64_from(1), f64_from(tol_inv))) == 1, name);
     return 0;
 }
@@ -199,11 +200,19 @@ fn _attn_check(T, C, nh): i64 {
     var nWo = t_alloc(CC); attn_ng(Wo, nWo, CC, Wq, bq, Wk, bk, Wv, bv, Wo, bo, x, out, dout, ar, T, C, nh);
     var nbq = t_alloc(C); attn_ng(bq, nbq, C, Wq, bq, Wk, bk, Wv, bv, Wo, bo, x, out, dout, ar, T, C, nh);
     var nbo = t_alloc(C); attn_ng(bo, nbo, C, Wq, bq, Wk, bk, Wv, bv, Wo, bo, x, out, dout, ar, T, C, nh);
-    check("attn dx", dx, ndx, TC, 100000);
-    check("attn dWq", dWq, nWq, CC, 100000);
-    check("attn dWo", dWo, nWo, CC, 100000);
-    check("attn dbq", dbq, nbq, C, 100000);
-    check("attn dbo", dbo, nbo, C, 100000);
+    # x86 keeps the tight 1e-5 bound. On aarch64 the attention path chains
+    # through the f64_exp polyfill, which makes the finite-difference reference
+    # noisier (~1.3e-5), so loosen to 1e-4 there only (a real bug is orders of
+    # magnitude larger either way).
+    var atol = 100000;
+    #ifdef CYRIUS_ARCH_AARCH64
+    atol = 10000;
+    #endif
+    check("attn dx", dx, ndx, TC, atol);
+    check("attn dWq", dWq, nWq, CC, atol);
+    check("attn dWo", dWo, nWo, CC, atol);
+    check("attn dbq", dbq, nbq, C, atol);
+    check("attn dbo", dbo, nbo, C, atol);
     return 0;
 }
 fn test_attention(): i64 {
@@ -364,15 +373,57 @@ fn test_ckpt_vocab_mismatch(): i64 {
     return 0;
 }
 
-# Pins the SIMD numeric contract: the packed f64v_fmadd must round identically
-# to the scalar f64_mul+f64_add (true on this toolchain, where it lowers to
-# mulpd+addpd). This is what makes the axpy paths bit-identical to scalar. If a
-# future toolchain emits a single-rounding fused FMA, this fails — flagging that
-# the "bit-identical" guarantee (and the unchanged loss curve) no longer holds.
+# Soak: training must not leak memory and must not blow up. The forward/backward
+# paths use only pre-allocated buffers, so alloc_used() must be IDENTICAL across
+# many steps; and reaching the target step proves the NaN guard never tripped
+# (loss stayed finite throughout).
+fn test_soak(): i64 {
+    var V = build_corpus();
+    model_init(V, 16, 8, 2, 2, 0, f64_from(0), 1);
+    var base = _lrc(1, 1000); var minl = _lrc(1, 10000); var clip = f64_from(1);
+    train(2, 90, 4, base, minl, 5, clip, 1000000000);   # warm-up
+    var used0 = alloc_used();
+    train(90, 90, 4, base, minl, 5, clip, 1000000000);  # 88 more steps
+    var used1 = alloc_used();
+    assert(used1 == used0, "soak: no per-step heap allocation (no leak)");
+    assert(g_step == 90, "soak: reached target step (loss stayed finite)");
+    return 0;
+}
+
+# The NaN guard must HALT training rather than poison weights. Inject a NaN into
+# a weight so the loss is non-finite; the guard should stop before stepping.
+fn test_nan_guard(): i64 {
+    var V = build_corpus();
+    model_init(V, 8, 4, 2, 1, 0, f64_from(0), 2);
+    store64(P_tokemb(), 0x7FF8000000000000);   # NaN into a weight
+    var before = g_step;
+    var w1 = load64(P_tokemb() + 8);            # a finite weight (not the NaN'd one)
+    var rc = train(5, 5, 2, _lrc(1, 1000), _lrc(1, 10000), 1, f64_from(1), 1000000000);
+    assert(rc == (0 - 1), "train returns -1 on non-finite loss");
+    assert(g_step == before, "NaN loss halts training (no step completed)");
+    assert(load64(P_tokemb() + 8) == w1, "weights not stepped after the guard fires");
+    return 0;
+}
+
+# relative error between two f64 bit patterns
+fn _rel(a, b): i64 {
+    var t = f64_div(f64_from(1), f64_from(1000000000));
+    return f64_div(f64_abs(f64_sub(a, b)), f64_add(f64_add(f64_abs(a), f64_abs(b)), t));
+}
+# Pins the SIMD numeric contract: f64v_fmadd computes a*b+c. On x86_64 it lowers
+# to mulpd+addpd (two roundings) so it is BIT-IDENTICAL to scalar f64_mul+f64_add
+# (tol 0). On aarch64 it is a fused fmla (one rounding) so it matches scalar only
+# within rounding (~1e-16); we still pin it tightly (1e-12) to prove it computes
+# a*b+c and not garbage. If x86 ever switches to a fused FMA this fails, flagging
+# that the axpy paths are no longer bit-identical to scalar.
 fn test_simd_contract(): i64 {
     rng_seed(4242);
     var a4[32]; var b4[32]; var c4[32];
-    var diffs = 0; var i = 0;
+    var tol = f64_from(0);
+    #ifdef CYRIUS_ARCH_AARCH64
+    tol = f64_div(f64_from(1), f64_from(1000000000000));   # 1e-12 (fused FMA)
+    #endif
+    var bad = 0; var i = 0;
     while (i < 5000) {
         var L = 0;
         while (L < 4) {
@@ -386,13 +437,13 @@ fn test_simd_contract(): i64 {
         var e2 = f64_add(load64(&c4 + 16), f64_mul(load64(&a4 + 16), load64(&b4 + 16)));
         var e3 = f64_add(load64(&c4 + 24), f64_mul(load64(&a4 + 24), load64(&b4 + 24)));
         f64v_fmadd(&c4, &a4, &b4, &c4, 4);
-        if (load64(&c4) != e0) { diffs = diffs + 1; }
-        if (load64(&c4 + 8) != e1) { diffs = diffs + 1; }
-        if (load64(&c4 + 16) != e2) { diffs = diffs + 1; }
-        if (load64(&c4 + 24) != e3) { diffs = diffs + 1; }
+        if (f64_gt(_rel(load64(&c4), e0), tol) == 1) { bad = bad + 1; }
+        if (f64_gt(_rel(load64(&c4 + 8), e1), tol) == 1) { bad = bad + 1; }
+        if (f64_gt(_rel(load64(&c4 + 16), e2), tol) == 1) { bad = bad + 1; }
+        if (f64_gt(_rel(load64(&c4 + 24), e3), tol) == 1) { bad = bad + 1; }
         i = i + 1;
     }
-    assert(diffs == 0, "f64v_fmadd rounds identically to scalar mul+add (SIMD bit-contract)");
+    assert(bad == 0, "f64v_fmadd matches scalar mul+add (bit-exact x86 / within-rounding aarch64)");
     return 0;
 }
 
@@ -415,6 +466,9 @@ fn main(): i64 {
     test_resume_dropout();
     test_ckpt_reject();
     test_ckpt_vocab_mismatch();
+    test_group("robustness");
+    test_soak();
+    test_nan_guard();
     return assert_summary();
 }
 

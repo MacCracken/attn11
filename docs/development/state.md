@@ -5,11 +5,12 @@
 
 ## Version
 
-**0.4.0** — performance (roadmap M3). 4-wide SIMD matmul (`f64v_fmadd`) on the
-linear + attention hot paths: **~2.27× faster training** (1939 → 4396 tok/s),
-gradients/convergence unchanged. Built 2026-06-08.
-(0.3.0: file/stdin corpus, checkpoints + deterministic resume, fuzzing.
-0.2.0: stacked layers, residual-init scaling, grad clipping, LR schedule.)
+**0.5.0** — portability & robustness (roadmap M4). aarch64 cross-build + qemu
+validation (grad checks pass; 250-step run matches x86 to display precision),
+NaN/inf training guard, soak/leak test, crash-atomic checkpoint save. Built
+2026-06-08.
+(0.4.0: 4-wide SIMD matmul, ~2.27× faster. 0.3.0: corpus loading, checkpoints +
+deterministic resume. 0.2.0: stacked layers, grad clipping, LR schedule.)
 
 ## Toolchain
 
@@ -23,7 +24,8 @@ fwd+bwd step 8.25ms → 3.64ms, **tokens/sec 1939 → 4396 (2.27×)**. See
 
 ## What works
 
-End-to-end, on x86_64 Linux:
+End-to-end, on Linux x86_64 **and aarch64** (cross-build + qemu; grad checks
+pass on both, training matches to display precision):
 
 - Char-level tokenizer over an embedded corpus
 - Token + learned positional embeddings
@@ -36,12 +38,13 @@ End-to-end, on x86_64 Linux:
 - Config-gated **attention biases** and **residual dropout** (dropout
   auto-disabled in eval/generation)
 - Mini-batch grad accumulation; training logs loss / lr / grad-norm
+- **NaN/inf training guard** (stops cleanly instead of poisoning weights)
 - Autoregressive generation (greedy + temperature sampling)
 - **Corpus from file/stdin** (`--corpus`/`--stdin`): `O_NOFOLLOW`, `fstat`
   size-cap, byte-level adaptive vocab
-- **Checkpoints** (`--save`/`--load`): validated header (magic/version/config/
-  size, all checked before allocation) + bit-for-bit **deterministic resume**
-  (weights, Adam moments, step, PRNG state)
+- **Checkpoints** (`--save`/`--load`): validated header (all checked before
+  allocation) + bit-for-bit **deterministic resume**; **crash-atomic save**
+  (temp + fsync + rename, prior checkpoint preserved on failure)
 - CLI: `--corpus --stdin --load --save --steps --gen-only`
 
 Default run (`./build/attn11`, 3 layers): loss `~3.2 → ~0.13` over 2000 steps;
@@ -84,12 +87,11 @@ sampled output reproduces real corpus phrases.
 
 ## Tests
 
-- `tests/attn11.tcyr` — **47 checks**: finite-difference gradient checks (every
+- `tests/attn11.tcyr` — **52 checks**: finite-difference gradient checks (every
   op incl. dropout, attention at head dims 6/8/10 incl. biases, 2-layer full
-  model), the `f64v_fmadd`==scalar SIMD bit-contract, **bit-for-bit
-  resume-determinism** (dropout off AND on), and checkpoint rejection smokes
-  (truncated / bad magic / absurd config / NaN+1.0 dropout / vocab-mismatch).
-  All pass (`cyrius test`).
+  model), the SIMD bit-contract, resume-determinism (dropout off/on), checkpoint
+  rejection smokes, a **soak/leak** test (`alloc_used` constant) and a **NaN
+  guard** test. All pass on x86_64 AND aarch64 (`cyrius test`; aarch64 via qemu).
 - `tests/attn11.bcyr` — benchmark harness (timings + tokens/sec).
 - `tests/attn11.fcyr` — fuzz harness: 500 mutated-checkpoint rounds + 100 random
   corpora; loaders reject malformed input without crashing.
@@ -109,7 +111,7 @@ _None yet._
 
 ## Next
 
-See [`roadmap.md`](roadmap.md). M2 (0.3.0) is complete: file/stdin corpus,
-byte-level tokenizer, validated checkpoints + deterministic resume, loader
-fuzzing. Next is M3 (0.4.0): SIMD hot paths + benchmarks (`benchmarks.md`).
-Optional BPE tokenizer remains deferred (byte-level covers the M2 gate).
+See [`roadmap.md`](roadmap.md). M4 (0.5.0) complete: aarch64 validation, NaN
+guard, soak test, atomic checkpoint save. Next is **M5 (0.6.0): AGNOS kernel
+port** (`--agnos`) — de-Linux the raw `syscall(...)` sites (exit/write/fsync/
+rename) behind portable stdlib wrappers. Optional BPE tokenizer still deferred.

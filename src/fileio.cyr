@@ -68,3 +68,41 @@ fn secure_write_file(path, buf, len): i64 {
     file_close(fd);
     return total;
 }
+
+fn _fsync(fd): i64 {
+    var n = 74;                  # SYS_FSYNC (x86_64)
+    #ifdef CYRIUS_ARCH_AARCH64
+    n = 82;                      # SYS_FSYNC (aarch64)
+    #endif
+    return syscall(n, fd);
+}
+
+# Crash-atomic write: write to `path`.tmp (O_NOFOLLOW), fsync, then rename over
+# the target. A failed/interrupted write leaves the prior file intact (the
+# rename is the only mutation of `path`, and it is atomic). Returns bytes
+# written or a negative error.
+fn secure_write_atomic(path, buf, len): i64 {
+    var plen = strlen(path);
+    var tmp = alloc(plen + 6);
+    var i = 0;
+    while (i < plen) { store8(tmp + i, load8(path + i)); i = i + 1; }
+    store8(tmp + plen, 46); store8(tmp + plen + 1, 116);        # '.t'
+    store8(tmp + plen + 2, 109); store8(tmp + plen + 3, 112);   # 'mp'
+    store8(tmp + plen + 4, 0);
+    var flags = _O_WRONLY() | _O_CREAT() | _O_TRUNC() | _O_NOFOLLOW();
+    var fd = file_open(tmp, flags, 420);
+    if (fd < 0) { return fd; }
+    var total = 0;
+    while (total < len) {
+        var n = file_write(fd, buf + total, len - total);
+        if (n <= 0) { file_close(fd); sys_unlink(tmp); return 0 - 1; }
+        total = total + n;
+    }
+    # Durability: a failed fsync means the data may not be on stable storage, so
+    # we must NOT rename over the (good) target — abort and clean up the temp.
+    if (_fsync(fd) < 0) { file_close(fd); sys_unlink(tmp); return 0 - 2; }
+    file_close(fd);
+    var r = sys_rename(tmp, path);
+    if (r < 0) { sys_unlink(tmp); return r; }   # target untouched on failure
+    return total;
+}

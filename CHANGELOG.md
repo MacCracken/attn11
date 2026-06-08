@@ -4,6 +4,32 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-06-08
+
+Portability & robustness (roadmap M4).
+
+### Added
+- **aarch64 validation**: the model cross-builds (`cyrius build --aarch64`) and
+  runs under `qemu-aarch64`; the grad-check suite passes on aarch64 (where
+  `f64_exp`/`f64_ln` are polyfills and the FMA is a fused NEON `fmla`), and a
+  250-step training run matches x86_64 to display precision. New CI lane
+  cross-builds + qemu-runs the suite and a binary smoke.
+- **NaN/inf guard**: `f64_is_finite` (bit-pattern check) + a training-loop guard
+  that stops cleanly on a non-finite loss or grad-norm rather than poisoning the
+  weights. Covered by `test_nan_guard`.
+- **Soak test**: `test_soak` asserts `alloc_used()` is identical across many
+  steps (no per-step allocation → no leak) and that training reaches its target
+  step (loss stayed finite).
+- **Crash-atomic checkpoint save**: `secure_write_atomic` writes to a `.tmp`
+  sibling (`O_NOFOLLOW`), `fsync`s, then `rename`s over the target; a failed
+  write/fsync aborts and cleans up, leaving the prior checkpoint intact.
+- Arch-aware test tolerances: attention grad checks stay 1e-5 on x86 and relax
+  to 1e-4 on aarch64 (exp-polyfill finite-difference noise); `test_simd_contract`
+  asserts bit-exact on x86 / within-rounding on aarch64 (fused FMA). **52 checks.**
+
+### Changed
+- Toolchain pin `6.1.5`.
+
 ## [0.4.0] - 2026-06-08
 
 Performance — SIMD matmul (roadmap M3). **~2.27× faster training** (1939 →

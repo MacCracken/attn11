@@ -81,6 +81,42 @@ jobs:
             ./build/$name
           done
 
+  aarch64:
+    name: aarch64 (cross + qemu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Cyrius toolchain
+        run: |
+          set -e
+          CYRIUS_VERSION="$(grep '^cyrius = ' cyrius.cyml | head -1 | sed 's/cyrius = "\(.*\)"/\1/')"
+          curl -sSf https://raw.githubusercontent.com/MacCracken/cyrius/main/scripts/install.sh | \
+            CYRIUS_VERSION="$CYRIUS_VERSION" sh
+          echo "$HOME/.cyrius/bin" >> "$GITHUB_PATH"
+
+      - name: Install qemu-user-static
+        run: sudo apt-get update && sudo apt-get install -y qemu-user-static
+
+      - name: Resolve deps
+        run: cyrius deps
+
+      - name: Cross-build + run the gradient-check suite on aarch64
+        # The f64_exp/f64_ln polyfills and the fused NEON FMA differ from x86;
+        # the suite has arch-aware tolerances / SIMD contract so it must pass.
+        run: |
+          mkdir -p build
+          cyrius build --aarch64 tests/attn11.tcyr build/test_a64
+          qemu-aarch64-static build/test_a64
+
+      - name: Cross-build + smoke-run the binary on aarch64
+        # --gen-only exercises the full forward + generation path under qemu
+        # without the slow training loop (backward is already covered by the
+        # grad-check suite above).
+        run: |
+          cyrius build --aarch64 src/main.cyr build/attn11_a64
+          qemu-aarch64-static build/attn11_a64 --gen-only
+
   security:
     name: Security Scan
     runs-on: ubuntu-latest

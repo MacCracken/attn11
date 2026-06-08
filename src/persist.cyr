@@ -138,15 +138,14 @@ fn ckpt_load_buf(buf, len): i64 {
     return 0;
 }
 
-# Save current model to a file. Returns 0 or a negative error.
-# NOTE: writes in place (O_TRUNC|O_NOFOLLOW, no O_EXCL/fsync/temp-rename), so a
-# failed/interrupted save can leave a truncated file. O_NOFOLLOW still refuses a
-# symlinked target. Crash-atomic save (temp+rename+fsync) is deferred to M4.
+# Save current model to a file, crash-atomically: serialize, write to a temp
+# sibling, fsync, then rename over the target (O_NOFOLLOW throughout). An
+# interrupted/failed save leaves the prior checkpoint intact. Returns 0 or neg.
 fn ckpt_save_file(path): i64 {
     var sz = ckpt_size();
     var buf = alloc(sz);
     ckpt_serialize(buf);
-    var w = secure_write_file(path, buf, sz);
+    var w = secure_write_atomic(path, buf, sz);
     if (w < 0) { return w; }
     if (w != sz) { return 0 - 20; }
     return 0;
