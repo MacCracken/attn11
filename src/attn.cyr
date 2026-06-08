@@ -34,7 +34,10 @@ fn _at_dprow(ar, T, C, nh): i64 { return ar + (11 * T * C + nh * T * T) * 8; }
 # Bias pointers bq/bk/bv/bo may be 0 (no bias).
 fn attn_fwd(Wq, bq, Wk, bk, Wv, bv, Wo, bo, x, out, ar, T, C, nh): i64 {
     var hd = C / nh;
+    var hd4 = hd - (hd % 4);        # head dim is contiguous -> 4-wide vector body
     var scale = f64_div(f64_from(1), f64_sqrt(f64_from(hd)));
+    var acc[32];                    # 4-lane dot accumulator
+    var pv[32];                     # 4-lane broadcast buffer
     var Qc = _at_Qc(ar);
     var Kc = _at_Kc(ar, T, C);
     var Vc = _at_Vc(ar, T, C);
@@ -55,13 +58,21 @@ fn attn_fwd(Wq, bq, Wk, bk, Wv, bv, Wo, bo, x, out, ar, T, C, nh): i64 {
         while (i < T) {
             var prow = Pc + (h * T + i) * T * 8;
             # raw scores for j = 0..i
+            var qbase = Qc + (i * C + base) * 8;
             var j = 0;
             while (j <= i) {
-                var dot = f64_from(0);
+                var kbase = Kc + (j * C + base) * 8;
+                store64(&acc, f64_from(0)); store64(&acc + 8, f64_from(0));
+                store64(&acc + 16, f64_from(0)); store64(&acc + 24, f64_from(0));
                 var d = 0;
+                while (d < hd4) {
+                    f64v_fmadd(&acc, qbase + d * 8, kbase + d * 8, &acc, 4);
+                    d = d + 4;
+                }
+                var dot = f64_add(f64_add(load64(&acc), load64(&acc + 8)),
+                                  f64_add(load64(&acc + 16), load64(&acc + 24)));
                 while (d < hd) {
-                    dot = f64_add(dot, f64_mul(load64(Qc + (i * C + base + d) * 8),
-                                               load64(Kc + (j * C + base + d) * 8)));
+                    dot = f64_add(dot, f64_mul(load64(qbase + d * 8), load64(kbase + d * 8)));
                     d = d + 1;
                 }
                 store64(prow + j * 8, f64_mul(dot, scale));
@@ -86,18 +97,28 @@ fn attn_fwd(Wq, bq, Wk, bk, Wv, bv, Wo, bo, x, out, ar, T, C, nh): i64 {
             var inv = f64_div(f64_from(1), sum);
             j = 0;
             while (j <= i) { store64(prow + j * 8, f64_mul(load64(prow + j * 8), inv)); j = j + 1; }
-            # concat[i, base+d] = sum_j P[i,j] * V[j, base+d]
-            var d2 = 0;
-            while (d2 < hd) {
-                var acc = f64_from(0);
-                j = 0;
-                while (j <= i) {
-                    acc = f64_add(acc, f64_mul(load64(prow + j * 8),
-                                              load64(Vc + (j * C + base + d2) * 8)));
-                    j = j + 1;
+            # concat[i, base+d] = sum_j P[i,j] * V[j, base+d]  (axpy over the
+            # contiguous head dim d, broadcasting the scalar P[i,j] over j)
+            var cbase = concat + (i * C + base) * 8;
+            var dz = 0;
+            while (dz < hd) { store64(cbase + dz * 8, f64_from(0)); dz = dz + 1; }
+            j = 0;
+            while (j <= i) {
+                var pij = load64(prow + j * 8);
+                store64(&pv, pij); store64(&pv + 8, pij);
+                store64(&pv + 16, pij); store64(&pv + 24, pij);
+                var vbase = Vc + (j * C + base) * 8;
+                var d = 0;
+                while (d < hd4) {
+                    f64v_fmadd(cbase + d * 8, &pv, vbase + d * 8, cbase + d * 8, 4);
+                    d = d + 4;
                 }
-                store64(concat + (i * C + base + d2) * 8, acc);
-                d2 = d2 + 1;
+                while (d < hd) {
+                    store64(cbase + d * 8, f64_add(load64(cbase + d * 8),
+                                                   f64_mul(pij, load64(vbase + d * 8))));
+                    d = d + 1;
+                }
+                j = j + 1;
             }
             i = i + 1;
         }
@@ -114,6 +135,9 @@ fn attn_bwd(Wq, Wk, Wv, Wo, x, dout, dx,
             dWq, dbq, dWk, dbk, dWv, dbv, dWo, dbo, ar, T, C, nh): i64 {
     var hd = C / nh;
     var scale = f64_div(f64_from(1), f64_sqrt(f64_from(hd)));
+    var hd4 = hd - (hd % 4);
+    var bb[32];                     # 4-lane broadcast buffer
+    var dacc[32];                   # 4-lane dot accumulator
     var Qc = _at_Qc(ar);
     var Kc = _at_Kc(ar, T, C);
     var Vc = _at_Vc(ar, T, C);
@@ -141,17 +165,30 @@ fn attn_bwd(Wq, Wk, Wv, Wo, x, dout, dx,
         var i = 0;
         while (i < T) {
             var prow = Pc + (h * T + i) * T * 8;
-            # dP[i,j] = sum_d dconcat[i,base+d]*V[j,base+d]; dV[j] += P[i,j]*dconcat[i]
+            # dP[i,j] = sum_d dconcat[i,base+d]*V[j,base+d]  (dot over d)
+            # dV[j,base+d] += P[i,j]*dconcat[i,base+d]       (axpy over d)
+            var dcbase = dconcat + (i * C + base) * 8;
             var j = 0;
             while (j <= i) {
-                var dpj = f64_from(0);
                 var pij = load64(prow + j * 8);
+                store64(&bb, pij); store64(&bb + 8, pij);
+                store64(&bb + 16, pij); store64(&bb + 24, pij);
+                store64(&dacc, f64_from(0)); store64(&dacc + 8, f64_from(0));
+                store64(&dacc + 16, f64_from(0)); store64(&dacc + 24, f64_from(0));
+                var vbase = Vc + (j * C + base) * 8;
+                var dvbase = dV + (j * C + base) * 8;
                 var d = 0;
+                while (d < hd4) {
+                    f64v_fmadd(dvbase + d * 8, &bb, dcbase + d * 8, dvbase + d * 8, 4);
+                    f64v_fmadd(&dacc, dcbase + d * 8, vbase + d * 8, &dacc, 4);
+                    d = d + 4;
+                }
+                var dpj = f64_add(f64_add(load64(&dacc), load64(&dacc + 8)),
+                                  f64_add(load64(&dacc + 16), load64(&dacc + 24)));
                 while (d < hd) {
-                    var dc = load64(dconcat + (i * C + base + d) * 8);
-                    dpj = f64_add(dpj, f64_mul(dc, load64(Vc + (j * C + base + d) * 8)));
-                    var vidx = (j * C + base + d);
-                    store64(dV + vidx * 8, f64_add(load64(dV + vidx * 8), f64_mul(pij, dc)));
+                    var dc = load64(dcbase + d * 8);
+                    dpj = f64_add(dpj, f64_mul(dc, load64(vbase + d * 8)));
+                    store64(dvbase + d * 8, f64_add(load64(dvbase + d * 8), f64_mul(pij, dc)));
                     d = d + 1;
                 }
                 store64(dprow + j * 8, dpj);
@@ -164,19 +201,28 @@ fn attn_bwd(Wq, Wk, Wv, Wo, x, dout, dx,
                 dotPdP = f64_add(dotPdP, f64_mul(load64(prow + j * 8), load64(dprow + j * 8)));
                 j = j + 1;
             }
+            var dqbase = dQ + (i * C + base) * 8;
+            var qbase2 = Qc + (i * C + base) * 8;
             j = 0;
             while (j <= i) {
                 var ds = f64_mul(load64(prow + j * 8), f64_sub(load64(dprow + j * 8), dotPdP));
                 var sds = f64_mul(scale, ds);
-                # score = scale*Q[i]·K[j]
+                # dQ[i,base+d] += sds*K[j,base+d]; dK[j,base+d] += sds*Q[i,base+d]
+                store64(&bb, sds); store64(&bb + 8, sds);
+                store64(&bb + 16, sds); store64(&bb + 24, sds);
+                var kbase = Kc + (j * C + base) * 8;
+                var dkbase = dK + (j * C + base) * 8;
                 var d = 0;
+                while (d < hd4) {
+                    f64v_fmadd(dqbase + d * 8, &bb, kbase + d * 8, dqbase + d * 8, 4);
+                    f64v_fmadd(dkbase + d * 8, &bb, qbase2 + d * 8, dkbase + d * 8, 4);
+                    d = d + 4;
+                }
                 while (d < hd) {
-                    var qidx = (i * C + base + d);
-                    var kidx = (j * C + base + d);
-                    store64(dQ + qidx * 8, f64_add(load64(dQ + qidx * 8),
-                                                   f64_mul(sds, load64(Kc + kidx * 8))));
-                    store64(dK + kidx * 8, f64_add(load64(dK + kidx * 8),
-                                                   f64_mul(sds, load64(Qc + qidx * 8))));
+                    store64(dqbase + d * 8, f64_add(load64(dqbase + d * 8),
+                                                    f64_mul(sds, load64(kbase + d * 8))));
+                    store64(dkbase + d * 8, f64_add(load64(dkbase + d * 8),
+                                                    f64_mul(sds, load64(qbase2 + d * 8))));
                     d = d + 1;
                 }
                 j = j + 1;

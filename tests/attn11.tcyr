@@ -174,8 +174,13 @@ fn attn_ng(p, np, n, Wq, bq, Wk, bk, Wv, bv, Wo, bo, x, out, dout, ar, T, C, nh)
     }
     return 0;
 }
-fn test_attention(): i64 {
-    var T = 3; var C = 4; var nh = 2; var CC = C * C; var TC = T * C;
+# Parameterized so we can grad-check several head dims: hd = C/nh selects how
+# many 4-wide SIMD chunks (+ tail) the attention kernels run. We cover hd=6
+# (1 chunk + 2 tail), hd=8 (2 chunks, no tail — the PRODUCTION C=32,nh=4 path),
+# and hd=10 (2 chunks + 2 tail), so a second-chunk stride/accumulator bug can't
+# hide behind a single-chunk test.
+fn _attn_check(T, C, nh): i64 {
+    var CC = C * C; var TC = T * C;
     var Wq = t_alloc(CC); var Wk = t_alloc(CC); var Wv = t_alloc(CC); var Wo = t_alloc(CC);
     var bq = t_alloc(C); var bk = t_alloc(C); var bv = t_alloc(C); var bo = t_alloc(C);
     var x = t_alloc(TC); var out = t_alloc(TC); var dout = t_alloc(TC);
@@ -199,6 +204,12 @@ fn test_attention(): i64 {
     check("attn dWo", dWo, nWo, CC, 100000);
     check("attn dbq", dbq, nbq, C, 100000);
     check("attn dbo", dbo, nbo, C, 100000);
+    return 0;
+}
+fn test_attention(): i64 {
+    _attn_check(3, 12, 2);   # hd=6: 1 SIMD chunk + 2 tail
+    _attn_check(3, 16, 2);   # hd=8: 2 SIMD chunks (production path)
+    _attn_check(3, 20, 2);   # hd=10: 2 SIMD chunks + 2 tail
     return 0;
 }
 
@@ -353,6 +364,38 @@ fn test_ckpt_vocab_mismatch(): i64 {
     return 0;
 }
 
+# Pins the SIMD numeric contract: the packed f64v_fmadd must round identically
+# to the scalar f64_mul+f64_add (true on this toolchain, where it lowers to
+# mulpd+addpd). This is what makes the axpy paths bit-identical to scalar. If a
+# future toolchain emits a single-rounding fused FMA, this fails — flagging that
+# the "bit-identical" guarantee (and the unchanged loss curve) no longer holds.
+fn test_simd_contract(): i64 {
+    rng_seed(4242);
+    var a4[32]; var b4[32]; var c4[32];
+    var diffs = 0; var i = 0;
+    while (i < 5000) {
+        var L = 0;
+        while (L < 4) {
+            store64(&a4 + L * 8, rng_normal());
+            store64(&b4 + L * 8, rng_normal());
+            store64(&c4 + L * 8, rng_normal());
+            L = L + 1;
+        }
+        var e0 = f64_add(load64(&c4), f64_mul(load64(&a4), load64(&b4)));
+        var e1 = f64_add(load64(&c4 + 8), f64_mul(load64(&a4 + 8), load64(&b4 + 8)));
+        var e2 = f64_add(load64(&c4 + 16), f64_mul(load64(&a4 + 16), load64(&b4 + 16)));
+        var e3 = f64_add(load64(&c4 + 24), f64_mul(load64(&a4 + 24), load64(&b4 + 24)));
+        f64v_fmadd(&c4, &a4, &b4, &c4, 4);
+        if (load64(&c4) != e0) { diffs = diffs + 1; }
+        if (load64(&c4 + 8) != e1) { diffs = diffs + 1; }
+        if (load64(&c4 + 16) != e2) { diffs = diffs + 1; }
+        if (load64(&c4 + 24) != e3) { diffs = diffs + 1; }
+        i = i + 1;
+    }
+    assert(diffs == 0, "f64v_fmadd rounds identically to scalar mul+add (SIMD bit-contract)");
+    return 0;
+}
+
 fn main(): i64 {
     alloc_init();
     rng_seed(123);
@@ -362,6 +405,7 @@ fn main(): i64 {
     test_gelu();
     test_softmax_xent();
     test_dropout();
+    test_simd_contract();
     test_group("attention grad-check");
     test_attention();
     test_group("full-model grad-check");

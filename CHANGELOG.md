@@ -4,6 +4,35 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-06-08
+
+Performance — SIMD matmul (roadmap M3). **~2.27× faster training** (1939 →
+4396 tokens/sec on the default config), gradients and convergence unchanged.
+
+### Added
+- **4-wide SIMD vectorization** of the matmul hot paths (`linear_fwd`,
+  `linear_bwd`, and the attention per-head score/AV/`dQ`/`dK`/`dV` loops) via
+  the packed `f64v_fmadd` builtin with memory accumulators and a scalar tail for
+  non-multiple-of-4 dims. `linear_fwd` alone is **3.88×**; a full fwd+bwd step
+  **2.27×**.
+- Real benchmark harness `tests/attn11.bcyr` (now_ns timings of linear /
+  forward / backward / step / Adam + tokens/sec); results in
+  [`docs/benchmarks.md`](docs/benchmarks.md) and tracked in
+  [`bench-history.csv`](bench-history.csv).
+- Grad checks now cover head dims 6/8/10 (the production `hd=8` two-chunk SIMD
+  path) and `test_simd_contract` pins `f64v_fmadd` == scalar `mul+add` so a
+  future toolchain emitting a fused single-rounding FMA is caught. **47 checks.**
+
+### Changed
+- Toolchain pin `6.1.5`.
+
+### Notes
+- The vectorization is numerically faithful: AXPY paths (forward `y`, `dW`,
+  attention AV/`dQ`/`dK`/`dV`) are **bit-identical** to scalar on this toolchain
+  (verified); the dot paths (`dx`, attention scores/`dP`) use a 4-lane tree
+  reduction and so differ only at floating-point rounding (~1e-16, far within
+  the grad-check tolerance). All 47 grad checks pass unchanged.
+
 ## [0.3.0] - 2026-06-08
 
 Data & persistence (roadmap M2).

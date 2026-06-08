@@ -68,13 +68,16 @@ v1.0.0 ships when **all** of these hold:
   (`test_resume_determinism`); the loaders have a fuzz harness (500 mutated
   checkpoints + 100 random corpora); `SECURITY.md` updated for the new surface.
 
-### M3 — Performance (v0.4.0)
+### M3 — Performance (v0.4.0) — ✅ shipped 2026-06-08
 
-- SIMD (`f64v2`/`f64v4`) hot paths for matmul / attention / Adam.
-- Benchmarks captured in [`benchmarks.md`](benchmarks.md) with a
-  `bench-history.csv` (step time, tokens/sec, build size).
-- **Gates**: documented `before → after` speedup per bench; grad checks and
-  training curve unchanged within tolerance.
+- ✅ 4-wide SIMD (`f64v_fmadd`) on the matmul hot paths — `linear_fwd`/
+  `linear_bwd` and the attention per-head score/AV/`dQ`/`dK`/`dV` loops. (Adam
+  is <1% of a step; GELU's `f64_tanh` has no packed form — both left scalar.)
+- ✅ Benchmarks in [`benchmarks.md`](benchmarks.md) + [`bench-history.csv`](../../bench-history.csv).
+- **Gates met**: documented `before → after` — `linear_fwd` 3.88×, fwd+bwd step
+  2.27×, **tokens/sec 1939 → 4396**; grad checks unchanged (47 pass, incl. the
+  production `hd=8` path) and the SIMD is bit-identical (axpy) / within-rounding
+  (dot) to scalar, so training converges identically.
 
 ### M4 — Portability & robustness (v0.5.0)
 

@@ -1,21 +1,75 @@
-# attn11 benchmarks
-# Stdlib auto-included via cyrius.cyml
+# attn11 benchmarks — model hot paths.
 #
-# Pattern: bench_new -> bench_batch_start -> tight loop -> bench_batch_stop -> bench_report.
-# For sub-1us ops use batch_size >= 1000 to amortize clock_gettime overhead
-# (~240 ns per start/stop pair on x86_64 Linux). See lib/bench.cyr header for
-# the full overhead-vs-batching guidance.
+# Measures the real training-step cost (matmul-dominated) so SIMD work can be
+# tracked before/after. Uses now_ns() (clock_gettime CLOCK_MONOTONIC_RAW)
+# deltas around N-iteration loops; the ~120 ns/call clock overhead amortizes to
+# nothing against the ms-scale ops measured.
 
-fn bench_noop(): i64 { return 0; }
+include "src/tensor.cyr"
+include "src/fileio.cyr"
+include "src/ops.cyr"
+include "src/attn.cyr"
+include "src/model.cyr"
+include "src/train.cyr"
+
+# print "<label>: <ns/op> ns/op" given total ns over `iters`
+fn _report(label, total, iters): i64 {
+    print(label, strlen(label));
+    print(": ", 2);
+    fmt_int(total / iters);
+    print(" ns/op\n", 7);
+    return 0;
+}
 
 fn main(): i64 {
     alloc_init();
-    var b = bench_new("noop");
-    bench_batch_start(b);
-    var i = 0;
-    while (i < 1000000) { bench_noop(); i = i + 1; }
-    bench_batch_stop(b, 1000000);
-    bench_report(b);
+    var V = build_corpus();
+    model_init(V, 32, 16, 4, 3, 1, f64_from(0), 1337);
+    var C = g_C; var F = g_F; var T = g_T;
+
+    # prime caches
+    model_forward(); model_zero_grads(); model_backward();
+
+    # ---- isolated linear (MLP fc size: T x C x F) ----
+    var x = t_alloc(T * C); var W = t_alloc(C * F); var bvec = t_alloc(F); var y = t_alloc(T * F);
+    t_randn(x, T * C, f64_from(1)); t_randn(W, C * F, f64_from(1)); t_randn(bvec, F, f64_from(1));
+    var NL1 = 2000;
+    var s = now_ns(); var i = 0;
+    while (i < NL1) { linear_fwd(x, W, bvec, y, T, C, F); i = i + 1; }
+    var e = now_ns();
+    _report("linear_fwd TxCxF ", e - s, NL1);
+
+    # ---- forward / backward / full step ----
+    var N = 200;
+    s = now_ns(); i = 0; while (i < N) { model_forward(); i = i + 1; } e = now_ns();
+    _report("model_forward    ", e - s, N);
+
+    s = now_ns(); i = 0; while (i < N) { model_backward(); i = i + 1; } e = now_ns();
+    _report("model_backward   ", e - s, N);
+
+    s = now_ns(); i = 0;
+    while (i < N) {
+        model_zero_grads(); sample_window(); model_forward(); model_backward();
+        i = i + 1;
+    }
+    e = now_ns();
+    var step_ns = (e - s) / N;
+    _report("fwd+bwd step     ", e - s, N);
+
+    # ---- Adam step (once per optimizer step over NP params) ----
+    var NA = 500;
+    var lr = f64_div(f64_from(1), f64_from(1000));
+    s = now_ns(); i = 0; while (i < NA) { model_adam_step(lr, i + 1); i = i + 1; } e = now_ns();
+    _report("adam_step (NP)   ", e - s, NA);
+
+    # ---- derived: tokens/sec for a batch=16 optimizer step ----
+    # one optimizer step ~= 16*(fwd+bwd); tokens = batch*T = 16*T
+    var opt_ns = 16 * step_ns;
+    var toks = 16 * T;
+    # tok/s = toks / (opt_ns / 1e9) = toks * 1e9 / opt_ns
+    print("tokens/sec (b=16): ", 19);
+    fmt_int(toks * 1000000000 / opt_ns);
+    _putc(10);
     return 0;
 }
 

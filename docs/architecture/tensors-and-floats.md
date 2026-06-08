@@ -69,6 +69,25 @@ perturb each input by ±ε, recompute a scalar loss, compare `(L₊−L₋)/2ε`
 analytic gradient. Pass threshold is max relative error `< 1e-5` per op
 (`< 1e-4` for the full model, where finite-difference noise is larger).
 
+## SIMD matmul
+
+The matmul hot paths (`linear_fwd`/`linear_bwd`, attention per-head loops) are
+vectorized 4-wide with the packed `f64v_fmadd(out, a, b, c, lanes)` builtin
+(`out = a*b + c`, `out` may alias `c`). Two non-obvious rules, learned the hard
+way:
+
+- **Never reassign a SIMD-typed var** (`accv = f64v2_...(...)`) — it miscompiles
+  to garbage. Accumulators and scalar broadcasts therefore live in plain byte
+  buffers (`var acc[32]` = four f64 lanes) and accumulate in place via
+  `f64v_fmadd`, which is the verified-correct pattern.
+- A scalar tail handles dims not a multiple of 4 (`n4 = N - N%4`).
+
+On this toolchain `f64v_fmadd` lowers to `mulpd`+`addpd` (two roundings), so the
+**AXPY** paths (forward `y`, `dW`, attention AV/`dQ`/`dK`/`dV`) are bit-identical
+to scalar; the **dot** paths (`dx`, attention scores/`dP`) use a 4-lane tree
+reduction and so differ only at the rounding level. `test_simd_contract` pins
+the `f64v_fmadd`==scalar contract so a future fused-FMA toolchain is caught.
+
 ## Gotchas observed in the toolchain
 
 - **Long float literals mis-parse.** `0.5` and `0.044715` are fine, but a

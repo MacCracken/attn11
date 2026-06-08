@@ -5,14 +5,21 @@
 
 ## Version
 
-**0.3.0** — data & persistence (roadmap M2). File/stdin corpus loading
-(`O_NOFOLLOW`, size-capped), byte-level tokenizer, validated checkpoints with
-bit-for-bit deterministic resume, loader fuzzing. Built 2026-06-08.
-(0.2.0: stacked layers, residual-init scaling, grad clipping, LR schedule.)
+**0.4.0** — performance (roadmap M3). 4-wide SIMD matmul (`f64v_fmadd`) on the
+linear + attention hot paths: **~2.27× faster training** (1939 → 4396 tok/s),
+gradients/convergence unchanged. Built 2026-06-08.
+(0.3.0: file/stdin corpus, checkpoints + deterministic resume, fuzzing.
+0.2.0: stacked layers, residual-init scaling, grad clipping, LR schedule.)
 
 ## Toolchain
 
 - **Cyrius pin**: `6.1.5` (in `cyrius.cyml [package].cyrius`)
+
+## Performance
+
+4-wide SIMD (`f64v_fmadd`) matmul. Default config, x86_64:
+fwd+bwd step 8.25ms → 3.64ms, **tokens/sec 1939 → 4396 (2.27×)**. See
+[`benchmarks.md`](benchmarks.md) + [`../../bench-history.csv`](../../bench-history.csv).
 
 ## What works
 
@@ -77,16 +84,17 @@ sampled output reproduces real corpus phrases.
 
 ## Tests
 
-- `tests/attn11.tcyr` — **36 checks**: 20 finite-difference gradient checks
-  (every op incl. dropout, attention incl. biases, 2-layer full model), plus
-  **bit-for-bit resume-determinism** with dropout off AND on, and checkpoint
-  rejection smokes (truncated / bad magic / absurd config / NaN+1.0 dropout /
-  vocab-mismatch). All pass (`cyrius test`).
+- `tests/attn11.tcyr` — **47 checks**: finite-difference gradient checks (every
+  op incl. dropout, attention at head dims 6/8/10 incl. biases, 2-layer full
+  model), the `f64v_fmadd`==scalar SIMD bit-contract, **bit-for-bit
+  resume-determinism** (dropout off AND on), and checkpoint rejection smokes
+  (truncated / bad magic / absurd config / NaN+1.0 dropout / vocab-mismatch).
+  All pass (`cyrius test`).
+- `tests/attn11.bcyr` — benchmark harness (timings + tokens/sec).
 - `tests/attn11.fcyr` — fuzz harness: 500 mutated-checkpoint rounds + 100 random
   corpora; loaders reject malformed input without crashing.
-- The M2 data/persistence code passed an adversarial multi-agent review; all 9
-  confirmed findings (1 high vocab-mismatch + 8 low) are fixed and regression-
-  tested. See CHANGELOG 0.3.0 "Hardened".
+- The M2 (persistence) and M3 (SIMD) code each passed an adversarial multi-agent
+  review; all confirmed findings fixed and regression-tested. See CHANGELOG.
 
 ## Dependencies
 

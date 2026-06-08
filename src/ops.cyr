@@ -18,21 +18,47 @@ fn _gelu_a(): i64 { return f64_div(f64_from(44715), f64_from(1000000)); } # 0.04
 # ===========================================================================
 # Linear:  y(M,N) = x(M,K) @ W(K,N) [+ b(N)]
 # ===========================================================================
+# SIMD note: matmul is ~80% of a training step. We vectorize over the
+# contiguous output dim N (W is row-major (K,N), so W[k, n..n+3] is contiguous),
+# 4-wide via the packed multiply-add builtin f64v_fmadd(out,a,b,c,4) (out may
+# alias c). Loop order is (m, k, n): y[m,:] is initialised to the bias then
+# accumulated as y[m, n..n+3] += x[m,k] * W[k, n..n+3]. This is an AXPY whose
+# per-element += sequence over k is unchanged, so it is BIT-IDENTICAL to the
+# scalar version on this toolchain (f64v_fmadd lowers to mulpd+addpd, which
+# rounds the same as f64_mul+f64_add — pinned by test_simd_contract; if a future
+# toolchain emits a fused single-rounding FMA the result stays within tolerance
+# but is no longer bit-identical). N not a multiple of 4 -> a scalar tail.
+# SIMD-typed vars are never reassigned (a known miscompile); the broadcast and
+# accumulator live in plain byte buffers.
 fn linear_fwd(x, W, b, y, M, K, N): i64 {
+    var n4 = N - (N % 4);           # 4-lane vector body; scalar tail for 0..3
+    var xv[32];                     # broadcast buffer [x_mk x4]
     var m = 0;
     while (m < M) {
+        var yrow = y + m * N * 8;
         var n = 0;
         while (n < N) {
-            var acc = f64_from(0);
-            if (b != 0) { acc = load64(b + n * 8); }
-            var k = 0;
-            while (k < K) {
-                acc = f64_add(acc, f64_mul(load64(x + (m * K + k) * 8),
-                                           load64(W + (k * N + n) * 8)));
-                k = k + 1;
-            }
-            store64(y + (m * N + n) * 8, acc);
+            if (b != 0) { store64(yrow + n * 8, load64(b + n * 8)); }
+            else { store64(yrow + n * 8, f64_from(0)); }
             n = n + 1;
+        }
+        var k = 0;
+        while (k < K) {
+            var xmk = load64(x + (m * K + k) * 8);
+            store64(&xv, xmk); store64(&xv + 8, xmk);
+            store64(&xv + 16, xmk); store64(&xv + 24, xmk);
+            var Wrow = W + k * N * 8;
+            n = 0;
+            while (n < n4) {
+                f64v_fmadd(yrow + n * 8, &xv, Wrow + n * 8, yrow + n * 8, 4);
+                n = n + 4;
+            }
+            while (n < N) {
+                store64(yrow + n * 8, f64_add(load64(yrow + n * 8),
+                                              f64_mul(xmk, load64(Wrow + n * 8))));
+                n = n + 1;
+            }
+            k = k + 1;
         }
         m = m + 1;
     }
@@ -40,50 +66,74 @@ fn linear_fwd(x, W, b, y, M, K, N): i64 {
 }
 
 # Given dy(M,N): write dx(M,K); accumulate dW(K,N), db(N) (db may be 0).
+# Vectorized over the contiguous N dim (dy[m,:] and W[k,:] are both row-major):
+#   dx[m,k] = sum_n dy[m,n]*W[k,n]   -> 4-lane partial sums + tree horizontal sum
+#   dW[k,n] += sum_m x[m,k]*dy[m,n]  -> packed axpy over n, summed over m
+# dW (axpy) preserves the scalar accumulation order exactly -> bit-identical.
+# dx uses a 4-lane partial-sum reduction, so its summation ORDER differs from a
+# sequential scalar dot; results match only within floating-point rounding
+# (~1e-16, far inside the grad-check tolerance) — gradients are unchanged.
 fn linear_bwd(x, W, dy, dx, dW, db, M, K, N): i64 {
+    var n4 = N - (N % 4);
+    var acc[32];                    # 4-lane dot accumulator
+    var xv[32];                     # broadcast buffer
     # dx[m,k] = sum_n dy[m,n] * W[k,n]
     var m = 0;
     while (m < M) {
+        var dyrow = dy + m * N * 8;
         var k = 0;
         while (k < K) {
-            var acc = f64_from(0);
+            var Wrow = W + k * N * 8;
+            store64(&acc, f64_from(0)); store64(&acc + 8, f64_from(0));
+            store64(&acc + 16, f64_from(0)); store64(&acc + 24, f64_from(0));
             var n = 0;
+            while (n < n4) {
+                f64v_fmadd(&acc, dyrow + n * 8, Wrow + n * 8, &acc, 4);
+                n = n + 4;
+            }
+            var s = f64_add(f64_add(load64(&acc), load64(&acc + 8)),
+                            f64_add(load64(&acc + 16), load64(&acc + 24)));
             while (n < N) {
-                acc = f64_add(acc, f64_mul(load64(dy + (m * N + n) * 8),
-                                           load64(W + (k * N + n) * 8)));
+                s = f64_add(s, f64_mul(load64(dyrow + n * 8), load64(Wrow + n * 8)));
                 n = n + 1;
             }
-            store64(dx + (m * K + k) * 8, acc);
+            store64(dx + (m * K + k) * 8, s);
             k = k + 1;
         }
         m = m + 1;
     }
-    # dW[k,n] += sum_m x[m,k] * dy[m,n] ; db[n] += sum_m dy[m,n]
+    # dW[k,n] += sum_m x[m,k] * dy[m,n]
     var kk = 0;
     while (kk < K) {
-        var n = 0;
-        while (n < N) {
-            var acc = f64_from(0);
-            var mm = 0;
-            while (mm < M) {
-                acc = f64_add(acc, f64_mul(load64(x + (mm * K + kk) * 8),
-                                           load64(dy + (mm * N + n) * 8)));
-                mm = mm + 1;
+        var dWrow = dW + kk * N * 8;
+        var mm = 0;
+        while (mm < M) {
+            var xmk = load64(x + (mm * K + kk) * 8);
+            store64(&xv, xmk); store64(&xv + 8, xmk);
+            store64(&xv + 16, xmk); store64(&xv + 24, xmk);
+            var dyrow = dy + mm * N * 8;
+            var n = 0;
+            while (n < n4) {
+                f64v_fmadd(dWrow + n * 8, &xv, dyrow + n * 8, dWrow + n * 8, 4);
+                n = n + 4;
             }
-            var idx = kk * N + n;
-            store64(dW + idx * 8, f64_add(load64(dW + idx * 8), acc));
-            n = n + 1;
+            while (n < N) {
+                store64(dWrow + n * 8, f64_add(load64(dWrow + n * 8),
+                                               f64_mul(xmk, load64(dyrow + n * 8))));
+                n = n + 1;
+            }
+            mm = mm + 1;
         }
         kk = kk + 1;
     }
     if (db != 0) {
-        var n2 = 0;
-        while (n2 < N) {
-            var acc = f64_from(0);
+        var nb = 0;
+        while (nb < N) {
+            var accb = f64_from(0);
             var mm = 0;
-            while (mm < M) { acc = f64_add(acc, load64(dy + (mm * N + n2) * 8)); mm = mm + 1; }
-            store64(db + n2 * 8, f64_add(load64(db + n2 * 8), acc));
-            n2 = n2 + 1;
+            while (mm < M) { accb = f64_add(accb, load64(dy + (mm * N + nb) * 8)); mm = mm + 1; }
+            store64(db + nb * 8, f64_add(load64(db + nb * 8), accb));
+            nb = nb + 1;
         }
     }
     return 0;
