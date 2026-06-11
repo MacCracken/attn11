@@ -101,16 +101,23 @@ fn secure_write_file(path, buf, len): i64 {
     return total;
 }
 
-# Durability barrier before the atomic rename. Linux: fsync(fd) (raw number —
-# the stdlib ships no sys_fsync wrapper). agnos: the frozen ABI has no per-fd
-# fsync; sys_sync() (syscall 12) flushes globally, which subsumes the fd.
-fn _fsync(fd): i64 {
+# Durability barrier before the atomic rename. Linux: fdatasync(fd) — flushes
+# the temp's DATA plus the metadata a later read needs (file size / block map),
+# which is the whole crash-atomic guarantee here; it skips only mtime/atime,
+# irrelevant for a checkpoint. We use fdatasync, NOT fsync, on purpose: under
+# qemu-user aarch64, fsync (82) returns EFAULT (an emulation quirk — fsync works
+# on real aarch64), which would make the CI aarch64 lane unable to test the
+# save path; fdatasync (75/83) is emulated correctly and is sufficient (the
+# rename publishes the directory entry; we only need `path`'s data durable).
+# Raw number — the stdlib ships no sys_fdatasync wrapper. agnos: the frozen ABI
+# has no per-fd sync; sys_sync() (syscall 12) flushes globally, subsuming the fd.
+fn _fdatasync(fd): i64 {
     #ifdef CYRIUS_TARGET_AGNOS
     return sys_sync();
     #endif
-    var n = 74;                  # SYS_FSYNC (x86_64)
+    var n = 75;                  # SYS_FDATASYNC (x86_64)
     #ifdef CYRIUS_ARCH_AARCH64
-    n = 82;                      # SYS_FSYNC (aarch64)
+    n = 83;                      # SYS_FDATASYNC (aarch64)
     #endif
     return syscall(n, fd);
 }
@@ -136,9 +143,9 @@ fn secure_write_atomic(path, buf, len): i64 {
         if (n <= 0) { file_close(fd); _unlink(tmp); return 0 - 1; }
         total = total + n;
     }
-    # Durability: a failed fsync means the data may not be on stable storage, so
-    # we must NOT rename over the (good) target — abort and clean up the temp.
-    if (_fsync(fd) < 0) { file_close(fd); _unlink(tmp); return 0 - 2; }
+    # Durability: a failed fdatasync means the data may not be on stable storage,
+    # so we must NOT rename over the (good) target — abort and clean up the temp.
+    if (_fdatasync(fd) < 0) { file_close(fd); _unlink(tmp); return 0 - 2; }
     file_close(fd);
     var r = _rename(tmp, path);
     if (r < 0) { _unlink(tmp); return r; }   # target untouched on failure

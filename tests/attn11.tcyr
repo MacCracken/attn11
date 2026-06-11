@@ -389,6 +389,36 @@ fn test_resume_determinism(): i64 { return _resume_check(f64_from(0), 2); }
 fn test_resume_dropout(): i64 { return _resume_check(_lrc(1, 10), 2); }   # p=0.1
 fn test_resume_gqa(): i64 { return _resume_check(f64_from(0), 1); }       # MQA
 
+# File-path round-trip: ckpt_save_file -> ckpt_load_file. The resume checks
+# above exercise ckpt_load_buf (in-memory) but NEVER the FILE loader, where the
+# M8 _file_size(fd, path) dropped-arg bug lived (strlen on a garbage register ->
+# crash on every --load under AGNOS, masked on Linux). This drives the fixed
+# call end-to-end; on the AGNOS target a dropped path arg fails here.
+fn test_ckpt_file_roundtrip(): i64 {
+    var V = build_corpus();
+    model_init(V, 8, 4, 2, 2, 1, 0, f64_from(0), 7);
+    g_step = 5;
+    var npA = g_NP;
+    var snapA = t_alloc(npA); t_copy(snapA, g_params, npA);
+
+    var p = "/tmp/attn11-ckpt-rt.ckpt";
+    assert(ckpt_save_file(p) == 0, "ckpt_save_file writes ok");
+    # scramble model state, then reload from the file to prove it restores
+    model_init(V, 8, 4, 2, 2, 1, 0, f64_from(0), 999);
+    var rc = ckpt_load_file(p);
+    assert(rc == 0, "ckpt_load_file reads back ok (exercises _file_size path)");
+    assert(g_NP == npA, "file round-trip param count matches");
+    assert(g_step == 5, "file round-trip restores step");
+    var mism = 0; var i = 0;
+    while (i < g_NP) {
+        if (load64(g_params + i * 8) != load64(snapA + i * 8)) { mism = mism + 1; }
+        i = i + 1;
+    }
+    assert(mism == 0, "file round-trip reproduces params bit-for-bit");
+    _unlink(p);
+    return 0;
+}
+
 # Hostile-checkpoint smoke: a few corrupt buffers must be rejected, not crash.
 fn test_ckpt_reject(): i64 {
     var V = build_corpus();
@@ -1146,6 +1176,7 @@ fn main(): i64 {
     test_resume_determinism();
     test_resume_dropout();
     test_resume_gqa();
+    test_ckpt_file_roundtrip();
     test_param_layout();
     test_alloc_accounting();
     test_config_caps();

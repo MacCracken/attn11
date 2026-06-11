@@ -4,8 +4,10 @@ on:
   push:
     tags: ["[0-9]+.[0-9]+.[0-9]+*"]
 
+# Least privilege (M8 supply-chain): default read for all jobs; only the
+# release job that creates the GitHub release is granted contents: write.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   ci:
@@ -16,8 +18,10 @@ jobs:
     name: Build & Release
     needs: [ci]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4 — SHA-pinned (M8 supply-chain)
 
       - name: Verify version
         run: |
@@ -54,7 +58,9 @@ jobs:
 
       - name: Extract changelog
         run: |
-          awk "/^## \\[${GITHUB_REF_NAME}\\]/{found=1; next} /^## \\[/{if(found) exit} found{print}" \
+          # Pass the tag as DATA (awk -v), never interpolated into the awk
+          # program text — a hostile tag name cannot inject awk code (M8).
+          awk -v tag="${GITHUB_REF_NAME}" 'index($0,"## ["tag"]")==1{found=1;next} /^## \[/{if(found)exit} found{print}' \
             CHANGELOG.md > /tmp/body.md
           if [ ! -s /tmp/body.md ]; then
             echo "No changelog entry for ${GITHUB_REF_NAME}." > /tmp/body.md
@@ -67,7 +73,7 @@ jobs:
           cp build/attn11 "attn11-${TAG}-x86_64-linux"
           sha256sum attn11-*.tar.gz attn11-*-x86_64-linux > SHA256SUMS
 
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2 — SHA-pinned (M8 supply-chain)
         with:
           name: "attn11 ${{ github.ref_name }}"
           body_path: /tmp/body.md

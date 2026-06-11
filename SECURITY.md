@@ -37,9 +37,10 @@ attn11 *does not* defend against:
 | **Corpus loading** (`--corpus` / `--stdin`) | Opened with `O_NOFOLLOW` (refuses symlinks / TOCTOU at the final path component → `ELOOP`); size-capped via `fstat` to `MAX_CORPUS_BYTES` (4 MB) **before** reading; byte-level tokenizer accepts any of the 256 byte values into a fixed 256-entry table; short reads are looped. A corpus shorter than `ctx+1` is detected and training is skipped rather than reading out of bounds. |
 | **Checkpoint loading** (`--load`) | Opened with `O_NOFOLLOW`; the exact file size is `fstat`'d and capped (128 MB) before allocation. `ckpt_load_buf` validates magic, version (v1/v2/v3 accepted; the v2 header adds `nkv` with `nkv ≥ 1`, `nkv ≤ nh`, `nh % nkv == 0`, plus `step ≥ 0` and `rng ≠ 0`; the v3 header adds the tokenizer triple `tok_kind ∈ {0,1}`, `base_vocab ∈ [1,256]`, `n_merges ∈ [0,512]` with `V = base + merges` enforced), every config field (range + `C % nh`), recomputes the parameter count (≤ 4M), checks the **total model allocation** the config implies against a 128 MB bound (`model_alloc_bytes`, mirroring `model_init` exactly — so a shape-valid header can't drive the allocator past its cap), and requires the **exact** total size — all **before** any allocation or copy. Truncated / bit-flipped / wild-config / fully random inputs are rejected with a negative error, never a crash (see `tests/attn11.fcyr`: 500 byte-level + 500 BPE mutated rounds + 100 random corpora). On genuine host OOM, `t_alloc` aborts cleanly rather than writing through a null pointer. |
 | **BPE merge table** (`--load`, format v3) | A hostile merge table is the classic decompression-bomb / cyclic-reference shape, so it is validated structurally before install: every merge's left/right id must lie in `[0, base + j)` for merge `j` — a **well-founded DAG** (rejects negative ids, self-reference, forward references, and therefore all cycles: the decoder cannot loop), and a length recurrence bounds every token's byte expansion to 64 (rejects exponential expansion chains, which double per merge and would reach 2^512 bytes). Both run on fixed stack scratch — hostile input drives **zero** heap allocation. Decode never recurses: expansions are precomputed into a flat span table at install time. Fuzzed with dedicated merge-slot, triple-inconsistency, and expansion-bomb mutation modes. |
-| **Checkpoint writing** (`--save`) | Crash-atomic: written to a `.tmp` sibling (`O_NOFOLLOW`), `fsync`'d, then `rename`'d over the target (the rename is the only mutation of the target and is atomic). A failed/interrupted save leaves the prior checkpoint intact; `O_NOFOLLOW` refuses writing through a symlink. |
-| **Numeric / memory layout** | All training buffers (parameters, optimizer state, activation caches, attention arena) are allocated once at fixed, dimension-derived sizes; no allocation or unbounded growth in the training loop. Indices are computed from validated dims. |
+| **Checkpoint writing** (`--save`) | Crash-atomic: written to a `.tmp` sibling (`O_NOFOLLOW`), **`fdatasync`'d** (flushes data + the size/block metadata a read needs — not `fsync`, which qemu-user aarch64 mis-emulates; `fdatasync` is portable and sufficient for the temp-write-then-rename pattern), then `rename`'d over the target (the rename is the only mutation of the target and is atomic). A failed/interrupted save leaves the prior checkpoint intact; `O_NOFOLLOW` refuses writing through a symlink. |
+| **Numeric / memory layout** | All training buffers (parameters, optimizer state, activation caches, attention arena) are allocated once at fixed, dimension-derived sizes; no allocation or unbounded growth in the training loop. Indices are computed from validated dims. CLI numbers (`_atoi`) saturate, so a garbage-huge arg cannot wrap to a small/negative value. |
 | **PRNG** | Deterministic xorshift64 with splitmix64 seeding — used for weight init and sampling only, **not** for any security purpose. Its state is part of a checkpoint solely for reproducible resume. |
+| **Supply chain / CI** | GitHub Actions are **SHA-pinned** (no floating tags — the retag-compromise vector); the release job passes the git tag to `awk` as data, not interpolated code; `contents: write` is scoped to the release job only. The cyrius toolchain version is pinned in `cyrius.cyml` (single source of truth). Deferred (rationale in the M8 audit): installer `curl\|sh` SHA-pinning, release-artifact signing/provenance, a `lib/`-closure lockfile. |
 
 ## Residual notes
 
@@ -51,9 +52,15 @@ attn11 *does not* defend against:
   no `O_NOFOLLOW` (the `AO_*` flag set has no nofollow bit), sizes come from
   path-`stat` rather than `fstat` (a benign race — the size only caps the
   allocation, and reads stop at EOF), and durability uses the global `sync()`
-  (no per-fd `fsync`). See `docs/guides/agnos.md` and
+  (no per-fd `fdatasync`). See `docs/guides/agnos.md` and
   `docs/audit/2026-06-10-agnos-audit.md`.
 - Cross-architecture checkpoints are not portable: tensors are raw native
   little-endian `f64` bit patterns (no endianness header). A checkpoint is
   validated for shape/size but its payload is trusted once the header passes —
   load only checkpoints you produced.
+- The **M8 security sweep** (`docs/audit/2026-06-11-m8-security-sweep-audit.md`)
+  surveyed six vulnerability classes against recent CVEs and recorded a
+  per-class disposition for each — including the headline negative result that
+  the flat-i64 checkpoint is structurally immune to the model-file
+  deserialization-RCE genre, and the accepted residuals (leaf-only
+  `O_NOFOLLOW`, no `S_ISREG` gate on user-supplied corpus paths) with rationale.

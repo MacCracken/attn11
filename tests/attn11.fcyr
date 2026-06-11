@@ -49,7 +49,7 @@ fn main(): i64 {
     var rounds = 0; var rejected = 0; var accepted = 0;
     while (rounds < 500) {
         t_copy(work, good, sz / 8);          # fresh copy of the valid checkpoint
-        var mode = fz_pos() % 5;
+        var mode = fz_pos() % 6;
         var mlen = sz;
         if (mode == 0) {                      # flip a random byte
             var off = fz_pos() % sz;
@@ -61,6 +61,12 @@ fn main(): i64 {
             store64(work + fld * 8, fz_next());
         } elif (mode == 3) {                  # clobber the magic
             store64(work, fz_next());
+        } elif (mode == 4) {                  # boundary-combination: every size field at/over its cap
+            store64(work + 2 * 8, 768 + (fz_pos() % 3));    # V  (cap BPE_VMAX 768)
+            store64(work + 3 * 8, 4096 + (fz_pos() % 3));   # C  (cap 4096)
+            store64(work + 4 * 8, 8192 + (fz_pos() % 3));   # T  (cap 8192)
+            store64(work + 6 * 8, 128 + (fz_pos() % 3));    # NL (cap 128)
+            store64(work + 9 * 8, 4194304 + (fz_pos() % 3));# np (cap 4M) — stresses size arithmetic + check order
         } else {                              # fully random header
             var k = 0;
             while (k < 16) { store64(work + k * 8, fz_next()); k = k + 1; }
@@ -105,11 +111,16 @@ fn main(): i64 {
         } elif (bmode == 5) {                 # clobber one merge slot
             var slot = fz_pos() % (2 * Kb);
             store64(bwork + (16 + Bb + slot) * 8, fz_next());
-        } elif (bmode == 6) {                 # inconsistent (V, Vb, K) triple
-            var pick = fz_pos() % 3;
+        } elif (bmode == 6) {                 # inconsistent OR max-boundary (V, Vb, K) triple
+            var pick = fz_pos() % 4;
             if (pick == 0) { store64(bwork + 2 * 8, 1 + (fz_pos() % 1024)); }
             elif (pick == 1) { store64(bwork + 14 * 8, fz_pos() % 300); }
-            else { store64(bwork + 15 * 8, fz_pos() % 600); }
+            elif (pick == 2) { store64(bwork + 15 * 8, fz_pos() % 600); }
+            else {                            # the extreme VALID triple: V=768, Vb=256, K=512
+                store64(bwork + 2 * 8, 768);  # = BPE_VMAX, the lens[6144] boundary
+                store64(bwork + 14 * 8, 256); # passes -4/-33/-34/-35, rejects on -11 (size)
+                store64(bwork + 15 * 8, 512);
+            }
         } else {                              # expansion-bomb merge chain
             var bj = 0;
             while (bj < Kb) {

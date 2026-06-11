@@ -4,6 +4,69 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-06-11
+
+**Security sweep (roadmap M8).** A research-driven hardening release: six
+vulnerability classes web-researched against recent CVEs, then adversarially
+mapped onto attn11's surfaces (survey→map workflow, 12 agents); per-class
+dispositions — negative results included — in
+[`docs/audit/2026-06-11-m8-security-sweep-audit.md`](docs/audit/2026-06-11-m8-security-sweep-audit.md).
+The headline result is a **negative** one: the checkpoint is a flat
+native-endian i64 array with no opcode interpreter, callable revival, or
+embedded path, so it is **structurally immune** to the pickle/Keras/numpy
+model-file deserialization-RCE genre. Two real bugs and a batch of hardening
+fell out of the map + the new file-path coverage.
+
+### Security
+- **Fixed a crash on every AGNOS `--load`**: `ckpt_load_file` called
+  `_file_size(fd)` but the function is `_file_size(fd, path)`; on AGNOS the
+  path-stat branch ran `strlen()` on the garbage register left by the dropped
+  arg → OOB read / SIGSEGV before any content was examined (masked on Linux's
+  `fstat` branch; the arity mismatch compiled silently). Now passes `path`.
+- **`_atoi` saturates at ~1e9**: a garbage-huge `--steps`/`--layers`/… can no
+  longer wrap mod 2⁶⁴ to a plausible small or negative value (defense-in-depth
+  atop `model_config_ok`'s caps).
+- **Merge-table scratch pinned to its buffer**: the `lens[6144]` validation
+  array sat at the exact `BPE_VMAX` boundary; an explicit `(Vb+j) ≥ 768 → -37`
+  bound stops a future cap bump from silently overflowing the stack buffer.
+- **CI supply-chain hardening**: every GitHub Action **SHA-pinned**
+  (`actions/checkout`, `softprops/action-gh-release`) against the floating-tag
+  retag-compromise vector; the `GITHUB_REF_NAME` **awk-injection** in
+  `release.yml` closed (tag passed as `awk -v` data); `contents: write`
+  **scoped** to the release job only (CI gate runs read-only). Deferred items
+  (installer `curl|sh` pinning, release-artifact signing/provenance, a `lib/`
+  closure lockfile) are documented with rationale in the audit.
+
+### Fixed
+- **Checkpoint *save* was broken on the entire aarch64 CI lane.** The new
+  file-path round-trip test (below) exposed that `secure_write_atomic`'s
+  durability barrier used `fsync`, which **qemu-user aarch64 mis-emulates**
+  (returns `EFAULT`; it works on real aarch64). Every `ckpt_save_file`
+  returned `-2` and wrote nothing under qemu. Switched the barrier to
+  **`fdatasync`** (75 x86_64 / 83 aarch64) — sufficient for the
+  temp-write-then-rename crash-atomic guarantee (flushes data + size, skips
+  only mtime/atime) and emulated correctly. Real aarch64 binary now saves and
+  loads under qemu.
+
+### Added
+- **`test_ckpt_file_roundtrip`** (5 checks, 247 total): the file-path loader
+  (`ckpt_save_file`/`ckpt_load_file`) was untested — only the in-memory
+  `ckpt_load_buf` was. Drives a save→load→bit-compare round-trip; this is what
+  surfaced the two `Fixed`/`Security` findings above.
+- **`agnos-smoke.sh` now `--load`s on AGNOS**: the run gate saved a checkpoint
+  and byte-compared it to Linux but never *loaded* it — exactly the surface the
+  AGNOS crash lived on. It now loads and asserts the "resumed from checkpoint"
+  marker.
+- **Two fuzz modes** (`tests/attn11.fcyr`): a boundary-combination checkpoint
+  mutation (every size field at/over its cap at once) and a max-vocab triple
+  mode (`V=768, Vb=256, K=512` — the `BPE_VMAX`/`lens` boundary).
+
+### Changed
+- `_fsync` → `_fdatasync` (`src/fileio.cyr`); `CKPT_MAX_MODEL_BYTES` already
+  lives in `model.cyr` (see `docs/architecture/004`). Training, generation,
+  checkpoint format, and CLI surface are unchanged — a 0.7.1 binary and an
+  0.8.0 binary produce bit-identical checkpoints and output.
+
 ## [0.7.1] - 2026-06-11
 
 **Scale preset + BPE (roadmap M7 — frontier E3 graduated).** A `--preset` for

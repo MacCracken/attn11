@@ -194,6 +194,11 @@ fn ckpt_load_buf(buf, len): i64 {
             var ml = load64(buf + (base + Vb + 2 * j) * 8);
             var mr = load64(buf + (base + Vb + 2 * j + 1) * 8);
             if ((ml < 0) || (ml >= Vb + j) || (mr < 0) || (mr >= Vb + j)) { return 0 - 37; }
+            # stack-buffer bound: lens holds 768 slots (= BPE_VMAX). -33/-34/-35
+            # already keep Vb+j < 768, but pin the minted id to lens's capacity
+            # so a future BPE_VMAX bump that misses this buffer can't silently
+            # overflow the stack (defense-in-depth, M8 audit 2026-06-11).
+            if ((Vb + j) >= 768) { return 0 - 37; }
             var e = load64(&lens + ml * 8) + load64(&lens + mr * 8);
             if (e > BPE_MAX_TOKLEN()) { return 0 - 38; }
             store64(&lens + (Vb + j) * 8, e);
@@ -280,7 +285,11 @@ fn ckpt_save_file(path): i64 {
 fn ckpt_load_file(path): i64 {
     var fd = file_open(path, _O_RDONLY() | _O_NOFOLLOW(), 0);
     if (fd < 0) { return fd; }
-    var size = _file_size(fd);
+    # _file_size(fd, path): the AGNOS branch path-stats via strlen(path), so the
+    # path arg is load-bearing there — dropping it fed strlen a garbage register
+    # (OOB read / crash on every --load under the kernel, masked on Linux's
+    # fstat branch). Matches secure_read_file's call (M8 audit, 2026-06-11).
+    var size = _file_size(fd, path);
     if (size < 0) { file_close(fd); return size; }
     if (size < CKPT_HDR_V1() * 8) { file_close(fd); return 0 - 1; }
     if (size > CKPT_MAX_BYTES()) { file_close(fd); return 0 - 30; }

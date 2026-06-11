@@ -220,6 +220,32 @@ for _ in range(120):
     prev = cur; time.sleep(1.0)
 if "greedy sample" not in ser(): fail("training finished but no sample output")
 print("   samples generated under AGNOS")
+
+# M8: exercise the LOAD path on AGNOS too. The save-only smoke never invoked
+# ckpt_load_file -> _file_size(fd, path), so the loader's AGNOS path-stat
+# surface went ungated — exactly where the M8 dropped-path-arg crash lived
+# (strlen on a garbage register, SIGSEGV on every --load, masked on Linux).
+# "resumed from checkpoint" is unique to the load path (the save run never
+# prints it), so it cleanly distinguishes a successful load from a crash/hang.
+print("   testing --load under AGNOS")
+typ("run /bin/attn11 --load /ck.ckpt --gen-only\n")
+loaded = False; lnudged = False
+for i in range(4800):
+    out = ser()
+    if "resumed from checkpoint" in out: loaded = True; break
+    if "checkpoint load failed" in out: fail("--load reported failure under AGNOS")
+    if not lnudged and i > 40 and ("[y" in out[-200:] or "(y/" in out[-200:]):
+        typ("y\n"); lnudged = True
+    time.sleep(0.25)
+if not loaded: fail("no 'resumed from checkpoint' on serial (--load crashed/hung under AGNOS?)")
+print("   checkpoint loaded under AGNOS")
+# let the load run's samples settle before quitting
+prev = -1
+for _ in range(120):
+    cur = os.path.getsize(SER)
+    if cur == prev: break
+    prev = cur; time.sleep(1.0)
+
 try:
     s.sendall(b"quit\n"); time.sleep(1.0)
 except OSError:

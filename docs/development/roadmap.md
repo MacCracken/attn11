@@ -168,22 +168,33 @@ Straight from what the vidya run (X001) exposed — small, additive, freeze-safe
   diff caught + fixed a `--layers` heap-OOB (the fresh-config path had skipped
   the loader's alloc cap) — see [`../audit/2026-06-11-m7-bpe-audit.md`](../audit/2026-06-11-m7-bpe-audit.md).
 
-### M8 — Security sweep (v0.8.0)
+### M8 — Security sweep (v0.8.0) — ✅ shipped 2026-06-11
 
-A research-driven hardening release — survey the world first, then repair:
+A research-driven hardening release — surveyed the world first, then repaired.
+Six vulnerability classes web-researched against recent CVEs, then
+adversarially mapped onto attn11's surfaces (survey→map workflow, 12 agents);
+full per-class dispositions in
+[`../audit/2026-06-11-m8-security-sweep-audit.md`](../audit/2026-06-11-m8-security-sweep-audit.md).
 
-- **Survey**: web research of current CVEs / 0-day classes relevant to
-  attn11's shape — hostile-file parser bugs (checkpoint/corpus loaders),
-  integer-overflow-to-OOB patterns, allocator abuse, ML model-file
-  deserialization CVEs (a rich genre), and supply-chain/toolchain exposure
-  (the cyrius pin + `lib/` snapshot, CI actions).
-- **Map** every relevant class onto attn11's surfaces and record the
-  disposition in `docs/audit/` — negative results included; the trail is the
-  point.
-- **Repair** whatever maps; extend the fuzz harness where a class suggests
-  new mutations; regression-test every fix.
-- **Gates**: a dated CVE-survey audit in `docs/audit/` with per-class
-  dispositions; fuzz extended accordingly; all repairs regression-tested.
+- ✅ **Headline (negative) result**: the checkpoint is a flat native-endian
+  i64 array — no opcode interpreter, callable revival, or embedded path — so
+  it is **structurally immune** to the pickle/Keras/numpy model-file
+  deserialization-RCE genre. Integer-overflow, size-vs-shape, alloc-bomb, and
+  merge-DAG vectors all confirmed mitigated against their exact code guards.
+- ✅ **Two real bugs fixed**: a dropped `_file_size` path arg that crashed
+  every AGNOS `--load` (`strlen` on a garbage register), and — exposed by the
+  new file-path coverage — checkpoint *save* broken on the whole aarch64 lane
+  (qemu mis-emulates `fsync`; switched the durability barrier to `fdatasync`).
+- ✅ **Hardening**: `_atoi` overflow saturation; the `lens` merge-scratch
+  pinned to its buffer; **CI supply-chain** — every GitHub Action SHA-pinned,
+  the `GITHUB_REF_NAME` awk-injection closed, `contents: write` scoped to the
+  release job. Deferred infra-bound items (installer pinning, artifact
+  signing, `lib/` lockfile) documented with rationale.
+- ✅ **Coverage**: `test_ckpt_file_roundtrip` (the file loader was untested),
+  the AGNOS run gate now `--load`s, two new fuzz boundary modes.
+- **Gates met**: 247 checks green on x86_64 AND aarch64/qemu (incl.
+  checkpoint save+load on both); fuzz extended; all repairs regression-tested;
+  the dated CVE-survey audit with per-class dispositions is in `docs/audit/`.
 
 ### M9 — Performance (v0.8.x)
 
