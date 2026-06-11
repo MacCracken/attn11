@@ -4,6 +4,94 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-06-11
+
+**Inference efficiency (roadmap M6 — frontier E1 + E2 graduated).** KV-cached
+generation makes sampling **6.2× faster** (951 → 5 868 tok/s at the default
+config), and grouped-query attention (GQA/MQA) makes the KV cache's size a
+config knob (up to 4× smaller at `nkv=1`). Training at the default config is
+unchanged (same 39 488 params, same init draws, same loss curve).
+
+### Added
+- **KV-cached generation (E1)**: per-layer K/V caches + a single-row cached
+  forward (`attn_fwd_row`, `model_fwd_row`) — generation processes one row per
+  token instead of recomputing the whole window. **Bit-identity gate**: the
+  cached path's logits match the uncached reference (`model_eval_window`)
+  bit-for-bit at every prefix length, across context-shifts, greedy and
+  temperature, MHA and MQA (`test_kv_generation`). Bench: 1 050 579 →
+  170 392 ns/token greedy (x86_64, default config, pin 6.1.33).
+- **Grouped-query / multi-query attention (E2)**: `n_kv_heads` config
+  (`nkv ≤ nh`, must divide it; default `nkv = nh` = classic MHA). K/V
+  projections shrink to `C × Ckv` (`Ckv = nkv·C/nh`); each group of `nh/nkv`
+  query heads shares one K/V head. Backward derives grouped `dK`/`dV`
+  accumulation; **grad-checked at `nkv ∈ {1, 2, nh}`** (attention level) and
+  `nkv < nh` (full model), plus MQA resume-determinism. KV bytes are
+  accounted in the bench: 24 576 (`nkv=4`) → 6 144 (`nkv=1`) at the default
+  config.
+- **Checkpoint format v2**: 13-field header adds `nkv` (field 12); new
+  validations — `nkv ≥ 1`, `nkv ≤ nh`, `nh % nkv == 0` (reject `-16`) and
+  `step ≥ 0` (reject `-17`). **v1 checkpoints (≤ 0.6.0) still load**, as
+  `nkv = nh` (with `nkv = nh` the v2 parameter layout is identical to v1's);
+  saves always write v2. Covered by `test_ckpt_v1_compat`,
+  `test_ckpt_gqa_roundtrip`, and the extended fuzz header mutations.
+- Generation benchmarks (`gen uncached` / `gen kv-cached` / tokens/sec /
+  KV bytes per `nkv` / MQA training + generation timings) in
+  `tests/attn11.bcyr`.
+- 97 new checks (64 → 161): GQA/MQA grad checks incl. `dWk`/`dWv`/`dbv`, the
+  KV bit-identity suite (hd ∈ {4,6,8,10} — SIMD tails live — × nkv ∈
+  {1,2,nh} × odd-T shifts), checkpoint v1-compat/GQA round-trip/rejection
+  tests, the parameter-layout tiling pin, and the alloc-accounting pin.
+
+### Security (M6 adversarial review — see `docs/audit/2026-06-11-kv-gqa-audit.md`)
+- **Pre-allocation bound on checkpoint loads**: a shape-valid header whose
+  model would blow the allocator (e.g. the `nh·T·T` attention-arena term,
+  independent of `np`) is rejected (`-18`) via `model_alloc_bytes()` — an
+  exact, test-pinned mirror of `model_init`'s allocations — BEFORE anything
+  is allocated. Caps tightened to the allocator's reality: `CKPT_MAX_NP`
+  64M → 4M params, `CKPT_MAX_BYTES` 2 GB → 128 MB, new
+  `CKPT_MAX_MODEL_BYTES` 128 MB. Previously such a checkpoint SIGSEGV'd in
+  `t_alloc`'s zero-fill (alloc() returns 0 past its cap).
+- `model_init` now enforces the config invariants itself (`nh | C`,
+  `nkv | nh`, `nkv ≤ nh`) — an invalid in-process config aborts cleanly
+  instead of silently corrupting arena/KV memory.
+- Checkpoint `rng_state = 0` (the xorshift64 fixed point — bricks the PRNG
+  stream) is rejected (`-19`).
+- `t_alloc` aborts cleanly on allocation failure (was: zero-fill from
+  address 0); `ckpt_load_file`/`ckpt_save_file`/corpus loaders null-check
+  their buffers (`-31`/`-21`/`-4`).
+
+### Changed
+- **Toolchain pin `6.1.31` → `6.1.33`** (`lib/` re-synced). The 0.7.0 AGNOS
+  run gate caught the drift: cycc 6.1.32 fixed the argv-capture issue attn11
+  filed (init rsp parked in r15 at the entry landing; the
+  `_agnos_init_rsp` global and `_agnos_capture_rsp` are GONE), so a 6.1.33
+  compiler against the stale 6.1.31 `lib/args_agnos.cyr` gave `argc()==0`
+  under the booted kernel — CLI flags silently ignored, Linux unaffected.
+  At pin ≥ 6.1.32 the `docs/architecture/002` statement-call epilogue
+  workaround is no longer load-bearing (entries keep it; it is harmless).
+- **Generation semantics**: the sampler no longer left-pads short prompts with
+  id 0 — the prompt's last `min(plen, T)` bytes occupy positions `0..n-1` and
+  the context grows incrementally. When the window fills, the oldest `T/2`
+  tokens are dropped and the kept context re-primed at its new positions
+  (context-shift; required because learned absolute positional embeddings pin
+  each cached row to its position — ADR 0005). Sample output for a given
+  checkpoint therefore differs from 0.6.0's sliding-window sampler.
+- `model_init` gained an `nkv` parameter (after `nh`); `attn_fwd`/`attn_bwd`/
+  `attn_arena_size` take `nkv`. Banner prints `kv_heads=`.
+
+### Fixed
+- `docs/examples/minimal_train.cyr` still used the pre-M5 `var r = main();`
+  entry epilogue (banned by `docs/architecture/002`) and the pre-0.7.0
+  `model_init` signature — both updated; the example builds and runs again.
+
+### Discovered
+- **The K-projection bias has exactly zero gradient** — a constant bias added
+  to every K row shifts each attention score row by `q_i·bk`, constant over
+  the softmax dimension, and softmax is shift-invariant; GPT-2's K bias is a
+  no-op parameter. Found when the new `dbk` grad check compared two
+  rounding-noise vectors. The suite now FD-checks `dbv` instead and pins
+  `|dbk| < 1e-10` (the backward must *respect* the invariance).
+
 ## [0.6.0] - 2026-06-11
 
 **AGNOS kernel port (roadmap M5).** attn11 now runs as a ring-3 application

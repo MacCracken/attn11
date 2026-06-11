@@ -32,6 +32,11 @@ attn11 --load run.ckpt --corpus mytext.txt --steps 4000   # resume to 4000
 attn11 --load run.ckpt --gen-only                         # sample from it
 ```
 
+Sampling is **KV-cached** (0.7.0): the prompt prefills per-layer K/V caches
+and each generated token costs one cached row instead of a window recompute
+(~6.2× faster; bit-identical to the uncached reference — see ADR 0005).
+Checkpoints from 0.6.0 and earlier (format v1) still load.
+
 ## Layout
 
 - `src/main.cyr` — CLI + orchestration; `src/{tensor,fileio,ops,attn,model,train,persist}.cyr` — the model.

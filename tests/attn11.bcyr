@@ -24,7 +24,7 @@ fn _report(label, total, iters): i64 {
 fn main(): i64 {
     alloc_init();
     var V = build_corpus();
-    model_init(V, 32, 16, 4, 3, 1, f64_from(0), 1337);
+    model_init(V, 32, 16, 4, 4, 3, 1, f64_from(0), 1337);
     var C = g_C; var F = g_F; var T = g_T;
 
     # prime caches
@@ -70,6 +70,54 @@ fn main(): i64 {
     print("tokens/sec (b=16): ", 19);
     fmt_int(toks * 1000000000 / opt_ns);
     _putc(10);
+
+    # ---- generation: uncached window-forward vs KV-cached decode (E1) ----
+    # Both paths share semantics (and are bit-identical — see tests); the
+    # uncached path recomputes the whole window per token, the cached path
+    # runs one row per token plus a re-prime every GEN_SHIFT() tokens.
+    g_training = 0;
+    var NGEN = 500;
+    var pids = t_alloc(1); store64(pids, 1);
+    s = now_ns();
+    gen_prime(pids, 1, 0);
+    gen_decode(NGEN, f64_from(0), 0, 0, 0);
+    e = now_ns();
+    var un_ns = (e - s) / NGEN;
+    _report("gen uncached     ", e - s, NGEN);
+    s = now_ns();
+    gen_prime(pids, 1, 1);
+    gen_decode(NGEN, f64_from(0), 1, 0, 0);
+    e = now_ns();
+    var ca_ns = (e - s) / NGEN;
+    _report("gen kv-cached    ", e - s, NGEN);
+    print("gen tokens/sec uncached: ", 25); fmt_int(1000000000 / un_ns); _putc(10);
+    print("gen tokens/sec cached:   ", 25); fmt_int(1000000000 / ca_ns); _putc(10);
+    print("gen speedup (x100):      ", 25); fmt_int(un_ns * 100 / ca_ns); _putc(10);
+
+    # ---- KV-cache bytes vs nkv (the E2 lever; default config above) ----
+    var nkv = 1;
+    while (nkv <= g_nh) {
+        print("kv cache bytes (nkv=", 20); fmt_int(nkv); print("): ", 3);
+        fmt_int(2 * g_NL * g_T * (nkv * (g_C / g_nh)) * 8); _putc(10);
+        nkv = nkv * 2;
+    }
+
+    # ---- GQA: training step + cached generation at nkv=1 (MQA) ----
+    model_init(V, 32, 16, 4, 1, 3, 1, f64_from(0), 1337);
+    model_forward(); model_zero_grads(); model_backward();   # prime
+    s = now_ns(); i = 0;
+    while (i < N) {
+        model_zero_grads(); sample_window(); model_forward(); model_backward();
+        i = i + 1;
+    }
+    e = now_ns();
+    _report("fwd+bwd step MQA ", e - s, N);
+    g_training = 0;
+    s = now_ns();
+    gen_prime(pids, 1, 1);
+    gen_decode(NGEN, f64_from(0), 1, 0, 0);
+    e = now_ns();
+    _report("gen kv-cached MQA", e - s, NGEN);
     return 0;
 }
 

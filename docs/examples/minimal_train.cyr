@@ -24,9 +24,9 @@ fn main(): i64 {
     # 1. build a vocab + encoded id stream from the embedded corpus
     var V = build_corpus();
 
-    # 2. init a tiny model: V vocab, C=32, ctx=16, 2 heads, 1 layer, biases on,
-    #    no dropout, fixed seed for reproducibility
-    model_init(V, 32, 16, 2, 1, 1, f64_from(0), 1234);
+    # 2. init a tiny model: V vocab, C=32, ctx=16, 2 heads (2 K/V heads = full
+    #    MHA), 1 layer, biases on, no dropout, fixed seed for reproducibility
+    model_init(V, 32, 16, 2, 2, 1, 1, f64_from(0), 1234);
 
     # 3. train: run_until=300, total=300 (schedule horizon), batch 8,
     #    base_lr 3e-3, min_lr 3e-4, warmup 30, grad-clip 1.0, log every 100
@@ -40,5 +40,7 @@ fn main(): i64 {
     return 0;
 }
 
-var r = main();
-syscall(SYS_EXIT, r);
+# Statement-call epilogue (not a `var` initializer) — see docs/architecture/002.
+var r = 0;
+r = main();
+sys_exit(r);

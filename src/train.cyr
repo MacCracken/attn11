@@ -73,6 +73,7 @@ fn build_corpus(): i64 {
 # negative error (open/read error, or 0-2 if larger than MAX_CORPUS_BYTES).
 fn corpus_load_file(path): i64 {
     var buf = alloc(MAX_CORPUS_BYTES());
+    if (buf == 0) { return 0 - 4; }
     var len = secure_read_file(path, buf, MAX_CORPUS_BYTES());
     if (len < 0) { return len; }
     if (len < 1) { return 0 - 3; }
@@ -85,6 +86,7 @@ fn corpus_load_file(path): i64 {
 fn corpus_load_stdin(): i64 {
     var cap = MAX_CORPUS_BYTES();
     var buf = alloc(cap + 1);
+    if (buf == 0) { return 0 - 4; }
     var len = read_stdin(buf, cap + 1);
     if (len < 0) { return len; }
     if (len > cap) { return 0 - 2; }
@@ -230,37 +232,103 @@ fn sample_logits_row(row, V, temp): i64 {
     return V - 1;
 }
 
-# Seed the context with `prompt` (plen chars), then emit `ngen` more chars.
-fn generate(prompt, plen, ngen, temp): i64 {
-    g_training = 0;   # disable dropout for eval
-    var T = g_T; var V = g_V;
-    # init context window: last T chars of prompt, left-padded with id 0
+# KV-cached incremental decoding (E1). The prompt's last min(plen,T) bytes
+# occupy window positions 0..n-1 (no padding); each generated token is then
+# processed as ONE cached row (model_fwd_row, attending over the per-layer K/V
+# caches) instead of recomputing the whole window. Learned absolute positional
+# embeddings pin every cached row to its position, so a full window cannot
+# slide for free: when the window fills, the oldest GEN_SHIFT() tokens are
+# dropped and the kept context re-primed at its new positions — one window
+# recompute amortized over GEN_SHIFT() generated tokens (the context-shift
+# scheme of absolute-position GPT-2-style models). An uncached reference path
+# (full forward over the window for every token, identical semantics) backs
+# the bit-identity gate and the benchmark baseline.
+
+fn GEN_SHIFT(): i64 {
+    var s = g_T / 2;
+    if (s < 1) { s = 1; }
+    return s;
+}
+
+# Full uncached forward over the current G_win[0..G_n): tokens -> A_tokens,
+# logits -> A_logits rows 0..G_n-1.
+fn gen_forward_window(): i64 {
     var t = 0;
-    while (t < T) {
-        var src = plen - T + t;
-        if (src < 0) { store64(A_tokens + t * 8, 0); }
-        else {
-            var id = load64(g_char2id + load8(prompt + src) * 8);
-            if (id < 0) { id = 0; }   # byte not in vocab -> fall back to id 0
-            store64(A_tokens + t * 8, id);
-        }
-        t = t + 1;
+    while (t < G_n) { store64(A_tokens + t * 8, load64(G_win + t * 8)); t = t + 1; }
+    return model_eval_window(G_n);
+}
+
+# Reset the window to ids[0..n) and process it (prefill). cached: 1 = KV path.
+fn gen_prime(ids, n, cached): i64 {
+    var t = 0;
+    while (t < n) { store64(G_win + t * 8, load64(ids + t * 8)); t = t + 1; }
+    G_n = n;
+    if (cached == 1) {
+        var i = 0;
+        while (i < n) { model_fwd_row(load64(G_win + i * 8), i); i = i + 1; }
+    } else {
+        gen_forward_window();
     }
-    print(prompt, plen);
-    # dummy targets (loss ignored during generation)
-    t = 0; while (t < T) { store64(A_targets + t * 8, 0); t = t + 1; }
+    return 0;
+}
+
+# pointer to the logits row of the last processed position
+fn _gen_logits_row(cached): i64 {
+    if (cached == 1) { return R_logits; }
+    return A_logits + (G_n - 1) * g_V * 8;
+}
+
+# Emit ngen tokens continuing the primed window. Both paths share this loop, so
+# they sample at identical points (same PRNG draw sequence given the same
+# starting _rng_state). out_ids != 0 collects the ids (>= ngen entries);
+# emit == 1 prints each char.
+fn gen_decode(ngen, temp, cached, out_ids, emit): i64 {
     var k = 0;
     while (k < ngen) {
-        model_forward();
-        var row = A_logits + (T - 1) * V * 8;
-        var next = sample_logits_row(row, V, temp);
-        _putc(decode_char(next));
-        # slide window left, append next
-        var j = 0;
-        while (j < T - 1) { store64(A_tokens + j * 8, load64(A_tokens + (j + 1) * 8)); j = j + 1; }
-        store64(A_tokens + (T - 1) * 8, next);
+        var next = sample_logits_row(_gen_logits_row(cached), g_V, temp);
+        if (out_ids != 0) { store64(out_ids + k * 8, next); }
+        if (emit == 1) { _putc(decode_char(next)); }
+        # append `next` (sliding the window if it is full), then process it
+        if (G_n == g_T) {
+            var sh = GEN_SHIFT();
+            var keep = g_T - sh;
+            var t = 0;
+            while (t < keep) { store64(G_win + t * 8, load64(G_win + (t + sh) * 8)); t = t + 1; }
+            G_n = keep;
+            if (cached == 1) {
+                # re-prime: the kept tokens sit at new positions, so their
+                # cached K/V are stale — recompute the whole kept context
+                var i = 0;
+                while (i < keep) { model_fwd_row(load64(G_win + i * 8), i); i = i + 1; }
+            }
+        }
+        store64(G_win + G_n * 8, next);
+        G_n = G_n + 1;
+        if (cached == 1) { model_fwd_row(next, G_n - 1); }
+        else { gen_forward_window(); }
         k = k + 1;
     }
+    return 0;
+}
+
+# Seed the context with `prompt` (plen chars), then emit `ngen` more chars.
+fn generate(prompt, plen, ngen, temp): i64 {
+    g_training = 0;   # eval: no dropout
+    var T = g_T;
+    var n = plen;
+    if (n > T) { n = T; }
+    var t = 0;
+    while (t < n) {
+        var src = plen - n + t;
+        var id = load64(g_char2id + load8(prompt + src) * 8);
+        if (id < 0) { id = 0; }   # byte not in vocab -> fall back to id 0
+        store64(G_win + t * 8, id);
+        t = t + 1;
+    }
+    if (n < 1) { store64(G_win, 0); n = 1; }   # empty prompt: seed with id 0
+    print(prompt, plen);
+    gen_prime(G_win, n, 1);
+    gen_decode(ngen, temp, 1, 0, 1);
     _putc(10);
     return 0;
 }

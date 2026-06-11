@@ -59,3 +59,14 @@ placement, same assumption).
 attn11 works around it by using the statement-call epilogue in all five entry
 files — see `docs/architecture/002-agnos-entry-epilogue.md`. The workaround
 is correct on every target and can stay after the upstream fix.
+
+## Resolution (2026-06-11)
+
+**Fixed upstream in cyrius 6.1.32**: the init rsp is parked in callee-saved
+r15 at the entry landing (first runtime instruction, ahead of any gvar-init
+call); `lib/args_agnos.cyr` reads it via `_agnos_argv_base()`. attn11 bumped
+its pin 6.1.31 → 6.1.33 in 0.7.0 and re-verified the AGNOS run gate
+(`scripts/agnos-smoke.sh`). One trap discovered while validating: a 6.1.32+
+compiler against a stale ≤ 6.1.31 `lib/` snapshot reproduces the
+`argc()==0` symptom (the lib half reads the removed global) — pin and
+snapshot must move together. `docs/architecture/002` updated to RETIRED.

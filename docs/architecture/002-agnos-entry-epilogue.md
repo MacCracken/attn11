@@ -1,7 +1,20 @@
 # 002 — agnos entry epilogue: `r = main()` must be a statement, not an initializer
 
-**Status**: active workaround (cyrius 6.1.31) · **Affects**: every entry file
-(`src/main.cyr`, `src/test.cyr`, `tests/attn11.{tcyr,bcyr,fcyr}`)
+**Status**: RETIRED as a load-bearing rule at pin ≥ 6.1.32 (was: active
+workaround at 6.1.31) · **Affects**: every entry file (`src/main.cyr`,
+`src/test.cyr`, `tests/attn11.{tcyr,bcyr,fcyr}`, `docs/examples/minimal_train.cyr`)
+
+> **Resolution (2026-06-11, pin 6.1.31 → 6.1.33)**: cyrius 6.1.32 fixed the
+> upstream gap attn11 filed — the agnos init rsp is now parked in
+> callee-saved **r15 at the entry landing** (the first runtime instruction,
+> ahead of any gvar-init call), and `lib/args_agnos.cyr` reads it via
+> `_agnos_argv_base()`; the `_agnos_init_rsp` global and
+> `_agnos_capture_rsp` are gone. Either entry shape now works on agnos.
+> The statement-call epilogues below are kept in the entry files (harmless,
+> and they document the history). **Drift warning**: a 6.1.32+ compiler
+> against a ≤ 6.1.31 `lib/` snapshot reproduces the `argc()==0` symptom —
+> the 0.7.0 run gate caught exactly that; keep the pin and `lib/` in sync.
+> The rest of this note describes the ≤ 6.1.31 behavior for the record.
 
 ## The rule
 

@@ -115,7 +115,31 @@ v1.0.0 ships when **all** of these hold:
   serial output matches native Linux to every displayed digit; grad-check
   suite builds for AGNOS; documented in `docs/guides/agnos.md`.
 
-### M6 — Freeze & consumer (v0.9.0 → v1.0.0)
+### M6 — Inference efficiency (v0.7.0) — ✅ shipped 2026-06-11
+
+Frontier-track items E1 + E2 graduated (both freeze-safe and additive; landing
+them before the M7 freeze means the frozen surface includes them).
+
+- ✅ **E1 — KV-cached generation**: per-layer K/V caches + a single-row cached
+  forward; generation runs one row per token. Learned absolute positional
+  embeddings pin cached rows to positions, so a full window context-shifts
+  (drop oldest T/2, re-prime) instead of sliding per token (ADR 0005).
+- ✅ **E2 — GQA/MQA**: `n_kv_heads` config; K/V projections at `C × Ckv`;
+  checkpoint v2 (+`nkv` header field, v1 still loads); default `nkv = nh`
+  keeps training bit-identical to 0.6.0.
+- **Gates met**: cached and uncached generation **bit-identical** (every
+  prefix, across context-shifts, greedy + temperature, hd ∈ {4,6,8,10} ×
+  nkv ∈ {1,2,nh}); generation **6.2× faster** (951 → 5 868 tok/s, default
+  config, x86_64); GQA grad-checked at `nkv ∈ {1, 2, nh}` + full-model
+  `nkv < nh` + MQA resume-determinism; KV bytes accounted in the bench
+  (24 576 → 6 144 at `nkv = 1`); 161 checks green on x86_64 and
+  aarch64/qemu; the AGNOS run gate **PASS** (bit-for-bit checkpoint under
+  the booted kernel, pin 6.1.33); adversarial multi-agent review passed
+  (9 confirmed findings, all fixed — `docs/audit/2026-06-11-kv-gqa-audit.md`).
+- Bonus discovery: the K bias has exactly zero gradient (softmax
+  shift-invariance) — pinned by a dedicated check.
+
+### M7 — Freeze & consumer (v0.9.0 → v1.0.0)
 
 - Freeze the config/CLI surface; finalize docs (guides + a runnable example).
 - Land one downstream consumer or example pipeline against a tagged build.
@@ -141,15 +165,10 @@ v1.0.0 ships when **all** of these hold:
 
 Ordered by (value ÷ risk), each independently shippable:
 
-- **E1 — KV-cached generation.** Generation currently recomputes the full
-  context every token. Add per-layer K/V caches to the sampler (training
-  untouched). Gate: cached and uncached generation are bit-identical; bench
-  the tokens/sec gain. *This is the survey's "central object" rendered at
-  reference scale.*
-- **E2 — GQA/MQA config.** Share K/V heads across query-head groups
-  (`n_kv_heads ≤ n_heads`) — the architectural KV-cache cut. Backward is a
-  small extension of existing attention grads. Gate: grad checks at
-  `n_kv_heads ∈ {1, 2, nh}`; KV bytes accounted in the bench.
+- ~~**E1 — KV-cached generation.**~~ ✅ Graduated into **M6 (v0.7.0)** — gates
+  met (bit-identity + 5.9× tokens/sec).
+- ~~**E2 — GQA/MQA config.**~~ ✅ Graduated into **M6 (v0.7.0)** — gates met
+  (grad checks at `n_kv_heads ∈ {1, 2, nh}`; KV bytes in the bench).
 - **E3 — Scale preset + BPE.** A `--preset` for ctx 64 / d_model 64 (whole
   statements instead of 16-char fragments — the honest lever the vidya run
   exposed), plus the long-deferred simple BPE tokenizer. The survey's
@@ -176,8 +195,9 @@ Ordered by (value ÷ risk), each independently shippable:
   where defined; accuracy vs f64 baseline; the i64-add matmul benched
   against SIMD f64.
 
-Sequencing intent: E1–E3 are v1.x candidates (small, additive, freeze-safe);
-E4–E6 are v2-track (new model families) and may fork the architecture config.
+Sequencing intent: E1–E2 shipped pre-freeze as M6 (v0.7.0); E3 is the
+remaining pre-/post-freeze candidate (small, additive); E4–E6 are v2-track
+(new model families) and may fork the architecture config.
 
 ## Out of scope (for v1.0)
 

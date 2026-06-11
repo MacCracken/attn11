@@ -21,7 +21,8 @@
 var g_V = 0;    # vocab size
 var g_C = 0;    # embedding width (d_model)
 var g_T = 0;    # context length
-var g_nh = 0;   # number of heads
+var g_nh = 0;   # number of query heads
+var g_nkv = 0;  # number of K/V heads (GQA; nkv divides nh; == nh is full MHA)
 var g_F = 0;    # MLP hidden width (= 4*C)
 var g_NL = 0;   # number of transformer blocks
 var g_NP = 0;   # total parameter count
@@ -38,12 +39,15 @@ var g_adam_v = 0;
 
 # ---- parameter layout (element offsets) ------------------------------------
 fn _emb_end(): i64 { return g_V * g_C + g_T * g_C; }
-# one block, in elements: ln1(2C) + attn(4C^2) + ln2(2C) + Wfc(CF) + bfc(F) +
-# Wproj(FC) + bproj(C); plus 4C for attention biases (bq,bk,bv,bo) when enabled,
-# appended after bproj so the weight offsets below are unaffected.
-fn _blk_base_size(): i64 { return 5 * g_C + 4 * g_C * g_C + 2 * g_C * g_F + g_F; }
+# K/V projection width: nkv heads of dim C/nh (== C when nkv == nh)
+fn _Ckv(): i64 { return g_nkv * (g_C / g_nh); }
+# one block, in elements: ln1(2C) + Wq(C^2) + Wk(C*Ckv) + Wv(C*Ckv) + Wo(C^2) +
+# ln2(2C) + Wfc(CF) + bfc(F) + Wproj(FC) + bproj(C); plus 2C+2Ckv for attention
+# biases (bq,bk,bv,bo) when enabled, appended after bproj so the weight offsets
+# below are unaffected.
+fn _blk_base_size(): i64 { return 5 * g_C + 2 * g_C * g_C + 2 * g_C * _Ckv() + 2 * g_C * g_F + g_F; }
 fn _blk(): i64 {
-    if (g_attn_bias == 1) { return _blk_base_size() + 4 * g_C; }
+    if (g_attn_bias == 1) { return _blk_base_size() + 2 * g_C + 2 * _Ckv(); }
     return _blk_base_size();
 }
 fn _blk_base(L): i64 { return _emb_end() + L * _blk(); }
@@ -53,19 +57,19 @@ fn _o_ln1g(): i64 { return 0; }
 fn _o_ln1b(): i64 { return g_C; }
 fn _o_Wq(): i64 { return 2 * g_C; }
 fn _o_Wk(): i64 { return 2 * g_C + g_C * g_C; }
-fn _o_Wv(): i64 { return 2 * g_C + 2 * g_C * g_C; }
-fn _o_Wo(): i64 { return 2 * g_C + 3 * g_C * g_C; }
-fn _o_ln2g(): i64 { return 2 * g_C + 4 * g_C * g_C; }
-fn _o_ln2b(): i64 { return 3 * g_C + 4 * g_C * g_C; }
-fn _o_Wfc(): i64 { return 4 * g_C + 4 * g_C * g_C; }
-fn _o_bfc(): i64 { return 4 * g_C + 4 * g_C * g_C + g_C * g_F; }
-fn _o_Wproj(): i64 { return 4 * g_C + 4 * g_C * g_C + g_C * g_F + g_F; }
-fn _o_bproj(): i64 { return 4 * g_C + 4 * g_C * g_C + g_C * g_F + g_F + g_F * g_C; }
+fn _o_Wv(): i64 { return 2 * g_C + g_C * g_C + g_C * _Ckv(); }
+fn _o_Wo(): i64 { return 2 * g_C + g_C * g_C + 2 * g_C * _Ckv(); }
+fn _o_ln2g(): i64 { return 2 * g_C + 2 * g_C * g_C + 2 * g_C * _Ckv(); }
+fn _o_ln2b(): i64 { return _o_ln2g() + g_C; }
+fn _o_Wfc(): i64 { return _o_ln2g() + 2 * g_C; }
+fn _o_bfc(): i64 { return _o_Wfc() + g_C * g_F; }
+fn _o_Wproj(): i64 { return _o_bfc() + g_F; }
+fn _o_bproj(): i64 { return _o_Wproj() + g_F * g_C; }
 # attention biases, appended after the base block (only present when enabled)
 fn _o_bq(): i64 { return _blk_base_size(); }
 fn _o_bk(): i64 { return _blk_base_size() + g_C; }
-fn _o_bv(): i64 { return _blk_base_size() + 2 * g_C; }
-fn _o_bo(): i64 { return _blk_base_size() + 3 * g_C; }
+fn _o_bv(): i64 { return _blk_base_size() + g_C + _Ckv(); }
+fn _o_bo(): i64 { return _blk_base_size() + g_C + 2 * _Ckv(); }
 
 # per-layer param / grad sub-pointers
 fn PL(L, off): i64 { return g_params + (_blk_base(L) + off) * 8; }
@@ -126,10 +130,64 @@ var D_fc = 0;     # T x F
 var D_tmp = 0;    # T x C (ln residual-path scratch)
 var D_drop = 0;   # T x C (dropout-adjusted branch gradient)
 
+# ---- KV caches + single-row scratch (inference/generation path, E1) ---------
+var KV_K = 0;     # NL pointers, each T x Ckv (per-layer K cache)
+var KV_V = 0;     # NL pointers, each T x Ckv (per-layer V cache)
+var R_x = 0;      # C  residual-stream row
+var R_a = 0;      # C  ln1 out / attn in
+var R_attn = 0;   # C  attention out
+var R_xmid = 0;   # C  x + attn
+var R_b = 0;      # C  ln2 out / mlp in
+var R_fc = 0;     # F  pre-GELU
+var R_g = 0;      # F  GELU out
+var R_mlp = 0;    # C  mlp out
+var R_f = 0;      # C  final-LN out
+var R_q = 0;      # C  query row
+var R_concat = 0; # C  pre-Wo concat row
+var R_mean = 0; var R_rstd = 0;       # 1 each
+var R_prow = 0;   # T  attention-probability row scratch
+var R_logits = 0; # V  the processed position's logits
+var G_win = 0;    # T  token ids in the generation window
+var G_n = 0;      # tokens currently in the window (== valid cache positions)
+
+# Config invariants. An inconsistent (C, nh, nkv) silently corrupts memory:
+# kvb = (h/gsz)*hd walks past the Ckv-wide K/V rows when nkv doesn't divide
+# nh, and hd truncates when nh doesn't divide C. The checkpoint loader rejects
+# these (-16); the in-process constructor must too.
+fn model_config_ok(V, C, T, nh, nkv, NL): i64 {
+    if ((V < 1) || (C < 1) || (T < 1) || (NL < 1)) { return 0; }
+    if ((nh < 1) || (nh > C) || ((C % nh) != 0)) { return 0; }
+    if ((nkv < 1) || (nkv > nh) || ((nh % nkv) != 0)) { return 0; }
+    return 1;
+}
+
+# Exact bytes model_init will allocate for a config (NP precomputed by the
+# caller). Used by the checkpoint loader to reject configs that would drive
+# the allocator past its cap BEFORE any allocation happens. KEEP IN SYNC with
+# model_init — test_alloc_accounting pins the two together.
+fn model_alloc_bytes(V, C, T, nh, nkv, NL, NP): i64 {
+    var F = 4 * C;
+    var Ckv = nkv * (C / nh);
+    var asz = attn_arena_size(T, C, nh, nkv);
+    var e = 4 * NP;                                   # params, grads, m, v
+    e = e + 2 * T + 3 * T * C + 2 * T * V + 2 * T;    # tokens/targets, A_*, meanf/rstdf
+    e = e + (NL + 1) + 14 * NL;                       # pointer arrays (LA_* + KV_K/KV_V)
+    e = e + (NL + 1) * T * C;                         # residual stream
+    e = e + NL * (5 * T * C + 2 * T * F + 4 * T + asz + 2 * T * Ckv);  # per-layer caches + arena + KV
+    e = e + T * V + 7 * T * C + 2 * T * F;            # gradient temporaries
+    e = e + 9 * C + 2 * F + 2 + T + V + T;            # single-row scratch + G_win
+    return e * 8;
+}
+
 # ---- init ------------------------------------------------------------------
 # attn_bias: 1 to give Q/K/V/O biases. dropout: residual dropout prob (f64).
-fn model_init(V, C, T, nh, NL, attn_bias, dropout, seed): i64 {
-    g_V = V; g_C = C; g_T = T; g_nh = nh; g_NL = NL; g_F = 4 * C;
+# nkv: K/V heads (must divide nh; pass nh for classic multi-head attention).
+fn model_init(V, C, T, nh, nkv, NL, attn_bias, dropout, seed): i64 {
+    if (model_config_ok(V, C, T, nh, nkv, NL) == 0) {
+        puts("attn11: model_init: invalid config (need nh | C, nkv | nh, nkv <= nh, all dims >= 1)\n");
+        sys_exit(1);
+    }
+    g_V = V; g_C = C; g_T = T; g_nh = nh; g_nkv = nkv; g_NL = NL; g_F = 4 * C;
     g_attn_bias = attn_bias; g_dropout = dropout; g_training = 1; g_step = 0;
     var F = g_F;
     g_NP = _emb_end() + NL * _blk() + 2 * C;
@@ -146,13 +204,14 @@ fn model_init(V, C, T, nh, NL, attn_bias, dropout, seed): i64 {
     var rstd = f64_div(std, f64_sqrt(f64_from(2 * NL)));
     t_randn(P_tokemb(), V * C, std);
     t_randn(P_posemb(), T * C, std);
+    var Ckv = _Ckv();
     var L = 0;
     while (L < NL) {
         t_fill(PL(L, _o_ln1g()), C, f64_from(1));
         t_fill(PL(L, _o_ln2g()), C, f64_from(1));
         t_randn(PL(L, _o_Wq()), C * C, std);
-        t_randn(PL(L, _o_Wk()), C * C, std);
-        t_randn(PL(L, _o_Wv()), C * C, std);
+        t_randn(PL(L, _o_Wk()), C * Ckv, std);
+        t_randn(PL(L, _o_Wv()), C * Ckv, std);
         t_randn(PL(L, _o_Wo()), C * C, rstd);     # residual projection
         t_randn(PL(L, _o_Wfc()), C * F, std);
         t_randn(PL(L, _o_Wproj()), F * C, rstd);  # residual projection
@@ -178,7 +237,7 @@ fn model_init(V, C, T, nh, NL, attn_bias, dropout, seed): i64 {
     LA_dmask_attn = t_alloc(NL); LA_dmask_mlp = t_alloc(NL);
     var i = 0;
     while (i < NL + 1) { store64(LA_resid + i * 8, t_alloc(TC)); i = i + 1; }
-    var TF = T * F; var asz = attn_arena_size(T, C, nh);
+    var TF = T * F; var asz = attn_arena_size(T, C, nh, nkv);
     L = 0;
     while (L < NL) {
         store64(LA_a + L * 8, t_alloc(TC));
@@ -200,34 +259,61 @@ fn model_init(V, C, T, nh, NL, attn_bias, dropout, seed): i64 {
     D_logits = t_alloc(TV); D_f = t_alloc(TC); D_resid = t_alloc(TC);
     D_xmid = t_alloc(TC); D_a = t_alloc(TC); D_b = t_alloc(TC);
     D_g = t_alloc(TF); D_fc = t_alloc(TF); D_tmp = t_alloc(TC); D_drop = t_alloc(TC);
+
+    # KV caches + single-row scratch (generation)
+    var TKv = T * Ckv;
+    KV_K = t_alloc(NL); KV_V = t_alloc(NL);
+    L = 0;
+    while (L < NL) {
+        store64(KV_K + L * 8, t_alloc(TKv));
+        store64(KV_V + L * 8, t_alloc(TKv));
+        L = L + 1;
+    }
+    R_x = t_alloc(C); R_a = t_alloc(C); R_attn = t_alloc(C); R_xmid = t_alloc(C);
+    R_b = t_alloc(C); R_fc = t_alloc(F); R_g = t_alloc(F); R_mlp = t_alloc(C);
+    R_f = t_alloc(C); R_q = t_alloc(C); R_concat = t_alloc(C);
+    R_mean = t_alloc(1); R_rstd = t_alloc(1);
+    R_prow = t_alloc(T); R_logits = t_alloc(V);
+    G_win = t_alloc(T);
     return 0;
 }
+
+# bytes held by the per-layer K/V caches (the E2 lever: scales with nkv)
+fn kv_cache_bytes(): i64 { return 2 * g_NL * g_T * _Ckv() * 8; }
 
 # ---- tied LM head ----------------------------------------------------------
 # Weight tying — the token embedding is reused as the output projection:
 # Press & Wolf (2017) arXiv:1608.05859; Inan et al. (2017) arXiv:1611.01462.
-# logits(T,V) = f(T,C) @ tokemb^T
-fn head_fwd(): i64 {
-    var T = g_T; var C = g_C; var V = g_V;
+# logits(V) = f_row(C) @ tokemb^T — one row; head_fwd_n loops it, so the
+# training path and the cached generation path share the same arithmetic.
+fn head_fwd_row(f_row, logits_row): i64 {
+    var C = g_C; var V = g_V;
     var emb = P_tokemb();
-    var t = 0;
-    while (t < T) {
-        var v = 0;
-        while (v < V) {
-            var acc = f64_from(0);
-            var c = 0;
-            while (c < C) {
-                acc = f64_add(acc, f64_mul(load64(A_f + (t * C + c) * 8),
-                                           load64(emb + (v * C + c) * 8)));
-                c = c + 1;
-            }
-            store64(A_logits + (t * V + v) * 8, acc);
-            v = v + 1;
+    var v = 0;
+    while (v < V) {
+        var acc = f64_from(0);
+        var c = 0;
+        while (c < C) {
+            acc = f64_add(acc, f64_mul(load64(f_row + c * 8),
+                                       load64(emb + (v * C + c) * 8)));
+            c = c + 1;
         }
+        store64(logits_row + v * 8, acc);
+        v = v + 1;
+    }
+    return 0;
+}
+
+# logits(n,V) = f(n,C) @ tokemb^T over the first n rows
+fn head_fwd_n(n): i64 {
+    var t = 0;
+    while (t < n) {
+        head_fwd_row(A_f + t * g_C * 8, A_logits + t * g_V * 8);
         t = t + 1;
     }
     return 0;
 }
+fn head_fwd(): i64 { return head_fwd_n(g_T); }
 
 # dlogits(T,V) -> df(T,C); accumulate dtokemb (head part)
 fn head_bwd(): i64 {
@@ -270,8 +356,9 @@ fn head_bwd(): i64 {
 }
 
 # ---- embedding -------------------------------------------------------------
-fn embed_fwd(): i64 {
-    var T = g_T; var C = g_C;
+# over the first n rows (n = g_T for training; n < g_T for eval windows)
+fn embed_fwd_n(n): i64 {
+    var T = n; var C = g_C;
     var emb = P_tokemb(); var pos = P_posemb(); var x0 = La(LA_resid, 0);
     var t = 0;
     while (t < T) {
@@ -286,6 +373,7 @@ fn embed_fwd(): i64 {
     }
     return 0;
 }
+fn embed_fwd(): i64 { return embed_fwd_n(g_T); }
 
 # d(resid[0]) -> accumulate dtokemb (lookup part) and dposemb
 fn embed_bwd(dx0): i64 {
@@ -320,7 +408,7 @@ fn model_forward(): i64 {
         ln_fwd(xin, PL(L, _o_ln1g()), PL(L, _o_ln1b()), a, La(LA_m1, L), La(LA_r1, L), T, C);
         attn_fwd(PL(L, _o_Wq()), P_bq(L), PL(L, _o_Wk()), P_bk(L),
                  PL(L, _o_Wv()), P_bv(L), PL(L, _o_Wo()), P_bo(L),
-                 a, A_attn, La(LA_arena, L), T, C, nh);
+                 a, A_attn, La(LA_arena, L), T, C, nh, g_nkv);
         # residual dropout on the attention branch
         dropout_gen_mask(La(LA_dmask_attn, L), TC, g_dropout, g_training);
         dropout_apply(A_attn, La(LA_dmask_attn, L), A_attn, TC);
@@ -344,6 +432,87 @@ fn model_forward(): i64 {
     ln_fwd(La(LA_resid, g_NL), P_lnfg(), P_lnfb(), A_f, A_meanf, A_rstdf, T, C);
     head_fwd();
     return softmax_xent_fwd(A_logits, A_targets, A_probs, T, V);
+}
+
+# ---- cached single-row forward (inference, E1) ------------------------------
+# Process ONE token at window position `pos` against the per-layer K/V caches
+# (which must already hold positions 0..pos-1). Appends this position's K/V to
+# the caches and leaves its logits in R_logits. Eval-only: no backward caches,
+# no dropout (eval dropout is the identity, so skipping it is bit-neutral).
+# Per-row arithmetic is identical to the batch forward's — each op here is the
+# same kernel the T-row path runs, on one row — so a position's logits are
+# bit-identical to a full forward over the same window (pinned in tests).
+fn model_fwd_row(tok, pos): i64 {
+    var C = g_C; var F = g_F;
+    var emb = P_tokemb(); var posb = P_posemb();
+    var c = 0;
+    while (c < C) {
+        store64(R_x + c * 8, f64_add(load64(emb + (tok * C + c) * 8),
+                                     load64(posb + (pos * C + c) * 8)));
+        c = c + 1;
+    }
+    var L = 0;
+    while (L < g_NL) {
+        ln_fwd(R_x, PL(L, _o_ln1g()), PL(L, _o_ln1b()), R_a, R_mean, R_rstd, 1, C);
+        attn_fwd_row(PL(L, _o_Wq()), P_bq(L), PL(L, _o_Wk()), P_bk(L),
+                     PL(L, _o_Wv()), P_bv(L), PL(L, _o_Wo()), P_bo(L),
+                     R_a, R_attn, La(KV_K, L), La(KV_V, L), R_prow, R_concat,
+                     R_q, pos, C, g_nh, g_nkv);
+        c = 0;
+        while (c < C) {
+            store64(R_xmid + c * 8, f64_add(load64(R_x + c * 8), load64(R_attn + c * 8)));
+            c = c + 1;
+        }
+        ln_fwd(R_xmid, PL(L, _o_ln2g()), PL(L, _o_ln2b()), R_b, R_mean, R_rstd, 1, C);
+        linear_fwd(R_b, PL(L, _o_Wfc()), PL(L, _o_bfc()), R_fc, 1, C, F);
+        gelu_fwd(R_fc, R_g, F);
+        linear_fwd(R_g, PL(L, _o_Wproj()), PL(L, _o_bproj()), R_mlp, 1, F, C);
+        c = 0;
+        while (c < C) {
+            store64(R_x + c * 8, f64_add(load64(R_xmid + c * 8), load64(R_mlp + c * 8)));
+            c = c + 1;
+        }
+        L = L + 1;
+    }
+    ln_fwd(R_x, P_lnfg(), P_lnfb(), R_f, R_mean, R_rstd, 1, C);
+    head_fwd_row(R_f, R_logits);
+    return 0;
+}
+
+# ---- uncached eval-window forward (generation reference path) ---------------
+# Full forward over the first n window rows (positions 0..n-1, tokens already
+# in A_tokens), logits into A_logits rows 0..n-1. No loss, no dropout (eval),
+# no backward caches needed — but it reuses the training activation buffers
+# and the attention arena (an n-row layout fits inside the T-row arena).
+fn model_eval_window(n): i64 {
+    var C = g_C; var F = g_F; var nh = g_nh;
+    var nC = n * C;
+    embed_fwd_n(n);
+    var L = 0;
+    while (L < g_NL) {
+        var xin = La(LA_resid, L);
+        var a = La(LA_a, L);
+        ln_fwd(xin, PL(L, _o_ln1g()), PL(L, _o_ln1b()), a, La(LA_m1, L), La(LA_r1, L), n, C);
+        attn_fwd(PL(L, _o_Wq()), P_bq(L), PL(L, _o_Wk()), P_bk(L),
+                 PL(L, _o_Wv()), P_bv(L), PL(L, _o_Wo()), P_bo(L),
+                 a, A_attn, La(LA_arena, L), n, C, nh, g_nkv);
+        var xmid = La(LA_xmid, L);
+        var i = 0;
+        while (i < nC) { store64(xmid + i * 8, f64_add(load64(xin + i * 8), load64(A_attn + i * 8))); i = i + 1; }
+        var b = La(LA_b, L);
+        ln_fwd(xmid, PL(L, _o_ln2g()), PL(L, _o_ln2b()), b, La(LA_m2, L), La(LA_r2, L), n, C);
+        var fc = La(LA_fc, L); var gg = La(LA_g, L);
+        linear_fwd(b, PL(L, _o_Wfc()), PL(L, _o_bfc()), fc, n, C, F);
+        gelu_fwd(fc, gg, n * F);
+        linear_fwd(gg, PL(L, _o_Wproj()), PL(L, _o_bproj()), A_mlp, n, F, C);
+        var xout = La(LA_resid, L + 1);
+        i = 0;
+        while (i < nC) { store64(xout + i * 8, f64_add(load64(xmid + i * 8), load64(A_mlp + i * 8))); i = i + 1; }
+        L = L + 1;
+    }
+    ln_fwd(La(LA_resid, g_NL), P_lnfg(), P_lnfb(), A_f, A_meanf, A_rstdf, n, C);
+    head_fwd_n(n);
+    return 0;
 }
 
 # ---- full backward: fills g_grads (assumes grads already zeroed) -----------
@@ -375,7 +544,7 @@ fn model_backward(): i64 {
                  La(LA_a, L), D_drop, D_a,
                  GL(L, _o_Wq()), G_bq(L), GL(L, _o_Wk()), G_bk(L),
                  GL(L, _o_Wv()), G_bv(L), GL(L, _o_Wo()), G_bo(L),
-                 La(LA_arena, L), T, C, nh);
+                 La(LA_arena, L), T, C, nh, g_nkv);
         ln_bwd(xin, PL(L, _o_ln1g()), D_a, La(LA_m1, L), La(LA_r1, L), D_tmp, GL(L, _o_ln1g()), GL(L, _o_ln1b()), T, C);
         # d_xin = d_xmid (residual) + D_tmp (ln1 path) ; becomes next D_resid
         t_copy(D_resid, D_xmid, TC);

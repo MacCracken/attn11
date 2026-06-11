@@ -1,33 +1,44 @@
 # attn11 — model checkpoints (save / load with validated, deterministic resume).
 #
-# Format (all i64, native little-endian via store64/load64):
+# Format v2 (all i64, native little-endian via store64/load64):
 #   [0]  magic     [1] version   [2] V      [3] C       [4] T
 #   [5]  nh        [6] NL         [7] bias   [8] dropout(f64) [9] NP
-#   [10] step      [11] rng_state
-#   [12 .. 12+V)   vocab (id -> byte value)
+#   [10] step      [11] rng_state [12] nkv
+#   [13 .. 13+V)   vocab (id -> byte value)
 #   then NP f64 g_params, NP f64 g_adam_m, NP f64 g_adam_v
 # Saved state is exactly what a bit-for-bit resume needs: weights, optimizer
 # moments, the completed-step counter, and the PRNG state.
+#
+# v1 (pre-GQA, ≤0.6.0) lacks the nkv field (12-field header); it is still
+# accepted and loads as nkv = nh (with nkv == nh the v2 parameter layout is
+# identical to v1's). Saves always write v2.
 #
 # Loading is hostile-input-safe: magic/version, config bounds, a recomputed
 # parameter count, and the EXACT total size are all checked BEFORE any
 # allocation or copy. A truncated/corrupt/oversized buffer is rejected with a
 # negative error code, never a crash.
 
-fn CKPT_MAGIC(): i64 { return 0x4154544E31317631; }   # "ATTN11v1"
-fn CKPT_VER(): i64 { return 1; }
-fn CKPT_HDR(): i64 { return 12; }                     # header i64 fields
-fn CKPT_MAX_NP(): i64 { return 67108864; }            # 64M params cap (safety)
-fn CKPT_MAX_BYTES(): i64 { return 2147483648; }       # 2 GB file cap
+fn CKPT_MAGIC(): i64 { return 0x4154544E31317631; }   # "ATTN11v1" (file family)
+fn CKPT_VER(): i64 { return 2; }
+fn CKPT_HDR(): i64 { return 13; }                     # v2 header i64 fields
+fn CKPT_HDR_V1(): i64 { return 12; }                  # v1 header i64 fields
+# Caps sized to the allocator's reality (lib alloc cap is 256 MB): a header
+# that passes every shape check must also FIT — params (4 vectors), the file
+# buffer itself, and the nh*T*T attention arenas all have to coexist. 4M
+# params is ~100x the largest real attn11 run (X001: 42K).
+fn CKPT_MAX_NP(): i64 { return 4194304; }             # 4M params cap
+fn CKPT_MAX_BYTES(): i64 { return 134217728; }        # 128 MB file cap
+fn CKPT_MAX_MODEL_BYTES(): i64 { return 134217728; }  # 128 MB model-alloc cap
 
 # Parameter count for a config, computed without touching globals (used to
 # validate a checkpoint header before we trust it). Mirrors model.cyr's layout.
-fn ckpt_expected_np(V, C, T, NL, bias): i64 {
+fn ckpt_expected_np(V, C, T, nh, NL, bias, nkv): i64 {
     var F = 4 * C;
+    var Ckv = nkv * (C / nh);
     var emb = V * C + T * C;
-    var blkbase = 5 * C + 4 * C * C + 2 * C * F + F;
+    var blkbase = 5 * C + 2 * C * C + 2 * C * Ckv + 2 * C * F + F;
     var blk = blkbase;
-    if (bias == 1) { blk = blkbase + 4 * C; }
+    if (bias == 1) { blk = blkbase + 2 * C + 2 * Ckv; }
     return emb + NL * blk + 2 * C;
 }
 
@@ -48,6 +59,7 @@ fn ckpt_serialize(buf): i64 {
     store64(buf + 9 * 8, g_NP);
     store64(buf + 10 * 8, g_step);
     store64(buf + 11 * 8, _rng_state);
+    store64(buf + 12 * 8, g_nkv);
     var base = CKPT_HDR();
     var i = 0;
     while (i < g_V) { store64(buf + (base + i) * 8, load64(g_vocab + i * 8)); i = i + 1; }
@@ -64,9 +76,13 @@ fn ckpt_serialize(buf): i64 {
 # negative error code (and does NOT allocate). Does not touch g_data (the
 # corpus), so a resume keeps the separately-loaded corpus.
 fn ckpt_load_buf(buf, len): i64 {
-    if (len < CKPT_HDR() * 8) { return 0 - 1; }
+    if (len < CKPT_HDR_V1() * 8) { return 0 - 1; }
     if (load64(buf + 0 * 8) != CKPT_MAGIC()) { return 0 - 2; }
-    if (load64(buf + 1 * 8) != CKPT_VER()) { return 0 - 3; }
+    var ver = load64(buf + 1 * 8);
+    if ((ver != 1) && (ver != 2)) { return 0 - 3; }
+    var hdr = CKPT_HDR_V1();
+    if (ver == 2) { hdr = CKPT_HDR(); }
+    if (len < hdr * 8) { return 0 - 1; }
     var V = load64(buf + 2 * 8);
     var C = load64(buf + 3 * 8);
     var T = load64(buf + 4 * 8);
@@ -80,22 +96,33 @@ fn ckpt_load_buf(buf, len): i64 {
     if ((V < 1) || (V > 256)) { return 0 - 4; }
     if ((C < 1) || (C > 4096)) { return 0 - 5; }
     if ((nh < 1) || (nh > C) || ((C % nh) != 0)) { return 0 - 6; }
+    var nkv = nh;                       # v1: pre-GQA, always full MHA
+    if (ver == 2) { nkv = load64(buf + 12 * 8); }
+    if ((nkv < 1) || (nkv > nh) || ((nh % nkv) != 0)) { return 0 - 16; }
     if ((T < 1) || (T > 8192)) { return 0 - 7; }
     if ((NL < 1) || (NL > 128)) { return 0 - 8; }
     if ((bias != 0) && (bias != 1)) { return 0 - 9; }
+    if (step < 0) { return 0 - 17; }
+    # rng state 0 is the xorshift64 fixed point (the stream sticks at 0
+    # forever); rng_seed guards it, so 0 can only come from a hostile image
+    if (rng == 0) { return 0 - 19; }
     # dropout must be a finite f64 in [0,1). Validate the BIT PATTERN directly:
     # this toolchain's f64 comparisons are not NaN-correct, so we can't use
     # f64_ge/f64_lt here. Sign bit clear AND bits < 1.0's bits (0x3FF0...) means
     # [0,1) and rejects negatives, >=1.0, +Inf, and NaN (all have larger bits).
     if (((drop >> 63) & 1) == 1) { return 0 - 14; }
     if (drop >= 0x3FF0000000000000) { return 0 - 14; }
-    var expnp = ckpt_expected_np(V, C, T, NL, bias);
+    var expnp = ckpt_expected_np(V, C, T, nh, NL, bias, nkv);
     if ((np < 1) || (np > CKPT_MAX_NP())) { return 0 - 13; }
     if (np != expnp) { return 0 - 10; }
-    var need = (CKPT_HDR() + V + 3 * np) * 8;
+    # shape-valid is not enough: the nh*T*T attention arenas (independent of
+    # np) and the 4 parameter vectors must also fit the allocator. Reject any
+    # config whose model_init total would exceed the cap — BEFORE allocating.
+    if (model_alloc_bytes(V, C, T, nh, nkv, NL, np) > CKPT_MAX_MODEL_BYTES()) { return 0 - 18; }
+    var need = (hdr + V + 3 * np) * 8;
     if (len != need) { return 0 - 11; }
     # vocab bytes must be valid 0..255
-    var base = CKPT_HDR();
+    var base = hdr;
     var i = 0;
     while (i < V) {
         var code = load64(buf + (base + i) * 8);
@@ -117,7 +144,7 @@ fn ckpt_load_buf(buf, len): i64 {
         }
     }
     # validated — build the model and restore state
-    model_init(V, C, T, nh, NL, bias, drop, 1);
+    model_init(V, C, T, nh, nkv, NL, bias, drop, 1);
     g_vocab = t_alloc(256);
     g_char2id = t_alloc(256);
     i = 0;
@@ -144,6 +171,7 @@ fn ckpt_load_buf(buf, len): i64 {
 fn ckpt_save_file(path): i64 {
     var sz = ckpt_size();
     var buf = alloc(sz);
+    if (buf == 0) { return 0 - 21; }
     ckpt_serialize(buf);
     var w = secure_write_atomic(path, buf, sz);
     if (w < 0) { return w; }
@@ -158,9 +186,10 @@ fn ckpt_load_file(path): i64 {
     if (fd < 0) { return fd; }
     var size = _file_size(fd);
     if (size < 0) { file_close(fd); return size; }
-    if (size < CKPT_HDR() * 8) { file_close(fd); return 0 - 1; }
+    if (size < CKPT_HDR_V1() * 8) { file_close(fd); return 0 - 1; }
     if (size > CKPT_MAX_BYTES()) { file_close(fd); return 0 - 30; }
     var buf = alloc(size);
+    if (buf == 0) { file_close(fd); return 0 - 31; }
     var total = 0;
     while (total < size) {
         var n = file_read(fd, buf + total, size - total);

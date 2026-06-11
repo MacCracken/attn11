@@ -24,9 +24,16 @@ fn tset(p, i, v): i64 { store64(p + i * 8, v); return 0; }
 
 # ---- allocation ------------------------------------------------------------
 # Allocate n f64 elements, zero-initialised (alloc returns zeroed pages, but be
-# explicit so callers can rely on it after reuse).
+# explicit so callers can rely on it after reuse). alloc() returns 0 past the
+# allocator's cap — abort cleanly instead of zero-filling from address 0.
 fn t_alloc(n): i64 {
     var p = alloc(n * 8);
+    if (p == 0) {
+        puts("attn11: allocation failed (");
+        fmt_int(n);
+        puts(" f64s) -- aborting\n");
+        sys_exit(1);
+    }
     var i = 0;
     while (i < n) { store64(p + i * 8, 0); i = i + 1; }
     return p;

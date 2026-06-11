@@ -161,16 +161,16 @@ fn test_softmax_xent(): i64 {
     return 0;
 }
 
-fn attn_loss(Wq, bq, Wk, bk, Wv, bv, Wo, bo, x, out, dout, ar, T, C, nh): i64 {
-    attn_fwd(Wq, bq, Wk, bk, Wv, bv, Wo, bo, x, out, ar, T, C, nh);
+fn attn_loss(Wq, bq, Wk, bk, Wv, bv, Wo, bo, x, out, dout, ar, T, C, nh, nkv): i64 {
+    attn_fwd(Wq, bq, Wk, bk, Wv, bv, Wo, bo, x, out, ar, T, C, nh, nkv);
     return dotsum(dout, out, T * C);
 }
-fn attn_ng(p, np, n, Wq, bq, Wk, bk, Wv, bv, Wo, bo, x, out, dout, ar, T, C, nh): i64 {
+fn attn_ng(p, np, n, Wq, bq, Wk, bk, Wv, bv, Wo, bo, x, out, dout, ar, T, C, nh, nkv): i64 {
     var eps = _eps(); var te = f64_mul(f64_from(2), eps); var i = 0;
     while (i < n) {
         var o = load64(p + i * 8);
-        store64(p + i * 8, f64_add(o, eps)); var lp = attn_loss(Wq, bq, Wk, bk, Wv, bv, Wo, bo, x, out, dout, ar, T, C, nh);
-        store64(p + i * 8, f64_sub(o, eps)); var lm = attn_loss(Wq, bq, Wk, bk, Wv, bv, Wo, bo, x, out, dout, ar, T, C, nh);
+        store64(p + i * 8, f64_add(o, eps)); var lp = attn_loss(Wq, bq, Wk, bk, Wv, bv, Wo, bo, x, out, dout, ar, T, C, nh, nkv);
+        store64(p + i * 8, f64_sub(o, eps)); var lm = attn_loss(Wq, bq, Wk, bk, Wv, bv, Wo, bo, x, out, dout, ar, T, C, nh, nkv);
         store64(p + i * 8, o); store64(np + i * 8, f64_div(f64_sub(lp, lm), te)); i = i + 1;
     }
     return 0;
@@ -179,27 +179,32 @@ fn attn_ng(p, np, n, Wq, bq, Wk, bk, Wv, bv, Wo, bo, x, out, dout, ar, T, C, nh)
 # many 4-wide SIMD chunks (+ tail) the attention kernels run. We cover hd=6
 # (1 chunk + 2 tail), hd=8 (2 chunks, no tail — the PRODUCTION C=32,nh=4 path),
 # and hd=10 (2 chunks + 2 tail), so a second-chunk stride/accumulator bug can't
-# hide behind a single-chunk test.
-fn _attn_check(T, C, nh): i64 {
+# hide behind a single-chunk test. nkv < nh exercises the GQA/MQA K/V sharing
+# (Ckv-wide K/V projections, grouped dK/dV accumulation).
+fn _attn_check(T, C, nh, nkv): i64 {
     var CC = C * C; var TC = T * C;
-    var Wq = t_alloc(CC); var Wk = t_alloc(CC); var Wv = t_alloc(CC); var Wo = t_alloc(CC);
-    var bq = t_alloc(C); var bk = t_alloc(C); var bv = t_alloc(C); var bo = t_alloc(C);
+    var Ckv = nkv * (C / nh); var CK = C * Ckv;
+    var Wq = t_alloc(CC); var Wk = t_alloc(CK); var Wv = t_alloc(CK); var Wo = t_alloc(CC);
+    var bq = t_alloc(C); var bk = t_alloc(Ckv); var bv = t_alloc(Ckv); var bo = t_alloc(C);
     var x = t_alloc(TC); var out = t_alloc(TC); var dout = t_alloc(TC);
     var std = f64_div(f64_from(1), f64_from(2));
-    t_randn(Wq, CC, std); t_randn(Wk, CC, std); t_randn(Wv, CC, std); t_randn(Wo, CC, std);
-    t_randn(bq, C, std); t_randn(bk, C, std); t_randn(bv, C, std); t_randn(bo, C, std);
+    t_randn(Wq, CC, std); t_randn(Wk, CK, std); t_randn(Wv, CK, std); t_randn(Wo, CC, std);
+    t_randn(bq, C, std); t_randn(bk, Ckv, std); t_randn(bv, Ckv, std); t_randn(bo, C, std);
     t_randn(x, TC, f64_from(1)); t_randn(dout, TC, f64_from(1));
-    var ar = t_alloc(attn_arena_size(T, C, nh));
+    var ar = t_alloc(attn_arena_size(T, C, nh, nkv));
     var dx = t_alloc(TC);
-    var dWq = t_alloc(CC); var dWk = t_alloc(CC); var dWv = t_alloc(CC); var dWo = t_alloc(CC);
-    var dbq = t_alloc(C); var dbk = t_alloc(C); var dbv = t_alloc(C); var dbo = t_alloc(C);
-    attn_fwd(Wq, bq, Wk, bk, Wv, bv, Wo, bo, x, out, ar, T, C, nh);
-    attn_bwd(Wq, Wk, Wv, Wo, x, dout, dx, dWq, dbq, dWk, dbk, dWv, dbv, dWo, dbo, ar, T, C, nh);
-    var ndx = t_alloc(TC); attn_ng(x, ndx, TC, Wq, bq, Wk, bk, Wv, bv, Wo, bo, x, out, dout, ar, T, C, nh);
-    var nWq = t_alloc(CC); attn_ng(Wq, nWq, CC, Wq, bq, Wk, bk, Wv, bv, Wo, bo, x, out, dout, ar, T, C, nh);
-    var nWo = t_alloc(CC); attn_ng(Wo, nWo, CC, Wq, bq, Wk, bk, Wv, bv, Wo, bo, x, out, dout, ar, T, C, nh);
-    var nbq = t_alloc(C); attn_ng(bq, nbq, C, Wq, bq, Wk, bk, Wv, bv, Wo, bo, x, out, dout, ar, T, C, nh);
-    var nbo = t_alloc(C); attn_ng(bo, nbo, C, Wq, bq, Wk, bk, Wv, bv, Wo, bo, x, out, dout, ar, T, C, nh);
+    var dWq = t_alloc(CC); var dWk = t_alloc(CK); var dWv = t_alloc(CK); var dWo = t_alloc(CC);
+    var dbq = t_alloc(C); var dbk = t_alloc(Ckv); var dbv = t_alloc(Ckv); var dbo = t_alloc(C);
+    attn_fwd(Wq, bq, Wk, bk, Wv, bv, Wo, bo, x, out, ar, T, C, nh, nkv);
+    attn_bwd(Wq, Wk, Wv, Wo, x, dout, dx, dWq, dbq, dWk, dbk, dWv, dbv, dWo, dbo, ar, T, C, nh, nkv);
+    var ndx = t_alloc(TC); attn_ng(x, ndx, TC, Wq, bq, Wk, bk, Wv, bv, Wo, bo, x, out, dout, ar, T, C, nh, nkv);
+    var nWq = t_alloc(CC); attn_ng(Wq, nWq, CC, Wq, bq, Wk, bk, Wv, bv, Wo, bo, x, out, dout, ar, T, C, nh, nkv);
+    var nWk = t_alloc(CK); attn_ng(Wk, nWk, CK, Wq, bq, Wk, bk, Wv, bv, Wo, bo, x, out, dout, ar, T, C, nh, nkv);
+    var nWv = t_alloc(CK); attn_ng(Wv, nWv, CK, Wq, bq, Wk, bk, Wv, bv, Wo, bo, x, out, dout, ar, T, C, nh, nkv);
+    var nWo = t_alloc(CC); attn_ng(Wo, nWo, CC, Wq, bq, Wk, bk, Wv, bv, Wo, bo, x, out, dout, ar, T, C, nh, nkv);
+    var nbq = t_alloc(C); attn_ng(bq, nbq, C, Wq, bq, Wk, bk, Wv, bv, Wo, bo, x, out, dout, ar, T, C, nh, nkv);
+    var nbv = t_alloc(Ckv); attn_ng(bv, nbv, Ckv, Wq, bq, Wk, bk, Wv, bv, Wo, bo, x, out, dout, ar, T, C, nh, nkv);
+    var nbo = t_alloc(C); attn_ng(bo, nbo, C, Wq, bq, Wk, bk, Wv, bv, Wo, bo, x, out, dout, ar, T, C, nh, nkv);
     # x86 keeps the tight 1e-5 bound. On aarch64 the attention path chains
     # through the f64_exp polyfill, which makes the finite-difference reference
     # noisier (~1.3e-5), so loosen to 1e-4 there only (a real bug is orders of
@@ -210,15 +215,38 @@ fn _attn_check(T, C, nh): i64 {
     #endif
     check("attn dx", dx, ndx, TC, atol);
     check("attn dWq", dWq, nWq, CC, atol);
+    check("attn dWk", dWk, nWk, CK, atol);
+    check("attn dWv", dWv, nWv, CK, atol);
     check("attn dWo", dWo, nWo, CC, atol);
     check("attn dbq", dbq, nbq, C, atol);
+    check("attn dbv", dbv, nbv, Ckv, atol);
     check("attn dbo", dbo, nbo, C, atol);
+    # bk is FD-uncheckable: a constant K-row bias shifts each score row by
+    # q_i.bk — constant over j — and softmax is shift-invariant, so the TRUE
+    # dbk is identically zero (GPT-2's K bias is a no-op parameter). Both the
+    # analytic and FD values are pure rounding noise, so maxrel between them is
+    # meaningless. Instead pin that the analytic backward RESPECTS the
+    # invariance: |dbk| must be at rounding scale (~1e-15), not gradient scale.
+    var mxbk = f64_from(0);
+    var bi = 0;
+    while (bi < Ckv) {
+        var av = f64_abs(load64(dbk + bi * 8));
+        if (f64_gt(av, mxbk) == 1) { mxbk = av; }
+        bi = bi + 1;
+    }
+    print("attn dbk |max|=", 16); f_print(mxbk, 12); _putc(10);
+    assert(f64_lt(mxbk, f64_div(f64_from(1), f64_from(10000000000))) == 1,
+           "attn dbk ~ 0 (softmax shift-invariance)");
     return 0;
 }
 fn test_attention(): i64 {
-    _attn_check(3, 12, 2);   # hd=6: 1 SIMD chunk + 2 tail
-    _attn_check(3, 16, 2);   # hd=8: 2 SIMD chunks (production path)
-    _attn_check(3, 20, 2);   # hd=10: 2 SIMD chunks + 2 tail
+    _attn_check(3, 12, 2, 2);   # hd=6: 1 SIMD chunk + 2 tail
+    _attn_check(3, 16, 2, 2);   # hd=8: 2 SIMD chunks (production path)
+    _attn_check(3, 20, 2, 2);   # hd=10: 2 SIMD chunks + 2 tail
+    # GQA/MQA (E2 gate: nkv in {1, 2, nh}; nkv = nh is covered above)
+    _attn_check(3, 16, 4, 1);   # hd=4 MQA: 4 query heads share 1 K/V head
+    _attn_check(3, 16, 4, 2);   # hd=4 GQA: 2 query heads per K/V head
+    _attn_check(4, 16, 2, 1);   # hd=8 MQA: SIMD-chunk head dim, shared K/V
     return 0;
 }
 
@@ -262,7 +290,7 @@ fn model_ng(p, np, n): i64 {
 fn test_model(): i64 {
     var V = 5; var C = 4; var T = 3; var nh = 2; var NL = 2;
     # attention biases ON, dropout OFF (FD needs a deterministic forward)
-    model_init(V, C, T, nh, NL, 1, f64_from(0), 1);
+    model_init(V, C, T, nh, nh, NL, 1, f64_from(0), 1);
     store64(A_tokens + 0, 1); store64(A_tokens + 8, 3); store64(A_tokens + 16, 0);
     store64(A_targets + 0, 3); store64(A_targets + 8, 0); store64(A_targets + 16, 4);
     model_forward(); model_zero_grads(); model_backward();
@@ -289,6 +317,31 @@ fn test_model(): i64 {
     return 0;
 }
 
+# Full-model grad check with GQA (nkv < nh): exercises the Ckv-dependent
+# per-layer offset math (Wv/Wo/ln2/bias offsets all shift) and the grouped
+# dK/dV accumulation through the whole residual stack.
+fn test_model_gqa(): i64 {
+    var V = 5; var C = 8; var T = 3; var nh = 4; var nkv = 2; var NL = 2;
+    model_init(V, C, T, nh, nkv, NL, 1, f64_from(0), 11);
+    store64(A_tokens + 0, 1); store64(A_tokens + 8, 3); store64(A_tokens + 16, 0);
+    store64(A_targets + 0, 3); store64(A_targets + 8, 0); store64(A_targets + 16, 4);
+    model_forward(); model_zero_grads(); model_backward();
+    var Ckv = _Ckv(); var CK = C * Ckv; var Cc = C * C;
+    var aWk0 = t_alloc(CK); t_copy(aWk0, GL(0, _o_Wk()), CK);
+    var aWv1 = t_alloc(CK); t_copy(aWv1, GL(1, _o_Wv()), CK);
+    var abv0 = t_alloc(Ckv); t_copy(abv0, G_bv(0), Ckv);
+    var aWo1 = t_alloc(Cc); t_copy(aWo1, GL(1, _o_Wo()), Cc);
+    var nWk0 = t_alloc(CK); model_ng(PL(0, _o_Wk()), nWk0, CK);
+    var nWv1 = t_alloc(CK); model_ng(PL(1, _o_Wv()), nWv1, CK);
+    var nbv0 = t_alloc(Ckv); model_ng(P_bv(0), nbv0, Ckv);
+    var nWo1 = t_alloc(Cc); model_ng(PL(1, _o_Wo()), nWo1, Cc);
+    check("gqa model L0 dWk", aWk0, nWk0, CK, 10000);
+    check("gqa model L1 dWv", aWv1, nWv1, CK, 10000);
+    check("gqa model L0 dbv", abv0, nbv0, Ckv, 10000);
+    check("gqa model L1 dWo", aWo1, nWo1, Cc, 10000);
+    return 0;
+}
+
 # Resume determinism: train(K) in one go must equal train(K1) -> checkpoint
 # round-trip -> train(K). The schedule horizon `total` is held fixed across the
 # split so the LR/bias-correction match step-for-step. We compare the final
@@ -297,26 +350,27 @@ fn _lrc(n, d): i64 { return f64_div(f64_from(n), f64_from(d)); }
 # train(K) == train(K1) -> checkpoint round-trip -> train(K), bit-for-bit.
 # `drop` exercises the path with (drop>0) and without (drop==0) the dropout
 # PRNG draws, so the save/load RNG alignment is verified for both.
-fn _resume_check(drop): i64 {
+# `nkv` < nh runs the same pin under GQA (Ckv-wide K/V, grouped accumulation).
+fn _resume_check(drop, nkv): i64 {
     var V = build_corpus();                 # embedded corpus -> g_data
     var C = 8; var T = 4; var nh = 2; var NL = 2;
     var base = _lrc(3, 1000); var minl = _lrc(3, 10000); var clip = f64_from(1);
     var K = 24; var K1 = 9; var B = 4; var warm = 5; var quiet = 1000000000;
 
     # Path A: one continuous run to K (horizon = K)
-    model_init(V, C, T, nh, NL, 0, drop, 7);
+    model_init(V, C, T, nh, nkv, NL, 0, drop, 7);
     train(K, K, B, base, minl, warm, clip, quiet);
     var npA = g_NP;
     var snapA = t_alloc(npA); t_copy(snapA, g_params, npA);
 
     # Path B: run to K1, checkpoint round-trip, then continue to K (horizon = K)
-    model_init(V, C, T, nh, NL, 0, drop, 7);
+    model_init(V, C, T, nh, nkv, NL, 0, drop, 7);
     train(K1, K, B, base, minl, warm, clip, quiet);
     var sz = ckpt_size();
     var buf = alloc(sz);
     ckpt_serialize(buf);
     # scramble model state to a different seed to prove load restores everything
-    model_init(V, C, T, nh, NL, 0, drop, 999);
+    model_init(V, C, T, nh, nkv, NL, 0, drop, 999);
     var rc = ckpt_load_buf(buf, sz);
     train(K, K, B, base, minl, warm, clip, quiet);
 
@@ -331,13 +385,14 @@ fn _resume_check(drop): i64 {
     assert(mism == 0, "resume reproduces params bit-for-bit");
     return 0;
 }
-fn test_resume_determinism(): i64 { return _resume_check(f64_from(0)); }
-fn test_resume_dropout(): i64 { return _resume_check(_lrc(1, 10)); }   # p=0.1
+fn test_resume_determinism(): i64 { return _resume_check(f64_from(0), 2); }
+fn test_resume_dropout(): i64 { return _resume_check(_lrc(1, 10), 2); }   # p=0.1
+fn test_resume_gqa(): i64 { return _resume_check(f64_from(0), 1); }       # MQA
 
 # Hostile-checkpoint smoke: a few corrupt buffers must be rejected, not crash.
 fn test_ckpt_reject(): i64 {
     var V = build_corpus();
-    model_init(V, 8, 4, 2, 1, 0, f64_from(0), 3);
+    model_init(V, 8, 4, 2, 2, 1, 0, f64_from(0), 3);
     var sz = ckpt_size();
     var good = alloc(sz); ckpt_serialize(good);
     assert(ckpt_load_buf(good, sz) == 0, "valid checkpoint loads");
@@ -359,17 +414,222 @@ fn test_ckpt_reject(): i64 {
     return 0;
 }
 
+# The FD grad checks are structurally blind to parameter-layout aliasing:
+# forward and backward index through the same _o_* helpers, so overlapping
+# offsets would perturb and accumulate identically and every check would stay
+# green while the model silently trained a different architecture. Pin the
+# layout directly: each offset must equal the previous tensor's end, and the
+# block must tile exactly — at a GQA config where Ckv != C.
+fn _lay(off, sz, expect): i64 {
+    assert(off == expect, "layout: offset == previous end");
+    return off + sz;
+}
+fn test_param_layout(): i64 {
+    model_init(5, 16, 4, 4, 2, 2, 1, f64_from(0), 3);   # C=16 nh=4 nkv=2 -> Ckv=8
+    var C = g_C; var F = g_F; var Ckv = _Ckv();
+    var p = 0;
+    p = _lay(_o_ln1g(), C, p);
+    p = _lay(_o_ln1b(), C, p);
+    p = _lay(_o_Wq(), C * C, p);
+    p = _lay(_o_Wk(), C * Ckv, p);
+    p = _lay(_o_Wv(), C * Ckv, p);
+    p = _lay(_o_Wo(), C * C, p);
+    p = _lay(_o_ln2g(), C, p);
+    p = _lay(_o_ln2b(), C, p);
+    p = _lay(_o_Wfc(), C * F, p);
+    p = _lay(_o_bfc(), F, p);
+    p = _lay(_o_Wproj(), F * C, p);
+    p = _lay(_o_bproj(), C, p);
+    assert(p == _blk_base_size(), "layout: weights tile _blk_base_size exactly");
+    p = _lay(_o_bq(), C, p);
+    p = _lay(_o_bk(), Ckv, p);
+    p = _lay(_o_bv(), Ckv, p);
+    p = _lay(_o_bo(), C, p);
+    assert(p == _blk(), "layout: biases tile _blk exactly");
+    return 0;
+}
+
+# model_alloc_bytes (the checkpoint loader's pre-allocation bound) must
+# mirror model_init's actual allocations — pin the two together. Exact when
+# every t_alloc size is 16-byte aligned; allow small per-alloc slack.
+fn test_alloc_accounting(): i64 {
+    var used0 = alloc_used();
+    model_init(5, 16, 8, 4, 2, 2, 1, f64_from(0), 4);
+    var delta = alloc_used() - used0;
+    var predicted = model_alloc_bytes(5, 16, 8, 4, 2, 2, g_NP);
+    assert(delta >= predicted, "model_alloc_bytes never under-predicts model_init");
+    assert(delta <= predicted + 8192, "model_alloc_bytes tracks model_init (no forgotten buffers)");
+    return 0;
+}
+
+# GQA checkpoint round-trip + the new v2 header validations.
+fn test_ckpt_gqa_roundtrip(): i64 {
+    var V = build_corpus();
+    model_init(V, 8, 4, 4, 2, 1, 1, f64_from(0), 9);   # nh=4, nkv=2, biases on
+    var np = g_NP;
+    var snap = t_alloc(np); t_copy(snap, g_params, np);
+    var sz = ckpt_size();
+    var ck = alloc(sz); ckpt_serialize(ck);
+    model_init(V, 8, 4, 4, 4, 1, 1, f64_from(0), 31);  # scramble with full MHA
+    assert(ckpt_load_buf(ck, sz) == 0, "gqa checkpoint loads");
+    assert(g_nkv == 2, "gqa nkv restored");
+    var mism = 0; var i = 0;
+    while (i < np) {
+        if (load64(g_params + i * 8) != load64(snap + i * 8)) { mism = mism + 1; }
+        i = i + 1;
+    }
+    assert(mism == 0, "gqa load restores params bit-for-bit");
+    # invalid nkv values must be rejected (-16)
+    var bad = alloc(sz);
+    t_copy(bad, ck, sz / 8); store64(bad + 12 * 8, 3);
+    assert(ckpt_load_buf(bad, sz) == (0 - 16), "nkv not dividing nh rejected");
+    t_copy(bad, ck, sz / 8); store64(bad + 12 * 8, 0);
+    assert(ckpt_load_buf(bad, sz) == (0 - 16), "nkv = 0 rejected");
+    t_copy(bad, ck, sz / 8); store64(bad + 12 * 8, 8);
+    assert(ckpt_load_buf(bad, sz) == (0 - 16), "nkv > nh rejected");
+    # negative step must be rejected (-17)
+    t_copy(bad, ck, sz / 8); store64(bad + 10 * 8, 0 - 5);
+    assert(ckpt_load_buf(bad, sz) == (0 - 17), "negative step rejected");
+    # rng state 0 (the xorshift fixed point) must be rejected (-19)
+    t_copy(bad, ck, sz / 8); store64(bad + 11 * 8, 0);
+    assert(ckpt_load_buf(bad, sz) == (0 - 19), "rng state 0 rejected");
+    # a SHAPE-valid config whose nh*T*T attention arenas would blow the
+    # allocator (np stays tiny — the arena term is independent of np) must be
+    # rejected by the pre-allocation bound (-18), before the length check
+    t_copy(bad, ck, sz / 8);
+    store64(bad + 2 * 8, 2);        # V=2
+    store64(bad + 3 * 8, 64);       # C=64
+    store64(bad + 4 * 8, 8192);     # T=8192
+    store64(bad + 5 * 8, 64);       # nh=64 (hd=1)
+    store64(bad + 6 * 8, 1);        # NL=1
+    store64(bad + 7 * 8, 0);        # bias off
+    store64(bad + 12 * 8, 1);       # nkv=1
+    store64(bad + 9 * 8, ckpt_expected_np(2, 64, 8192, 64, 1, 0, 1));
+    assert(ckpt_load_buf(bad, sz) == (0 - 18), "oversized model (arena) rejected pre-alloc");
+    return 0;
+}
+
+# A v1 (pre-GQA, 12-field header) checkpoint must still load, as full MHA
+# (nkv = nh) — with nkv == nh the v2 parameter layout is identical to v1's.
+fn test_ckpt_v1_compat(): i64 {
+    var V = build_corpus();
+    model_init(V, 8, 4, 2, 2, 1, 0, f64_from(0), 6);
+    var np = g_NP;
+    var snap = t_alloc(np); t_copy(snap, g_params, np);
+    var sz = ckpt_size();
+    var v2 = alloc(sz); ckpt_serialize(v2);
+    # transform to v1: version = 1, drop header field [12] (nkv), shift the
+    # rest of the image down one i64
+    var sz1 = sz - 8;
+    var v1 = alloc(sz1);
+    var i = 0;
+    while (i < 12) { store64(v1 + i * 8, load64(v2 + i * 8)); i = i + 1; }
+    store64(v1 + 1 * 8, 1);
+    while (i < sz1 / 8) { store64(v1 + i * 8, load64(v2 + (i + 1) * 8)); i = i + 1; }
+    model_init(V, 8, 4, 2, 2, 1, 0, f64_from(0), 777);  # scramble
+    assert(ckpt_load_buf(v1, sz1) == 0, "v1 checkpoint loads");
+    assert(g_nkv == g_nh, "v1 loads as full MHA (nkv = nh)");
+    var mism = 0; i = 0;
+    while (i < np) {
+        if (load64(g_params + i * 8) != load64(snap + i * 8)) { mism = mism + 1; }
+        i = i + 1;
+    }
+    assert(mism == 0, "v1 load restores params bit-for-bit");
+    return 0;
+}
+
 # With a corpus already loaded, a checkpoint whose vocab differs must be
 # rejected (-15) rather than silently mis-indexing g_data.
 fn test_ckpt_vocab_mismatch(): i64 {
     var V = build_corpus();                 # sets g_data != 0 with corpus vocab
-    model_init(V, 8, 4, 2, 1, 0, f64_from(0), 3);
+    model_init(V, 8, 4, 2, 2, 1, 0, f64_from(0), 3);
     var sz = ckpt_size();
     var ck = alloc(sz); ckpt_serialize(ck);
     # corrupt the first vocab entry so it no longer matches the loaded corpus
-    var off = 12 * 8;                        # CKPT_HDR fields, then vocab[0]
+    var off = 13 * 8;                        # CKPT_HDR fields, then vocab[0]
     store64(ck + off, (load64(ck + off) + 1) % 256);
     assert(ckpt_load_buf(ck, sz) == (0 - 15), "vocab-mismatch rejected (-15)");
+    return 0;
+}
+
+# E1 gate: KV-cached generation must be BIT-IDENTICAL to the uncached
+# reference (full window forward per token, same semantics). Verified two
+# ways: (1) prefill — the cached path's logits match the uncached row at
+# EVERY prefix length 1..T, bit-for-bit; (2) decode — over 3T generated
+# tokens (crossing several context-shift re-primes), the sampled id
+# sequences match exactly (greedy AND temperature, same PRNG stream) and the
+# final logits row matches bit-for-bit. Run at nkv = nh and nkv = 1 (MQA).
+fn _gen_bits_check(C, T, nh, nkv): i64 {
+    var V = build_corpus();
+    var NL = 2;
+    model_init(V, C, T, nh, nkv, NL, 1, f64_from(0), 21);
+    train(8, 8, 2, _lrc(3, 1000), _lrc(3, 10000), 2, f64_from(1), 1000000000);
+    g_training = 0;
+    # a fixed in-vocab token window
+    var ids = t_alloc(T);
+    var i = 0;
+    while (i < T) { store64(ids + i * 8, (i * 3 + 1) % V); i = i + 1; }
+    # (1) prefill logits bits at every prefix length
+    var mism = 0;
+    var m = 1;
+    while (m <= T) {
+        gen_prime(ids, m, 1);
+        var cs = t_alloc(V); t_copy(cs, R_logits, V);
+        gen_prime(ids, m, 0);
+        var urow = A_logits + (m - 1) * g_V * 8;
+        var v = 0;
+        while (v < V) {
+            if (load64(cs + v * 8) != load64(urow + v * 8)) { mism = mism + 1; }
+            v = v + 1;
+        }
+        m = m + 1;
+    }
+    assert(mism == 0, "kv prefill logits bit-identical at every prefix");
+    # (2) decode across slide boundaries, greedy then temp 0.8
+    var NG = 3 * T;
+    var outA = t_alloc(NG); var outB = t_alloc(NG);
+    var fin = t_alloc(V);
+    var tt = 0;
+    while (tt < 2) {
+        var temp = f64_from(0);
+        if (tt == 1) { temp = _lrc(8, 10); }
+        _rng_state = 424242 + tt;
+        gen_prime(ids, T, 1);            # full window: slides immediately
+        gen_decode(NG, temp, 1, outA, 0);
+        t_copy(fin, R_logits, V);
+        _rng_state = 424242 + tt;
+        gen_prime(ids, T, 0);
+        gen_decode(NG, temp, 0, outB, 0);
+        var dm = 0;
+        i = 0;
+        while (i < NG) {
+            if (load64(outA + i * 8) != load64(outB + i * 8)) { dm = dm + 1; }
+            i = i + 1;
+        }
+        assert(dm == 0, "kv decode ids identical (cached vs uncached)");
+        var urow2 = A_logits + (G_n - 1) * g_V * 8;
+        var lm = 0;
+        var v2 = 0;
+        while (v2 < V) {
+            if (load64(fin + v2 * 8) != load64(urow2 + v2 * 8)) { lm = lm + 1; }
+            v2 = v2 + 1;
+        }
+        assert(lm == 0, "kv final logits bit-identical after slides");
+        tt = tt + 1;
+    }
+    return 0;
+}
+# Configs chosen so the contract is pinned where it could plausibly break:
+# hd=8 (pure SIMD chunks), hd∈{4,6,10} (scalar-tail loops live), nkv=nh /
+# 1<nkv<nh / nkv=1 (all three K/V-group mappings), odd T (odd GEN_SHIFT) and
+# a degenerate 2-token window.
+fn test_kv_generation(): i64 {
+    _gen_bits_check(16, 8, 2, 2);   # hd=8, full MHA (production head dim)
+    _gen_bits_check(16, 8, 2, 1);   # hd=8, MQA: shared K/V head
+    _gen_bits_check(12, 7, 2, 1);   # hd=6: SIMD tail; odd T (shift 3)
+    _gen_bits_check(20, 5, 2, 2);   # hd=10: SIMD tail; odd T (shift 2)
+    _gen_bits_check(16, 6, 4, 2);   # hd=4: true grouping 1 < nkv < nh
+    _gen_bits_check(12, 2, 2, 1);   # degenerate 2-token window (shift 1)
     return 0;
 }
 
@@ -379,7 +639,7 @@ fn test_ckpt_vocab_mismatch(): i64 {
 # (loss stayed finite throughout).
 fn test_soak(): i64 {
     var V = build_corpus();
-    model_init(V, 16, 8, 2, 2, 0, f64_from(0), 1);
+    model_init(V, 16, 8, 2, 2, 2, 0, f64_from(0), 1);
     var base = _lrc(1, 1000); var minl = _lrc(1, 10000); var clip = f64_from(1);
     train(2, 90, 4, base, minl, 5, clip, 1000000000);   # warm-up
     var used0 = alloc_used();
@@ -394,7 +654,7 @@ fn test_soak(): i64 {
 # a weight so the loss is non-finite; the guard should stop before stepping.
 fn test_nan_guard(): i64 {
     var V = build_corpus();
-    model_init(V, 8, 4, 2, 1, 0, f64_from(0), 2);
+    model_init(V, 8, 4, 2, 2, 1, 0, f64_from(0), 2);
     store64(P_tokemb(), 0x7FF8000000000000);   # NaN into a weight
     var before = g_step;
     var w1 = load64(P_tokemb() + 8);            # a finite weight (not the NaN'd one)
@@ -461,11 +721,19 @@ fn main(): i64 {
     test_attention();
     test_group("full-model grad-check");
     test_model();
+    test_model_gqa();
     test_group("persistence");
     test_resume_determinism();
     test_resume_dropout();
+    test_resume_gqa();
+    test_param_layout();
+    test_alloc_accounting();
     test_ckpt_reject();
+    test_ckpt_gqa_roundtrip();
+    test_ckpt_v1_compat();
     test_ckpt_vocab_mismatch();
+    test_group("kv-cached generation");
+    test_kv_generation();
     test_group("robustness");
     test_soak();
     test_nan_guard();

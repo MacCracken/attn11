@@ -37,6 +37,42 @@ Classifiers." *ICLR 2017.* arXiv:[1611.01462](https://arxiv.org/abs/1611.01462).
 Used in: `src/model.cyr` (`head_fwd`/`head_bwd`) — the token embedding doubles
 as the LM head; its gradient accumulates from both paths.
 
+### Multi-query attention (shared K/V heads)
+**Shazeer, N. (2019).** "Fast Transformer Decoding: One Write-Head is All You
+Need." arXiv:[1911.02150](https://arxiv.org/abs/1911.02150).
+Used in: `src/attn.cyr` — the `nkv = 1` end of the `n_kv_heads` config: all
+query heads share a single K/V head, cutting KV-cache memory `nh`-fold.
+
+### Grouped-query attention (GQA)
+**Ainslie, J., Lee-Thorp, J., de Jong, M., Zemlyanskiy, Y., Lebrón, F.,
+Sanghai, S. (2023).** "GQA: Training Generalized Multi-Query Transformer
+Models from Multi-Head Checkpoints." *EMNLP 2023.*
+arXiv:[2305.13245](https://arxiv.org/abs/2305.13245).
+Used in: `src/attn.cyr`, `src/model.cyr` — `1 < nkv < nh`: each group of
+`nh/nkv` query heads shares one K/V head (`Ckv = nkv·hd`-wide K/V
+projections, grouped `dK`/`dV` accumulation in the hand-derived backward).
+
+### KV-cache inference (cache K/V per position, one row per decoded token)
+**Pope, R., Douglas, S., Chowdhery, A., et al. (2022).** "Efficiently Scaling
+Transformer Inference." *MLSys 2023.* arXiv:[2211.05102](https://arxiv.org/abs/2211.05102).
+Used in: `src/attn.cyr` (`attn_fwd_row`), `src/model.cyr` (`model_fwd_row`,
+per-layer `KV_K`/`KV_V`) — generation appends each position's K/V to a cache
+and attends over it instead of recomputing the window. (The cache idea is
+folklore-old — it falls out of the incremental decoder in Vaswani et al. —
+but this paper is the standard reference for KV-cache memory accounting,
+which the GQA config and the bench's `kv cache bytes` line implement.)
+
+### Context-shift for a full window under absolute positional embeddings
+**Radford et al. (2019)** (GPT-2, above) — stride-style re-evaluation when a
+fixed window slides; **Xiao, G., Tian, Y., Chen, B., Han, S., Lewis, M.
+(2024).** "Efficient Streaming Language Models with Attention Sinks." *ICLR
+2024.* arXiv:[2309.17453](https://arxiv.org/abs/2309.17453) — the modern
+treatment of why cached rows cannot simply shift positions.
+Used in: `src/train.cyr` (`gen_decode`) — when the window fills, drop the
+oldest `T/2` tokens and re-prime the kept context at its new positions (one
+window recompute amortized over `T/2` tokens); see ADR 0005 for why shifting
+the cache in place is unsound with learned absolute positions.
+
 ## Layers & activations
 
 ### Layer normalization

@@ -36,7 +36,7 @@ fn main(): i64 {
 
     # ---- a valid reference checkpoint (tiny model) ----
     var V = build_corpus();
-    model_init(V, 8, 4, 2, 1, 0, f64_from(0), 5);
+    model_init(V, 8, 4, 2, 2, 1, 0, f64_from(0), 5);
     var sz = ckpt_size();
     var good = alloc(sz);
     ckpt_serialize(good);
@@ -52,14 +52,14 @@ fn main(): i64 {
             store8(work + off, (load8(work + off) ^ (fz_pos() & 0xFF)) & 0xFF);
         } elif (mode == 1) {                  # truncate to a random length
             mlen = fz_pos() % (sz + 1);
-        } elif (mode == 2) {                  # wild value into a config field (2..9)
-            var fld = 2 + (fz_pos() % 8);
+        } elif (mode == 2) {                  # wild value into a config/state field (2..12)
+            var fld = 2 + (fz_pos() % 11);
             store64(work + fld * 8, fz_next());
         } elif (mode == 3) {                  # clobber the magic
             store64(work, fz_next());
         } else {                              # fully random header
             var k = 0;
-            while (k < 12) { store64(work + k * 8, fz_next()); k = k + 1; }
+            while (k < 13) { store64(work + k * 8, fz_next()); k = k + 1; }
         }
         var rc = ckpt_load_buf(work, mlen);
         if (rc < 0) { rejected = rejected + 1; }

@@ -24,6 +24,7 @@ include "src/persist.cyr"
 fn CFG_C(): i64 { return 32; }       # d_model
 fn CFG_T(): i64 { return 16; }       # context length
 fn CFG_NH(): i64 { return 4; }       # attention heads (head dim = C/NH)
+fn CFG_NKV(): i64 { return CFG_NH(); } # K/V heads (= NH: full MHA; < NH: GQA)
 fn CFG_NL(): i64 { return 3; }       # transformer blocks
 fn CFG_SEED(): i64 { return 1337; }
 fn CFG_STEPS(): i64 { return 2000; }
@@ -82,7 +83,7 @@ fn main(): i64 {
         if (rc < 0) { puts("attn11: checkpoint load failed (code "); fmt_int(rc); puts(")\n"); return 1; }
         puts("attn11: resumed from checkpoint at step "); fmt_int(g_step); _putc(10);
     } else {
-        model_init(V, CFG_C(), CFG_T(), CFG_NH(), CFG_NL(), CFG_ATTN_BIAS(), CFG_DROPOUT(), CFG_SEED());
+        model_init(V, CFG_C(), CFG_T(), CFG_NH(), CFG_NKV(), CFG_NL(), CFG_ATTN_BIAS(), CFG_DROPOUT(), CFG_SEED());
     }
 
     puts("attn11 — transformer training in Cyrius\n");
@@ -90,6 +91,7 @@ fn main(): i64 {
     puts(" d_model="); fmt_int(g_C);
     puts(" ctx="); fmt_int(g_T);
     puts(" heads="); fmt_int(g_nh);
+    puts(" kv_heads="); fmt_int(g_nkv);
     puts(" layers="); fmt_int(g_NL);
     puts(" params="); fmt_int(g_NP); _putc(10);
     puts("  corpus chars="); fmt_int(g_datalen); _putc(10);

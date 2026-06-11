@@ -36,3 +36,30 @@ call shapes. Words wobble; *texture* is right.
 
 Checkpoint: `/tmp/vidya-cyr.ckpt` (ephemeral; regenerate with the flags
 above — deterministic, so the run reproduces bit-for-bit).
+
+## X002 — KV-cache + GQA gate measurements (E1/E2 → M6) (2026-06-11)
+
+**Setup**: 0.7.0 (default config: d_model 32, ctx 16, 4 heads, 3 layers,
+biases on; toolchain pin 6.1.33), embedded corpus, x86_64, greedy decode,
+500 generated tokens (`tests/attn11.bcyr`).
+
+**E1 result**: uncached generation (full window forward per token)
+1 050 579 ns/token; KV-cached decode (one row per token + context-shift
+re-prime every T/2 = 8 tokens) **170 392 ns/token — 6.16×**, i.e. 951 →
+**5 868 tokens/sec**. Bit-identity gate green (logits identical at every
+prefix and across context-shifts, greedy + temp, hd ∈ {4,6,8,10} ×
+nkv ∈ {1,2,nh}).
+
+**E2 result**: KV cache bytes 24 576 (`nkv=4`) → 12 288 (`nkv=2`) → **6 144
+(`nkv=1`)** — linear in `nkv`, the 4× architectural cut at MQA. MQA also
+trims compute: fwd+bwd step 3 680 703 → 3 456 801 ns (~6%, the K/V
+projection shrink), cached generation 170 392 → 164 282 ns/token.
+
+**Takeaways**:
+1. At ctx 16 the cached path is re-prime-bound (a window recompute every 8
+   tokens); the per-token win grows with T — E3's ctx-64 preset should
+   roughly double the speedup ratio.
+2. GQA's KV saving is real but only *matters* at scale (here the whole cache
+   is 24 KB); its value in attn11 is the grad-checked reference backward.
+3. Training quality at `nkv < nh` is untested on a real corpus — a vidya
+   iso-param GQA-vs-MHA run is the natural X003 (pairs with E3).

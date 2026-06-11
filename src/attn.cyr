@@ -2,62 +2,75 @@
 #
 # Source: Vaswani et al. (2017), "Attention Is All You Need", arXiv:1706.03762 —
 # scaled dot-product attention score = (Q·K)/sqrt(hd), softmax, multi-head split.
-# See docs/sources.md.
+# Grouped-query attention (nkv < nh): Ainslie et al. (2023), arXiv:2305.13245;
+# multi-query (nkv = 1): Shazeer (2019), arXiv:1911.02150. See docs/sources.md.
 #
-# Single sequence of length T, embedding width C, nh heads, head dim hd = C/nh.
-# Q/K/V/O projections are C x C, no bias (GPT style). Heads occupy contiguous
-# column blocks [h*hd, (h+1)*hd) of the (T,C) Q/K/V/concat tensors.
+# Single sequence of length T, embedding width C, nh query heads, head dim
+# hd = C/nh, and nkv K/V heads (nkv divides nh; nkv == nh is classic MHA).
+# Q/O projections are C x C; K/V projections are C x Ckv where Ckv = nkv*hd —
+# each group of gsz = nh/nkv query heads shares one K/V head. Biases optional.
+# Query heads occupy contiguous column blocks [h*hd, (h+1)*hd) of the (T,C)
+# Q/concat tensors; K/V head g occupies [g*hd, (g+1)*hd) of the (T,Ckv) K/V.
 #
 # All forward caches and backward temporaries live in one pre-allocated arena
 # (shapes are fixed across a training run, so we never alloc per step). Layout:
-#   Qc Kc Vc        : T*C each
+#   Qc              : T*C
+#   Kc Vc           : T*Ckv each
 #   Pc              : nh*T*T   (attention probabilities, causal-masked)
 #   concat          : T*C      (pre-Wo head concatenation)
-#   dconcat dQ dK dV dxq dxk dxv : T*C each   (backward temporaries)
+#   dconcat dQ      : T*C each (backward temporaries)
+#   dK dV           : T*Ckv each
+#   dxq dxk dxv     : T*C each
 #   dprow           : T        (one softmax-row gradient scratch)
 
-fn attn_arena_size(T, C, nh): i64 { return 11 * T * C + nh * T * T + T; }
+fn attn_arena_size(T, C, nh, nkv): i64 {
+    var Ckv = nkv * (C / nh);
+    return 7 * T * C + 4 * T * Ckv + nh * T * T + T;
+}
 
-# arena sub-pointers (deterministic given dims)
+# arena sub-pointers (deterministic given dims; Ckv = nkv * (C/nh))
 fn _at_Qc(ar): i64 { return ar; }
 fn _at_Kc(ar, T, C): i64 { return ar + (T * C) * 8; }
-fn _at_Vc(ar, T, C): i64 { return ar + (2 * T * C) * 8; }
-fn _at_Pc(ar, T, C): i64 { return ar + (3 * T * C) * 8; }
-fn _at_concat(ar, T, C, nh): i64 { return ar + (3 * T * C + nh * T * T) * 8; }
-fn _at_dconcat(ar, T, C, nh): i64 { return ar + (4 * T * C + nh * T * T) * 8; }
-fn _at_dQ(ar, T, C, nh): i64 { return ar + (5 * T * C + nh * T * T) * 8; }
-fn _at_dK(ar, T, C, nh): i64 { return ar + (6 * T * C + nh * T * T) * 8; }
-fn _at_dV(ar, T, C, nh): i64 { return ar + (7 * T * C + nh * T * T) * 8; }
-fn _at_dxq(ar, T, C, nh): i64 { return ar + (8 * T * C + nh * T * T) * 8; }
-fn _at_dxk(ar, T, C, nh): i64 { return ar + (9 * T * C + nh * T * T) * 8; }
-fn _at_dxv(ar, T, C, nh): i64 { return ar + (10 * T * C + nh * T * T) * 8; }
-fn _at_dprow(ar, T, C, nh): i64 { return ar + (11 * T * C + nh * T * T) * 8; }
+fn _at_Vc(ar, T, C, Ckv): i64 { return ar + (T * C + T * Ckv) * 8; }
+fn _at_Pc(ar, T, C, Ckv): i64 { return ar + (T * C + 2 * T * Ckv) * 8; }
+fn _at_concat(ar, T, C, nh, Ckv): i64 { return ar + (T * C + 2 * T * Ckv + nh * T * T) * 8; }
+fn _at_dconcat(ar, T, C, nh, Ckv): i64 { return ar + (2 * T * C + 2 * T * Ckv + nh * T * T) * 8; }
+fn _at_dQ(ar, T, C, nh, Ckv): i64 { return ar + (3 * T * C + 2 * T * Ckv + nh * T * T) * 8; }
+fn _at_dK(ar, T, C, nh, Ckv): i64 { return ar + (4 * T * C + 2 * T * Ckv + nh * T * T) * 8; }
+fn _at_dV(ar, T, C, nh, Ckv): i64 { return ar + (4 * T * C + 3 * T * Ckv + nh * T * T) * 8; }
+fn _at_dxq(ar, T, C, nh, Ckv): i64 { return ar + (4 * T * C + 4 * T * Ckv + nh * T * T) * 8; }
+fn _at_dxk(ar, T, C, nh, Ckv): i64 { return ar + (5 * T * C + 4 * T * Ckv + nh * T * T) * 8; }
+fn _at_dxv(ar, T, C, nh, Ckv): i64 { return ar + (6 * T * C + 4 * T * Ckv + nh * T * T) * 8; }
+fn _at_dprow(ar, T, C, nh, Ckv): i64 { return ar + (7 * T * C + 4 * T * Ckv + nh * T * T) * 8; }
 
 # ---- forward ----------------------------------------------------------------
 # x(T,C) -> out(T,C). Fills caches in `ar` for the backward pass.
-# Bias pointers bq/bk/bv/bo may be 0 (no bias).
-fn attn_fwd(Wq, bq, Wk, bk, Wv, bv, Wo, bo, x, out, ar, T, C, nh): i64 {
+# Bias pointers bq/bk/bv/bo may be 0 (no bias). bk/bv have Ckv entries.
+fn attn_fwd(Wq, bq, Wk, bk, Wv, bv, Wo, bo, x, out, ar, T, C, nh, nkv): i64 {
     var hd = C / nh;
+    var Ckv = nkv * hd;
+    var gsz = nh / nkv;             # query heads per K/V head (GQA group size)
     var hd4 = hd - (hd % 4);        # head dim is contiguous -> 4-wide vector body
     var scale = f64_div(f64_from(1), f64_sqrt(f64_from(hd)));
     var acc[32];                    # 4-lane dot accumulator
     var pv[32];                     # 4-lane broadcast buffer
     var Qc = _at_Qc(ar);
     var Kc = _at_Kc(ar, T, C);
-    var Vc = _at_Vc(ar, T, C);
-    var Pc = _at_Pc(ar, T, C);
-    var concat = _at_concat(ar, T, C, nh);
+    var Vc = _at_Vc(ar, T, C, Ckv);
+    var Pc = _at_Pc(ar, T, C, Ckv);
+    var concat = _at_concat(ar, T, C, nh, Ckv);
 
     linear_fwd(x, Wq, bq, Qc, T, C, C);
-    linear_fwd(x, Wk, bk, Kc, T, C, C);
-    linear_fwd(x, Wv, bv, Vc, T, C, C);
+    linear_fwd(x, Wk, bk, Kc, T, C, Ckv);
+    linear_fwd(x, Wv, bv, Vc, T, C, Ckv);
 
     # zero the full probability buffer (upper triangle stays 0)
     t_zero(Pc, nh * T * T);
 
     var h = 0;
     while (h < nh) {
-        var base = h * hd;
+        var base = h * hd;          # this query head's block in Q/concat
+        var kvb = (h / gsz) * hd;   # its shared K/V head's block in Kc/Vc
         var i = 0;
         while (i < T) {
             var prow = Pc + (h * T + i) * T * 8;
@@ -65,7 +78,7 @@ fn attn_fwd(Wq, bq, Wk, bk, Wv, bv, Wo, bo, x, out, ar, T, C, nh): i64 {
             var qbase = Qc + (i * C + base) * 8;
             var j = 0;
             while (j <= i) {
-                var kbase = Kc + (j * C + base) * 8;
+                var kbase = Kc + (j * Ckv + kvb) * 8;
                 store64(&acc, f64_from(0)); store64(&acc + 8, f64_from(0));
                 store64(&acc + 16, f64_from(0)); store64(&acc + 24, f64_from(0));
                 var d = 0;
@@ -101,7 +114,7 @@ fn attn_fwd(Wq, bq, Wk, bk, Wv, bv, Wo, bo, x, out, ar, T, C, nh): i64 {
             var inv = f64_div(f64_from(1), sum);
             j = 0;
             while (j <= i) { store64(prow + j * 8, f64_mul(load64(prow + j * 8), inv)); j = j + 1; }
-            # concat[i, base+d] = sum_j P[i,j] * V[j, base+d]  (axpy over the
+            # concat[i, base+d] = sum_j P[i,j] * V[j, kvb+d]  (axpy over the
             # contiguous head dim d, broadcasting the scalar P[i,j] over j)
             var cbase = concat + (i * C + base) * 8;
             var dz = 0;
@@ -111,7 +124,7 @@ fn attn_fwd(Wq, bq, Wk, bk, Wv, bv, Wo, bo, x, out, ar, T, C, nh): i64 {
                 var pij = load64(prow + j * 8);
                 store64(&pv, pij); store64(&pv + 8, pij);
                 store64(&pv + 16, pij); store64(&pv + 24, pij);
-                var vbase = Vc + (j * C + base) * 8;
+                var vbase = Vc + (j * Ckv + kvb) * 8;
                 var d = 0;
                 while (d < hd4) {
                     f64v_fmadd(cbase + d * 8, &pv, vbase + d * 8, cbase + d * 8, 4);
@@ -132,45 +145,146 @@ fn attn_fwd(Wq, bq, Wk, bk, Wv, bv, Wo, bo, x, out, ar, T, C, nh): i64 {
     return 0;
 }
 
+# ---- cached single-row forward (inference) ----------------------------------
+# E1 (KV-cached generation): process ONE new position `pos` — x_row(1,C) ->
+# out_row(1,C) — appending this position's K/V rows to the caller-owned caches
+# Kc/Vc ((T,Ckv), must already hold positions 0..pos-1) and attending over
+# cache rows 0..pos. Source: Pope et al. (2022), arXiv:2211.05102 (KV-cache
+# inference); see docs/sources.md. Generation-only: writes no backward caches.
+# prow: caller scratch (>= pos+1 f64); concat_row/q_row: C-f64 scratch.
+#
+# ARITHMETIC CONTRACT: bit-identical per row to attn_fwd — same kernels, same
+# accumulation order (linear_fwd rows are independent, so a 1-row call matches
+# row `pos` of a T-row call bit-for-bit). Pinned by the cached-vs-uncached
+# generation tests in tests/attn11.tcyr.
+fn attn_fwd_row(Wq, bq, Wk, bk, Wv, bv, Wo, bo, x_row, out_row,
+                Kc, Vc, prow, concat_row, q_row, pos, C, nh, nkv): i64 {
+    var hd = C / nh;
+    var Ckv = nkv * hd;
+    var gsz = nh / nkv;
+    var hd4 = hd - (hd % 4);
+    var scale = f64_div(f64_from(1), f64_sqrt(f64_from(hd)));
+    var acc[32];                    # 4-lane dot accumulator
+    var pv[32];                     # 4-lane broadcast buffer
+    linear_fwd(x_row, Wq, bq, q_row, 1, C, C);
+    linear_fwd(x_row, Wk, bk, Kc + pos * Ckv * 8, 1, C, Ckv);
+    linear_fwd(x_row, Wv, bv, Vc + pos * Ckv * 8, 1, C, Ckv);
+    var h = 0;
+    while (h < nh) {
+        var base = h * hd;          # this query head's block in q_row/concat_row
+        var kvb = (h / gsz) * hd;   # its shared K/V head's block in Kc/Vc
+        # raw scores for cache rows j = 0..pos
+        var qbase = q_row + base * 8;
+        var j = 0;
+        while (j <= pos) {
+            var kbase = Kc + (j * Ckv + kvb) * 8;
+            store64(&acc, f64_from(0)); store64(&acc + 8, f64_from(0));
+            store64(&acc + 16, f64_from(0)); store64(&acc + 24, f64_from(0));
+            var d = 0;
+            while (d < hd4) {
+                f64v_fmadd(&acc, qbase + d * 8, kbase + d * 8, &acc, 4);
+                d = d + 4;
+            }
+            var dot = f64_add(f64_add(load64(&acc), load64(&acc + 8)),
+                              f64_add(load64(&acc + 16), load64(&acc + 24)));
+            while (d < hd) {
+                dot = f64_add(dot, f64_mul(load64(qbase + d * 8), load64(kbase + d * 8)));
+                d = d + 1;
+            }
+            store64(prow + j * 8, f64_mul(dot, scale));
+            j = j + 1;
+        }
+        # softmax over j = 0..pos
+        var mx = load64(prow);
+        j = 1;
+        while (j <= pos) {
+            var s = load64(prow + j * 8);
+            if (f64_gt(s, mx) == 1) { mx = s; }
+            j = j + 1;
+        }
+        var sum = f64_from(0);
+        j = 0;
+        while (j <= pos) {
+            var e = f64_exp(f64_sub(load64(prow + j * 8), mx));
+            store64(prow + j * 8, e);
+            sum = f64_add(sum, e);
+            j = j + 1;
+        }
+        var inv = f64_div(f64_from(1), sum);
+        j = 0;
+        while (j <= pos) { store64(prow + j * 8, f64_mul(load64(prow + j * 8), inv)); j = j + 1; }
+        # concat_row[base+d] = sum_j P[j] * V[j, kvb+d]
+        var cbase = concat_row + base * 8;
+        var dz = 0;
+        while (dz < hd) { store64(cbase + dz * 8, f64_from(0)); dz = dz + 1; }
+        j = 0;
+        while (j <= pos) {
+            var pij = load64(prow + j * 8);
+            store64(&pv, pij); store64(&pv + 8, pij);
+            store64(&pv + 16, pij); store64(&pv + 24, pij);
+            var vbase = Vc + (j * Ckv + kvb) * 8;
+            var d = 0;
+            while (d < hd4) {
+                f64v_fmadd(cbase + d * 8, &pv, vbase + d * 8, cbase + d * 8, 4);
+                d = d + 4;
+            }
+            while (d < hd) {
+                store64(cbase + d * 8, f64_add(load64(cbase + d * 8),
+                                               f64_mul(pij, load64(vbase + d * 8))));
+                d = d + 1;
+            }
+            j = j + 1;
+        }
+        h = h + 1;
+    }
+    linear_fwd(concat_row, Wo, bo, out_row, 1, C, C);
+    return 0;
+}
+
 # ---- backward ---------------------------------------------------------------
 # dout(T,C) -> dx(T,C); accumulate dWq..dWo and (if non-0) dbq..dbo.
-# Uses caches from attn_fwd.
+# Uses caches from attn_fwd. With nkv < nh the gsz query heads of a group all
+# accumulate into the same dK/dV columns — the head loop is sequential, so the
+# accumulation order is deterministic.
 fn attn_bwd(Wq, Wk, Wv, Wo, x, dout, dx,
-            dWq, dbq, dWk, dbk, dWv, dbv, dWo, dbo, ar, T, C, nh): i64 {
+            dWq, dbq, dWk, dbk, dWv, dbv, dWo, dbo, ar, T, C, nh, nkv): i64 {
     var hd = C / nh;
+    var Ckv = nkv * hd;
+    var gsz = nh / nkv;
     var scale = f64_div(f64_from(1), f64_sqrt(f64_from(hd)));
     var hd4 = hd - (hd % 4);
     var bb[32];                     # 4-lane broadcast buffer
     var dacc[32];                   # 4-lane dot accumulator
     var Qc = _at_Qc(ar);
     var Kc = _at_Kc(ar, T, C);
-    var Vc = _at_Vc(ar, T, C);
-    var Pc = _at_Pc(ar, T, C);
-    var concat = _at_concat(ar, T, C, nh);
-    var dconcat = _at_dconcat(ar, T, C, nh);
-    var dQ = _at_dQ(ar, T, C, nh);
-    var dK = _at_dK(ar, T, C, nh);
-    var dV = _at_dV(ar, T, C, nh);
-    var dxq = _at_dxq(ar, T, C, nh);
-    var dxk = _at_dxk(ar, T, C, nh);
-    var dxv = _at_dxv(ar, T, C, nh);
-    var dprow = _at_dprow(ar, T, C, nh);
+    var Vc = _at_Vc(ar, T, C, Ckv);
+    var Pc = _at_Pc(ar, T, C, Ckv);
+    var concat = _at_concat(ar, T, C, nh, Ckv);
+    var dconcat = _at_dconcat(ar, T, C, nh, Ckv);
+    var dQ = _at_dQ(ar, T, C, nh, Ckv);
+    var dK = _at_dK(ar, T, C, nh, Ckv);
+    var dV = _at_dV(ar, T, C, nh, Ckv);
+    var dxq = _at_dxq(ar, T, C, nh, Ckv);
+    var dxk = _at_dxk(ar, T, C, nh, Ckv);
+    var dxv = _at_dxv(ar, T, C, nh, Ckv);
+    var dprow = _at_dprow(ar, T, C, nh, Ckv);
 
     # 1. out = concat @ Wo
     linear_bwd(concat, Wo, dout, dconcat, dWo, dbo, T, C, C);
 
     t_zero(dQ, T * C);
-    t_zero(dK, T * C);
-    t_zero(dV, T * C);
+    t_zero(dK, T * Ckv);
+    t_zero(dV, T * Ckv);
 
     var h = 0;
     while (h < nh) {
         var base = h * hd;
+        var kvb = (h / gsz) * hd;
         var i = 0;
         while (i < T) {
             var prow = Pc + (h * T + i) * T * 8;
-            # dP[i,j] = sum_d dconcat[i,base+d]*V[j,base+d]  (dot over d)
-            # dV[j,base+d] += P[i,j]*dconcat[i,base+d]       (axpy over d)
+            # dP[i,j] = sum_d dconcat[i,base+d]*V[j,kvb+d]  (dot over d)
+            # dV[j,kvb+d] += P[i,j]*dconcat[i,base+d]       (axpy over d)
             var dcbase = dconcat + (i * C + base) * 8;
             var j = 0;
             while (j <= i) {
@@ -179,8 +293,8 @@ fn attn_bwd(Wq, Wk, Wv, Wo, x, dout, dx,
                 store64(&bb + 16, pij); store64(&bb + 24, pij);
                 store64(&dacc, f64_from(0)); store64(&dacc + 8, f64_from(0));
                 store64(&dacc + 16, f64_from(0)); store64(&dacc + 24, f64_from(0));
-                var vbase = Vc + (j * C + base) * 8;
-                var dvbase = dV + (j * C + base) * 8;
+                var vbase = Vc + (j * Ckv + kvb) * 8;
+                var dvbase = dV + (j * Ckv + kvb) * 8;
                 var d = 0;
                 while (d < hd4) {
                     f64v_fmadd(dvbase + d * 8, &bb, dcbase + d * 8, dvbase + d * 8, 4);
@@ -211,11 +325,11 @@ fn attn_bwd(Wq, Wk, Wv, Wo, x, dout, dx,
             while (j <= i) {
                 var ds = f64_mul(load64(prow + j * 8), f64_sub(load64(dprow + j * 8), dotPdP));
                 var sds = f64_mul(scale, ds);
-                # dQ[i,base+d] += sds*K[j,base+d]; dK[j,base+d] += sds*Q[i,base+d]
+                # dQ[i,base+d] += sds*K[j,kvb+d]; dK[j,kvb+d] += sds*Q[i,base+d]
                 store64(&bb, sds); store64(&bb + 8, sds);
                 store64(&bb + 16, sds); store64(&bb + 24, sds);
-                var kbase = Kc + (j * C + base) * 8;
-                var dkbase = dK + (j * C + base) * 8;
+                var kbase = Kc + (j * Ckv + kvb) * 8;
+                var dkbase = dK + (j * Ckv + kvb) * 8;
                 var d = 0;
                 while (d < hd4) {
                     f64v_fmadd(dqbase + d * 8, &bb, kbase + d * 8, dqbase + d * 8, 4);
@@ -238,8 +352,8 @@ fn attn_bwd(Wq, Wk, Wv, Wo, x, dout, dx,
 
     # 5. back through Q=x@Wq, K=x@Wk, V=x@Wv; accumulate dx
     linear_bwd(x, Wq, dQ, dxq, dWq, dbq, T, C, C);
-    linear_bwd(x, Wk, dK, dxk, dWk, dbk, T, C, C);
-    linear_bwd(x, Wv, dV, dxv, dWv, dbv, T, C, C);
+    linear_bwd(x, Wk, dK, dxk, dWk, dbk, T, C, Ckv);
+    linear_bwd(x, Wv, dV, dxv, dWv, dbv, T, C, Ckv);
     var idx = 0;
     while (idx < T * C) {
         store64(dx + idx * 8, f64_add(f64_add(load64(dxq + idx * 8), load64(dxk + idx * 8)),

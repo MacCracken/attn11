@@ -55,6 +55,34 @@ of a step).
 
 A default 2000-step run drops from ~262 s of model compute to ~115 s.
 
+## KV-cached generation + GQA (0.7.0)
+
+Generation was the remaining O(T·rows) path: the 0.6.0 sampler recomputed the
+full window for every token. 0.7.0 adds per-layer K/V caches and a single-row
+cached forward (bit-identical to the uncached reference — see
+`docs/architecture/003`); a full window context-shifts (drop oldest T/2,
+re-prime) instead of sliding per token (ADR 0005). Greedy decode, 500 tokens,
+default config:
+
+| path | ns/token | tokens/sec |
+|------|----------|------------|
+| uncached (window forward per token) | 1 050 579 | 951 |
+| **KV-cached** (row per token + amortized re-prime) | **170 392** | **5 868 (6.16×)** |
+
+GQA (`n_kv_heads`) makes the cache size a knob — and trims the K/V projection
+compute (default config; MQA = `nkv 1`):
+
+| nkv | KV cache bytes | fwd+bwd step (ns) | gen cached (ns/tok) |
+|-----|----------------|-------------------|---------------------|
+| 4 (MHA, default) | 24 576 | 3 680 703 | 170 392 |
+| 2 (GQA)          | 12 288 | —         | —       |
+| 1 (MQA)          |  6 144 | 3 456 801 | 164 282 |
+
+At ctx 16 the cached path is re-prime-bound (a window recompute every 8
+tokens), so the speedup grows with context length — the E3 ctx-64 preset is
+the natural next measurement. Training numbers are unchanged from 0.6.0
+within noise (fwd+bwd ~3.7 ms, ~4 350 tok/s b=16; pin 6.1.33).
+
 History is tracked in [`bench-history.csv`](../bench-history.csv).
 
 ## Next perf levers (future)
@@ -63,3 +91,6 @@ History is tracked in [`bench-history.csv`](../bench-history.csv).
 - A packed `tanh` approximation for GELU (its ~16% share grows now that matmul
   is faster).
 - Cache-blocking / register-tiling the matmul for larger `d_model`.
+- A batched prefill (a window forward that also fills the K/V caches, instead
+  of `keep` single-row calls) if the context-shift re-prime cost starts to
+  matter at larger T.
