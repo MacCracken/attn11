@@ -119,12 +119,72 @@ v1.0.0 ships when **all** of these hold:
 
 - Freeze the config/CLI surface; finalize docs (guides + a runnable example).
 - Land one downstream consumer or example pipeline against a tagged build.
+  **Leading candidate**: the vidya corpus pipeline — train on
+  `vidya/content/**/cyrius.cyr` (~488 KB, 74 files) via `--corpus`, checkpoint,
+  sample; first run logged in [`experiments.md`](experiments.md) (loss 4.76
+  random → ~1.55 @ 8k steps; samples reproduce Cyrius idiom). Documents the
+  "curated small corpus" workflow end-to-end against a tagged build.
 - Security audit (`docs/audit/`); tag **v1.0.0** (first non-prerelease).
+
+## Beyond v1.0 — the frontier track (experiments)
+
+> Informed by the June-2026 frontier survey
+> (`ai-ml-frontier-2026-expanded.docx`, repo root): data quality > volume,
+> the KV cache as the central inference object, SSM/attention hybrids
+> displacing pure transformers, diffusion LMs as a maturing generation
+> paradigm, and the precision ladder (FP8→FP4→ternary). attn11 adapts by
+> building **reference implementations of the ideas**, not by chasing the
+> hardware: every item below keeps the project invariants — hand-derived
+> backward, finite-difference grad checks, CPU f64, no deps. Results are
+> logged in [`experiments.md`](experiments.md); an experiment graduates into
+> a milestone only when it earns one.
+
+Ordered by (value ÷ risk), each independently shippable:
+
+- **E1 — KV-cached generation.** Generation currently recomputes the full
+  context every token. Add per-layer K/V caches to the sampler (training
+  untouched). Gate: cached and uncached generation are bit-identical; bench
+  the tokens/sec gain. *This is the survey's "central object" rendered at
+  reference scale.*
+- **E2 — GQA/MQA config.** Share K/V heads across query-head groups
+  (`n_kv_heads ≤ n_heads`) — the architectural KV-cache cut. Backward is a
+  small extension of existing attention grads. Gate: grad checks at
+  `n_kv_heads ∈ {1, 2, nh}`; KV bytes accounted in the bench.
+- **E3 — Scale preset + BPE.** A `--preset` for ctx 64 / d_model 64 (whole
+  statements instead of 16-char fragments — the honest lever the vidya run
+  exposed), plus the long-deferred simple BPE tokenizer. The survey's
+  data-efficiency thesis makes byte-vs-BPE-at-iso-compute a measurable
+  experiment on the vidya corpus.
+- **E4 — A second sequence-mixer family (linear attention → selective SSM).**
+  The survey's structural shift: hybrids with ~10–25% attention layers beat
+  pure transformers. Ladder: (a) a gated linear-attention/RetNet-style block
+  (easiest hand-derivable backward — constant state, linear compute), then
+  (b) a minimal selective-SSM block (BPTT through the scan), then (c) a
+  per-layer `kind` config to interleave mixer types and sweep the **hybrid
+  ratio** at our scale. Gate: every new backward grad-checked; perplexity vs
+  iso-param transformer on the vidya corpus.
+- **E5 — Char-diffusion objective (dLLM at reference scale).** Same trunk,
+  different training model: masked-denoising objective (drop the causal
+  mask, predict masked bytes, confidence-aware parallel decode). Tests the
+  survey's "diffusion LMs are super data learners" thesis honestly at tiny
+  scale: AR vs diffusion on repeated epochs of the same small corpus. Gate:
+  grad check the masked CE path; matched-compute comparison logged.
+- **E6 — Ternary (BitNet-style) training.** Weights in {−1, 0, +1} with a
+  straight-through estimator — the precision ladder's algorithmic endpoint,
+  and a *natural fit* for an everything-is-i64 language: ternary matmul
+  collapses to integer adds. Gate: STE backward documented + grad-checked
+  where defined; accuracy vs f64 baseline; the i64-add matmul benched
+  against SIMD f64.
+
+Sequencing intent: E1–E3 are v1.x candidates (small, additive, freeze-safe);
+E4–E6 are v2-track (new model families) and may fork the architecture config.
 
 ## Out of scope (for v1.0)
 
 - GPU / accelerator backends — attn11 is a CPU, scalar-f64 (then SIMD)
-  reference implementation.
+  reference implementation. (The survey's engine/serving layer — vLLM/SGLang,
+  FP4 tensor cores, photonics — is *observed, not chased*; only its
+  algorithmic ideas translate here.)
 - Distributed / multi-process training.
 - A general autodiff engine — gradients stay hand-derived and grad-checked.
 - Windows / macOS as first-class training targets (cross-build only, if at all).

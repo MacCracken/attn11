@@ -128,9 +128,13 @@ See [`roadmap.md`](roadmap.md). M5 (0.6.0) complete: AGNOS port with the
 bit-for-bit run gate green. Next is **M6 (0.9.0 → v1.0.0): freeze &
 consumer** — freeze the config/CLI surface, land one downstream consumer (or
 example pipeline) against a tagged build, final security audit, first
-non-prerelease tag. Loose ends worth folding in: an `attn11` row upstream in
-`agnos/scripts/stage-tools.sh` (the staging convention already matches), and
-the cycc argv-capture issue
+non-prerelease tag. The **vidya corpus pipeline is the leading example-
+pipeline candidate** (first run logged as X001 in
+[`experiments.md`](experiments.md): 488 KB of Cyrius, loss 4.76 → ~1.55,
+samples reproduce Cyrius idiom). Post-1.0 sequencing now lives in the
+roadmap's **frontier track** (E1 KV-cached generation → E6 ternary training),
+mapped from the June-2026 survey. Loose ends: an `attn11` row upstream in
+`agnos/scripts/stage-tools.sh`; the cycc argv-capture issue
 ([`issues/`](issues/2026-06-10-cyrius-agnos-capture-after-gvar-init-call.md))
 getting fixed upstream so the `docs/architecture/002` workaround can retire.
-Optional BPE tokenizer still deferred.
+BPE tokenizer folded into frontier-track E3.
