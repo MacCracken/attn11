@@ -74,6 +74,13 @@ change on Linux (52 checks, fuzz, and benchmarks unchanged).
 - The unused `random` stdlib dep (kernel-CSPRNG `random_bytes`; attn11's PRNG
   is deliberately deterministic) — it was also the one undefined-symbol
   (`sys_getrandom`) hold-out in the AGNOS build.
+- **`lib/` is no longer committed** (patra model): the old
+  `lib/*.cyr`-with-whitelist gitignore shipped a tracked-but-incomplete lib
+  that shadowed the pinned snapshot — the new-at-6.1.31 `ganita.cyr` was
+  silently ignored and CI's `cyrius deps` failed on the clean checkout. The
+  whole dir is generated now: `cyrius deps` materializes the closure from the
+  pin (verified: the full CI matrix passes from a lib-less checkout);
+  `cyrius lib sync` refreshes a local copy.
 
 ## [0.5.1] - 2026-06-08
 
