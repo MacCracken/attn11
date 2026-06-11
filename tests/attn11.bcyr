@@ -154,6 +154,16 @@ fn main(): i64 {
     print("gen preset tokens/sec cached:   ", 32); fmt_int(1000000000 / pca_ns); _putc(10);
     print("gen preset speedup (x100):      ", 32); fmt_int(pun_ns * 100 / pca_ns); _putc(10);
 
+    # ---- isolated tied LM head at BPE-scale vocab (V=768): the M9 lever-1
+    # target. head_fwd_row is O(V*C) per row and runs in every training forward
+    # and every generated token; its share grows with the vocab, so bench it
+    # where it bites (BPE can push V to 768), not at the V=25 default.
+    model_init(768, 64, 64, 8, 8, 4, 1, f64_from(0), 1337);
+    sample_window(); model_forward();            # populate A_f (the head input)
+    var NHD = 2000;
+    s = now_ns(); i = 0; while (i < NHD) { head_fwd_n(g_T); i = i + 1; } e = now_ns();
+    _report("head_fwd V768 C64", e - s, NHD);
+
     # ---- BPE merge training (one-shot, pre-training cost; M7) ----
     # 256 KB of repeated corpus text — content quality is irrelevant to the
     # count/argmax/replace loop cost being measured.

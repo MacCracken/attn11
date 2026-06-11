@@ -109,11 +109,33 @@ tok/s b=16).
 
 History is tracked in [`bench-history.csv`](../bench-history.csv).
 
+## SIMD tied LM head (0.8.0 → 0.8.1, M9 lever 1)
+
+`head_fwd_row` (the weight-tied output projection, `logits(V) = f_row(C) @
+tokemb^T`) was a scalar dot product while the linear layers had been 4-wide
+since 0.4.0. It is `O(V·C)` per row and runs in **every** training forward and
+**every** generated token, so its cost grows with the vocabulary — negligible
+at the V=25 default, but ~17% of the forward at a BPE-scale V=768. Vectorized
+with the same `f64v_fmadd` 4-lane accumulator + scalar tail as the matmul
+(shared by the training and cached-generation paths, so the bit-identity gate
+holds):
+
+| `head_fwd` (V=768, C=64, T=64) | ns/op | speedup |
+|--------------------------------|-------|---------|
+| scalar (0.8.0)                 | ~9 700 000 | — |
+| 4-wide SIMD (0.8.1)            | **~3 590 000** | **2.7×** |
+
+Default-config training is unchanged within noise (the V=25 head is tiny);
+the win lands on BPE/large-vocab and generation throughput. Grad checks, the
+KV bit-identity gate, and resume-determinism stay green on x86_64 and aarch64;
+a new `head SIMD == scalar dot (C=6 tail)` test exercises the `C % 4 ≠ 0` tail
+that no other config hits (mutation-verified to catch a dropped tail).
+
 ## Next perf levers (roadmap M9, v0.8.x)
 
-- Vectorize the tied LM head (matters as vocab grows with larger corpora).
+- ~~Vectorize the tied LM head~~ ✅ **0.8.1** (2.7× at V=768; above).
 - A packed `tanh` approximation for GELU (its ~16% share grows now that matmul
-  is faster).
+  and the head are faster).
 - Cache-blocking / register-tiling the matmul for larger `d_model`.
 - A batched prefill (a window forward that also fills the K/V caches, instead
   of `keep` single-row calls) if the context-shift re-prime cost starts to

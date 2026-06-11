@@ -342,6 +342,40 @@ fn test_model_gqa(): i64 {
     return 0;
 }
 
+# The M9 SIMD LM head (head_fwd_row) has a scalar tail for C % 4 != 0 that NO
+# other test exercises — every config above uses C ∈ {8,16}. C=6 (% 4 = 2)
+# hits it. Compare the vectorized head output to an independent scalar dot
+# product: a dropped/short tail would diverge by a whole term, far past tol.
+fn test_head_tail(): i64 {
+    var V = 5; var C = 6; var T = 4; var nh = 2; var nkv = 2; var NL = 1;
+    model_init(V, C, T, nh, nkv, NL, 1, f64_from(0), 7);
+    store64(A_tokens + 0, 1); store64(A_tokens + 8, 3);
+    store64(A_tokens + 16, 0); store64(A_tokens + 24, 2);
+    store64(A_targets + 0, 3); store64(A_targets + 8, 0);
+    store64(A_targets + 16, 4); store64(A_targets + 24, 1);
+    model_forward();                                   # fills A_f + A_logits (SIMD head)
+    var emb = P_tokemb();
+    var ref = t_alloc(T * V);
+    var t = 0;
+    while (t < T) {
+        var v = 0;
+        while (v < V) {
+            var acc = f64_from(0);
+            var c = 0;
+            while (c < C) {
+                acc = f64_add(acc, f64_mul(load64(A_f + (t * C + c) * 8),
+                                           load64(emb + (v * C + c) * 8)));
+                c = c + 1;
+            }
+            store64(ref + (t * V + v) * 8, acc);
+            v = v + 1;
+        }
+        t = t + 1;
+    }
+    check("head SIMD == scalar dot (C=6 tail)", A_logits, ref, T * V, 100000000);
+    return 0;
+}
+
 # Resume determinism: train(K) in one go must equal train(K1) -> checkpoint
 # round-trip -> train(K). The schedule horizon `total` is held fixed across the
 # split so the LR/bias-correction match step-for-step. We compare the final
@@ -1172,6 +1206,7 @@ fn main(): i64 {
     test_group("full-model grad-check");
     test_model();
     test_model_gqa();
+    test_head_tail();
     test_group("persistence");
     test_resume_determinism();
     test_resume_dropout();

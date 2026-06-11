@@ -4,6 +4,30 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-06-11
+
+**Performance — SIMD tied LM head (roadmap M9, lever 1).** The first of the
+one-lever-per-release perf cuts. `head_fwd_row` (the weight-tied output
+projection) was a scalar dot product; the matmul has been 4-wide SIMD since
+0.4.0. Vectorized it with the same `f64v_fmadd` accumulator + scalar tail.
+
+### Changed
+- **`head_fwd_row` is now 4-wide SIMD**: `head_fwd` (V=768, C=64, T=64)
+  **~9.7 ms → ~3.59 ms (2.7×)**. The head is `O(V·C)` per row and runs in every
+  training forward and every generated token, so the win scales with the
+  vocabulary — negligible at the V=25 default (default-config training is
+  unchanged within noise), ~17% of the forward at a BPE-scale V=768. The kernel
+  is shared by the training and cached-generation paths, so the cached-vs-
+  uncached bit-identity gate is unaffected. See
+  [`docs/benchmarks.md`](docs/benchmarks.md) + the CSV.
+
+### Added
+- `head SIMD == scalar dot (C=6 tail)` test (248 checks): every other config
+  uses `C ∈ {8,16}`, so the new `C % 4 ≠ 0` scalar tail was otherwise
+  unexercised. Compares the vectorized head to an independent scalar dot at
+  C=6; **mutation-verified** (a dropped tail fails it). Green on x86_64 and
+  aarch64; grad checks + KV bit-identity + resume-determinism unchanged.
+
 ## [0.8.0] - 2026-06-11
 
 **Security sweep (roadmap M8).** A research-driven hardening release: six

@@ -313,16 +313,25 @@ fn kv_cache_bytes(): i64 { return 2 * g_NL * g_T * _Ckv() * 8; }
 fn head_fwd_row(f_row, logits_row): i64 {
     var C = g_C; var V = g_V;
     var emb = P_tokemb();
+    var c4 = C - (C % 4);
+    var acc[32];                     # 4-lane dot accumulator (M9: SIMD head)
     var v = 0;
     while (v < V) {
-        var acc = f64_from(0);
+        var erow = emb + v * C * 8;
+        store64(&acc, f64_from(0)); store64(&acc + 8, f64_from(0));
+        store64(&acc + 16, f64_from(0)); store64(&acc + 24, f64_from(0));
         var c = 0;
+        while (c < c4) {
+            f64v_fmadd(&acc, f_row + c * 8, erow + c * 8, &acc, 4);
+            c = c + 4;
+        }
+        var dot = f64_add(f64_add(load64(&acc), load64(&acc + 8)),
+                          f64_add(load64(&acc + 16), load64(&acc + 24)));
         while (c < C) {
-            acc = f64_add(acc, f64_mul(load64(f_row + c * 8),
-                                       load64(emb + (v * C + c) * 8)));
+            dot = f64_add(dot, f64_mul(load64(f_row + c * 8), load64(erow + c * 8)));
             c = c + 1;
         }
-        store64(logits_row + v * 8, acc);
+        store64(logits_row + v * 8, dot);
         v = v + 1;
     }
     return 0;

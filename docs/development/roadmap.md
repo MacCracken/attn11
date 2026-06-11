@@ -201,7 +201,11 @@ full per-class dispositions in
 The accumulated perf levers, landed one at a time against
 [`bench-history.csv`](../../bench-history.csv) (numbers or it didn't happen):
 
-- Vectorize the tied LM head (matters as vocab grows — 117 symbols on vidya).
+- ✅ **Vectorize the tied LM head** — **0.8.1**: `head_fwd_row` scalar → 4-wide
+  `f64v_fmadd`, **2.7×** at V=768 (`head_fwd` 9.7 → 3.59 ms); win scales with
+  the vocab (negligible at V=25, ~17% of the forward at BPE-scale). Bit-identity
+  gate unaffected (shared kernel); a C=6 tail test (mutation-verified) covers
+  the new `C % 4 ≠ 0` path. See [`benchmarks.md`](../benchmarks.md).
 - A packed `tanh` approximation for GELU (its share grows as matmul shrinks).
 - Cache-blocking / register-tiling the matmul for the ctx-64/d_model-64
   preset sizes.

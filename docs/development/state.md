@@ -5,21 +5,21 @@
 
 ## Version
 
-**0.8.0** — security sweep (M8): a research-driven hardening release. Six
-vulnerability classes web-researched against recent CVEs, then adversarially
-mapped onto attn11's surfaces (survey→map workflow); the headline is a
-**negative** result — the flat native-endian i64 checkpoint is structurally
-immune to the pickle/Keras/numpy model-file deserialization-RCE genre (no
-opcode interpreter / callable revival / embedded path). Two real bugs fixed:
-a dropped `_file_size` path arg that crashed every **AGNOS `--load`**, and —
-exposed by new file-path test coverage — checkpoint **save broken on the whole
-aarch64 lane** (qemu mis-emulates `fsync`; durability barrier switched to
-`fdatasync`). Plus `_atoi` overflow saturation, the merge-scratch buffer pin,
-and **CI supply-chain** hardening (Actions SHA-pinned, awk-injection closed,
-least-privilege permissions). Training, generation, checkpoint format, and CLI
-are unchanged — an 0.7.1 and an 0.8.0 binary produce bit-identical output. See
+**0.8.1** — performance, M9 lever 1 (SIMD tied LM head): `head_fwd_row` (the
+weight-tied output projection, `O(V·C)` per row, run in every training forward
+and every generated token) was a scalar dot product while the matmul has been
+4-wide since 0.4.0. Vectorized with the same `f64v_fmadd` accumulator + tail —
+**2.7×** at V=768 (`head_fwd` 9.7 → 3.59 ms). The win scales with the vocab
+(negligible at the V=25 default — default training unchanged; ~17% of the
+forward at BPE-scale). Shared kernel, so the cached-vs-uncached bit-identity
+gate is unaffected; a mutation-verified C=6 test covers the new `C % 4 ≠ 0`
+tail. (0.8.0 — security sweep (M8): a survey→map hardening release;
+checkpoint **format immunity** to the model-file-deser RCE genre confirmed; a
+dropped `_file_size` arg crashing every **AGNOS `--load`** and checkpoint
+**save broken on the aarch64 lane** (qemu `fsync` → `fdatasync`) both fixed;
+`_atoi` saturation, merge-scratch pin, **CI supply-chain** hardening. See
 [`../audit/2026-06-11-m8-security-sweep-audit.md`](../audit/2026-06-11-m8-security-sweep-audit.md).
-(0.7.1 — scale preset + BPE (M7, E3): `--preset` (ctx 64 / d_model 64; gen
+0.7.1 — scale preset + BPE (M7, E3): `--preset` (ctx 64 / d_model 64; gen
 **23×**), opt-in **BPE** (`--bpe K`, ADR 0006), checkpoint **v3**, `--eval`
 bits-per-byte, pin 6.1.33 → 6.1.34; X003 byte-vs-BPE −11 to −13% bits/byte.
 0.7.0 — inference efficiency (M6, E1+E2): KV-cached generation
@@ -158,11 +158,12 @@ raises V to `base + K` (≤ 768).
 
 ## Tests
 
-- `tests/attn11.tcyr` — **247 checks**: finite-difference gradient checks
+- `tests/attn11.tcyr` — **248 checks**: finite-difference gradient checks
   (every op incl. dropout; attention at head dims 6/8/10 and GQA/MQA at
   `nkv ∈ {1, 2, nh}` incl. `dWk`/`dWv`/`dbv`; the `|dbk| ≈ 0`
   softmax-shift-invariance pin; 2-layer full model at MHA and GQA), the SIMD
-  bit-contract, the **parameter-layout tiling pin** (FD is blind to offset
+  bit-contract, the **SIMD-LM-head tail pin** (`C % 4 ≠ 0` at C=6 vs a scalar
+  dot — mutation-verified; no other config exercises it), the **parameter-layout tiling pin** (FD is blind to offset
   aliasing), the **alloc-accounting pin** (`model_alloc_bytes` ==
   `model_init`, incl. V=300), the **config-magnitude-cap pin**
   (`model_config_ok` rejects out-of-range V/C/T/NL — the `--layers`
@@ -216,17 +217,17 @@ _None yet._
 
 ## Next
 
-See [`roadmap.md`](roadmap.md). M8 (0.8.0) complete: a research-driven
-security sweep — checkpoint format immunity confirmed, the AGNOS `--load`
-crash + the aarch64 `fsync`-save break fixed, CI supply-chain hardened, file
-loader + AGNOS `--load` + boundary fuzz now covered; 247 checks green on both
-arches. The remaining pre-v1 ladder:
+See [`roadmap.md`](roadmap.md). **M9 (v0.8.x) — performance — in progress**,
+one lever per release benched against the CSV:
 
-1. **M9 (v0.8.x)** — performance: LM-head SIMD, packed tanh, matmul tiling,
-   batched prefill — one lever per release, benched against the CSV.
-   **← next.**
-2. **M10 (v0.9.0)** — freeze/docs/cleanup + the vidya example pipeline, so
-   **v1.0.0 is a clean cut** (final audit + tag only).
+1. ✅ **0.8.1 — SIMD tied LM head** (2.7× at V=768).
+2. **next** — a packed `tanh` for GELU (its ~16% share grows as matmul + the
+   head get faster).
+3. then — matmul cache-blocking / register-tiling for the preset sizes; a
+   batched prefill if the context-shift re-prime dominates at larger T.
+
+Then **M10 (v0.9.0)** — freeze/docs/cleanup + the vidya example pipeline, so
+**v1.0.0 is a clean cut** (final audit + tag only).
 
 Loose ends: an `attn11` row upstream in `agnos/scripts/stage-tools.sh`
 (folds into M10 cleanup). The pin and `lib/` snapshot must move together on
