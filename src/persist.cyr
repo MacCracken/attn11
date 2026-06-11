@@ -34,7 +34,10 @@ fn CKPT_HDR_V1(): i64 { return 12; }                  # v1 header i64 fields
 # params is ~100x the largest real attn11 run (X001: 42K).
 fn CKPT_MAX_NP(): i64 { return 4194304; }             # 4M params cap
 fn CKPT_MAX_BYTES(): i64 { return 134217728; }        # 128 MB file cap
-fn CKPT_MAX_MODEL_BYTES(): i64 { return 134217728; }  # 128 MB model-alloc cap
+# CKPT_MAX_MODEL_BYTES (the 128 MB model-alloc cap) lives in model.cyr beside
+# model_alloc_bytes: both the loader (here, -18) and model_init's fresh-path
+# pre-flight gate on it, and model.cyr is included by every harness that builds
+# a model (the bench includes model.cyr but not persist.cyr).
 
 # Parameter count for a config, computed without touching globals (used to
 # validate a checkpoint header before we trust it). Mirrors model.cyr's layout.

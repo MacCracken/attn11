@@ -24,3 +24,9 @@ Not decisions (those live in [`../adr/`](../adr/)) and not guides (those live in
   arithmetically identical, per row, to the batch path; what that forbids
   when changing kernels. **Affects**: `src/attn.cyr`, `src/model.cyr`,
   `src/ops.cyr` — any forward-kernel change.
+- [004 — Harness include sets](004-harness-include-sets.md) — the bench
+  (`tests/attn11.bcyr`) is the only entry point that omits `persist.cyr`, and
+  cyrius compiles an undefined function to a runtime *trap* (not a build
+  error), so a symbol `model.cyr` references must not live only in
+  `persist.cyr` — rebuild **and run** all four harnesses after touching shared
+  `src/`. **Affects**: `src/model.cyr`, `tests/attn11.bcyr`.

@@ -187,6 +187,12 @@ fn model_alloc_bytes(V, C, T, nh, nkv, NL, NP): i64 {
     return e * 8;
 }
 
+# The model-allocation cap (128 MB), gating model_alloc_bytes for BOTH the
+# checkpoint loader (persist.cyr `-18`) and model_init's fresh-path pre-flight.
+# Defined here, not in persist.cyr, so every harness that builds a model has it
+# (the bench harness includes model.cyr but not persist.cyr).
+fn CKPT_MAX_MODEL_BYTES(): i64 { return 134217728; }
+
 # ---- init ------------------------------------------------------------------
 # attn_bias: 1 to give Q/K/V/O biases. dropout: residual dropout prob (f64).
 # nkv: K/V heads (must divide nh; pass nh for classic multi-head attention).
