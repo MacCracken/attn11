@@ -12,6 +12,13 @@ var DT_REG = 8;
 var DT_DIR = 4;
 var DT_LNK = 10;
 
+# v6.1.18: Windows has no getdents64 — directory enumeration is FindFirstFileW.
+# fs_win.cyr supplies the Windows dir_list/is_dir; the getdents64 bodies below
+# are excluded on PE (#ifndef CYRIUS_TARGET_WIN). Mirrors args.cyr/process.cyr.
+#ifdef CYRIUS_TARGET_WIN
+include "lib/fs_win.cyr"
+#endif
+
 # Join two path components with /
 fn path_join(dir, name): i64 {
     var sb = str_builder_new();
@@ -72,6 +79,7 @@ fn path_has_ext(path, ext): i64 {
 # present — `path_has_ext(name, ".tcyr")` returned false for
 # every borrowed-then-clobbered name. dir_list_full + dir_walk
 # inherit the fix transitively (they call dir_list).
+#ifndef CYRIUS_TARGET_WIN
 fn dir_list(path): i64 {
     var entries = vec_new();
     var fd = sys_open(str_data(path), O_RDONLY, 0);
@@ -118,6 +126,7 @@ fn dir_list(path): i64 {
     sys_close(fd);
     return entries;
 }
+#endif
 
 # List directory entries with full paths
 fn dir_list_full(path): i64 {
@@ -132,6 +141,7 @@ fn dir_list_full(path): i64 {
 }
 
 # Check if path is a directory (try to open with getdents)
+#ifndef CYRIUS_TARGET_WIN
 fn is_dir(path): i64 {
     var fd = sys_open(str_data(path), O_RDONLY, 0);
     if (fd < 0) { return 0; }
@@ -147,6 +157,7 @@ fn is_dir(path): i64 {
     if (n >= 0) { return 1; }
     return 0;
 }
+#endif
 
 # Walk a directory tree, push all file paths to a vec
 fn dir_walk(path, results): i64 {

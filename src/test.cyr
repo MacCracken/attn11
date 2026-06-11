@@ -7,5 +7,7 @@ fn main() {
     return 0;
 }
 
-var r = main();
-syscall(SYS_EXIT, r);
+# Statement-call epilogue (not a `var` initializer) — see docs/architecture/002.
+var r = 0;
+r = main();
+sys_exit(r);

@@ -116,6 +116,9 @@
 #   FDL_ERR_ARCH_UNSUPPORTED  = -6  not x86_64 Linux
 #   FDL_ERR_CALLBACK_FAILED   = -7  helper ran but callback never fired
 #   FDL_ERR_UNINIT            = -8  orchestration not yet landed (v5.5.28)
+#   FDL_ERR_UNTRUSTED         = -9  fdlopen_init_trusted: no root-owned system
+#                                   helper at /usr/lib/cyrius/dlopen-helper that
+#                                   passes the lstat trust check (v6.1.29)
 
 enum FdlopenOff {
     FDL_JMPBUF          = 0;
@@ -223,11 +226,28 @@ fn dl_longjmp(buf, val): i64 {
 # Helper path resolution
 # ================================================================
 
-# Build `$HOME/.cyrius/dlopen-helper` into `buf`, returning length
-# on success or 0 if HOME is unset.
+# Trusted-helper mode (v6.1.29). When set by fdlopen_init_trusted(), the helper
+# resolves to the root-owned SYSTEM path instead of the caller's $HOME — closing
+# the setuid privilege-escalation vector where a non-root caller's $HOME copy
+# would be execve'd as root. See the proposal in docs/development/proposals/.
+var _fdl_trusted_mode = 0;
+var _FDL_SYSTEM_HELPER = "/usr/lib/cyrius/dlopen-helper";
+
+# Build the dlopen-helper path into `buf`, returning length on success or 0.
+# Default: `$HOME/.cyrius/dlopen-helper`. In trusted mode: the root-owned
+# system helper (the $HOME copy is NEVER consulted).
 fn _fdlopen_helper_path(buf, bufsz): i64 {
     if (buf == 0) { return 0; }
     if (bufsz < 64) { return 0; }
+    if (_fdl_trusted_mode == 1) {
+        var c = 0;
+        while (load8(_FDL_SYSTEM_HELPER + c) != 0) {
+            store8(buf + c, load8(_FDL_SYSTEM_HELPER + c));
+            c = c + 1;
+        }
+        store8(buf + c, 0);
+        return c;
+    }
     # Read HOME from environ via getenv-style walk. Since we may
     # be called before any libc bootstrap, walk /proc/self/environ
     # directly. Fallback: /home/$USER if HOME is empty.
@@ -739,6 +759,50 @@ fn fdlopen_init_full(state): i64 {
     #endif
     #endif
     store64(state + 216, 0 - 6);
+    return 0 - 6;
+}
+
+# Verify a candidate helper is setuid-safe: a regular file (NOT a symlink),
+# owned by uid 0, and not group/other-writable. Uses lstat (syscall #6) — not
+# stat — so a symlink fails the S_IFREG check below rather than being followed.
+# x86_64 Linux `struct stat`: st_mode @24 (u32), st_uid @28 (u32). Returns 1 if
+# trusted, 0 otherwise.
+fn _fdlopen_verify_trusted(path): i64 {
+    var st[144];
+    var r = syscall(6, path, &st);              # lstat(path, &st)
+    if (r < 0) { return 0; }
+    var mode = load32(&st + 24);
+    var uid = load32(&st + 28);
+    if ((mode & 0xF000) != 0x8000) { return 0; }  # S_IFMT != S_IFREG (rejects symlink/dir)
+    if (uid != 0) { return 0; }                    # not root-owned
+    if ((mode & 0x12) != 0) { return 0; }          # group/other-writable (0o022)
+    return 1;
+}
+
+# fdlopen using a TRUSTED, root-owned system helper — for setuid-root consumers
+# (e.g. shakti, "sudo for AGNOS"). Resolves /usr/lib/cyrius/dlopen-helper and
+# refuses it unless it is a regular file owned by uid 0, not a symlink, and not
+# group/other-writable. The caller's $HOME copy is NEVER consulted — a non-root
+# invoker of a setuid binary owns their $HOME and could replace the helper,
+# which fdlopen would then execve AS ROOT (arbitrary root code execution).
+# Returns -9 (FDL_ERR_UNTRUSTED) if no trusted helper is found; otherwise behaves
+# exactly like fdlopen_init_full. Callers should fail closed on any non-zero
+# return (treat NSS/TLS as unavailable) rather than fall back to the $HOME path.
+fn fdlopen_init_trusted(state): i64 {
+    #ifdef CYRIUS_TARGET_LINUX
+    #ifdef CYRIUS_ARCH_X86
+    if (_fdlopen_verify_trusted(_FDL_SYSTEM_HELPER) == 0) {
+        if (state != 0) { store64(state + 216, 0 - 9); }
+        return 0 - 9;
+    }
+    _fdl_trusted_mode = 1;
+    var rc = fdlopen_init_full(state);
+    _fdl_trusted_mode = 0;
+    return rc;
+    #endif
+    #endif
+    # Non-x86-Linux: foreign-dlopen is glibc-shaped; unsupported here.
+    if (state != 0) { store64(state + 216, 0 - 6); }
     return 0 - 6;
 }
 

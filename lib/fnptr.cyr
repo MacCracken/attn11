@@ -97,6 +97,19 @@ fn fncall0(fp): i64 {
     }
     #endif
     #endif
+    # 6.1.13: agnos ring-3 = x86_64 SysV register-arg passing, identical
+    # to Linux. Without this branch every indirect call returned 0 on
+    # --agnos builds, cascading alloc_via → vec_new → null deref. See
+    # CHANGELOG [6.1.13].
+    #ifdef CYRIUS_TARGET_AGNOS
+    #ifdef CYRIUS_ARCH_X86
+    asm {
+        0x48; 0x8B; 0x45; 0xF8;    # mov rax, [rbp-8]  (fp)
+        0xFF; 0xD0;                # call rax
+        0x48; 0x89; 0x45; 0xF0;    # mov [rbp-16], rax (result)
+    }
+    #endif
+    #endif
     #ifdef CYRIUS_TARGET_WIN
     # Win64 strict-compliance (v5.5.7): 32 B shadow mandatory at
     # every call site. Cyrius callees ignore it (they spill arg
@@ -158,6 +171,20 @@ fn fncall1(fp, a): i64 {
     }
     #endif
     #endif
+    # 6.1.13: agnos ring-3 = x86_64 SysV register-arg passing, identical
+    # to Linux. Without this branch every indirect call returned 0 on
+    # --agnos builds, cascading alloc_via → vec_new → null deref. See
+    # CHANGELOG [6.1.13].
+    #ifdef CYRIUS_TARGET_AGNOS
+    #ifdef CYRIUS_ARCH_X86
+    asm {
+        0x48; 0x8B; 0x7D; 0xF0;    # mov rdi, [rbp-16] (a)
+        0x48; 0x8B; 0x45; 0xF8;    # mov rax, [rbp-8]  (fp)
+        0xFF; 0xD0;                # call rax
+        0x48; 0x89; 0x45; 0xE8;    # mov [rbp-24], rax (result)
+    }
+    #endif
+    #endif
     #ifdef CYRIUS_TARGET_WIN
     asm {
         0x48; 0x8B; 0x4D; 0xF0;    # mov rcx, [rbp-16] (a → arg 0)
@@ -215,6 +242,21 @@ fn fncall2(fp, a, b): i64 {
         0xA9; 0x83; 0x5F; 0xF8;    # ldur x9, [x29, #-8]   (fp)
         0x20; 0x01; 0x3F; 0xD6;    # blr x9
         0xA0; 0x03; 0x1E; 0xF8;    # stur x0, [x29, #-32]  (result)
+    }
+    #endif
+    #endif
+    # 6.1.13: agnos ring-3 = x86_64 SysV register-arg passing, identical
+    # to Linux. Without this branch every indirect call returned 0 on
+    # --agnos builds, cascading alloc_via → vec_new → null deref. See
+    # CHANGELOG [6.1.13].
+    #ifdef CYRIUS_TARGET_AGNOS
+    #ifdef CYRIUS_ARCH_X86
+    asm {
+        0x48; 0x8B; 0x75; 0xE8;    # mov rsi, [rbp-24] (b)
+        0x48; 0x8B; 0x7D; 0xF0;    # mov rdi, [rbp-16] (a)
+        0x48; 0x8B; 0x45; 0xF8;    # mov rax, [rbp-8]  (fp)
+        0xFF; 0xD0;                # call rax
+        0x48; 0x89; 0x45; 0xE0;    # mov [rbp-32], rax (result)
     }
     #endif
     #endif
@@ -280,6 +322,22 @@ fn fncall3(fp, a, b, c): i64 {
         0xA9; 0x83; 0x5F; 0xF8;    # ldur x9, [x29, #-8]   (fp)
         0x20; 0x01; 0x3F; 0xD6;    # blr x9
         0xA0; 0x83; 0x1D; 0xF8;    # stur x0, [x29, #-40]  (result)
+    }
+    #endif
+    #endif
+    # 6.1.13: agnos ring-3 = x86_64 SysV register-arg passing, identical
+    # to Linux. Without this branch every indirect call returned 0 on
+    # --agnos builds, cascading alloc_via → vec_new → null deref. See
+    # CHANGELOG [6.1.13].
+    #ifdef CYRIUS_TARGET_AGNOS
+    #ifdef CYRIUS_ARCH_X86
+    asm {
+        0x48; 0x8B; 0x55; 0xE0;    # mov rdx, [rbp-32] (c)
+        0x48; 0x8B; 0x75; 0xE8;    # mov rsi, [rbp-24] (b)
+        0x48; 0x8B; 0x7D; 0xF0;    # mov rdi, [rbp-16] (a)
+        0x48; 0x8B; 0x45; 0xF8;    # mov rax, [rbp-8]  (fp)
+        0xFF; 0xD0;                # call rax
+        0x48; 0x89; 0x45; 0xD8;    # mov [rbp-40], rax (result)
     }
     #endif
     #endif
@@ -350,6 +408,23 @@ fn fncall4(fp, a, b, c, d): i64 {
         0xA9; 0x83; 0x5F; 0xF8;    # ldur x9, [x29, #-8]   (fp)
         0x20; 0x01; 0x3F; 0xD6;    # blr x9
         0xA0; 0x03; 0x1D; 0xF8;    # stur x0, [x29, #-48]  (result)
+    }
+    #endif
+    #endif
+    # 6.1.13: agnos ring-3 = x86_64 SysV register-arg passing, identical
+    # to Linux. Without this branch every indirect call returned 0 on
+    # --agnos builds, cascading alloc_via → vec_new → null deref. See
+    # CHANGELOG [6.1.13].
+    #ifdef CYRIUS_TARGET_AGNOS
+    #ifdef CYRIUS_ARCH_X86
+    asm {
+        0x48; 0x8B; 0x4D; 0xD8;    # mov rcx, [rbp-40] (d)
+        0x48; 0x8B; 0x55; 0xE0;    # mov rdx, [rbp-32] (c)
+        0x48; 0x8B; 0x75; 0xE8;    # mov rsi, [rbp-24] (b)
+        0x48; 0x8B; 0x7D; 0xF0;    # mov rdi, [rbp-16] (a)
+        0x48; 0x8B; 0x45; 0xF8;    # mov rax, [rbp-8]  (fp)
+        0xFF; 0xD0;                # call rax
+        0x48; 0x89; 0x45; 0xD0;    # mov [rbp-48], rax (result)
     }
     #endif
     #endif
@@ -425,6 +500,24 @@ fn fncall5(fp, a, b, c, d, e): i64 {
         0xA9; 0x83; 0x5F; 0xF8;    # ldur x9, [x29, #-8]   (fp)
         0x20; 0x01; 0x3F; 0xD6;    # blr x9
         0xA0; 0x83; 0x1C; 0xF8;    # stur x0, [x29, #-56]  (result)
+    }
+    #endif
+    #endif
+    # 6.1.13: agnos ring-3 = x86_64 SysV register-arg passing, identical
+    # to Linux. Without this branch every indirect call returned 0 on
+    # --agnos builds, cascading alloc_via → vec_new → null deref. See
+    # CHANGELOG [6.1.13].
+    #ifdef CYRIUS_TARGET_AGNOS
+    #ifdef CYRIUS_ARCH_X86
+    asm {
+        0x4C; 0x8B; 0x45; 0xD0;    # mov r8, [rbp-48] (e)
+        0x48; 0x8B; 0x4D; 0xD8;    # mov rcx, [rbp-40] (d)
+        0x48; 0x8B; 0x55; 0xE0;    # mov rdx, [rbp-32] (c)
+        0x48; 0x8B; 0x75; 0xE8;    # mov rsi, [rbp-24] (b)
+        0x48; 0x8B; 0x7D; 0xF0;    # mov rdi, [rbp-16] (a)
+        0x48; 0x8B; 0x45; 0xF8;    # mov rax, [rbp-8]  (fp)
+        0xFF; 0xD0;                # call rax
+        0x48; 0x89; 0x45; 0xC8;    # mov [rbp-56], rax (result)
     }
     #endif
     #endif
@@ -508,6 +601,25 @@ fn fncall6(fp, a, b, c, d, e, f): i64 {
         0xA9; 0x83; 0x5F; 0xF8;    # ldur x9, [x29, #-8]   (fp)
         0x20; 0x01; 0x3F; 0xD6;    # blr x9
         0xA0; 0x03; 0x1C; 0xF8;    # stur x0, [x29, #-64]  (result)
+    }
+    #endif
+    #endif
+    # 6.1.13: agnos ring-3 = x86_64 SysV register-arg passing, identical
+    # to Linux. Without this branch every indirect call returned 0 on
+    # --agnos builds, cascading alloc_via → vec_new → null deref. See
+    # CHANGELOG [6.1.13].
+    #ifdef CYRIUS_TARGET_AGNOS
+    #ifdef CYRIUS_ARCH_X86
+    asm {
+        0x4C; 0x8B; 0x4D; 0xC8;    # mov r9,  [rbp-56] (f)
+        0x4C; 0x8B; 0x45; 0xD0;    # mov r8,  [rbp-48] (e)
+        0x48; 0x8B; 0x4D; 0xD8;    # mov rcx, [rbp-40] (d)
+        0x48; 0x8B; 0x55; 0xE0;    # mov rdx, [rbp-32] (c)
+        0x48; 0x8B; 0x75; 0xE8;    # mov rsi, [rbp-24] (b)
+        0x48; 0x8B; 0x7D; 0xF0;    # mov rdi, [rbp-16] (a)
+        0x48; 0x8B; 0x45; 0xF8;    # mov rax, [rbp-8]  (fp)
+        0xFF; 0xD0;                # call rax
+        0x48; 0x89; 0x45; 0xC0;    # mov [rbp-64], rax (result)
     }
     #endif
     #endif
@@ -626,6 +738,29 @@ fn fncall7(fp, a, b, c, d, e, f, g): i64 {
     }
     #endif
     #endif
+    # 6.1.13: agnos ring-3 = x86_64 SysV register-arg passing, identical
+    # to Linux. Without this branch every indirect call returned 0 on
+    # --agnos builds, cascading alloc_via → vec_new → null deref. See
+    # CHANGELOG [6.1.13].
+    #ifdef CYRIUS_TARGET_AGNOS
+    #ifdef CYRIUS_ARCH_X86
+    asm {
+        0x48; 0x83; 0xEC; 0x10;         # sub rsp, 16       (reserve stack-arg slot + padding)
+        0x48; 0x8B; 0x45; 0xC0;         # mov rax, [rbp-64] (g)
+        0x48; 0x89; 0x04; 0x24;         # mov [rsp], rax    (stack arg 7)
+        0x4C; 0x8B; 0x4D; 0xC8;         # mov r9,  [rbp-56] (f)
+        0x4C; 0x8B; 0x45; 0xD0;         # mov r8,  [rbp-48] (e)
+        0x48; 0x8B; 0x4D; 0xD8;         # mov rcx, [rbp-40] (d)
+        0x48; 0x8B; 0x55; 0xE0;         # mov rdx, [rbp-32] (c)
+        0x48; 0x8B; 0x75; 0xE8;         # mov rsi, [rbp-24] (b)
+        0x48; 0x8B; 0x7D; 0xF0;         # mov rdi, [rbp-16] (a)
+        0x48; 0x8B; 0x45; 0xF8;         # mov rax, [rbp-8]  (fp)
+        0xFF; 0xD0;                     # call rax
+        0x48; 0x83; 0xC4; 0x10;         # add rsp, 16       (restore)
+        0x48; 0x89; 0x45; 0xB8;         # mov [rbp-72], rax (result)
+    }
+    #endif
+    #endif
     #ifdef CYRIUS_TARGET_WIN
     # v5.5.7 strict: 32 B shadow + args 4-6 (e, f, g) at
     # [rsp+32..48]. framesize = 32 + 24 + 8 pad = 64 (16-aligned).
@@ -735,6 +870,31 @@ fn fncall8(fp, a, b, c, d, e, f, g, h): i64 {
         0x20; 0x01; 0x3F; 0xD6;    # blr x9
         0xFF; 0x83; 0x00; 0x91;    # add sp, sp, #32       (restore 2 × 16 bytes)
         0xA0; 0x03; 0x1B; 0xF8;    # stur x0, [x29, #-80]  (result)
+    }
+    #endif
+    #endif
+    # 6.1.13: agnos ring-3 = x86_64 SysV register-arg passing, identical
+    # to Linux. Without this branch every indirect call returned 0 on
+    # --agnos builds, cascading alloc_via → vec_new → null deref. See
+    # CHANGELOG [6.1.13].
+    #ifdef CYRIUS_TARGET_AGNOS
+    #ifdef CYRIUS_ARCH_X86
+    asm {
+        0x48; 0x83; 0xEC; 0x10;         # sub rsp, 16         (room for args 7+8)
+        0x48; 0x8B; 0x45; 0xC0;         # mov rax, [rbp-64]   (g)
+        0x48; 0x89; 0x04; 0x24;         # mov [rsp], rax      (stack arg 7)
+        0x48; 0x8B; 0x45; 0xB8;         # mov rax, [rbp-72]   (h)
+        0x48; 0x89; 0x44; 0x24; 0x08;   # mov [rsp+8], rax    (stack arg 8)
+        0x4C; 0x8B; 0x4D; 0xC8;         # mov r9,  [rbp-56]   (f)
+        0x4C; 0x8B; 0x45; 0xD0;         # mov r8,  [rbp-48]   (e)
+        0x48; 0x8B; 0x4D; 0xD8;         # mov rcx, [rbp-40]   (d)
+        0x48; 0x8B; 0x55; 0xE0;         # mov rdx, [rbp-32]   (c)
+        0x48; 0x8B; 0x75; 0xE8;         # mov rsi, [rbp-24]   (b)
+        0x48; 0x8B; 0x7D; 0xF0;         # mov rdi, [rbp-16]   (a)
+        0x48; 0x8B; 0x45; 0xF8;         # mov rax, [rbp-8]    (fp)
+        0xFF; 0xD0;                     # call rax
+        0x48; 0x83; 0xC4; 0x10;         # add rsp, 16
+        0x48; 0x89; 0x45; 0xB0;         # mov [rbp-80], rax   (result)
     }
     #endif
     #endif

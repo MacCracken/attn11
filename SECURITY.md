@@ -45,6 +45,13 @@ attn11 *does not* defend against:
 - Checkpoint save writes to `<path>.tmp` then renames over `<path>`; the temp
   uses `O_TRUNC` (a stale `.tmp` from a prior crash is overwritten) and
   `O_NOFOLLOW`. Don't point `--save` at an attacker-controlled directory.
+- **The table above describes the Linux targets.** On the AGNOS target
+  (v0.6.0+) three guarantees are weaker, inherent to the frozen agnos ABI:
+  no `O_NOFOLLOW` (the `AO_*` flag set has no nofollow bit), sizes come from
+  path-`stat` rather than `fstat` (a benign race — the size only caps the
+  allocation, and reads stop at EOF), and durability uses the global `sync()`
+  (no per-fd `fsync`). See `docs/guides/agnos.md` and
+  `docs/audit/2026-06-10-agnos-audit.md`.
 - Cross-architecture checkpoints are not portable: tensors are raw native
   little-endian `f64` bit patterns (no endianness header). A checkpoint is
   validated for shape/size but its payload is trusted once the header passes —

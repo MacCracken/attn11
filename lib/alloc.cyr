@@ -97,26 +97,95 @@ include "lib/alloc_agnos.cyr"
 #endif
 
 #ifdef CYRIUS_TARGET_LINUX
-var _heap_base = 0;
-var _heap_ptr = 0;
-var _heap_end = 0;
+# v6.1.19: the Linux heap was brk(2)-backed (1 MB + grow via brk). brk is a
+# PROCESS-GLOBAL resource glibc malloc's main arena ALSO owns; whenever a
+# glibc-using shared library is loaded into the process (lib/fdlopen.cyr →
+# libssl.so.3 / libcrypto.so.3 for the default TLS backend), cyrius's direct
+# brk(12) growth and glibc's sbrk arena fought over the single program break.
+# The 1 MB reservation masked it until the FIRST grow, at which point a libssl
+# allocation deref'd a clobbered pointer → process SIGSEGV inside libssl. The
+# fix is to allocate from ANONYMOUS mmap instead — anonymous mappings can't
+# collide with glibc's brk arena, so the libssl backend (and any future fdlopen
+# of a glibc library) is no longer a latent process-killer.
+#
+# Structure: a CHUNK-based bump allocator (mirrors lib/alloc_agnos.cyr, the
+# proven pattern). brk grew ONE contiguous region without bound; anonymous mmap
+# can't be grown contiguously (the page after a reservation is usually already
+# mapped — that's what broke the first up-front-reserve attempt: the
+# unicode_normconf suite alloc'd >256 MB and the hinted-grow contiguity check
+# failed → null → segfault). So instead of requiring contiguity, bump within
+# the current chunk and, on overflow, mmap a FRESH chunk anywhere and continue
+# there. Old chunks stay mapped + valid (no individual free; reclaimed at
+# process exit). A single allocation never spans chunks — an alloc larger than
+# the chunk grain gets a chunk sized to it — so handed-out pointers are always
+# contiguous over their own length. Linux overcommits anonymous RW mmap, so the
+# chunk size is virtual: only touched pages cost RAM.
+# See docs/development/issues/2026-06-09-brk-bump-heap-vs-fdlopen-libssl-malloc.md,
+# CHANGELOG [6.1.19].
+var _heap_base = 0;         # current chunk base
+var _heap_ptr = 0;          # bump pointer within the current chunk
+var _heap_end = 0;          # current chunk end (base + chunk size)
+var _heap_first_base = 0;   # first chunk base (alloc_reset rewind target)
+var _heap_first_end = 0;    # first chunk end
+var _heap_used = 0;         # total bytes handed out since last init/reset
 
-# Initialize the heap allocator. Pre-v5.8.37 this had to be called
-# before any alloc(); v5.8.37 makes the call optional via lazy-init
-# in alloc() itself. Still callable for explicitness; re-callable
-# (re-brk's the heap to its initial 1MB size).
-fn alloc_init(): i64 {
-    _heap_base = syscall(12, 0);
-    _heap_end = _heap_base + 0x100000;
-    syscall(12, _heap_end);
-    _heap_ptr = _heap_base;
-    return _heap_base;
-}
+# Per-chunk reservation: 256 MB virtual, lazy-committed. Big enough that the
+# vast majority of programs (incl. cycc's own vec/rp_vec usage) never grow past
+# the first chunk, so alloc_reset cleanly reuses it with no chunk leak.
+var _LINUX_CHUNK = 0x10000000;
+
+# Linux mmap flags for an anonymous private mapping: MAP_PRIVATE (0x2) |
+# MAP_ANONYMOUS (0x20). (macOS uses 0x1002 — Darwin's MAP_ANON is 0x1000.)
+var _LINUX_MAP_ANON_PRIVATE = 0x22;
 
 # Maximum single allocation size (256MB)
 var ALLOC_MAX = 0x10000000;
 
-# Allocate size bytes from the heap, 8-byte aligned
+# Round `n` up to the next _LINUX_CHUNK multiple.
+fn _linux_round_chunk(n): i64 {
+    return (n + (_LINUX_CHUNK - 1)) & (0 - _LINUX_CHUNK);
+}
+
+# mmap a fresh anonymous chunk of at least `min` bytes (rounded to the chunk
+# grain) and make it the current chunk. Returns the base, or 0 on failure
+# (raw mmap returns a small negative -errno on error).
+fn _linux_new_chunk(min): i64 {
+    var sz = _linux_round_chunk(min);
+    if (sz < _LINUX_CHUNK) { sz = _LINUX_CHUNK; }
+    var base = syscall(9, 0, sz, 3, _LINUX_MAP_ANON_PRIVATE, 0 - 1, 0);
+    if (base < 0) { return 0; }
+    _heap_base = base;
+    _heap_ptr = base;
+    _heap_end = base + sz;
+    return base;
+}
+
+# Initialize the heap allocator. Pre-v5.8.37 this had to be called before any
+# alloc(); v5.8.37 makes the call optional via lazy-init in alloc(). Still
+# callable for explicitness; re-callable (re-mmaps a fresh first chunk — the
+# old chunks are abandoned, matching alloc_agnos.cyr / alloc_macos.cyr).
+fn alloc_init(): i64 {
+    # Idempotent (v6.1.23): once the heap is up, a re-call is a no-op returning the
+    # existing first-chunk base. Pre-fix, every recall mmap'd a FRESH 256 MB chunk
+    # + zeroed _heap_used, abandoning the live chunk — a 256 MB-VA leak per repeated
+    # caller (notably lib/thread.cyr's per-thread alloc_init). Callers that want to
+    # free everything use alloc_reset(). The brk-era alloc_init this replaced was
+    # effectively idempotent (re-brk to current break); the v6.1.19 brk→chunk switch
+    # lost that. See docs/development/issues/2026-06-09-chunked-alloc-init-not-idempotent-rechunks-on-recall.md.
+    if (_heap_base != 0) { return _heap_first_base; }
+    var base = _linux_new_chunk(_LINUX_CHUNK);
+    if (base == 0) {
+        syscall(1, 2, "alloc_init: mmap failed\n", 24);
+        syscall(60, 1);
+    }
+    _heap_first_base = base;
+    _heap_first_end = _heap_end;
+    _heap_used = 0;
+    return base;
+}
+
+# Allocate size bytes from the heap, 8-byte aligned. Bumps within the current
+# chunk; on overflow mmaps a new chunk big enough for the request.
 fn alloc(size): i64 {
     # Reject oversized or negative allocations. Pure (no shared state) —
     # validated OUTSIDE the lock so bad calls never contend.
@@ -124,45 +193,39 @@ fn alloc(size): i64 {
     if (size > ALLOC_MAX) { return 0; }
     # Align to 8 bytes (local — outside the lock).
     size = (size + 7) & (0 - 8);
-    # --- critical section: bump pointer + grow are shared mutable state ---
+    # --- critical section: chunk state + _linux_new_chunk are shared ---
     _alloc_lock_acquire();
     # v5.8.37 — lazy-init the heap if alloc_init() was never called
     # (now race-safe: two threads can't both init). See CHANGELOG [5.8.37].
     if (_heap_base == 0) { alloc_init(); }
-    var ptr = _heap_ptr;
-    var new_ptr = ptr + size;
-    # Overflow check: wrapped pointer means arithmetic overflow
-    if (new_ptr < ptr) { _alloc_lock_release(); return 0; }
-    _heap_ptr = new_ptr;
-    if (_heap_ptr > _heap_end) {
-        # Grow to cover _heap_ptr, round up to next 1MB grain
-        # (low brk-churn + correct for alloc(>1MB); see CHANGELOG [5.6.34]).
-        var new_end = (_heap_ptr + 0xFFFFF) & (0 - 0x100000);
-        var result = syscall(12, new_end);
-        if (result < new_end) {
-            # brk failed — out of memory
-            _heap_ptr = ptr;
-            _alloc_lock_release();
-            return 0;
-        }
-        _heap_end = new_end;
+    if (_heap_ptr + size > _heap_end) {
+        # Current chunk can't fit it — mmap a fresh chunk sized to the request.
+        if (_linux_new_chunk(size) == 0) { _alloc_lock_release(); return 0; }
     }
+    var ptr = _heap_ptr;
+    _heap_ptr = ptr + size;
+    _heap_used = _heap_used + size;
     _alloc_lock_release();
     return ptr;
 }
 
-# Reset the heap, freeing all allocations at once. Locked so a concurrent
+# Batch-free: rewind to the first chunk. Later chunks stay mapped (re-bumped by
+# fresh mmaps if growth is needed again — reclaimed at process exit), so this is
+# a cheap reuse of the first chunk, not a munmap sweep. Locked so a concurrent
 # alloc() can't observe a half-updated bump pointer.
 fn alloc_reset(): i64 {
     _alloc_lock_acquire();
-    _heap_ptr = _heap_base;
+    _heap_base = _heap_first_base;
+    _heap_ptr = _heap_first_base;
+    _heap_end = _heap_first_end;
+    _heap_used = 0;
     _alloc_lock_release();
     return 0;
 }
 
-# Return the number of heap bytes currently in use
+# Return the number of heap bytes handed out since the last init/reset
 fn alloc_used(): i64 {
-    return _heap_ptr - _heap_base;
+    return _heap_used;
 }
 #endif
 

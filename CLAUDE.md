@@ -56,6 +56,7 @@ cyrius build tests/attn11.bcyr build/bench && ./build/bench # benchmarks
 cyrius lint src/*.cyr                         # static checks
 CYRIUS_DCE=1 cyrius build src/main.cyr build/attn11         # release build (DCE)
 cyrius build --aarch64 tests/attn11.tcyr build/test_a64 && qemu-aarch64 build/test_a64  # aarch64 via qemu
+cyrius build --agnos src/main.cyr build/attn11_agnos        # AGNOS ring-3 target (build-only here; see docs/guides/agnos.md)
 ```
 
 ## Key Principles

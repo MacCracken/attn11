@@ -25,8 +25,9 @@ v1.0.0 ships when **all** of these hold:
       fuzz harnesses for every external input path.
 - [ ] **Benchmarks** — step time + tokens/sec captured in
       [`benchmarks.md`](../benchmarks.md), with a tracked history.
-- [ ] **Portability** — builds and trains on Linux x86_64 **and** aarch64, and
-      runs under the **AGNOS kernel** (`--agnos`); results match within tolerance.
+- [x] **Portability** — builds and trains on Linux x86_64 **and** aarch64, and
+      runs under the **AGNOS kernel** (`--agnos`); results match within tolerance
+      (aarch64: display-precision; AGNOS: bit-for-bit at fixed CPU — M5).
 - [ ] **One consumer green** — at least one downstream user (or a documented
       example pipeline) builds against a tagged attn11.
 - [ ] **CHANGELOG complete** from 0.1.0 onward; **security audit** recorded in
@@ -91,24 +92,28 @@ v1.0.0 ships when **all** of these hold:
 - **Gates met**: aarch64 CI lane (cross-build + qemu) green; soak clean; both
   arches pass 52 checks. (Native aarch64 hardware runs are emulated via qemu.)
 
-### M5 — Portability: AGNOS kernel (v0.6.0)
+### M5 — Portability: AGNOS kernel (v0.6.0) — ✅ shipped 2026-06-11
 
-Adapt attn11 to run as a ring-3 application under the **AGNOS kernel** (the
-sovereign OS Cyrius writes), not just Linux. The stdlib already ships the target
-layer (`syscalls_x86_64_agnos.cyr`, `alloc_agnos.cyr`, …); `cyrius build --agnos`
-selects it via `CYRIUS_TARGET_AGNOS`.
-
-- **De-Linux the syscalls**: replace the raw Linux syscall numbers baked into
-  the source (`syscall(60)` exit, `syscall(1, 1, …)` write in `_putc`/`fmt`
-  paths) with the portable stdlib wrappers that dispatch per target — so the
-  same source compiles for Linux, aarch64, and AGNOS.
-- Build `cyrius build --agnos src/main.cyr` clean; resolve any
-  AGNOS-userland-ABI gaps (see `agnos/docs/development/agnos-userland-abi.md`).
-- Confirm the AGNOS allocator path (`alloc_agnos.cyr`) backs the one-shot
-  arena allocation the training loop relies on.
-- **Gates**: `--agnos` build is green in CI; the binary trains + samples under
-  AGNOS and reproduces the Linux run bit-for-bit for a fixed seed; grad-check
-  suite builds for AGNOS. Document the AGNOS build/run in a guide.
+- ✅ **De-Linuxed every raw syscall site** (exit/write in `_putc`, harness
+  epilogues, and the fileio fstat/fsync/unlink/rename Linux-isms) behind
+  portable wrappers + `#ifdef CYRIUS_TARGET_AGNOS` bridges — one source tree
+  compiles for Linux x86_64, Linux aarch64, and AGNOS.
+- ✅ `cyrius build --agnos` clean for the binary AND the grad-check suite
+  (static x86_64 ELF64); new build-only `agnos` CI lane. The agnos allocator
+  (`alloc_agnos.cyr`, chunked mmap bump) backs the one-shot arena fine.
+- ✅ Toolchain pin `6.1.6` → `6.1.31` (old pin predated the 6.1.13/6.1.14
+  HIGH-sev agnos codegen fixes); found + worked around a remaining cycc gap
+  (argv capture emitted after call-bearing gvar inits → statement-call entry
+  epilogues; filed upstream, `docs/architecture/002`).
+- ✅ `scripts/agnos-smoke.sh` — boots the real kernel (gnoboot + agnos 1.44.15
+  + agnsh 1.6.x) in QEMU, drives `run /bin/attn11 --steps N --save /ck.ckpt`
+  over the emulated keyboard, extracts the checkpoint from the ext2 image.
+- **Gates met**: the binary **trains + samples under AGNOS**; the saved
+  checkpoint is **bit-for-bit identical** to the Linux run (948,008 bytes,
+  fixed seed, CPU implementation held constant — Linux reference under
+  `qemu-x86_64`, mirroring the aarch64 method); 1000-step loss/lr/grad-norm
+  serial output matches native Linux to every displayed digit; grad-check
+  suite builds for AGNOS; documented in `docs/guides/agnos.md`.
 
 ### M6 — Freeze & consumer (v0.9.0 → v1.0.0)
 

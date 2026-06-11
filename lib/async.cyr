@@ -29,27 +29,49 @@ var TASK_DONE = 2;
 # Task struct: { fp, arg, state, next } = 32 bytes
 var TASK_SIZE = 32;
 
-# Runtime struct: { epfd, tasks, task_count, active } = 32 bytes
-var RT_SIZE = 32;
+# Runtime struct: { epfd, tasks, task_count, active, allocator } = 40 bytes.
+# v6.1.22 — +allocator slot @32: async_new_in threads a caller-owned Allocator
+# so the rt AND its spawned task structs come from it. A long-running batched
+# accept loop (daimon serve_async, sandhi sandhi_server_run_async) recreates the
+# runtime each batch (async_run closes its epfd → single-use); with the global
+# bump (no free) that leaked ~32 B/task + 32 B/batch forever. Passing an
+# arena_allocator + reset_via(a) per batch reclaims it. See
+# docs/development/issues/2026-06-09-async-runtime-no-free-task-leak.md.
+var RT_SIZE = 40;
 
-# Create a new async runtime with epoll. Consumer: daimon
-# (src/main.cyr) — the cooperative multitasking event loop is
-# the runtime kybernet sd_notify + bote streaming dispatch both
-# delegate to.
-fn async_new(): i64 {
-    alloc_init();
-    var rt = alloc(RT_SIZE);
+# Create a new async runtime whose rt + every async_spawn task struct are
+# allocated from `a` — an Allocator from lib/alloc.cyr (bump_allocator /
+# arena_allocator / default_alloc). For a long-running batched loop, pass an
+# arena_allocator and reset_via(a) after each async_run to reclaim that batch's
+# runtime + tasks with zero residual leak (the global bump has no free). v6.1.22.
+fn async_new_in(a): i64 {
+    var rt = alloc_via(a, RT_SIZE);
+    if (rt == 0) { return 0; }
     var epfd = syscall(SYS_EPOLL_CREATE1, 0);
     store64(rt, epfd);
     store64(rt + 8, 0);
     store64(rt + 16, 0);
     store64(rt + 24, 0);
+    store64(rt + 32, a);
     return rt;
 }
 
+# Create a new async runtime with epoll, backed by the global bump allocator
+# (back-compat — wraps async_new_in(default_alloc())). Consumer: daimon
+# (src/main.cyr) — the cooperative multitasking event loop kybernet sd_notify +
+# bote streaming dispatch both delegate to. NOTE: the global bump has no free,
+# so a loop that recreates the runtime per batch leaks; use
+# async_new_in(arena_allocator(...)) + reset_via for a zero-leak server.
+fn async_new(): i64 {
+    return async_new_in(default_alloc());
+}
+
 # Spawn a task on the runtime. fp is a function pointer, arg is its argument.
+# The task struct comes from the runtime's allocator (set by async_new_in),
+# so an arena-backed runtime keeps spawned tasks out of the global bump.
 fn async_spawn(rt, fp, arg): i64 {
-    var t = alloc(TASK_SIZE);
+    var t = alloc_via(load64(rt + 32), TASK_SIZE);
+    if (t == 0) { return 0; }
     store64(t, fp);
     store64(t + 8, arg);
     store64(t + 16, TASK_READY);

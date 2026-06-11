@@ -164,7 +164,7 @@ fn t_randn(p, n, std): i64 {
 }
 
 # ---- diagnostics -----------------------------------------------------------
-fn _putc(ch): i64 { var b[8]; store8(&b, ch); syscall(1, 1, &b, 1); return 0; }
+fn _putc(ch): i64 { var b[8]; store8(&b, ch); sys_write(1, &b, 1); return 0; }
 
 # print a null-terminated string (length via strlen — avoids byte-count slips
 # with multi-byte UTF-8 like the em-dash).

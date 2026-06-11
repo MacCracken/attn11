@@ -4,6 +4,77 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-06-11
+
+**AGNOS kernel port (roadmap M5).** attn11 now runs as a ring-3 application
+under the AGNOS kernel: it **trains, checkpoints, and samples under the booted
+kernel**, and the saved checkpoint is **bit-for-bit identical** to the Linux
+run (948,008 bytes, fixed seed, CPU implementation held constant). One source
+tree compiles for Linux x86_64, Linux aarch64, and AGNOS. No model behavior
+change on Linux (52 checks, fuzz, and benchmarks unchanged).
+
+### Added
+- **AGNOS cross-build** (`cyrius build --agnos src/main.cyr build/attn11_agnos`)
+  compiles clean — a static x86_64 ELF64, the shape agnos exec-from-disk
+  (`elf_load_from_file`) requires. New build-only `agnos` CI lane (binary +
+  grad-check suite + static-ELF verify).
+- `scripts/agnos-smoke.sh` — the M5 run gate as a one-command harness, **PASS**
+  on agnos 1.44.15 + agnsh 1.6.x: boots the real kernel in QEMU (gnoboot +
+  ext2 rootfs with `/bin/agnsh` + `/bin/attn11`), drives
+  `run /bin/attn11 --steps N --save /ck.ckpt` over the emulated keyboard,
+  extracts the checkpoint from the ext2 image with `debugfs` (post-boot
+  `e2fsck` clean) and `cmp`s it against the Linux reference. The reference
+  runs under `qemu-x86_64` when the guest is TCG — x87 transcendentals are
+  implementation-defined, so silicon-vs-TCG differs by ULPs; holding the CPU
+  constant isolates the software stack, mirroring the aarch64 method. A
+  1000-step run under AGNOS also matches native serial output (loss/lr/
+  grad-norm) to every displayed digit.
+- `docs/guides/agnos.md` — how the AGNOS build works, what the target lacks
+  (no `fstat`/`fsync`, explicit-length paths, `AO_*` flags), how attn11
+  bridges each gap, and how to run the gate.
+- `docs/audit/2026-06-10-agnos-audit.md` — the M5 delta audit (adversarial
+  review + run-gate findings, both fixed/worked-around; the two documented
+  AGNOS security deltas).
+- `docs/architecture/002-agnos-entry-epilogue.md` + the upstream issue filing
+  (see Fixed below).
+
+### Fixed
+- **agnos argv: entry epilogues converted to the statement-call shape**
+  (`var r = 0; r = main();` — all five entry files). With the scaffold's
+  `var r = main();` initializer shape, cycc emits the `main()` call inside the
+  gvar-init block, *before* the v6.1.14 `_agnos_capture_rsp` emission — so on
+  agnos `argc()` returned 0 inside `main` and every CLI flag was silently
+  ignored (Linux unaffected). Diagnosed by disassembly + a minimal argv probe
+  under the booted kernel; upstream cycc gap filed in
+  `docs/development/issues/2026-06-10-cyrius-agnos-capture-after-gvar-init-call.md`,
+  rule recorded in `docs/architecture/002-agnos-entry-epilogue.md`.
+
+### Changed
+- **Toolchain pin `6.1.6` → `6.1.31`** — flagged by the M5 adversarial review:
+  6.1.6 predates two HIGH-sev agnos codegen fixes (6.1.13: indirect calls
+  returned 0 on the agnos target; 6.1.14: `argc()`/`argv()` returned 0/null
+  because the init-stack capture ran after top-level code moved rsp — exactly
+  attn11's `var r = main()` shape), so a 6.1.6-built agnos binary silently
+  ignores every CLI flag. `lib/` re-synced to the 6.1.31 snapshot. Stdlib deps
+  follow the 6.1.31 reshuffle: `ganita` added (`f64_tanh`/`f64_pow` moved
+  there from `math.cyr`), unused `matrix` dropped (its `mat_*` now duplicate
+  ganita's, and attn11 has its own SIMD matmul).
+- **De-Linuxed every raw syscall site** so one source tree compiles for Linux
+  x86_64, Linux aarch64, and AGNOS:
+  - `tensor.cyr` `_putc`: raw `syscall(1, 1, …)` → portable `sys_write`.
+  - `main.cyr`/`test.cyr` + the test/bench/fuzz harness epilogues: raw
+    `syscall(60, …)` exit / `syscall(1, 2, …)` stderr → `sys_exit`/`sys_write`.
+  - `fileio.cyr`: `_file_size` now takes `(fd, path)` — Linux keeps `fstat(fd)`
+    (st_size @ 48); AGNOS has no fstat, so it path-stats (ABI §4.1, size @ 16).
+    New `_unlink`/`_rename` shims bridge the explicit-path-length AGNOS ABI
+    (§3.2) vs the NUL-terminated Linux wrappers. `_fsync` falls back to the
+    global `sys_sync()` on AGNOS (no per-fd fsync in the frozen ABI).
+
+### Removed
+- The unused `random` stdlib dep (kernel-CSPRNG `random_bytes`; attn11's PRNG
+  is deliberately deterministic) — it was also the one undefined-symbol
+  (`sys_getrandom`) hold-out in the AGNOS build.
+
 ## [0.5.1] - 2026-06-08
 
 First-party standards conformance (docs/process; no model behavior change).

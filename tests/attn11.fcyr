@@ -75,13 +75,13 @@ fn main(): i64 {
         var j = 0;
         while (j < clen) { store8(cb + j, fz_pos() & 0xFF); j = j + 1; }
         var vv = corpus_set(cb, clen);
-        if (vv < 1) { syscall(1, 2, "FAIL: corpus vocab < 1\n", 23); syscall(60, 1); }
-        if (vv > 256) { syscall(1, 2, "FAIL: corpus vocab > 256\n", 25); syscall(60, 2); }
+        if (vv < 1) { sys_write(2, "FAIL: corpus vocab < 1\n", 23); sys_exit(1); }
+        if (vv > 256) { sys_write(2, "FAIL: corpus vocab > 256\n", 25); sys_exit(2); }
         cr = cr + 1;
     }
 
     # ensure the malformed inputs were actually exercised (most must reject)
-    if (rejected < 1) { syscall(1, 2, "FAIL: nothing rejected\n", 23); syscall(60, 3); }
+    if (rejected < 1) { sys_write(2, "FAIL: nothing rejected\n", 23); sys_exit(3); }
 
     puts("fuzz: ok  ("); fmt_int(rounds); puts(" ckpt rounds, ");
     fmt_int(rejected); puts(" rejected / "); fmt_int(accepted);
@@ -89,5 +89,7 @@ fn main(): i64 {
     return 0;
 }
 
-var r = main();
-syscall(60, r);
+# Statement-call epilogue (not a `var` initializer) — see docs/architecture/002.
+var r = 0;
+r = main();
+sys_exit(r);

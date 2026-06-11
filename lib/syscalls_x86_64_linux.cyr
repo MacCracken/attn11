@@ -39,6 +39,7 @@ enum SysNr {
     SYS_WAIT4 = 61;
     SYS_KILL = 62;
     SYS_UNAME = 63;
+    SYS_SYSINFO = 99;
     SYS_FCNTL = 72;
     SYS_GETCWD = 79;
     SYS_CHDIR = 80;
@@ -364,9 +365,11 @@ fn sys_symlink(target, linkpath): i64 {
 fn sys_link(oldpath, newpath): i64 {
     return syscall(SYS_LINK, oldpath, newpath);
 }
+# lstat(path, buf) — stat that does NOT follow a trailing symlink.
 fn sys_lstat(path, buf): i64 {
     return syscall(SYS_LSTAT, path, buf);
 }
+# rename(oldpath, newpath) — single-filesystem rename/move.
 fn sys_rename(oldpath, newpath): i64 {
     return syscall(SYS_RENAME, oldpath, newpath);
 }

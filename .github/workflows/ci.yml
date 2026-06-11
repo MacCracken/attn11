@@ -117,6 +117,39 @@ jobs:
           cyrius build --aarch64 src/main.cyr build/attn11_a64
           qemu-aarch64-static build/attn11_a64 --gen-only
 
+  agnos:
+    name: AGNOS (cross-build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Cyrius toolchain
+        run: |
+          set -e
+          CYRIUS_VERSION="$(grep '^cyrius = ' cyrius.cyml | head -1 | sed 's/cyrius = "\(.*\)"/\1/')"
+          curl -sSf https://raw.githubusercontent.com/MacCracken/cyrius/main/scripts/install.sh | \
+            CYRIUS_VERSION="$CYRIUS_VERSION" sh
+          echo "$HOME/.cyrius/bin" >> "$GITHUB_PATH"
+
+      - name: Resolve deps
+        run: cyrius deps
+
+      - name: Cross-build the binary + grad-check suite for AGNOS
+        # Build-only lane: running needs a booted AGNOS kernel (qemu-system +
+        # OVMF + gnoboot), which lives in the agnos repo's smoke harnesses.
+        # This gates the portable-syscall surface: any Linux-ism (raw syscall
+        # numbers, fstat/fsync, NUL-path unlink/rename) fails this build.
+        run: |
+          mkdir -p build
+          cyrius build --agnos src/main.cyr build/attn11_agnos
+          cyrius build --agnos tests/attn11.tcyr build/test_agnos
+
+      - name: Verify static ELF64
+        # agnos exec-from-disk (elf_load_from_file) loads static x86_64
+        # ELF64 only — reject anything dynamic before it ever reaches a disk.
+        run: |
+          file build/attn11_agnos | grep -q "ELF 64-bit.*x86-64.*static"
+
   security:
     name: Security Scan
     runs-on: ubuntu-latest

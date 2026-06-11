@@ -48,7 +48,13 @@ include "lib/vec.cyr"
 include "lib/hashmap.cyr"
 include "lib/io.cyr"
 include "lib/fs.cyr"
-include "lib/bigint.cyr"
+# v6.1.25 bayan carve: bigint (u256_*) moved into lib/bayan.cyr. sigil's
+# ECDSA/crypto path calls u256_* — satisfied by bayan's back-compat aliases.
+# bayan's bundled json portion references result/fnptr (io is above);
+# include-once dedupes. See CHANGELOG [6.1.25].
+include "lib/result.cyr"
+include "lib/fnptr.cyr"
+include "lib/bayan.cyr"
 include "lib/ct.cyr"
 include "lib/keccak.cyr"
 # v6.0.53: sigil 3.6.0 added a thread-local constant-bank (reachable
@@ -4780,44 +4786,79 @@ fn tls_native_set_ca_system(ctx): i64 {
     return tls_native_set_ca_bundle(ctx, buf, total, 0);
 }
 
-# Client: verify the server's certificate chain against the configured
-# trust anchor (.29). `now_unix` is the validation time (the caller
-# supplies it — there is no in-stdlib clock wrapper yet). Uses sigil's
-# x509_verify_chain over the parsed server leaf + the CA root. Returns
-# TLS_OK on a verified chain, or TLS_ERR_CERT_INVALID. Intermediate
-# certificates from the Certificate message are a follow-on (today the
-# leaf must chain directly to the trust anchor, e.g. self-signed roots).
+# Client: verify the server's certificate chain by PATH BUILDING (v6.1.19,
+# RFC 5280 §6.1 / RFC 8446 §4.4.2). `now_unix` is the validation time (the
+# caller supplies it — no in-stdlib clock wrapper yet). Returns TLS_OK on a
+# verified path to a trusted, in-window CA root, else TLS_ERR_CERT_INVALID.
+#
+# Why not sigil's x509_verify_chain directly: that primitive has a RIGID
+# contract — `intermediates` must be EXACTLY the ordered path root..leaf-signer,
+# every cert used. Real servers don't honor that. A server MAY include its
+# trust-anchor (or a cross-signed copy of it) in the Certificate message
+# (RFC 8446 §4.4.2 makes the self-signed anchor OPTIONAL, not forbidden), and
+# may list certs out of strict order. example.com fronted by Cloudflare sends
+# leaf + 3 intermediates where the top entry is the SSL.com root cross-signed by
+# AAA — the rigid verify then fails `_x509_issuer_matches` on that extra cert.
+# 1.1.1.1 happens to send a clean leaf+1-intermediate chain, so it passed; that
+# asymmetry was the reported "native handshake gap" (it's actually a chain-
+# verification gap — the handshake itself completes for both).
+#
+# Path-build from the leaf upward instead: at each node, (1) anchor immediately
+# if a trusted root issuer-matches AND signs it (so a wire-included root /
+# cross-cert is harmlessly unused), else (2) follow ONE verified signing
+# intermediate (CA + in-window + good signature). Extra / out-of-order /
+# cross-signed certs are simply never selected. Every link is signature-checked;
+# we only anchor at a trusted, in-window CA root — same security floor as the old
+# rigid path, just tolerant of real-world chains. The `ni + 1` iteration bound
+# terminates any cross-sign cycle. See
+# docs/development/issues/2026-06-09-native-tls-handshake-gap-public-servers.md,
+# CHANGELOG [6.1.19].
 fn tls_native_client_verify_chain(ctx, now_unix): i64 {
     if (ctx == 0) { return TLS_ERR_INVALID_PARAM; }
     var leaf = load64(ctx + TLS_CTX_OFF_SERVER_CERT);
     var rootset = load64(ctx + TLS_CTX_OFF_CA_ROOT);
     if (leaf == 0) { return _tn_ctx_fail(ctx, TLS_ERR_CERT_INVALID); }
     if (rootset == 0) { return _tn_ctx_fail(ctx, TLS_ERR_CERT_INVALID); }
-    # Reverse the server's intermediates: TLS order (leaf-signer..top) → the
-    # order x509_verify_chain wants (root-signed first..leaf-signer last).
+    if (_x509_in_window(leaf, now_unix) == 0) { return _tn_ctx_fail(ctx, TLS_ERR_CERT_INVALID); }
     var inters = load64(ctx + TLS_CTX_OFF_SERVER_INTERS);
     var ni = 0;
-    var rev = 0;
-    if (inters != 0) {
-        ni = load64(inters);
-        if (ni > 0) {
-            rev = alloc(ni * 8);
-            if (rev == 0) { return _tn_ctx_fail(ctx, TLS_ERR_OOM); }
-            var k = 0;
-            while (k < ni) {
-                store64(rev + k * 8, load64(inters + 8 + (ni - 1 - k) * 8));
-                k = k + 1;
-            }
-        }
-    }
-    # Try each trusted root until one validates leaf←intermediates←root.
+    if (inters != 0) { ni = load64(inters); }
     var rcount = load64(rootset);
-    var ri = 0;
-    while (ri < rcount) {
-        if (x509_verify_chain(leaf, rev, ni, load64(rootset + 8 + ri * 8), now_unix) == 1) {
-            return TLS_OK;
+    var cur = leaf;
+    var depth = 0;
+    while (depth <= ni + 1) {
+        # (1) Anchor: a trusted root that issuer-matches AND signs `cur`.
+        var ri = 0;
+        while (ri < rcount) {
+            var R = load64(rootset + 8 + ri * 8);
+            if (_x509_issuer_matches(cur, R) == 1) {
+                if (_x509_in_window(R, now_unix) == 1) {
+                    if (x509_cert_is_ca(R) == 1) {
+                        if (_x509_verify_link(cur, R) == 1) { return TLS_OK; }
+                    }
+                }
+            }
+            ri = ri + 1;
         }
-        ri = ri + 1;
+        # (2) Else follow ONE signing intermediate up (CA + in-window + verified).
+        var nextp = 0;
+        var ii = 0;
+        while (ii < ni) {
+            var P = load64(inters + 8 + ii * 8);
+            if (P != cur) {
+                if (_x509_issuer_matches(cur, P) == 1) {
+                    if (x509_cert_is_ca(P) == 1) {
+                        if (_x509_in_window(P, now_unix) == 1) {
+                            if (_x509_verify_link(cur, P) == 1) { nextp = P; ii = ni; }
+                        }
+                    }
+                }
+            }
+            ii = ii + 1;
+        }
+        if (nextp == 0) { return _tn_ctx_fail(ctx, TLS_ERR_CERT_INVALID); }
+        cur = nextp;
+        depth = depth + 1;
     }
     return _tn_ctx_fail(ctx, TLS_ERR_CERT_INVALID);
 }

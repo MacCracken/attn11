@@ -11,3 +11,9 @@ Not decisions (those live in [`../adr/`](../adr/)) and not guides (those live in
   matmul convention (memory accumulators, never reassign a SIMD var); and the
   toolchain gotchas (long-literal mis-parse, byte-counting `print`, f64
   comparisons not being NaN-correct). **Affects**: all numeric code in `src/`.
+- [002 — agnos entry epilogue](002-agnos-entry-epilogue.md) — `r = main()`
+  must be a top-level *statement*, never a `var` initializer: on agnos, a
+  call-bearing gvar init runs before the compiler-emitted argv capture, so
+  `main()` would see `argc()==0` and silently ignore every CLI flag.
+  **Affects**: every entry file (`src/main.cyr`, `src/test.cyr`,
+  `tests/attn11.{tcyr,bcyr,fcyr}`).

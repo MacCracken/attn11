@@ -8,18 +8,21 @@
 # 16-byte aligned, argc capped at 8.
 #
 # Like lib/args_macos.cyr (which reads the arm64 entry's x28), the init rsp
-# is captured by the cycc-emitted entry — NOT here. On the agnos executable
-# path (km==0) nothing moves rsp between e_entry and the auto-call to main,
-# so src/main.cyr emits `call _agnos_capture_rsp` (gated _TARGET_AGNOS) at
-# the epilogue, just before `call main`, while rsp still = the init rsp.
-# That records it into _agnos_init_rsp; argc()/argv() read from there.
+# is captured by the cycc-emitted entry — NOT here. src/main.cyr emits `call
+# _agnos_capture_rsp` (gated _TARGET_AGNOS) immediately after EMIT_GVAR_INITS
+# and BEFORE PARSE_PROG — while rsp still = the kernel init rsp ([rsp]=argc,
+# [rsp+8+i*8]=argv[i]), ahead of any top-level statement that shifts it. That
+# records it into _agnos_init_rsp; argc()/argv() read from there. (v6.1.14
+# moved this UP from the entry epilogue — the old placement captured a shifted
+# rsp once any top-level code ran, so argc()==0 in non-trivial programs.)
 
 var _agnos_init_rsp = 0;
 
-# Record the agnos init-stack pointer. cycc emits the `call` to this from
-# the entry epilogue while rsp = init rsp. The `call` pushed the return
-# address (8 bytes) and EFNPRO pushed rbp (8 bytes), so the init rsp is
-# rbp + 16. (rbp+16 is read via inline asm into the first local, then
+# Record the agnos init-stack pointer. cycc emits the `call` to this from the
+# entry, after gvar-inits / before top-level code, while rsp = init rsp. The
+# `call` pushed the return address (8 bytes) and EFNPRO pushed rbp (8 bytes),
+# so the init rsp is rbp + 16. (rbp+16 is read via inline asm into the first
+# local, then
 # stored to the global through the normal compiler path — same shape as
 # lib/args_macos.cyr's x28 read.)
 fn _agnos_capture_rsp() {

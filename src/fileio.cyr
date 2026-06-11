@@ -11,12 +11,44 @@ fn _O_CREAT(): i64 { return 64; }
 fn _O_TRUNC(): i64 { return 512; }
 fn _O_NOFOLLOW(): i64 { return 131072; }   # Linux x86_64/aarch64
 
-# st_size lives at byte offset 48 in struct stat (stable across linux arches).
-fn _file_size(fd): i64 {
+# Size of an already-open file. Linux: fstat(fd); st_size lives at byte
+# offset 48 in struct stat (stable across linux arches). agnos: the frozen
+# ABI has no fstat — stat the path (explicit length, size at offset 16, ABI
+# §4.1). The path was already opened, so the residual TOCTOU window only
+# affects the size cap; the read loop stops at actual EOF regardless.
+fn _file_size(fd, path): i64 {
+    #ifdef CYRIUS_TARGET_AGNOS
+    var st[48];
+    var r = sys_stat(path, strlen(path), &st);
+    if (r < 0) { return r; }
+    return load64(&st + 16);
+    #endif
+    #ifndef CYRIUS_TARGET_AGNOS
     var st[144];
     var r = sys_fstat(fd, &st);
     if (r < 0) { return r; }
     return load64(&st + 48);
+    #endif
+}
+
+# Portable unlink/rename: the agnos ABI takes explicit path lengths (§3.2);
+# the Linux wrappers take NUL-terminated paths. All call sites funnel here.
+fn _unlink(path): i64 {
+    #ifdef CYRIUS_TARGET_AGNOS
+    return sys_unlink(path, strlen(path));
+    #endif
+    #ifndef CYRIUS_TARGET_AGNOS
+    return sys_unlink(path);
+    #endif
+}
+
+fn _rename(old, new): i64 {
+    #ifdef CYRIUS_TARGET_AGNOS
+    return sys_rename(old, strlen(old), new, strlen(new));
+    #endif
+    #ifndef CYRIUS_TARGET_AGNOS
+    return sys_rename(old, new);
+    #endif
 }
 
 # Open `path` read-only refusing symlinks, fstat its size; if size > maxlen
@@ -25,7 +57,7 @@ fn _file_size(fd): i64 {
 fn secure_read_file(path, buf, maxlen): i64 {
     var fd = file_open(path, _O_RDONLY() | _O_NOFOLLOW(), 0);
     if (fd < 0) { return fd; }
-    var size = _file_size(fd);
+    var size = _file_size(fd, path);
     if (size < 0) { file_close(fd); return size; }
     if (size > maxlen) { file_close(fd); return 0 - 2; }
     var total = 0;
@@ -69,7 +101,13 @@ fn secure_write_file(path, buf, len): i64 {
     return total;
 }
 
+# Durability barrier before the atomic rename. Linux: fsync(fd) (raw number —
+# the stdlib ships no sys_fsync wrapper). agnos: the frozen ABI has no per-fd
+# fsync; sys_sync() (syscall 12) flushes globally, which subsumes the fd.
 fn _fsync(fd): i64 {
+    #ifdef CYRIUS_TARGET_AGNOS
+    return sys_sync();
+    #endif
     var n = 74;                  # SYS_FSYNC (x86_64)
     #ifdef CYRIUS_ARCH_AARCH64
     n = 82;                      # SYS_FSYNC (aarch64)
@@ -95,14 +133,14 @@ fn secure_write_atomic(path, buf, len): i64 {
     var total = 0;
     while (total < len) {
         var n = file_write(fd, buf + total, len - total);
-        if (n <= 0) { file_close(fd); sys_unlink(tmp); return 0 - 1; }
+        if (n <= 0) { file_close(fd); _unlink(tmp); return 0 - 1; }
         total = total + n;
     }
     # Durability: a failed fsync means the data may not be on stable storage, so
     # we must NOT rename over the (good) target — abort and clean up the temp.
-    if (_fsync(fd) < 0) { file_close(fd); sys_unlink(tmp); return 0 - 2; }
+    if (_fsync(fd) < 0) { file_close(fd); _unlink(tmp); return 0 - 2; }
     file_close(fd);
-    var r = sys_rename(tmp, path);
-    if (r < 0) { sys_unlink(tmp); return r; }   # target untouched on failure
+    var r = _rename(tmp, path);
+    if (r < 0) { _unlink(tmp); return r; }   # target untouched on failure
     return total;
 }

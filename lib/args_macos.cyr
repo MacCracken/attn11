@@ -34,8 +34,15 @@ fn _macho_argv_base() {
     }
     return result;
     #else
-    # x86-macОS uses _macho_init_rsp (see _macho_capture_args), not a register.
-    return 0;
+    # x86-macOS (v6.1.30): the entry parks the init rsp in r15, reserved from
+    # regalloc (parse_fn.cyr caps the pool at 4 on _TARGET_MACHO==1), so r15
+    # survives from entry through every call into here. Read it via inline asm.
+    var result = 0;
+    asm {
+        0x4C; 0x89; 0xF8;          # mov rax, r15
+        0x48; 0x89; 0x45; 0xF8;    # mov [rbp-8], rax   (-> result, first local)
+    }
+    return result;
     #endif
 }
 
@@ -76,8 +83,9 @@ fn argc() {
     var base = _macho_argv_base();
     return load64(base);
     #else
-    if (_macho_init_rsp == 0) { return 0; }
-    return load64(_macho_init_rsp);
+    var base = _macho_argv_base();
+    if (base == 0) { return 0; }
+    return load64(base);
     #endif
 }
 
@@ -93,9 +101,10 @@ fn argv(n) {
     var argvp = load64(base + 8);
     return load64(argvp + n * 8);
     #else
-    if (_macho_init_rsp == 0) { return 0; }
-    var cnt = load64(_macho_init_rsp);
+    var base = _macho_argv_base();
+    if (base == 0) { return 0; }
+    var cnt = load64(base);
     if (n >= cnt) { return 0; }
-    return load64(_macho_init_rsp + 8 + n * 8);
+    return load64(base + 8 + n * 8);
     #endif
 }

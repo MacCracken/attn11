@@ -472,5 +472,7 @@ fn main(): i64 {
     return assert_summary();
 }
 
-var exit_code = main();
-syscall(60, exit_code);
+# Statement-call epilogue (not a `var` initializer) — see docs/architecture/002.
+var exit_code = 0;
+exit_code = main();
+sys_exit(exit_code);

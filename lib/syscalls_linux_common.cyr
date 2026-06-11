@@ -44,28 +44,46 @@ var UTIME_OMIT = 1073741822;       # (1 << 30) - 2
 fn sys_openat(dirfd, path, flags, mode): i64 {
     return syscall(SYS_OPENAT, dirfd, path, flags, mode);
 }
+# mkdirat(dirfd, path, mode) — symlink-safe directory creation during a walk.
 fn sys_mkdirat(dirfd, path, mode): i64 {
     return syscall(SYS_MKDIRAT, dirfd, path, mode);
 }
-# With AT_SYMLINK_NOFOLLOW, the canonical lstat-during-walk.
+# fstatat(dirfd, path, buf, flags) — with AT_SYMLINK_NOFOLLOW, the canonical lstat-during-walk.
 fn sys_fstatat(dirfd, path, buf, flags): i64 {
     return syscall(SYS_NEWFSTATAT, dirfd, path, buf, flags);
 }
-# AT_REMOVEDIR makes one call serve both unlink and rmdir.
+# unlinkat(dirfd, path, flags) — AT_REMOVEDIR makes one call serve both unlink and rmdir.
 fn sys_unlinkat(dirfd, path, flags): i64 {
     return syscall(SYS_UNLINKAT, dirfd, path, flags);
 }
+# linkat(olddirfd, oldpath, newdirfd, newpath, flags) — hard-link with explicit AT_SYMLINK_FOLLOW policy.
 fn sys_linkat(olddirfd, oldpath, newdirfd, newpath, flags): i64 {
     return syscall(SYS_LINKAT, olddirfd, oldpath, newdirfd, newpath, flags);
 }
+# renameat(olddirfd, oldpath, newdirfd, newpath) — rename across FD-rooted dirs.
 fn sys_renameat(olddirfd, oldpath, newdirfd, newpath): i64 {
     return syscall(SYS_RENAMEAT, olddirfd, oldpath, newdirfd, newpath);
 }
+# fchmodat(dirfd, path, mode, flags) — symlink-aware chmod.
 fn sys_fchmodat(dirfd, path, mode, flags): i64 {
     return syscall(SYS_FCHMODAT, dirfd, path, mode, flags);
 }
+# utimensat(dirfd, path, times, flags) — set atime/mtime (NULL times = now; UTIME_OMIT to skip one).
+# Darwin has NO utimensat syscall (absent from MacOSX.sdk sys/syscall.h — only
+# setattrlist/setattrlistat exist). No in-tree consumer sets file times on macOS,
+# so rather than emit an unrouted svc 280 (→ garbage/SIGSYS) we return -ENOSYS
+# (Darwin 78) on the macОS build; a setattrlist(2)-based emulation is deferred
+# until a consumer needs it. The two-#ifdef form keeps syscall(280) out of the
+# Mach-O emit entirely (no "syscall not routed" warning). The arch-Linux ESYSXLAT
+# maps 280→88 (utimensat); only the Darwin syscall table lacks it.
+# See issues/2026-06-08-macho-arm-at-family-darwin-syscall-mappings.md, CHANGELOG [6.1.20].
 fn sys_utimensat(dirfd, path, times, flags): i64 {
+    #ifdef CYRIUS_TARGET_MACOS
+    return 0 - 78;
+    #endif
+    #ifdef CYRIUS_TARGET_LINUX
     return syscall(SYS_UTIMENSAT, dirfd, path, times, flags);
+    #endif
 }
 
 # ================================================================

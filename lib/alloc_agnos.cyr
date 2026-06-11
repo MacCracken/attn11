@@ -44,6 +44,10 @@ fn _agnos_new_chunk(min): i64 {
 # Initialize the heap (optional — alloc() lazy-inits on first call).
 # Re-callable; re-mmaps a fresh first chunk. Returns the base.
 fn alloc_init(): i64 {
+    # Idempotent (v6.1.23): re-call is a no-op once the first chunk is up — pre-fix
+    # every recall mmap'd a fresh 2 MB chunk, abandoning the live one. Free via
+    # alloc_reset(). See issue 2026-06-09-chunked-alloc-init-not-idempotent.
+    if (_heap_base != 0) { return _heap_first_base; }
     var base = _agnos_new_chunk(AGNOS_CHUNK);
     _heap_first_base = base;
     _heap_first_end = _heap_end;
