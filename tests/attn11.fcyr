@@ -1,8 +1,12 @@
 # attn11 fuzz harness — hostile inputs to the loaders must never crash.
 #
-# Covers the two untrusted-input paths added in M2:
-#   * ckpt_load_buf  — fed truncated / bit-flipped / wild-config / random bytes
-#   * corpus_set     — fed random byte buffers of random length
+# Covers the untrusted-input paths (M2 loaders + the M7 BPE surface):
+#   * ckpt_load_buf  — fed truncated / bit-flipped / wild-config / random bytes,
+#                      on BOTH a byte-level and a BPE reference image; BPE
+#                      rounds add merge-slot clobbers, inconsistent (V,Vb,K)
+#                      triples, and expansion-bomb merge chains
+#   * corpus_set     — fed random byte buffers of random length; bpe_learn
+#                      over each must round-trip (decode reconstructs input)
 # Property: the loader always returns (a negative error or a sane success),
 # never reads out of bounds or over-allocates. Validation happens before any
 # allocation/copy, so a malformed buffer is rejected, not trusted.
@@ -52,14 +56,14 @@ fn main(): i64 {
             store8(work + off, (load8(work + off) ^ (fz_pos() & 0xFF)) & 0xFF);
         } elif (mode == 1) {                  # truncate to a random length
             mlen = fz_pos() % (sz + 1);
-        } elif (mode == 2) {                  # wild value into a config/state field (2..12)
-            var fld = 2 + (fz_pos() % 11);
+        } elif (mode == 2) {                  # wild value into a config/state field (2..15)
+            var fld = 2 + (fz_pos() % 14);
             store64(work + fld * 8, fz_next());
         } elif (mode == 3) {                  # clobber the magic
             store64(work, fz_next());
         } else {                              # fully random header
             var k = 0;
-            while (k < 13) { store64(work + k * 8, fz_next()); k = k + 1; }
+            while (k < 16) { store64(work + k * 8, fz_next()); k = k + 1; }
         }
         var rc = ckpt_load_buf(work, mlen);
         if (rc < 0) { rejected = rejected + 1; }
@@ -67,7 +71,63 @@ fn main(): i64 {
         rounds = rounds + 1;
     }
 
-    # ---- corpus tokenizer on random byte buffers ----
+    # ---- a valid BPE reference checkpoint: merge-table mutations ----
+    # tok_kind=1 images exercise the merge-table scan (-37/-38), the
+    # (V, Vb, K) triple checks, and the install/rebuild path on accepts.
+    build_corpus();
+    var Vb2 = bpe_learn(8);
+    model_init(Vb2, 8, 4, 2, 2, 1, 0, f64_from(0), 5);
+    var bsz = ckpt_size();
+    var bgood = alloc(bsz);
+    ckpt_serialize(bgood);
+    var bwork = alloc(bsz);
+    var Bb = load64(bgood + 14 * 8);          # base vocab
+    var Kb = load64(bgood + 15 * 8);          # merge count
+    var brejected = 0; var baccepted = 0;
+    var br = 0;
+    while (br < 500) {
+        t_copy(bwork, bgood, bsz / 8);
+        var bmode = fz_pos() % 8;
+        var bmlen = bsz;
+        if (bmode == 0) {                     # flip a random byte
+            var boff = fz_pos() % bsz;
+            store8(bwork + boff, (load8(bwork + boff) ^ (fz_pos() & 0xFF)) & 0xFF);
+        } elif (bmode == 1) {                 # truncate
+            bmlen = fz_pos() % (bsz + 1);
+        } elif (bmode == 2) {                 # wild config/tokenizer field
+            var bfld = 2 + (fz_pos() % 14);
+            store64(bwork + bfld * 8, fz_next());
+        } elif (bmode == 3) {                 # clobber the magic
+            store64(bwork, fz_next());
+        } elif (bmode == 4) {                 # fully random header
+            var bk = 0;
+            while (bk < 16) { store64(bwork + bk * 8, fz_next()); bk = bk + 1; }
+        } elif (bmode == 5) {                 # clobber one merge slot
+            var slot = fz_pos() % (2 * Kb);
+            store64(bwork + (16 + Bb + slot) * 8, fz_next());
+        } elif (bmode == 6) {                 # inconsistent (V, Vb, K) triple
+            var pick = fz_pos() % 3;
+            if (pick == 0) { store64(bwork + 2 * 8, 1 + (fz_pos() % 1024)); }
+            elif (pick == 1) { store64(bwork + 14 * 8, fz_pos() % 300); }
+            else { store64(bwork + 15 * 8, fz_pos() % 600); }
+        } else {                              # expansion-bomb merge chain
+            var bj = 0;
+            while (bj < Kb) {
+                var ref = 0;
+                if (bj > 0) { ref = Bb + bj - 1; }
+                store64(bwork + (16 + Bb + 2 * bj) * 8, ref);
+                store64(bwork + (16 + Bb + 2 * bj + 1) * 8, ref);
+                bj = bj + 1;
+            }
+        }
+        var brc = ckpt_load_buf(bwork, bmlen);
+        if (brc < 0) { brejected = brejected + 1; }
+        else { baccepted = baccepted + 1; }
+        br = br + 1;
+    }
+    if (brejected < 1) { sys_write(2, "FAIL: no BPE image rejected\n", 28); sys_exit(4); }
+
+    # ---- corpus tokenizer on random byte buffers (+ BPE round-trip) ----
     var cb = alloc(2048);
     var cr = 0;
     while (cr < 100) {
@@ -77,6 +137,27 @@ fn main(): i64 {
         var vv = corpus_set(cb, clen);
         if (vv < 1) { sys_write(2, "FAIL: corpus vocab < 1\n", 23); sys_exit(1); }
         if (vv > 256) { sys_write(2, "FAIL: corpus vocab > 256\n", 25); sys_exit(2); }
+        # BPE over random bytes: whatever it learns, expanding the encoded
+        # stream must reconstruct the input byte-exactly
+        if (clen >= 2) {
+            var bV = bpe_learn(1 + (fz_pos() % 32));
+            if (bV < vv) { sys_write(2, "FAIL: bpe V < base\n", 19); sys_exit(5); }
+            var pos = 0; var ei = 0; var bad = 0;
+            while (ei < g_datalen) {
+                var id = load64(g_data + ei * 8);
+                var tl = load64(g_tok_len + id * 8);
+                var sp = g_tok_bytes + id * BPE_MAX_TOKLEN();
+                var bj2 = 0;
+                while (bj2 < tl) {
+                    if (pos >= clen) { bad = 1; }
+                    elif (load8(sp + bj2) != load8(cb + pos)) { bad = 1; }
+                    pos = pos + 1;
+                    bj2 = bj2 + 1;
+                }
+                ei = ei + 1;
+            }
+            if ((bad == 1) || (pos != clen)) { sys_write(2, "FAIL: bpe roundtrip\n", 20); sys_exit(6); }
+        }
         cr = cr + 1;
     }
 
@@ -85,7 +166,9 @@ fn main(): i64 {
 
     puts("fuzz: ok  ("); fmt_int(rounds); puts(" ckpt rounds, ");
     fmt_int(rejected); puts(" rejected / "); fmt_int(accepted);
-    puts(" accepted; 100 random corpora)\n");
+    puts(" accepted; "); fmt_int(br); puts(" bpe rounds, ");
+    fmt_int(brejected); puts(" rejected / "); fmt_int(baccepted);
+    puts(" accepted; 100 random corpora + bpe roundtrip)\n");
     return 0;
 }
 

@@ -156,6 +156,14 @@ var G_n = 0;      # tokens currently in the window (== valid cache positions)
 # these (-16); the in-process constructor must too.
 fn model_config_ok(V, C, T, nh, nkv, NL): i64 {
     if ((V < 1) || (C < 1) || (T < 1) || (NL < 1)) { return 0; }
+    # Magnitude caps mirror the checkpoint loader's (-4/-5/-7/-8). The fresh
+    # path takes CLI-supplied dims (`--layers`, and `--preset`-set C/T) — an
+    # unbounded NL makes `NL * _blk()` (and model_alloc_bytes) overflow i64,
+    # wrapping to a small positive size that t_alloc accepts, after which the
+    # weight-init loops write past the undersized buffer (heap OOB). Capping
+    # here keeps every product below the overflow point so the byte-total
+    # pre-flight in model_init is meaningful. BPE_VMAX() == 768.
+    if ((V > BPE_VMAX()) || (C > 4096) || (T > 8192) || (NL > 128)) { return 0; }
     if ((nh < 1) || (nh > C) || ((C % nh) != 0)) { return 0; }
     if ((nkv < 1) || (nkv > nh) || ((nh % nkv) != 0)) { return 0; }
     return 1;
@@ -191,6 +199,16 @@ fn model_init(V, C, T, nh, nkv, NL, attn_bias, dropout, seed): i64 {
     g_attn_bias = attn_bias; g_dropout = dropout; g_training = 1; g_step = 0;
     var F = g_F;
     g_NP = _emb_end() + NL * _blk() + 2 * C;
+
+    # Pre-allocation cap, mirroring the checkpoint loader's -18 (model_config_ok
+    # has already bounded the dims, so this product cannot overflow): a
+    # shape-valid config can still imply a model larger than the allocator cap.
+    # Reject BEFORE any allocation so a hostile --layers/--preset combination
+    # aborts cleanly instead of through an oversized/undersized t_alloc.
+    if (model_alloc_bytes(V, C, T, nh, nkv, NL, g_NP) > CKPT_MAX_MODEL_BYTES()) {
+        puts("attn11: model_init: config exceeds the 128 MB model-allocation cap\n");
+        sys_exit(1);
+    }
 
     g_params = t_alloc(g_NP);
     g_grads = t_alloc(g_NP);

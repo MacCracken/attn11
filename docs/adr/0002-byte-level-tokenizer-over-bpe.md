@@ -1,6 +1,7 @@
 # 0002 — Byte-level tokenizer over BPE
 
-**Status**: Accepted
+**Status**: Accepted — amended by [0006](0006-opt-in-bpe-tokenizer.md) (0.7.1
+adds BPE as an opt-in; byte-level remains the default this ADR chose)
 **Date**: 2026-06-08
 
 ## Context

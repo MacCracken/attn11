@@ -79,13 +79,37 @@ compute (default config; MQA = `nkv 1`):
 | 1 (MQA)          |  6 144 | 3 456 801 | 164 282 |
 
 At ctx 16 the cached path is re-prime-bound (a window recompute every 8
-tokens), so the speedup grows with context length — the E3 ctx-64 preset is
-the natural next measurement. Training numbers are unchanged from 0.6.0
-within noise (fwd+bwd ~3.7 ms, ~4 350 tok/s b=16; pin 6.1.33).
+tokens), so the speedup grows with context length — measured next.
+
+## The `--preset` config + BPE training cost (0.7.1)
+
+The M7 `--preset` (ctx 64 / d_model 64 / 8 heads / 4 layers; 205 760 params
+at the embedded corpus) confirms the prediction above: at T=64 the
+context-shift re-prime amortizes over 32 tokens instead of 8, and the
+uncached reference simultaneously gets more expensive, so the cached
+advantage widens from 6.2× to **23×** (greedy, 200 tokens, x86_64, pin
+6.1.34):
+
+| config | path | ns/token | tokens/sec |
+|--------|------|----------|------------|
+| default (ctx 16) | uncached | 1 068 001 | 936 |
+| default (ctx 16) | KV-cached | 174 689 | 5 724 (**6.1×**) |
+| preset (ctx 64) | uncached | 15 564 530 | 64 |
+| preset (ctx 64) | KV-cached | **672 747** | **1 486 (23.1×)** |
+
+Preset training: fwd+bwd step 65.0 ms → ~984 tok/s (b=16) — ~17.6× the
+default config's step cost for 5.2× the params and 4× the context (the
+attention T²-terms and the wider matmuls compound).
+
+BPE merge training (`--bpe K`, 0.7.1) is a one-shot pre-training cost:
+**~110 ms** for a 256 KB corpus at K=128 (`bpe_learn 256KB K=128` in the
+bench) — negligible against minutes of training. Default-config training
+numbers are unchanged from 0.6.0 within noise (fwd+bwd ~3.7 ms, ~4 350
+tok/s b=16).
 
 History is tracked in [`bench-history.csv`](../bench-history.csv).
 
-## Next perf levers (future)
+## Next perf levers (roadmap M9, v0.8.x)
 
 - Vectorize the tied LM head (matters as vocab grows with larger corpora).
 - A packed `tanh` approximation for GELU (its ~16% share grows now that matmul

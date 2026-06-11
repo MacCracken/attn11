@@ -118,6 +118,60 @@ fn main(): i64 {
     gen_decode(NGEN, f64_from(0), 1, 0, 0);
     e = now_ns();
     _report("gen kv-cached MQA", e - s, NGEN);
+
+    # ---- the --preset config (M7): ctx 64 / d_model 64 / 8 heads / 4 layers.
+    # The context-shift re-prime amortizes over GEN_SHIFT()=32 tokens here
+    # (vs 8 at the default), so the cached-vs-uncached ratio should widen.
+    model_init(V, 64, 64, 8, 8, 4, 1, f64_from(0), 1337);
+    model_forward(); model_zero_grads(); model_backward();   # prime
+    var NP2 = 50;
+    s = now_ns(); i = 0;
+    while (i < NP2) {
+        model_zero_grads(); sample_window(); model_forward(); model_backward();
+        i = i + 1;
+    }
+    e = now_ns();
+    var pstep_ns = (e - s) / NP2;
+    _report("fwd+bwd preset   ", e - s, NP2);
+    print("tokens/sec preset (b=16): ", 26);
+    fmt_int(16 * g_T * 1000000000 / (16 * pstep_ns));
+    _putc(10);
+    g_training = 0;
+    var NGP = 200;
+    s = now_ns();
+    gen_prime(pids, 1, 0);
+    gen_decode(NGP, f64_from(0), 0, 0, 0);
+    e = now_ns();
+    var pun_ns = (e - s) / NGP;
+    _report("gen uncached pre ", e - s, NGP);
+    s = now_ns();
+    gen_prime(pids, 1, 1);
+    gen_decode(NGP, f64_from(0), 1, 0, 0);
+    e = now_ns();
+    var pca_ns = (e - s) / NGP;
+    _report("gen kv-cached pre", e - s, NGP);
+    print("gen preset tokens/sec uncached: ", 32); fmt_int(1000000000 / pun_ns); _putc(10);
+    print("gen preset tokens/sec cached:   ", 32); fmt_int(1000000000 / pca_ns); _putc(10);
+    print("gen preset speedup (x100):      ", 32); fmt_int(pun_ns * 100 / pca_ns); _putc(10);
+
+    # ---- BPE merge training (one-shot, pre-training cost; M7) ----
+    # 256 KB of repeated corpus text — content quality is irrelevant to the
+    # count/argmax/replace loop cost being measured.
+    var seg = alloc(256);
+    var slen = corpus_build(seg);
+    var big = alloc(262144);
+    var bl = 0;
+    while (bl + slen < 262144) {
+        var si = 0;
+        while (si < slen) { store8(big + bl + si, load8(seg + si)); si = si + 1; }
+        bl = bl + slen;
+    }
+    corpus_set(big, bl);
+    s = now_ns();
+    var bv = bpe_learn(128);
+    e = now_ns();
+    print("bpe_learn 256KB K=128: ", 23); fmt_int((e - s) / 1000000);
+    print(" ms (V=", 7); fmt_int(bv); print(")\n", 2);
     return 0;
 }
 

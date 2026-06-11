@@ -1,4 +1,5 @@
-# attn11 — corpus, char-level tokenizer, training loop, and generation.
+# attn11 — corpus, tokenizers (byte-level + opt-in BPE), training loop, and
+# generation.
 
 # ---- corpus ----------------------------------------------------------------
 # A small, structured corpus so the tiny model can visibly learn and produce
@@ -24,11 +25,25 @@ fn corpus_build(buf): i64 {
 }
 
 # ---- tokenizer (byte-level) ------------------------------------------------
-var g_vocab = 0;     # id -> byte value  (length g_V, <= 256)
-var g_char2id = 0;   # byte value -> id  (256 entries, -1 if absent)
+var g_vocab = 0;     # id -> BASE byte value (<= 256 entries; BPE ids >= base
+                     # resolve through g_tok_bytes/g_tok_len instead)
+var g_char2id = 0;   # byte value -> BASE id (256 entries, -1 if absent)
 var g_data = 0;      # encoded corpus (ids), length g_datalen
 var g_datalen = 0;
-var g_corpus_vlen = 0;  # vocab size of the loaded corpus (NOT g_V, which is the model's)
+var g_corpus_vlen = 0;  # BYTE vocab size of the loaded corpus (the BPE base;
+                        # NOT g_V, which is the model's)
+
+# BPE state (see the BPE section below; all zero in byte-level mode)
+var g_bpe_on = 0;       # 0 = byte-level (default, ADR 0002), 1 = BPE active
+var g_bpe_base = 0;     # base (byte) vocab size B
+var g_bpe_nmerges = 0;  # merges actually learned/loaded (<= BPE_MAX_MERGES)
+var g_merges = 0;       # 2*BPE_MAX_MERGES i64: merge m = (left id, right id)
+var g_tok_len = 0;      # BPE_VMAX i64: byte length of each id's expansion
+var g_tok_bytes = 0;    # BPE_VMAX * BPE_MAX_TOKLEN raw BYTES (fixed stride)
+var g_enc_buf = 0;      # ENC_MAX i64: prompt-encode scratch
+var g_paircnt = 0;      # BPE_VMAX^2 i64: pair counts (bpe_learn only)
+var g_text = 0;         # raw corpus bytes, retained by corpus_set
+var g_textlen = 0;
 
 fn MAX_CORPUS_BYTES(): i64 { return 4194304; }   # 4 MB cap on loaded corpora
 
@@ -36,6 +51,10 @@ fn MAX_CORPUS_BYTES(): i64 { return 4194304; }   # 4 MB cap on loaded corpora
 # adaptive vocab (only the byte values that actually occur) and the encoded
 # id stream. Handles any of the 256 byte values. Returns vocab size.
 fn corpus_set(text, len): i64 {
+    # retain the raw bytes (the BPE checkpoint loader re-encodes from them)
+    # and reset any prior tokenizer state — a fresh corpus starts byte-level
+    g_text = text; g_textlen = len;
+    g_bpe_on = 0; g_bpe_nmerges = 0; g_bpe_base = 0;
     g_datalen = len;
     g_char2id = t_alloc(256);
     var i = 0;
@@ -95,6 +114,186 @@ fn corpus_load_stdin(): i64 {
 }
 
 fn decode_char(id): i64 { return load64(g_vocab + id * 8); }
+
+# ---- BPE tokenizer (opt-in; byte-level stays the default) -------------------
+# Simple byte-pair encoding, Sennrich et al. 2016 (arXiv:1508.07909) — see
+# docs/sources.md. Layered ON TOP of the byte-level tokenizer: layer 0 is the
+# adaptive byte vocab above (g_vocab/g_char2id, ids 0..B-1); each merge mints
+# id B+m for an adjacent pair. Pure i64 arithmetic throughout — no f64, no
+# PRNG — so the whole pipeline is bit-reproducible across x86_64 and aarch64.
+fn BPE_MAX_MERGES(): i64 { return 512; }   # cap on merge count (CLI + checkpoint)
+fn BPE_VMAX(): i64 { return 768; }         # 256 base + 512 merges = max vocab
+fn BPE_MAX_TOKLEN(): i64 { return 64; }    # cap on a token's byte expansion
+fn BPE_MIN_FREQ(): i64 { return 2; }       # stop merging below this pair count
+fn ENC_MAX(): i64 { return 8192; }         # prompt-encode scratch, in ids
+
+# One-time, cap-sized allocations, reused for the process lifetime — the
+# checkpoint loader must not grow the arena per accepted load (fuzz loads
+# the loader hundreds of times).
+fn bpe_alloc_once(): i64 {
+    if (g_merges == 0) {
+        g_merges = t_alloc(2 * BPE_MAX_MERGES());
+        g_tok_len = t_alloc(BPE_VMAX());
+        g_tok_bytes = alloc(BPE_VMAX() * BPE_MAX_TOKLEN());   # raw BYTES
+        if (g_tok_bytes == 0) { puts("attn11: bpe alloc failed\n"); sys_exit(1); }
+        g_enc_buf = t_alloc(ENC_MAX());
+    }
+    return 0;
+}
+
+# Precompute every id's byte expansion. Decode is a flat table, NOT recursion:
+# merge m references only ids < B+m (the loader enforces this on hostile
+# checkpoints, -37), so one forward pass fills everything in minting order.
+fn bpe_build_spans(): i64 {
+    var t = 0;
+    while (t < g_bpe_base) {
+        store64(g_tok_len + t * 8, 1);
+        store8(g_tok_bytes + t * BPE_MAX_TOKLEN(), load64(g_vocab + t * 8));
+        t = t + 1;
+    }
+    var m = 0;
+    while (m < g_bpe_nmerges) {
+        var nid = g_bpe_base + m;
+        var l = load64(g_merges + (2 * m) * 8);
+        var r = load64(g_merges + (2 * m + 1) * 8);
+        var ll = load64(g_tok_len + l * 8);
+        var rl = load64(g_tok_len + r * 8);
+        var dst = g_tok_bytes + nid * BPE_MAX_TOKLEN();
+        var i = 0;
+        while (i < ll) { store8(dst + i, load8(g_tok_bytes + l * BPE_MAX_TOKLEN() + i)); i = i + 1; }
+        i = 0;
+        while (i < rl) { store8(dst + ll + i, load8(g_tok_bytes + r * BPE_MAX_TOKLEN() + i)); i = i + 1; }
+        store64(g_tok_len + nid * 8, ll + rl);
+        m = m + 1;
+    }
+    return 0;
+}
+
+# Learn up to K merges over the byte-level encoded corpus (g_data), in place.
+# Per iteration: count adjacent pairs (overlaps included — frozen semantics),
+# take the most frequent, record the merge, re-encode. The argmax scans
+# row-major ascending with strict > — the scan order IS the deterministic
+# tie-break (highest count, then smallest left id, then smallest right id).
+# NEVER reorder this scan: checkpoints store the resulting merges and every
+# encode replays them. The TOKLEN eligibility test sits INSIDE the (c > best)
+# body so an oversized pair can never shadow an eligible one. Stops early when
+# no pair reaches BPE_MIN_FREQ(). Returns the model vocab V = B + merges, or
+# negative on a bad K / missing corpus.
+fn bpe_learn(K): i64 {
+    if ((K < 1) || (K > BPE_MAX_MERGES())) { return 0 - 1; }
+    if ((g_data == 0) || (g_datalen < 2)) { return 0 - 2; }
+    bpe_alloc_once();
+    if (g_paircnt == 0) { g_paircnt = t_alloc(BPE_VMAX() * BPE_VMAX()); }
+    g_bpe_base = g_corpus_vlen;
+    var B = g_bpe_base;
+    var i = 0;
+    while (i < B) { store64(g_tok_len + i * 8, 1); i = i + 1; }
+    var n = g_datalen;
+    var Vcur = B;
+    var m = 0;
+    while (m < K) {
+        # zero only the live Vcur x Vcur region (row stride is BPE_VMAX)
+        var a = 0;
+        while (a < Vcur) { t_zero(g_paircnt + (a * BPE_VMAX()) * 8, Vcur); a = a + 1; }
+        i = 0;
+        while (i + 1 < n) {
+            var cell = g_paircnt + (load64(g_data + i * 8) * BPE_VMAX() + load64(g_data + (i + 1) * 8)) * 8;
+            store64(cell, load64(cell) + 1);
+            i = i + 1;
+        }
+        var best = 0; var ba = 0 - 1; var bb = 0 - 1;
+        a = 0;
+        while (a < Vcur) {
+            var la = load64(g_tok_len + a * 8);
+            var b = 0;
+            while (b < Vcur) {
+                var c = load64(g_paircnt + (a * BPE_VMAX() + b) * 8);
+                if (c > best) {
+                    if (la + load64(g_tok_len + b * 8) <= BPE_MAX_TOKLEN()) {
+                        best = c; ba = a; bb = b;
+                    }
+                }
+                b = b + 1;
+            }
+            a = a + 1;
+        }
+        if (best < BPE_MIN_FREQ()) { break; }
+        store64(g_merges + (2 * m) * 8, ba);
+        store64(g_merges + (2 * m + 1) * 8, bb);
+        # greedy left-to-right non-overlapping replace, in place. Safe only
+        # because wr <= rd invariantly (the stream only shrinks) — do NOT
+        # "optimize" into any copy-forward scheme.
+        var rd = 0; var wr = 0;
+        while (rd < n) {
+            var hit = 0;
+            if (rd + 1 < n) {
+                if ((load64(g_data + rd * 8) == ba) && (load64(g_data + (rd + 1) * 8) == bb)) { hit = 1; }
+            }
+            if (hit == 1) { store64(g_data + wr * 8, Vcur); rd = rd + 2; }
+            else { store64(g_data + wr * 8, load64(g_data + rd * 8)); rd = rd + 1; }
+            wr = wr + 1;
+        }
+        n = wr;
+        store64(g_tok_len + Vcur * 8, load64(g_tok_len + ba * 8) + load64(g_tok_len + bb * 8));
+        Vcur = Vcur + 1;
+        m = m + 1;
+    }
+    g_bpe_nmerges = m;
+    g_datalen = n;
+    g_bpe_on = 1;
+    bpe_build_spans();
+    return B + m;
+}
+
+# Encode len raw bytes into out (caller guarantees >= len i64 slots): bytes ->
+# base ids via g_char2id (unseen byte -> id 0, matching generate()'s fallback),
+# then each learned merge applied in order with the same greedy left-to-right
+# replace as bpe_learn. That is EXACTLY the pass sequence bpe_learn performed
+# on the corpus, so encoding the original corpus bytes reproduces g_data
+# bit-for-bit — the property the checkpoint loader's corpus rebuild relies on
+# (and test_bpe_roundtrip pins). Output count <= len: never grows. Returns the
+# id count.
+fn tok_encode(text, len, out): i64 {
+    var n = 0;
+    var i = 0;
+    while (i < len) {
+        var id = load64(g_char2id + load8(text + i) * 8);
+        if (id < 0) { id = 0; }
+        store64(out + n * 8, id);
+        n = n + 1;
+        i = i + 1;
+    }
+    if (g_bpe_on == 0) { return n; }
+    var m = 0;
+    while (m < g_bpe_nmerges) {
+        var ba = load64(g_merges + (2 * m) * 8);
+        var bb = load64(g_merges + (2 * m + 1) * 8);
+        var nid = g_bpe_base + m;
+        var rd = 0; var wr = 0;
+        while (rd < n) {
+            var hit = 0;
+            if (rd + 1 < n) {
+                if ((load64(out + rd * 8) == ba) && (load64(out + (rd + 1) * 8) == bb)) { hit = 1; }
+            }
+            if (hit == 1) { store64(out + wr * 8, nid); rd = rd + 2; }
+            else { store64(out + wr * 8, load64(out + rd * 8)); rd = rd + 1; }
+            wr = wr + 1;
+        }
+        n = wr;
+        m = m + 1;
+    }
+    return n;
+}
+
+# Emit one sampled id's bytes. Byte mode: the single vocab byte. BPE: the
+# precomputed span — print() counts BYTES, which is exactly right: spans may
+# hold partial UTF-8 sequences and byte-level-underneath BPE reassembles them
+# across tokens. decode_char stays legal only for id < g_bpe_base.
+fn tok_emit(id): i64 {
+    if (g_bpe_on == 0) { _putc(decode_char(id)); return 0; }
+    print(g_tok_bytes + id * BPE_MAX_TOKLEN(), load64(g_tok_len + id * 8));
+    return 0;
+}
 
 # ---- batch sampling --------------------------------------------------------
 # Fill A_tokens/A_targets from a random window of the corpus.
@@ -194,6 +393,53 @@ fn train(run_until, total, batch, base_lr, min_lr, warmup, clip, log_every): i64
     return 0;
 }
 
+# ---- evaluation: cross-entropy + bits-per-byte ------------------------------
+# One deterministic pass over the encoded corpus at stride T (windows
+# s = 0, T, 2T, ...; a tail shorter than T+1 ids is dropped). Accumulates
+# total CE in nats (model_forward returns mean-per-token, so x T per window)
+# and the BYTE count the targets span — 1 per target in byte mode,
+# g_tok_len[target] under BPE. Bits-per-byte = nats / (ln2 * bytes) is the
+# tokenizer-independent comparison metric: per-token CE is not comparable
+# across vocabularies, amortizing it over the bytes each token spans is
+# (X003). RNG-neutral: g_training = 0 draws nothing from the PRNG, so an
+# eval pass perturbs neither checkpoints nor subsequent sampling.
+var g_eval_nats = 0;    # f64 bits: total cross-entropy over all eval targets
+var g_eval_tokens = 0;  # targets evaluated
+var g_eval_bytes = 0;   # bytes those targets decode to
+fn eval_corpus(): i64 {
+    g_eval_nats = f64_from(0);
+    g_eval_tokens = 0;
+    g_eval_bytes = 0;
+    if ((g_data == 0) || (g_datalen < g_T + 1)) { return 0 - 1; }
+    var was_training = g_training;
+    g_training = 0;
+    var T = g_T;
+    var s = 0;
+    while (s + T + 1 <= g_datalen) {
+        var t = 0;
+        while (t < T) {
+            store64(A_tokens + t * 8, load64(g_data + (s + t) * 8));
+            var tgt = load64(g_data + (s + t + 1) * 8);
+            store64(A_targets + t * 8, tgt);
+            if (g_bpe_on == 1) { g_eval_bytes = g_eval_bytes + load64(g_tok_len + tgt * 8); }
+            else { g_eval_bytes = g_eval_bytes + 1; }
+            t = t + 1;
+        }
+        var loss = model_forward();
+        g_eval_nats = f64_add(g_eval_nats, f64_mul(loss, f64_from(T)));
+        g_eval_tokens = g_eval_tokens + T;
+        s = s + T;
+    }
+    g_training = was_training;
+    return g_eval_tokens;
+}
+
+# bits/byte over the last eval_corpus() pass
+fn eval_bpb(): i64 {
+    if (g_eval_bytes < 1) { return f64_from(0); }
+    return f64_div(g_eval_nats, f64_mul(F64_LN2, f64_from(g_eval_bytes)));
+}
+
 # ---- generation ------------------------------------------------------------
 # Sample from one logits row with temperature (temp is an f64 bit pattern).
 # temp == 0 means greedy (argmax).
@@ -287,7 +533,7 @@ fn gen_decode(ngen, temp, cached, out_ids, emit): i64 {
     while (k < ngen) {
         var next = sample_logits_row(_gen_logits_row(cached), g_V, temp);
         if (out_ids != 0) { store64(out_ids + k * 8, next); }
-        if (emit == 1) { _putc(decode_char(next)); }
+        if (emit == 1) { tok_emit(next); }
         # append `next` (sliding the window if it is full), then process it
         if (G_n == g_T) {
             var sh = GEN_SHIFT();
@@ -311,19 +557,36 @@ fn gen_decode(ngen, temp, cached, out_ids, emit): i64 {
     return 0;
 }
 
-# Seed the context with `prompt` (plen chars), then emit `ngen` more chars.
+# Seed the context with `prompt` (plen bytes), then emit `ngen` more tokens.
+# Byte mode keeps the original inline per-byte loop VERBATIM (the audited
+# default path); BPE encodes the prompt through tok_encode (clamped to its
+# last ENC_MAX() bytes) and takes the last <= T resulting ids.
 fn generate(prompt, plen, ngen, temp): i64 {
     g_training = 0;   # eval: no dropout
     var T = g_T;
-    var n = plen;
-    if (n > T) { n = T; }
-    var t = 0;
-    while (t < n) {
-        var src = plen - n + t;
-        var id = load64(g_char2id + load8(prompt + src) * 8);
-        if (id < 0) { id = 0; }   # byte not in vocab -> fall back to id 0
-        store64(G_win + t * 8, id);
-        t = t + 1;
+    var n = 0;
+    if (g_bpe_on == 0) {
+        n = plen;
+        if (n > T) { n = T; }
+        var t = 0;
+        while (t < n) {
+            var src = plen - n + t;
+            var id = load64(g_char2id + load8(prompt + src) * 8);
+            if (id < 0) { id = 0; }   # byte not in vocab -> fall back to id 0
+            store64(G_win + t * 8, id);
+            t = t + 1;
+        }
+    } else {
+        var pb = plen;
+        if (pb > ENC_MAX()) { pb = ENC_MAX(); }
+        var nids = tok_encode(prompt + plen - pb, pb, g_enc_buf);
+        n = nids;
+        if (n > T) { n = T; }
+        var t2 = 0;
+        while (t2 < n) {
+            store64(G_win + t2 * 8, load64(g_enc_buf + (nids - n + t2) * 8));
+            t2 = t2 + 1;
+        }
     }
     if (n < 1) { store64(G_win, 0); n = 1; }   # empty prompt: seed with id 0
     print(prompt, plen);

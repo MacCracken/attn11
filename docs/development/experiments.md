@@ -63,3 +63,55 @@ projection shrink), cached generation 170 392 → 164 282 ns/token.
    is 24 KB); its value in attn11 is the grad-checked reference backward.
 3. Training quality at `nkv < nh` is untested on a real corpus — a vidya
    iso-param GQA-vs-MHA run is the natural X003 (pairs with E3).
+
+## X003 — byte vs BPE at iso-compute (E3 → M7) (2026-06-11)
+
+**Setup**: 0.7.1, `--preset` (d_model 64, ctx 64, 8 heads, 4 layers), the X001
+vidya corpus (488,489 bytes, 74 files), x86_64, seed 1337, `--eval`
+bits-per-byte. The comparison is held at **iso-compute**, not iso-step: each
+config's total training MACs are matched, anchored on byte-level = 3000 steps.
+Per-token MAC ≈ `12C² + 2TC + CV` (ADR 0006); the `CV` (tied-head) term grows
+with the BPE vocab `V = 117 + K`, so a higher-`K` config does more work per
+step and is given proportionally fewer steps. Derived horizons: byte 3000,
+bpe-128 2664, bpe-256 2395, bpe-512 1993 — total MACs matched to <0.03%.
+`bits/byte` (cross-entropy nats / ln 2, normalized by the **decoded byte**
+count, BPE targets weighted by their span length) is the tokenizer-comparable
+metric; eval byte counts are ~equal (488.3–488.5 K) across all four, so the
+numbers compare directly.
+
+**Result** (lower bits/byte = better):
+
+| tokenizer | V | params | steps | corpus tokens | ce/token (nats) | **bits/byte** |
+|-----------|-----|---------|-------|---------------|-----------------|---------------|
+| byte      | 117 | 211 648 | 3000  | 488 489 (1.00×) | 1.323 | **1.909** |
+| bpe-128   | 245 | 219 840 | 2664  | 269 779 (1.81×) | 2.130 | **1.697** (−11.1%) |
+| bpe-256   | 373 | 228 032 | 2395  | 229 067 (2.13×) | 2.487 | **1.683** (−11.8%) |
+| bpe-512   | 629 | 244 416 | 1993  | 192 434 (2.54×) | 2.907 | **1.652** (−13.4%) |
+
+At matched compute, **BPE reaches lower bits-per-byte than byte-level, and the
+advantage grows with merge count K** (−11% to −13%). `ce/token` *rises* with K
+(each token now carries more bytes, so it is harder to predict) while
+bits-per-*byte* *falls* — the metric correctly credits BPE for covering more
+of the corpus per token. Byte-level itself reached train loss **1.17** here
+(vs X001's 1.55 at the tiny config on the same corpus), so the preset's larger
+model is independently the better predictor — X001 takeaway #2 (ctx-16 was the
+binding constraint) confirmed.
+
+**Takeaways**:
+1. The frontier survey's **data-efficiency thesis holds on vidya**: at
+   iso-compute, subword tokens spend the fixed MAC budget on more of the
+   corpus's bytes, so BPE predicts the stream ~11–13% more cheaply (bits/byte).
+   The gain is monotone in K across [128, 512] but with **diminishing returns**
+   (−11.1 → −11.8 → −13.4%): most of it is captured by K=128.
+2. **Caveat — iso-compute, not iso-parameter.** A larger BPE vocab inflates the
+   embedding + tied head (211 K → 244 K params), so BPE also buys capacity.
+   The MAC accounting prices the `CV` term in, so the comparison is fair on the
+   *compute* axis the question posed; an iso-param sweep (hold params, vary K
+   by shrinking C) is a separate future probe.
+3. Methodology pin: `--eval` is RNG-neutral and the merge training is pure i64
+   (bit-reproducible cross-arch), so every row above reproduces bit-for-bit
+   from the flags — re-run with `--corpus <vidya> --preset [--bpe K] --steps S
+   --eval`.
+
+Checkpoints: ephemeral (no `--save`); regenerate deterministically with the
+flags above.

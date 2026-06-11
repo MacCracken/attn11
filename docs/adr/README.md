@@ -24,3 +24,4 @@ Decisions about attn11 — what we chose, the context, and the consequences we a
 - [0003 — SIMD via memory-accumulator f64v_fmadd](0003-simd-memory-accumulators.md) — matmul vectorized with memory accumulators (never reassign a SIMD-typed var).
 - [0004 — Native-endian raw checkpoint blob](0004-native-endian-checkpoint-format.md) — fast same-arch resume; not cross-architecture portable.
 - [0005 — Context-shift generation under absolute positional embeddings](0005-context-shift-generation-under-absolute-positions.md) — KV-cached decode with drop-oldest-T/2 + re-prime when the window fills; cached path gated bit-identical to an uncached reference.
+- [0006 — Opt-in BPE tokenizer, byte-level default](0006-opt-in-bpe-tokenizer.md) — `--bpe K` learns ≤512 merges over the byte base vocab; frozen deterministic tie-break; checkpoints (v3) carry the tokenizer; amends 0002.

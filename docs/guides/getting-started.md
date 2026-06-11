@@ -22,7 +22,16 @@ attn11 --steps N             total training steps (also the LR-schedule horizon)
 attn11 --save PATH           write a crash-atomic checkpoint after training
 attn11 --load PATH           resume from a checkpoint (+ --corpus to continue training)
 attn11 --gen-only            skip training, just sample
+attn11 --preset              ctx 64 / d_model 64 / 8 heads / 4 layers (default: ctx 16)
+attn11 --heads N             override attention heads (must divide d_model)
+attn11 --kv-heads N          override K/V heads (< heads = GQA, 1 = MQA)
+attn11 --layers N            override transformer blocks
+attn11 --bpe K               learn K BPE merges first (1..512; default is byte-level)
+attn11 --eval                print CE/token + bits-per-byte after training/save
 ```
+
+Config flags (`--preset`/`--heads`/`--kv-heads`/`--layers`/`--bpe`) shape a
+**fresh** model; under `--load` the checkpoint's config and tokenizer win.
 
 Example — train on your own text, checkpoint, then resume:
 
@@ -32,10 +41,19 @@ attn11 --load run.ckpt --corpus mytext.txt --steps 4000   # resume to 4000
 attn11 --load run.ckpt --gen-only                         # sample from it
 ```
 
+Example — the scale preset with BPE, compared on bits-per-byte:
+
+```sh
+attn11 --preset --corpus mytext.txt --steps 4000 --eval            # byte-level
+attn11 --preset --bpe 256 --corpus mytext.txt --steps 4000 --eval  # BPE
+```
+
 Sampling is **KV-cached** (0.7.0): the prompt prefills per-layer K/V caches
 and each generated token costs one cached row instead of a window recompute
-(~6.2× faster; bit-identical to the uncached reference — see ADR 0005).
-Checkpoints from 0.6.0 and earlier (format v1) still load.
+(~6× faster at ctx 16, ~23× at the ctx-64 preset; bit-identical to the
+uncached reference — see ADR 0005). Checkpoints from earlier formats (v1
+≤ 0.6.0, v2 = 0.7.0) still load; saves write v3 (which records the
+tokenizer — see ADR 0006).
 
 ## Layout
 

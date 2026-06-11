@@ -459,6 +459,84 @@ fn test_alloc_accounting(): i64 {
     var predicted = model_alloc_bytes(5, 16, 8, 4, 2, 2, g_NP);
     assert(delta >= predicted, "model_alloc_bytes never under-predicts model_init");
     assert(delta <= predicted + 8192, "model_alloc_bytes tracks model_init (no forgotten buffers)");
+    # second pin at a BPE-scale vocab (V > 256): the V-dependent terms
+    # (embeddings, logits/probs rows, R_logits) must stay accounted
+    used0 = alloc_used();
+    model_init(300, 16, 8, 4, 2, 2, 1, f64_from(0), 4);
+    delta = alloc_used() - used0;
+    predicted = model_alloc_bytes(300, 16, 8, 4, 2, 2, g_NP);
+    assert(delta >= predicted, "alloc accounting holds at V=300 (under)");
+    assert(delta <= predicted + 8192, "alloc accounting holds at V=300 (over)");
+    return 0;
+}
+
+# Regression for the M7 --layers heap-OOB (adversarial review, 2026-06-11): the
+# fresh-model path takes CLI-supplied dims, so model_config_ok must cap their
+# MAGNITUDE the same way the checkpoint loader does (-4/-5/-7/-8). Without the
+# NL cap an unbounded --layers makes NL*_blk() overflow i64, wrapping to a
+# small positive size that t_alloc accepts — then weight-init writes past the
+# undersized buffer (SIGSEGV / heap corruption). model_config_ok is the gate
+# model_init checks before any allocation.
+fn test_config_caps(): i64 {
+    # valid shapes accepted (default, BPE-max preset, NL at the cap boundary)
+    assert(model_config_ok(25, 32, 16, 4, 4, 3) == 1, "valid default config accepted");
+    assert(model_config_ok(768, 64, 64, 8, 8, 4) == 1, "valid BPE-max preset config accepted");
+    assert(model_config_ok(25, 32, 16, 4, 4, 128) == 1, "NL at cap (128) accepted");
+    # NL is the exploit vector (CLI --layers); cap mirrors the loader's -8
+    assert(model_config_ok(25, 32, 16, 4, 4, 129) == 0, "NL over cap (129) rejected");
+    assert(model_config_ok(25, 32, 16, 4, 4, 1000000000) == 0, "huge NL rejected before overflow");
+    # the remaining magnitude caps mirror the loader's -4/-5/-7
+    assert(model_config_ok(769, 32, 16, 4, 4, 3) == 0, "V over BPE_VMAX (769) rejected");
+    assert(model_config_ok(25, 4097, 16, 4, 4, 3) == 0, "C over cap (4097) rejected");
+    assert(model_config_ok(25, 32, 8193, 4, 4, 3) == 0, "T over cap (8193) rejected");
+    return 0;
+}
+
+# A BPE-scale vocab (V > 256) through the generation paths: the cached and
+# uncached forwards must stay bit-identical with logits/probs rows, the tied
+# head, and sampling all running at V past the old byte-level cap. No corpus
+# or vocab table involved (emit off; synthetic ids) — V is just a dimension.
+fn test_kv_vocab300(): i64 {
+    var V = 300;
+    model_init(V, 16, 8, 2, 2, 2, 1, f64_from(0), 29);
+    g_training = 0;
+    var T = g_T;
+    var ids = t_alloc(T);
+    var i = 0;
+    while (i < T) { store64(ids + i * 8, (i * 37 + 5) % V); i = i + 1; }
+    # prefill bit-identity at every prefix
+    var mism = 0;
+    var m = 1;
+    while (m <= T) {
+        gen_prime(ids, m, 1);
+        var cs = t_alloc(V); t_copy(cs, R_logits, V);
+        gen_prime(ids, m, 0);
+        var urow = A_logits + (m - 1) * g_V * 8;
+        var v = 0;
+        while (v < V) {
+            if (load64(cs + v * 8) != load64(urow + v * 8)) { mism = mism + 1; }
+            v = v + 1;
+        }
+        m = m + 1;
+    }
+    assert(mism == 0, "V=300 prefill logits bit-identical at every prefix");
+    # decode ids across context-shifts, temperature sampling
+    var NG = 2 * T;
+    var outA = t_alloc(NG); var outB = t_alloc(NG);
+    _rng_state = 31337;
+    gen_prime(ids, T, 1);
+    gen_decode(NG, _lrc(8, 10), 1, outA, 0);
+    _rng_state = 31337;
+    gen_prime(ids, T, 0);
+    gen_decode(NG, _lrc(8, 10), 0, outB, 0);
+    var bad = 0; i = 0;
+    while (i < NG) {
+        var a = load64(outA + i * 8);
+        if (a != load64(outB + i * 8)) { bad = bad + 1; }
+        if ((a < 0) || (a >= V)) { bad = bad + 1; }
+        i = i + 1;
+    }
+    assert(bad == 0, "V=300 decode ids identical and in range");
     return 0;
 }
 
@@ -504,39 +582,46 @@ fn test_ckpt_gqa_roundtrip(): i64 {
     store64(bad + 6 * 8, 1);        # NL=1
     store64(bad + 7 * 8, 0);        # bias off
     store64(bad + 12 * 8, 1);       # nkv=1
+    store64(bad + 14 * 8, 2);       # Vb=2 (keep V = Vb + K consistent)
     store64(bad + 9 * 8, ckpt_expected_np(2, 64, 8192, 64, 1, 0, 1));
     assert(ckpt_load_buf(bad, sz) == (0 - 18), "oversized model (arena) rejected pre-alloc");
     return 0;
 }
 
-# A v1 (pre-GQA, 12-field header) checkpoint must still load, as full MHA
-# (nkv = nh) — with nkv == nh the v2 parameter layout is identical to v1's.
-fn test_ckpt_v1_compat(): i64 {
+# Older checkpoint versions must still load. A byte-kind v3 body (vocab +
+# params) is bit-identical to v1/v2's, so older images are pure header
+# shifts of the v3 the serializer now emits: v2 (pre-BPE, 13 fields) drops
+# [13..15]; v1 (pre-GQA, 12 fields) also drops [12] (nkv) and loads as full
+# MHA (nkv = nh, under which the v2/v3 parameter layout is identical).
+fn _ckpt_compat_check(ver, hdr_fields): i64 {
     var V = build_corpus();
     model_init(V, 8, 4, 2, 2, 1, 0, f64_from(0), 6);
     var np = g_NP;
     var snap = t_alloc(np); t_copy(snap, g_params, np);
     var sz = ckpt_size();
-    var v2 = alloc(sz); ckpt_serialize(v2);
-    # transform to v1: version = 1, drop header field [12] (nkv), shift the
-    # rest of the image down one i64
-    var sz1 = sz - 8;
-    var v1 = alloc(sz1);
+    var v3 = alloc(sz); ckpt_serialize(v3);
+    var dropped = 16 - hdr_fields;
+    var szo = sz - dropped * 8;
+    var old = alloc(szo);
     var i = 0;
-    while (i < 12) { store64(v1 + i * 8, load64(v2 + i * 8)); i = i + 1; }
-    store64(v1 + 1 * 8, 1);
-    while (i < sz1 / 8) { store64(v1 + i * 8, load64(v2 + (i + 1) * 8)); i = i + 1; }
+    while (i < hdr_fields) { store64(old + i * 8, load64(v3 + i * 8)); i = i + 1; }
+    store64(old + 1 * 8, ver);
+    while (i < szo / 8) { store64(old + i * 8, load64(v3 + (i + dropped) * 8)); i = i + 1; }
     model_init(V, 8, 4, 2, 2, 1, 0, f64_from(0), 777);  # scramble
-    assert(ckpt_load_buf(v1, sz1) == 0, "v1 checkpoint loads");
-    assert(g_nkv == g_nh, "v1 loads as full MHA (nkv = nh)");
+    assert(ckpt_load_buf(old, szo) == 0, "old-version checkpoint loads");
+    assert(g_nkv == g_nh, "old version loads as full MHA (nkv = nh)");
+    assert(g_bpe_on == 0, "old version loads as byte-level tokenizer");
+    assert(g_bpe_nmerges == 0, "old version loads with zero merges");
     var mism = 0; i = 0;
     while (i < np) {
         if (load64(g_params + i * 8) != load64(snap + i * 8)) { mism = mism + 1; }
         i = i + 1;
     }
-    assert(mism == 0, "v1 load restores params bit-for-bit");
+    assert(mism == 0, "old-version load restores params bit-for-bit");
     return 0;
 }
+fn test_ckpt_v1_compat(): i64 { return _ckpt_compat_check(1, 12); }
+fn test_ckpt_v2_compat(): i64 { return _ckpt_compat_check(2, 13); }
 
 # With a corpus already loaded, a checkpoint whose vocab differs must be
 # rejected (-15) rather than silently mis-indexing g_data.
@@ -546,9 +631,330 @@ fn test_ckpt_vocab_mismatch(): i64 {
     var sz = ckpt_size();
     var ck = alloc(sz); ckpt_serialize(ck);
     # corrupt the first vocab entry so it no longer matches the loaded corpus
-    var off = 13 * 8;                        # CKPT_HDR fields, then vocab[0]
+    var off = 16 * 8;                        # CKPT_HDR fields, then vocab[0]
     store64(ck + off, (load64(ck + off) + 1) % 256);
     assert(ckpt_load_buf(ck, sz) == (0 - 15), "vocab-mismatch rejected (-15)");
+    return 0;
+}
+
+# eval_corpus: deterministic, repeatable, RNG-neutral; byte mode counts one
+# byte per target, BPE counts each target's expansion (so bits-per-byte is
+# comparable across tokenizers).
+fn test_eval_bpb(): i64 {
+    var V = build_corpus();
+    model_init(V, 8, 4, 2, 2, 1, 0, f64_from(0), 19);
+    train(4, 4, 2, _lrc(3, 1000), _lrc(3, 10000), 2, f64_from(1), 1000000000);
+    var rng0 = _rng_state;
+    var n1 = eval_corpus();
+    var nats1 = g_eval_nats; var tok1 = g_eval_tokens; var byt1 = g_eval_bytes;
+    var n2 = eval_corpus();
+    assert((n1 > 0) && (n1 == n2), "eval runs and is repeatable");
+    assert(g_eval_nats == nats1, "eval nats bit-identical across passes");
+    assert(_rng_state == rng0, "eval is RNG-neutral");
+    assert(byt1 == tok1, "byte-level eval: bytes == tokens");
+    assert(f64_is_finite(eval_bpb()) == 1, "bits/byte is finite");
+    # BPE: merged targets span > 1 byte each, so bytes must exceed tokens
+    build_corpus();
+    var V2 = bpe_learn(8);
+    model_init(V2, 8, 4, 2, 2, 1, 0, f64_from(0), 19);
+    assert(eval_corpus() > 0, "bpe eval runs");
+    assert(g_eval_bytes > g_eval_tokens, "bpe eval: targets span more bytes than tokens");
+    return 0;
+}
+
+# v3 BPE checkpoint round-trip: tokenizer state (kind, base, merges, spans)
+# and params restore bit-exactly, and the corpus id stream is rebuilt from
+# the retained raw bytes through the loaded merges.
+fn test_ckpt_v3_roundtrip(): i64 {
+    var B = build_corpus();
+    var V = bpe_learn(8);
+    var nm = g_bpe_nmerges;
+    var dl = g_datalen;
+    var mer = t_alloc(2 * nm); t_copy(mer, g_merges, 2 * nm);
+    var dat = t_alloc(dl); t_copy(dat, g_data, dl);
+    model_init(V, 8, 4, 2, 2, 1, 1, f64_from(0), 13);
+    var np = g_NP;
+    var snap = t_alloc(np); t_copy(snap, g_params, np);
+    var sz = ckpt_size();
+    assert(sz == (16 + B + 2 * nm + 3 * np) * 8, "v3 size accounts header+base+merges+params");
+    var ck = alloc(sz); ckpt_serialize(ck);
+    # scramble: fresh byte-level corpus state + different-seed model
+    build_corpus();
+    model_init(B, 8, 4, 2, 2, 1, 1, f64_from(0), 555);
+    assert(g_bpe_on == 0, "scramble reset to byte-level");
+    assert(ckpt_load_buf(ck, sz) == 0, "v3 BPE checkpoint loads");
+    assert(g_bpe_on == 1, "BPE tokenizer restored");
+    assert((g_bpe_base == B) && (g_bpe_nmerges == nm), "base/merge counts restored");
+    var mism = 0; var i = 0;
+    while (i < 2 * nm) {
+        if (load64(g_merges + i * 8) != load64(mer + i * 8)) { mism = mism + 1; }
+        i = i + 1;
+    }
+    assert(mism == 0, "merge table restored bit-for-bit");
+    assert(g_datalen == dl, "corpus id stream rebuilt to merged length");
+    mism = 0; i = 0;
+    while (i < dl) {
+        if (load64(g_data + i * 8) != load64(dat + i * 8)) { mism = mism + 1; }
+        i = i + 1;
+    }
+    assert(mism == 0, "corpus id stream rebuilt bit-for-bit");
+    mism = 0; i = 0;
+    while (i < np) {
+        if (load64(g_params + i * 8) != load64(snap + i * 8)) { mism = mism + 1; }
+        i = i + 1;
+    }
+    assert(mism == 0, "v3 BPE load restores params bit-for-bit");
+    # double-load idempotency: re-encoding from raw bytes must not drift
+    assert(ckpt_load_buf(ck, sz) == 0, "v3 BPE checkpoint re-loads");
+    assert(g_datalen == dl, "second load leaves the id stream identical");
+    return 0;
+}
+
+# v3 rejection paths: every new tokenizer-field error code, the forgery
+# cascade (a single inconsistent field can never pass all checks), and the
+# merge-table scan (well-foundedness -37, expansion bomb -38).
+fn test_ckpt_v3_reject(): i64 {
+    var B = build_corpus();
+    var V = bpe_learn(8);
+    var nm = g_bpe_nmerges;
+    assert(nm >= 7, "reject setup: corpus sustains >= 7 merges");
+    model_init(V, 8, 4, 2, 2, 1, 0, f64_from(0), 17);
+    var np = g_NP;
+    var sz = ckpt_size();
+    var ck = alloc(sz); ckpt_serialize(ck);
+    var bad = alloc(sz);
+    # tok_kind out of {0,1}
+    t_copy(bad, ck, sz / 8); store64(bad + 13 * 8, 2);
+    assert(ckpt_load_buf(bad, sz) == (0 - 32), "tok_kind=2 rejected (-32)");
+    # base vocab out of [1,256]
+    t_copy(bad, ck, sz / 8); store64(bad + 14 * 8, 0);
+    assert(ckpt_load_buf(bad, sz) == (0 - 33), "Vb=0 rejected (-33)");
+    t_copy(bad, ck, sz / 8); store64(bad + 14 * 8, 257);
+    assert(ckpt_load_buf(bad, sz) == (0 - 33), "Vb=257 rejected (-33)");
+    # merge count out of [0,512] — negative K would alias base ids past V
+    t_copy(bad, ck, sz / 8); store64(bad + 15 * 8, 0 - 1);
+    assert(ckpt_load_buf(bad, sz) == (0 - 34), "K=-1 rejected (-34)");
+    t_copy(bad, ck, sz / 8); store64(bad + 15 * 8, 513);
+    assert(ckpt_load_buf(bad, sz) == (0 - 34), "K=513 rejected (-34)");
+    # the forgery cascade: V+1 alone -> -35; with K+1 -> -10 (recomputed NP);
+    # with NP also patched -> -11 (exact size). A forger must rewrite the
+    # whole file consistently — at which point it is a different checkpoint.
+    t_copy(bad, ck, sz / 8); store64(bad + 2 * 8, V + 1);
+    assert(ckpt_load_buf(bad, sz) == (0 - 35), "V != Vb+K rejected (-35)");
+    t_copy(bad, ck, sz / 8); store64(bad + 15 * 8, nm + 1);
+    assert(ckpt_load_buf(bad, sz) == (0 - 35), "K+1 alone rejected (-35)");
+    t_copy(bad, ck, sz / 8); store64(bad + 2 * 8, V + 1); store64(bad + 15 * 8, nm + 1);
+    assert(ckpt_load_buf(bad, sz) == (0 - 10), "K+1,V+1 rejected by recomputed NP (-10)");
+    t_copy(bad, ck, sz / 8); store64(bad + 2 * 8, V + 1); store64(bad + 15 * 8, nm + 1);
+    store64(bad + 9 * 8, ckpt_expected_np(V + 1, 8, 4, 2, 1, 0, 2));
+    assert(ckpt_load_buf(bad, sz) == (0 - 11), "K+1,V+1,np patched rejected by exact size (-11)");
+    # byte-level kind cannot carry merges
+    t_copy(bad, ck, sz / 8); store64(bad + 13 * 8, 0);
+    assert(ckpt_load_buf(bad, sz) == (0 - 36), "tok_kind=0 with K>0 rejected (-36)");
+    # merge-table well-foundedness: self, forward, negative refs
+    t_copy(bad, ck, sz / 8); store64(bad + (16 + B) * 8, B);
+    assert(ckpt_load_buf(bad, sz) == (0 - 37), "merge 0 self-reference rejected (-37)");
+    t_copy(bad, ck, sz / 8); store64(bad + (16 + B) * 8, B + 3);
+    assert(ckpt_load_buf(bad, sz) == (0 - 37), "merge 0 forward reference rejected (-37)");
+    t_copy(bad, ck, sz / 8); store64(bad + (16 + B + 1) * 8, 0 - 2);
+    assert(ckpt_load_buf(bad, sz) == (0 - 37), "merge 0 negative reference rejected (-37)");
+    # expansion bomb: chained self-doubling merges, header fully consistent —
+    # only the length recurrence can catch this (2^(j+1) bytes at merge j)
+    t_copy(bad, ck, sz / 8);
+    store64(bad + (16 + B) * 8, 0); store64(bad + (16 + B + 1) * 8, 0);
+    var j = 1;
+    while (j < 7) {
+        store64(bad + (16 + B + 2 * j) * 8, B + j - 1);
+        store64(bad + (16 + B + 2 * j + 1) * 8, B + j - 1);
+        j = j + 1;
+    }
+    assert(ckpt_load_buf(bad, sz) == (0 - 38), "expansion bomb rejected (-38)");
+    # a v3 header on a buffer too short for it
+    assert(ckpt_load_buf(ck, 13 * 8) == (0 - 1), "v3 header on 13-field buffer rejected (-1)");
+    # version forged down to 2: the v2 size formula no longer matches
+    t_copy(bad, ck, sz / 8); store64(bad + 1 * 8, 2);
+    assert(ckpt_load_buf(bad, sz) == (0 - 11), "BPE image forged to v2 rejected by size (-11)");
+    return 0;
+}
+
+# BPE resume determinism: train(K) one-shot == train(K1) -> v3 round-trip ->
+# train(K), params bit-for-bit — through the corpus rebuild (the loaded
+# corpus is re-encoded from raw bytes with the checkpoint's merges).
+fn test_resume_bpe(): i64 {
+    var base = _lrc(3, 1000); var minl = _lrc(3, 10000); var clip = f64_from(1);
+    var K = 24; var K1 = 9; var Bch = 4; var warm = 5; var quiet = 1000000000;
+    # Path A: one continuous run
+    build_corpus();
+    var V = bpe_learn(8);
+    model_init(V, 8, 4, 2, 2, 2, 0, f64_from(0), 7);
+    train(K, K, Bch, base, minl, warm, clip, quiet);
+    var npA = g_NP;
+    var snapA = t_alloc(npA); t_copy(snapA, g_params, npA);
+    # Path B: split run with a checkpoint round-trip at K1
+    build_corpus();
+    bpe_learn(8);
+    model_init(V, 8, 4, 2, 2, 2, 0, f64_from(0), 7);
+    train(K1, K, Bch, base, minl, warm, clip, quiet);
+    var sz = ckpt_size();
+    var buf = alloc(sz); ckpt_serialize(buf);
+    build_corpus();                                       # scramble corpus to byte-level
+    model_init(V, 8, 4, 2, 2, 2, 0, f64_from(0), 999);    # scramble model
+    assert(ckpt_load_buf(buf, sz) == 0, "bpe resume: checkpoint loads");
+    train(K, K, Bch, base, minl, warm, clip, quiet);
+    assert(g_step == K, "bpe resume: step counter reaches K");
+    var mism = 0; var i = 0;
+    while (i < g_NP) {
+        if (load64(g_params + i * 8) != load64(snapA + i * 8)) { mism = mism + 1; }
+        i = i + 1;
+    }
+    assert((g_NP == npA) && (mism == 0), "bpe resume reproduces params bit-for-bit");
+    return 0;
+}
+
+# BPE generation: cached and uncached decode agree on ids at a BPE vocab,
+# every sampled id is in range, and the prompt path (tok_encode + clamp)
+# runs end-to-end.
+fn test_bpe_generate(): i64 {
+    build_corpus();
+    var V = bpe_learn(8);
+    model_init(V, 16, 8, 2, 2, 2, 1, f64_from(0), 23);
+    train(8, 8, 2, _lrc(3, 1000), _lrc(3, 10000), 2, f64_from(1), 1000000000);
+    g_training = 0;
+    var T = g_T;
+    var ids = t_alloc(T);
+    var i = 0;
+    while (i < T) { store64(ids + i * 8, (i * 5 + 2) % V); i = i + 1; }
+    var NG = 2 * T;
+    var outA = t_alloc(NG); var outB = t_alloc(NG);
+    _rng_state = 777;
+    gen_prime(ids, T, 1);
+    gen_decode(NG, _lrc(8, 10), 1, outA, 0);
+    _rng_state = 777;
+    gen_prime(ids, T, 0);
+    gen_decode(NG, _lrc(8, 10), 0, outB, 0);
+    var bad = 0; i = 0;
+    while (i < NG) {
+        var a = load64(outA + i * 8);
+        if (a != load64(outB + i * 8)) { bad = bad + 1; }
+        if ((a < 0) || (a >= V)) { bad = bad + 1; }
+        i = i + 1;
+    }
+    assert(bad == 0, "bpe decode ids identical (cached vs uncached) and in range");
+    # the BPE prompt-encode path end-to-end (emits a short sample)
+    generate("cyrius ", 7, 8, f64_from(0));
+    return 0;
+}
+
+# BPE: pin the exact merge sequence on the classic Sennrich corpus
+# "aaabdaaabac" under OUR frozen semantics (overlap counting; row-major
+# ascending argmax = ties to smallest left id then smallest right id; greedy
+# left-to-right non-overlapping replace). Hand trace: vocab a=0 b=1 d=2 c=3;
+# ids [0,0,0,1,2,0,0,0,1,0,3]. Round 1: (0,0) count 4 -> id 4 "aa", stream
+# [4,0,1,2,4,0,1,0,3]. Round 2: (0,1) and (4,0) tie at 2; (0,1) scans first
+# -> id 5 "ab", stream [4,5,2,4,5,0,3]. Round 3: (4,5) count 2 -> id 6
+# "aaab", stream [6,2,6,0,3]. On the aarch64/qemu CI leg this same assert is
+# the cross-arch merge-determinism pin.
+fn test_bpe_known(): i64 {
+    var buf = alloc(32);
+    var len = _append(buf, 0, "aaabdaaabac");
+    var B = corpus_set(buf, len);
+    assert(B == 4, "bpe known: byte vocab a,b,d,c");
+    var V = bpe_learn(3);
+    assert(V == 7, "bpe known: V = 4 base + 3 merges");
+    assert(g_bpe_nmerges == 3, "bpe known: 3 merges learned");
+    assert((load64(g_merges + 0) == 0) && (load64(g_merges + 8) == 0), "bpe known: merge 0 = (a,a)");
+    assert((load64(g_merges + 16) == 0) && (load64(g_merges + 24) == 1), "bpe known: merge 1 = (a,b)");
+    assert((load64(g_merges + 32) == 4) && (load64(g_merges + 40) == 5), "bpe known: merge 2 = (aa,ab)");
+    assert(g_datalen == 5, "bpe known: encoded stream length 5");
+    var want[40];
+    store64(&want + 0, 6); store64(&want + 8, 2); store64(&want + 16, 6);
+    store64(&want + 24, 0); store64(&want + 32, 3);
+    var mism = 0; var i = 0;
+    while (i < 5) {
+        if (load64(g_data + i * 8) != load64(&want + i * 8)) { mism = mism + 1; }
+        i = i + 1;
+    }
+    assert(mism == 0, "bpe known: encoded stream [aaab,d,aaab,a,c]");
+    assert(load64(g_tok_len + 6 * 8) == 4, "bpe known: id 6 expands to 4 bytes");
+    var sp = g_tok_bytes + 6 * BPE_MAX_TOKLEN();
+    var okb = 0;
+    if ((load8(sp) == 97) && (load8(sp + 1) == 97) && (load8(sp + 2) == 97) && (load8(sp + 3) == 98)) { okb = 1; }
+    assert(okb == 1, "bpe known: id 6 span is 'aaab'");
+    return 0;
+}
+
+# BPE round-trip: expanding every encoded id reconstructs the corpus bytes
+# exactly, and tok_encode over the raw bytes reproduces the merged stream
+# bit-for-bit (the property the checkpoint loader's corpus rebuild relies
+# on). Unseen bytes at encode time fall back to id 0 without crashing.
+fn test_bpe_roundtrip(): i64 {
+    var B = build_corpus();
+    var V = bpe_learn(16);
+    assert(V == B + g_bpe_nmerges, "bpe roundtrip: V = base + merges");
+    assert(g_bpe_nmerges >= 1, "bpe roundtrip: corpus yields at least one merge");
+    # (a) decode: expand g_data through the span table, compare to g_text
+    var pos = 0; var bad = 0; var i = 0;
+    while (i < g_datalen) {
+        var id = load64(g_data + i * 8);
+        var tl = load64(g_tok_len + id * 8);
+        var sp = g_tok_bytes + id * BPE_MAX_TOKLEN();
+        var j = 0;
+        while (j < tl) {
+            if (pos >= g_textlen) { bad = bad + 1; }
+            elif (load8(sp + j) != load8(g_text + pos)) { bad = bad + 1; }
+            pos = pos + 1;
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    assert((bad == 0) && (pos == g_textlen), "bpe roundtrip: decode reconstructs corpus byte-exactly");
+    # (b) encode: tok_encode(raw bytes) == g_data, bit-for-bit
+    var out = t_alloc(g_textlen);
+    var n = tok_encode(g_text, g_textlen, out);
+    assert(n == g_datalen, "bpe roundtrip: re-encode length matches");
+    var mism = 0; i = 0;
+    while (i < n) {
+        if (load64(out + i * 8) != load64(g_data + i * 8)) { mism = mism + 1; }
+        i = i + 1;
+    }
+    assert(mism == 0, "bpe roundtrip: re-encode reproduces g_data bit-for-bit");
+    # (c) unseen bytes (the corpus has no 'Z'/0xF0) fall back to id 0, in range
+    var probe = alloc(8);
+    store8(probe, 90); store8(probe + 1, 0xF0); store8(probe + 2, 97);
+    var pn = tok_encode(probe, 3, out);
+    var oor = 0; i = 0;
+    while (i < pn) {
+        var pid = load64(out + i * 8);
+        if ((pid < 0) || (pid >= V)) { oor = oor + 1; }
+        i = i + 1;
+    }
+    assert(((pn >= 1) && (oor == 0)), "bpe roundtrip: unseen bytes encode in-range (id 0 fallback)");
+    return 0;
+}
+
+# BPE determinism: two independent corpus_set + bpe_learn runs over the same
+# bytes produce bit-identical merge tables and encoded streams.
+fn test_bpe_determinism(): i64 {
+    var B1 = build_corpus();
+    var V1 = bpe_learn(12);
+    var m1 = g_bpe_nmerges;
+    var n1 = g_datalen;
+    var mer1 = t_alloc(2 * m1); t_copy(mer1, g_merges, 2 * m1);
+    var dat1 = t_alloc(n1); t_copy(dat1, g_data, n1);
+    var B2 = build_corpus();
+    var V2 = bpe_learn(12);
+    assert((V1 == V2) && (m1 == g_bpe_nmerges) && (n1 == g_datalen), "bpe determinism: same V/merges/length");
+    var mism = 0; var i = 0;
+    while (i < 2 * m1) {
+        if (load64(mer1 + i * 8) != load64(g_merges + i * 8)) { mism = mism + 1; }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < n1) {
+        if (load64(dat1 + i * 8) != load64(g_data + i * 8)) { mism = mism + 1; }
+        i = i + 1;
+    }
+    assert(mism == 0, "bpe determinism: merges + stream bit-identical across runs");
     return 0;
 }
 
@@ -559,9 +965,8 @@ fn test_ckpt_vocab_mismatch(): i64 {
 # tokens (crossing several context-shift re-primes), the sampled id
 # sequences match exactly (greedy AND temperature, same PRNG stream) and the
 # final logits row matches bit-for-bit. Run at nkv = nh and nkv = 1 (MQA).
-fn _gen_bits_check(C, T, nh, nkv): i64 {
+fn _gen_bits_cfg(C, T, nh, nkv, NL, pstep, NG): i64 {
     var V = build_corpus();
-    var NL = 2;
     model_init(V, C, T, nh, nkv, NL, 1, f64_from(0), 21);
     train(8, 8, 2, _lrc(3, 1000), _lrc(3, 10000), 2, f64_from(1), 1000000000);
     g_training = 0;
@@ -569,7 +974,7 @@ fn _gen_bits_check(C, T, nh, nkv): i64 {
     var ids = t_alloc(T);
     var i = 0;
     while (i < T) { store64(ids + i * 8, (i * 3 + 1) % V); i = i + 1; }
-    # (1) prefill logits bits at every prefix length
+    # (1) prefill logits bits at prefix lengths 1, 1+pstep, ... and T
     var mism = 0;
     var m = 1;
     while (m <= T) {
@@ -582,11 +987,11 @@ fn _gen_bits_check(C, T, nh, nkv): i64 {
             if (load64(cs + v * 8) != load64(urow + v * 8)) { mism = mism + 1; }
             v = v + 1;
         }
-        m = m + 1;
+        if ((m < T) && (m + pstep > T)) { m = T; }
+        else { m = m + pstep; }
     }
     assert(mism == 0, "kv prefill logits bit-identical at every prefix");
     # (2) decode across slide boundaries, greedy then temp 0.8
-    var NG = 3 * T;
     var outA = t_alloc(NG); var outB = t_alloc(NG);
     var fin = t_alloc(V);
     var tt = 0;
@@ -619,6 +1024,10 @@ fn _gen_bits_check(C, T, nh, nkv): i64 {
     }
     return 0;
 }
+# Small-config form: NL=2, every prefix, 3T decode tokens (several shifts).
+fn _gen_bits_check(C, T, nh, nkv): i64 {
+    return _gen_bits_cfg(C, T, nh, nkv, 2, 1, 3 * T);
+}
 # Configs chosen so the contract is pinned where it could plausibly break:
 # hd=8 (pure SIMD chunks), hd∈{4,6,10} (scalar-tail loops live), nkv=nh /
 # 1<nkv<nh / nkv=1 (all three K/V-group mappings), odd T (odd GEN_SHIFT) and
@@ -631,6 +1040,17 @@ fn test_kv_generation(): i64 {
     _gen_bits_check(16, 6, 4, 2);   # hd=4: true grouping 1 < nkv < nh
     _gen_bits_check(12, 2, 2, 1);   # degenerate 2-token window (shift 1)
     return 0;
+}
+
+# M7 gate: the bit-identity contract at the --preset shape (ctx 64 / d_model
+# 64 / 8 heads / 4 layers). The per-row arithmetic (hd=8) is already pinned
+# above; this pins the preset's window/shift geometry (T=64, GEN_SHIFT 32) and
+# the 4-layer cache wiring at full scale. The uncached reference is expensive
+# at T=64, so the prefix sweep is strided (1, 10, ..., 55, 64 — both edges
+# hit) and the decode runs T+8 tokens: priming at full T makes the FIRST
+# decode token context-shift, and 64+8 more crosses two further shifts.
+fn test_kv_preset(): i64 {
+    return _gen_bits_cfg(64, 64, 8, 8, 4, 9, 72);
 }
 
 # Soak: training must not leak memory and must not blow up. The forward/backward
@@ -728,12 +1148,25 @@ fn main(): i64 {
     test_resume_gqa();
     test_param_layout();
     test_alloc_accounting();
+    test_config_caps();
     test_ckpt_reject();
     test_ckpt_gqa_roundtrip();
     test_ckpt_v1_compat();
+    test_ckpt_v2_compat();
     test_ckpt_vocab_mismatch();
+    test_group("bpe tokenizer");
+    test_bpe_known();
+    test_bpe_roundtrip();
+    test_bpe_determinism();
+    test_eval_bpb();
+    test_ckpt_v3_roundtrip();
+    test_ckpt_v3_reject();
+    test_resume_bpe();
+    test_bpe_generate();
     test_group("kv-cached generation");
     test_kv_generation();
+    test_kv_preset();
+    test_kv_vocab300();
     test_group("robustness");
     test_soak();
     test_nan_guard();

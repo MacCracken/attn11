@@ -4,6 +4,94 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-06-11
+
+**Scale preset + BPE (roadmap M7 — frontier E3 graduated).** A `--preset` for
+ctx 64 / d_model 64 (whole statements instead of 16-char fragments — the
+quality lever the X001 vidya run exposed), an opt-in simple BPE tokenizer
+(`--bpe K`; byte-level stays the default — ADR 0006), checkpoint format v3
+(records the tokenizer; v1/v2 still load), and `--eval` (bits-per-byte, the
+tokenizer-comparable metric). Byte-vs-BPE at iso-compute measured on the
+vidya corpus (X003 in the experiments ledger). A run without the new flags is
+behaviorally identical to 0.7.0.
+
+### Added
+- **`--preset`**: ctx 64 / d_model 64 / 8 heads / 4 layers (205 760 params at
+  the embedded corpus). At T=64 the context-shift re-prime amortizes over 32
+  tokens, so KV-cached generation is **23× faster** than uncached (vs 6.1×
+  at the default config) — 64 → 1 486 tok/s greedy.
+- **`--heads N` / `--kv-heads N` / `--layers N`**: config overrides for fresh
+  models (last-wins with `--preset`; ignored under `--load`); invalid
+  combinations abort cleanly in `model_init`.
+- **Simple BPE tokenizer (`--bpe K`, K ∈ [1, 512])**: learns K most-frequent
+  adjacent-pair merges over the byte-level base vocab (Sennrich et al. 2016;
+  byte-level layering per GPT-2). Pure i64 — bit-reproducible across arches
+  (pinned by an exact-merge-sequence test on both x86_64 and aarch64/qemu).
+  Deterministic tie-break frozen: row-major ascending argmax, greedy
+  left-to-right non-overlapping replace, overlap-inclusive counting
+  (ADR 0006). Decode via a precomputed flat span table — no recursion.
+  `bpe_learn` benched: ~110 ms for 256 KB at K=128 (one-shot, pre-training).
+- **Checkpoint format v3**: 16-field header adds `tok_kind`/`base_vocab`/
+  `n_merges` + the merge table after the base vocab; saves always write v3;
+  **v1 and v2 checkpoints still load** (as byte-level; pure header shifts of
+  the same body). The loader's vocab cap rises to 768 for v3 (`= 256 base +
+  512 merges`); v1/v2 keep the 256 cap verbatim.
+- **`--eval`**: one deterministic, RNG-neutral pass over the corpus at stride
+  T; prints CE/token and **bits-per-byte** (BPE targets weighted by their
+  byte expansion) so byte and BPE runs are directly comparable. Runs after
+  `--save`, so checkpoints are identical with or without it.
+- **X003** (experiments ledger): byte vs BPE at iso-compute (analytic MACs,
+  `12C² + 2TC + CV` per token) on the vidya corpus at the preset config.
+- 81 new checks (161 → 242): BPE known-merge/round-trip/determinism pins,
+  v3 round-trip + the full rejection matrix (-32…-39 incl. the forgery
+  cascade), BPE resume determinism (through the corpus rebuild), BPE
+  generation bit-identity, eval determinism/RNG-neutrality, the preset-shape
+  KV bit-identity gate, V=300 generation bit-identity + alloc-accounting
+  pins, and the **config-magnitude-cap pin** (`model_config_ok` rejects
+  out-of-range V/C/T/NL — the `--layers` heap-OOB regression below). Fuzz:
+  +500 BPE-image rounds (merge-slot clobber, (V,Vb,K) triple inconsistency,
+  expansion-bomb rewrite) + a BPE round-trip property over 100 random
+  corpora.
+
+### Security
+- **Hostile merge tables cannot loop or bomb the decoder**: the v3 loader
+  validates the merge table as a well-founded DAG (every reference strictly
+  below its minting id — rejects self/forward/negative refs and all cycles,
+  `-37`) with a length recurrence capping every token's expansion at 64
+  bytes (rejects exponential chains, `-38`) — on fixed stack scratch,
+  BEFORE any allocation. New codes: `-32` tok_kind, `-33` base vocab, `-34`
+  merge count, `-35` V ≠ Vb+K, `-36` byte-kind with merges, `-39` BPE
+  resume without retained corpus bytes (defensive).
+- **Fixed a `--layers` heap-OOB (M7 adversarial review, confirmed 3/3).** The
+  new `--heads`/`--kv-heads`/`--layers` flags made the fresh-model config
+  CLI-controllable, but `model_config_ok` bounded `NL` only by `≥ 1` and the
+  fresh path skipped the checkpoint loader's pre-allocation cap. A crafted
+  `--layers` value overflowed `NL · _blk()` in `model_init`, wrapping the
+  allocation size to a small positive that `t_alloc` accepted — then
+  weight-init wrote past the undersized buffer (SIGSEGV / heap corruption,
+  reachable on the default corpus with no `--load`). `model_config_ok` now
+  caps V/C/T/NL to the same magnitudes the loader enforces (`-4/-5/-7/-8`),
+  and `model_init` runs the `model_alloc_bytes` pre-flight against the 128 MB
+  cap before any allocation — the two config gates (file and CLI) now share
+  one invariant. Pinned by `test_config_caps`.
+- Fixed a latent OOB read the BPE work exposed: `ckpt_serialize`'s vocab
+  loop ran to `g_V` over the 256-entry `g_vocab` table — correct while
+  V ≤ 256 always held, an OOB read once BPE pushes V past it. The loop now
+  runs to the base-vocab count.
+- `_atoi(0)` null guard: a value flag given as the last CLI arg (e.g.
+  `--steps` with no value) read through `argv()`'s out-of-range null instead
+  of crashing.
+
+### Changed
+- Toolchain pin `6.1.33` → `6.1.34` (with the matching `lib/` snapshot —
+  the pin and snapshot move together).
+- Banner now prints the active tokenizer (`tokenizer=byte` /
+  `tokenizer=bpe(merges=K)`) and labels the corpus length in **tokens**
+  (post-merge ids), not chars.
+- `generate()`'s prompt path branches: byte mode keeps the 0.7.0 loop
+  verbatim; BPE prompts encode through the learned merges (last ≤ 8 192
+  bytes), then take the last ≤ T ids.
+
 ## [0.7.0] - 2026-06-11
 
 **Inference efficiency (roadmap M6 — frontier E1 + E2 graduated).** KV-cached

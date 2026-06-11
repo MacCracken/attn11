@@ -11,6 +11,25 @@
 #   attn11 --load PATH              resume from a checkpoint (with --corpus to
 #                                   continue training; alone for --gen-only)
 #   attn11 --gen-only               skip training, just sample from the model
+#   attn11 --preset                 ctx 64 / d_model 64 / 8 heads / 4 layers
+#                                   (the scale preset; default stays ctx 16)
+#   attn11 --heads N                override attention heads (must divide d_model)
+#   attn11 --kv-heads N             override K/V heads (must divide heads;
+#                                   < heads = GQA, 1 = MQA; default = heads)
+#   attn11 --layers N               override transformer blocks
+#   attn11 --bpe K                  learn K BPE merges over the corpus before
+#                                   training (1..512; byte-level is the default;
+#                                   ignored under --load — the checkpoint
+#                                   carries its own tokenizer)
+#   attn11 --eval                   after training/save: one deterministic pass
+#                                   over the corpus, prints CE/token and
+#                                   bits-per-byte (tokenizer-comparable)
+#
+# Config flags (--preset/--heads/--kv-heads/--layers) apply to a FRESH model
+# only; with --load the checkpoint's config wins. Later flags override earlier
+# ones (so `--preset --heads 4` is the preset at 4 heads). Invalid combinations
+# (heads not dividing d_model, kv-heads not dividing heads) abort cleanly in
+# model_init.
 
 include "src/tensor.cyr"
 include "src/fileio.cyr"
@@ -38,6 +57,7 @@ fn CFG_ATTN_BIAS(): i64 { return 1; }                                 # Q/K/V/O 
 fn CFG_DROPOUT(): i64 { return f64_from(0); }                         # residual dropout (off; tiny corpus)
 
 fn _atoi(s): i64 {
+    if (s == 0) { return 0; }   # a value flag given as the last arg: argv() OOB
     var v = 0; var i = 0; var neg = 0;
     if (load8(s) == 45) { neg = 1; i = 1; }
     while (load8(s + i) != 0) {
@@ -56,6 +76,12 @@ fn main(): i64 {
     # ---- parse args ----
     var corpus_path = 0; var use_stdin = 0; var load_path = 0; var save_path = 0;
     var steps = CFG_STEPS(); var gen_only = 0;
+    # fresh-model config (ignored under --load: the checkpoint's config wins).
+    # cfg_nkv == 0 means "follow cfg_nh" (full MHA), resolved after parsing so
+    # --preset/--heads never clobber an explicit --kv-heads.
+    var cfg_c = CFG_C(); var cfg_t = CFG_T(); var cfg_nh = CFG_NH();
+    var cfg_nl = CFG_NL(); var cfg_nkv = 0;
+    var use_bpe = 0; var bpe_k = 0; var do_eval = 0;
     var i = 1;
     while (i < argc()) {
         var a = argv(i);
@@ -65,7 +91,19 @@ fn main(): i64 {
         elif (streq(a, "--save") == 1) { i = i + 1; save_path = argv(i); }
         elif (streq(a, "--steps") == 1) { i = i + 1; steps = _atoi(argv(i)); }
         elif (streq(a, "--gen-only") == 1) { gen_only = 1; }
+        elif (streq(a, "--preset") == 1) { cfg_c = 64; cfg_t = 64; cfg_nh = 8; cfg_nl = 4; }
+        elif (streq(a, "--heads") == 1) { i = i + 1; cfg_nh = _atoi(argv(i)); }
+        elif (streq(a, "--kv-heads") == 1) { i = i + 1; cfg_nkv = _atoi(argv(i)); }
+        elif (streq(a, "--layers") == 1) { i = i + 1; cfg_nl = _atoi(argv(i)); }
+        elif (streq(a, "--bpe") == 1) { use_bpe = 1; i = i + 1; bpe_k = _atoi(argv(i)); }
+        elif (streq(a, "--eval") == 1) { do_eval = 1; }
         i = i + 1;
+    }
+    if (cfg_nkv == 0) { cfg_nkv = cfg_nh; }
+    # K is the experiment's key variable — a silent default would hide it
+    if ((use_bpe == 1) && ((bpe_k < 1) || (bpe_k > BPE_MAX_MERGES()))) {
+        puts("attn11: --bpe needs a merge count in 1..512\n");
+        return 1;
     }
 
     # ---- corpus ----
@@ -75,6 +113,18 @@ fn main(): i64 {
     elif (load_path == 0) { V = build_corpus(); }    # default embedded corpus
     if (V < 0) { puts("attn11: corpus load failed (code "); fmt_int(V); puts(")\n"); return 1; }
 
+    # ---- BPE (opt-in; a loaded checkpoint's tokenizer always wins) ----
+    # Runs AFTER the corpus is loaded and BEFORE model_init: the model's
+    # embedding/logits sizes depend on the post-merge V.
+    if (use_bpe == 1) {
+        if (load_path != 0) {
+            puts("attn11: --bpe ignored; the checkpoint carries its tokenizer\n");
+        } else {
+            V = bpe_learn(bpe_k);
+            if (V < 0) { puts("attn11: bpe merge training failed (code "); fmt_int(V); puts(")\n"); return 1; }
+        }
+    }
+
     # ---- model: fresh or resumed ----
     if (load_path != 0) {
         # ckpt_load_file hard-rejects (code -15) if a loaded corpus's vocab
@@ -83,7 +133,7 @@ fn main(): i64 {
         if (rc < 0) { puts("attn11: checkpoint load failed (code "); fmt_int(rc); puts(")\n"); return 1; }
         puts("attn11: resumed from checkpoint at step "); fmt_int(g_step); _putc(10);
     } else {
-        model_init(V, CFG_C(), CFG_T(), CFG_NH(), CFG_NKV(), CFG_NL(), CFG_ATTN_BIAS(), CFG_DROPOUT(), CFG_SEED());
+        model_init(V, cfg_c, cfg_t, cfg_nh, cfg_nkv, cfg_nl, CFG_ATTN_BIAS(), CFG_DROPOUT(), CFG_SEED());
     }
 
     puts("attn11 — transformer training in Cyrius\n");
@@ -94,7 +144,10 @@ fn main(): i64 {
     puts(" kv_heads="); fmt_int(g_nkv);
     puts(" layers="); fmt_int(g_NL);
     puts(" params="); fmt_int(g_NP); _putc(10);
-    puts("  corpus chars="); fmt_int(g_datalen); _putc(10);
+    puts("  tokenizer=");
+    if (g_bpe_on == 1) { puts("bpe(merges="); fmt_int(g_bpe_nmerges); puts(")"); }
+    else { puts("byte"); }
+    puts(" corpus tokens="); fmt_int(g_datalen); _putc(10);
     _putc(10);
 
     # ---- train ----
@@ -112,6 +165,19 @@ fn main(): i64 {
         var sv = ckpt_save_file(save_path);
         if (sv < 0) { puts("attn11: checkpoint save failed (code "); fmt_int(sv); puts(")\n"); }
         else { puts("attn11: saved checkpoint ("); fmt_int(ckpt_size()); puts(" bytes)\n"); }
+    }
+
+    # ---- eval (after save, so the checkpoint is identical with or without) ----
+    if (do_eval == 1) {
+        var et = eval_corpus();
+        if (et < 0) { puts("attn11: no/short corpus; skipping eval\n"); }
+        else {
+            puts("eval: tokens "); fmt_int(g_eval_tokens);
+            puts("  bytes "); fmt_int(g_eval_bytes);
+            puts("  ce/token "); f_print(f64_div(g_eval_nats, f64_from(g_eval_tokens)), 5);
+            puts("  bits/byte "); f_print(eval_bpb(), 5);
+            _putc(10);
+        }
     }
 
     # ---- sample ----

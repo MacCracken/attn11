@@ -73,6 +73,18 @@ oldest `T/2` tokens and re-prime the kept context at its new positions (one
 window recompute amortized over `T/2` tokens); see ADR 0005 for why shifting
 the cache in place is unsound with learned absolute positions.
 
+## Tokenization
+
+### Byte-pair encoding (BPE) for subword vocabularies
+**Sennrich, R., Haddow, B., Birch, A. (2016).** "Neural Machine Translation of
+Rare Words with Subword Units." *ACL 2016.*
+arXiv:[1508.07909](https://arxiv.org/abs/1508.07909).
+Used in: `src/train.cyr` (`bpe_learn`/`tok_encode`/`bpe_build_spans`) — the
+iterative most-frequent-adjacent-pair merge algorithm, applied over the
+byte-level base vocab (the byte-level layering follows GPT-2's byte-level BPE,
+Radford et al. 2019, above). attn11 freezes its own deterministic tie-break
+(row-major ascending argmax) and greedy left-to-right encoding — see ADR 0006.
+
 ## Layers & activations
 
 ### Layer normalization

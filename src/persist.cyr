@@ -1,26 +1,32 @@
 # attn11 — model checkpoints (save / load with validated, deterministic resume).
 #
-# Format v2 (all i64, native little-endian via store64/load64):
-#   [0]  magic     [1] version   [2] V      [3] C       [4] T
+# Format v3 (all i64, native little-endian via store64/load64):
+#   [0]  magic     [1] version    [2] V      [3] C       [4] T
 #   [5]  nh        [6] NL         [7] bias   [8] dropout(f64) [9] NP
-#   [10] step      [11] rng_state [12] nkv
-#   [13 .. 13+V)   vocab (id -> byte value)
+#   [10] step      [11] rng_state [12] nkv   [13] tok_kind (0=byte, 1=BPE)
+#   [14] base_vocab Vb             [15] n_merges K       (V = Vb + K)
+#   [16 .. 16+Vb)         base vocab (id -> byte value)
+#   [16+Vb .. 16+Vb+2K)   merge pairs (left id, right id), in learned order
 #   then NP f64 g_params, NP f64 g_adam_m, NP f64 g_adam_v
 # Saved state is exactly what a bit-for-bit resume needs: weights, optimizer
-# moments, the completed-step counter, and the PRNG state.
+# moments, the completed-step counter, the PRNG state — and the tokenizer,
+# which is learned from the corpus exactly like the weights are.
 #
-# v1 (pre-GQA, ≤0.6.0) lacks the nkv field (12-field header); it is still
-# accepted and loads as nkv = nh (with nkv == nh the v2 parameter layout is
-# identical to v1's). Saves always write v2.
+# v1 (pre-GQA, ≤0.6.0, 12-field header) and v2 (pre-BPE, 0.7.0, 13-field) are
+# still accepted: v1 loads as nkv = nh, both load as tok_kind = byte with no
+# merges (a byte-kind v3 body is bit-identical to v2's behind the longer
+# header). Saves always write v3.
 #
-# Loading is hostile-input-safe: magic/version, config bounds, a recomputed
-# parameter count, and the EXACT total size are all checked BEFORE any
+# Loading is hostile-input-safe: magic/version, config bounds, the tokenizer
+# triple (kind, Vb, K), a recomputed parameter count, the EXACT total size,
+# and the merge table's well-foundedness are all checked BEFORE any
 # allocation or copy. A truncated/corrupt/oversized buffer is rejected with a
-# negative error code, never a crash.
+# negative error code, never a crash or a decode loop.
 
 fn CKPT_MAGIC(): i64 { return 0x4154544E31317631; }   # "ATTN11v1" (file family)
-fn CKPT_VER(): i64 { return 2; }
-fn CKPT_HDR(): i64 { return 13; }                     # v2 header i64 fields
+fn CKPT_VER(): i64 { return 3; }
+fn CKPT_HDR(): i64 { return 16; }                     # v3 header i64 fields
+fn CKPT_HDR_V2(): i64 { return 13; }                  # v2 header i64 fields
 fn CKPT_HDR_V1(): i64 { return 12; }                  # v1 header i64 fields
 # Caps sized to the allocator's reality (lib alloc cap is 256 MB): a header
 # that passes every shape check must also FIT — params (4 vectors), the file
@@ -42,11 +48,20 @@ fn ckpt_expected_np(V, C, T, nh, NL, bias, nkv): i64 {
     return emb + NL * blk + 2 * C;
 }
 
+# The serialized tokenizer shape: base vocab size and merge count. Byte-level
+# (g_bpe_on == 0): the whole vocab is the base, no merges.
+fn _ckpt_vb(): i64 { if (g_bpe_on == 1) { return g_bpe_base; } return g_V; }
+fn _ckpt_k(): i64 { if (g_bpe_on == 1) { return g_bpe_nmerges; } return 0; }
+
 # Total checkpoint size in bytes for the current model.
-fn ckpt_size(): i64 { return (CKPT_HDR() + g_V + 3 * g_NP) * 8; }
+fn ckpt_size(): i64 { return (CKPT_HDR() + _ckpt_vb() + 2 * _ckpt_k() + 3 * g_NP) * 8; }
 
 # Serialize the current model state into buf (caller allocs ckpt_size bytes).
+# The vocab loop runs to Vb, NOT g_V: g_vocab is a 256-entry base table, and
+# under BPE g_V = Vb + K > Vb — looping to g_V would read past it.
 fn ckpt_serialize(buf): i64 {
+    var vb = _ckpt_vb();
+    var K = _ckpt_k();
     store64(buf + 0 * 8, CKPT_MAGIC());
     store64(buf + 1 * 8, CKPT_VER());
     store64(buf + 2 * 8, g_V);
@@ -60,10 +75,15 @@ fn ckpt_serialize(buf): i64 {
     store64(buf + 10 * 8, g_step);
     store64(buf + 11 * 8, _rng_state);
     store64(buf + 12 * 8, g_nkv);
+    store64(buf + 13 * 8, g_bpe_on);
+    store64(buf + 14 * 8, vb);
+    store64(buf + 15 * 8, K);
     var base = CKPT_HDR();
     var i = 0;
-    while (i < g_V) { store64(buf + (base + i) * 8, load64(g_vocab + i * 8)); i = i + 1; }
-    var p = base + g_V;
+    while (i < vb) { store64(buf + (base + i) * 8, load64(g_vocab + i * 8)); i = i + 1; }
+    i = 0;
+    while (i < 2 * K) { store64(buf + (base + vb + i) * 8, load64(g_merges + i * 8)); i = i + 1; }
+    var p = base + vb + 2 * K;
     t_copy(buf + p * 8, g_params, g_NP);
     t_copy(buf + (p + g_NP) * 8, g_adam_m, g_NP);
     t_copy(buf + (p + 2 * g_NP) * 8, g_adam_v, g_NP);
@@ -79,9 +99,10 @@ fn ckpt_load_buf(buf, len): i64 {
     if (len < CKPT_HDR_V1() * 8) { return 0 - 1; }
     if (load64(buf + 0 * 8) != CKPT_MAGIC()) { return 0 - 2; }
     var ver = load64(buf + 1 * 8);
-    if ((ver != 1) && (ver != 2)) { return 0 - 3; }
+    if ((ver != 1) && (ver != 2) && (ver != 3)) { return 0 - 3; }
     var hdr = CKPT_HDR_V1();
-    if (ver == 2) { hdr = CKPT_HDR(); }
+    if (ver == 2) { hdr = CKPT_HDR_V2(); }
+    if (ver == 3) { hdr = CKPT_HDR(); }
     if (len < hdr * 8) { return 0 - 1; }
     var V = load64(buf + 2 * 8);
     var C = load64(buf + 3 * 8);
@@ -93,11 +114,14 @@ fn ckpt_load_buf(buf, len): i64 {
     var np = load64(buf + 9 * 8);
     var step = load64(buf + 10 * 8);
     var rng = load64(buf + 11 * 8);
-    if ((V < 1) || (V > 256)) { return 0 - 4; }
+    # v1/v2 are pre-BPE: byte-level only, V <= 256 kept verbatim. v3 raises
+    # the cap to BPE_VMAX; the (tok_kind, Vb, K) triple below ties it down.
+    if (ver == 3) { if ((V < 1) || (V > BPE_VMAX())) { return 0 - 4; } }
+    else { if ((V < 1) || (V > 256)) { return 0 - 4; } }
     if ((C < 1) || (C > 4096)) { return 0 - 5; }
     if ((nh < 1) || (nh > C) || ((C % nh) != 0)) { return 0 - 6; }
     var nkv = nh;                       # v1: pre-GQA, always full MHA
-    if (ver == 2) { nkv = load64(buf + 12 * 8); }
+    if (ver >= 2) { nkv = load64(buf + 12 * 8); }
     if ((nkv < 1) || (nkv > nh) || ((nh % nkv) != 0)) { return 0 - 16; }
     if ((T < 1) || (T > 8192)) { return 0 - 7; }
     if ((NL < 1) || (NL > 128)) { return 0 - 8; }
@@ -112,6 +136,26 @@ fn ckpt_load_buf(buf, len): i64 {
     # [0,1) and rejects negatives, >=1.0, +Inf, and NaN (all have larger bits).
     if (((drop >> 63) & 1) == 1) { return 0 - 14; }
     if (drop >= 0x3FF0000000000000) { return 0 - 14; }
+    # tokenizer triple: v1/v2 never read slots [13..15] — they synthesize
+    # byte-level (kind 0, Vb = V, K = 0) and so cannot hit -32..-38.
+    var tok_kind = 0;
+    var Vb = V;
+    var K = 0;
+    if (ver == 3) {
+        tok_kind = load64(buf + 13 * 8);
+        Vb = load64(buf + 14 * 8);
+        K = load64(buf + 15 * 8);
+    }
+    if ((tok_kind != 0) && (tok_kind != 1)) { return 0 - 32; }
+    if ((Vb < 1) || (Vb > 256)) { return 0 - 33; }
+    # K's range is checked BEFORE the V = Vb + K identity so a wild K (e.g.
+    # negative, which would let Vb > V alias base ids past the embedding
+    # table) never feeds any later arithmetic
+    if ((K < 0) || (K > BPE_MAX_MERGES())) { return 0 - 34; }
+    if (V != Vb + K) { return 0 - 35; }
+    # a byte-level checkpoint cannot carry merges (with -33/-35 this restores
+    # the V <= 256 invariant for tok_kind 0 inside v3)
+    if ((tok_kind == 0) && (K != 0)) { return 0 - 36; }
     var expnp = ckpt_expected_np(V, C, T, nh, NL, bias, nkv);
     if ((np < 1) || (np > CKPT_MAX_NP())) { return 0 - 13; }
     if (np != expnp) { return 0 - 10; }
@@ -119,44 +163,93 @@ fn ckpt_load_buf(buf, len): i64 {
     # np) and the 4 parameter vectors must also fit the allocator. Reject any
     # config whose model_init total would exceed the cap — BEFORE allocating.
     if (model_alloc_bytes(V, C, T, nh, nkv, NL, np) > CKPT_MAX_MODEL_BYTES()) { return 0 - 18; }
-    var need = (hdr + V + 3 * np) * 8;
+    var need = (hdr + Vb + 2 * K + 3 * np) * 8;
     if (len != need) { return 0 - 11; }
-    # vocab bytes must be valid 0..255
+    # base vocab bytes must be valid 0..255
     var base = hdr;
     var i = 0;
-    while (i < V) {
+    while (i < Vb) {
         var code = load64(buf + (base + i) * 8);
         if ((code < 0) || (code > 255)) { return 0 - 12; }
         i = i + 1;
     }
+    # Merge-table scan (after -11 proved the table lies inside the buffer).
+    # Every merge must reference only already-minted ids: left/right in
+    # [0, Vb + j) for merge j. That strict decrease makes the table a
+    # well-founded DAG — negative ids (OOB read), self-reference (id == Vb+j,
+    # infinite decode), forward references, and therefore ALL cycles are
+    # rejected. The length recurrence kills expansion bombs (a chained
+    # (prev, prev) table doubles per merge and would expand to 2^K bytes):
+    # any token expanding past BPE_MAX_TOKLEN is rejected (-38). Fixed stack
+    # scratch — hostile input still drives ZERO allocation.
+    if (K > 0) {
+        var lens[6144];          # 6144 BYTES = 768 i64 slots = BPE_VMAX
+        var li = 0;
+        while (li < Vb) { store64(&lens + li * 8, 1); li = li + 1; }
+        var j = 0;
+        while (j < K) {
+            var ml = load64(buf + (base + Vb + 2 * j) * 8);
+            var mr = load64(buf + (base + Vb + 2 * j + 1) * 8);
+            if ((ml < 0) || (ml >= Vb + j) || (mr < 0) || (mr >= Vb + j)) { return 0 - 37; }
+            var e = load64(&lens + ml * 8) + load64(&lens + mr * 8);
+            if (e > BPE_MAX_TOKLEN()) { return 0 - 38; }
+            store64(&lens + (Vb + j) * 8, e);
+            j = j + 1;
+        }
+    }
     # If a corpus is already loaded (resume), its byte-level vocab MUST match
-    # the checkpoint's exactly. g_data was encoded against the corpus's own
-    # first-occurrence id ordering; if that differs from the checkpoint's
-    # ordering, the restored embeddings would be silently mis-indexed. Reject.
-    # (Compare the CORPUS vocab size g_corpus_vlen, not g_V — the latter is the
-    # model's and is unset on the load-without-prior-init path.)
+    # the checkpoint's BASE vocab exactly. g_data was encoded against the
+    # corpus's own first-occurrence id ordering; if that differs from the
+    # checkpoint's, the restored embeddings would be silently mis-indexed.
+    # (Compare the CORPUS vocab size g_corpus_vlen, not g_V — the latter is
+    # the model's and is unset on the load-without-prior-init path.)
     if (g_data != 0) {
-        if (g_corpus_vlen != V) { return 0 - 15; }
+        if (g_corpus_vlen != Vb) { return 0 - 15; }
         i = 0;
-        while (i < V) {
+        while (i < Vb) {
             if (load64(g_vocab + i * 8) != load64(buf + (base + i) * 8)) { return 0 - 15; }
             i = i + 1;
         }
+        # a BPE resume re-encodes the corpus from its retained raw bytes;
+        # corpus_set always retains them, so this is purely defensive
+        if ((tok_kind == 1) && (g_text == 0)) { return 0 - 39; }
     }
     # validated — build the model and restore state
+    var was_bpe = g_bpe_on;
     model_init(V, C, T, nh, nkv, NL, bias, drop, 1);
     g_vocab = t_alloc(256);
     g_char2id = t_alloc(256);
     i = 0;
     while (i < 256) { store64(g_char2id + i * 8, 0 - 1); i = i + 1; }
     i = 0;
-    while (i < V) {
+    while (i < Vb) {
         var code = load64(buf + (base + i) * 8);
         store64(g_vocab + i * 8, code);
         store64(g_char2id + code * 8, i);
         i = i + 1;
     }
-    var p = base + V;
+    # tokenizer install: the checkpoint carries its own tokenizer (it is
+    # model state, learned from the original corpus exactly like weights)
+    g_bpe_base = Vb;
+    g_bpe_nmerges = K;
+    g_bpe_on = tok_kind;
+    if (tok_kind == 1) {
+        bpe_alloc_once();
+        var mi = 0;
+        while (mi < 2 * K) { store64(g_merges + mi * 8, load64(buf + (base + Vb + mi) * 8)); mi = mi + 1; }
+        bpe_build_spans();
+    }
+    # Corpus rebuild: re-encode the RETAINED RAW BYTES through the loaded
+    # tokenizer (NOT re-merge the id stream — that would not be idempotent
+    # across repeated loads). Also restores byte-level g_data when a
+    # byte-kind load follows a BPE load in the same process. Output count
+    # <= byte count, so g_data (sized at one id per byte) never grows.
+    if ((g_data != 0) && (g_text != 0)) {
+        if ((tok_kind == 1) || (was_bpe == 1)) {
+            g_datalen = tok_encode(g_text, g_textlen, g_data);
+        }
+    }
+    var p = base + Vb + 2 * K;
     t_copy(g_params, buf + p * 8, np);
     t_copy(g_adam_m, buf + (p + np) * 8, np);
     t_copy(g_adam_v, buf + (p + 2 * np) * 8, np);

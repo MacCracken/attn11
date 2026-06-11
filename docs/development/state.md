@@ -5,37 +5,48 @@
 
 ## Version
 
-**0.7.0** — inference efficiency (M6, frontier E1+E2 graduated): KV-cached
-generation (**6.2× faster sampling**, bit-identical to the uncached
-reference) + grouped-query attention (`n_kv_heads` config, KV cache up to 4×
-smaller at `nkv=1`); checkpoint format v2 (+`nkv`, v1 still loads) with a
-pre-allocation bound on hostile configs; toolchain pin 6.1.31 → 6.1.33
-(argv-capture fix landed upstream; `docs/architecture/002` retired);
-training at the default config unchanged. (0.6.0 — AGNOS kernel port (M5),
-bit-for-bit checkpoint vs Linux, toolchain pin 6.1.6 → 6.1.31. 0.5.1 —
-standards conformance. 0.5.0 — aarch64 validation, NaN/inf guard, soak,
-crash-atomic save. 0.4.0: 4-wide SIMD matmul, ~2.27× faster. 0.3.0: corpus
-loading, checkpoints + deterministic resume. 0.2.0: stacked layers, grad
-clipping, LR schedule.)
+**0.7.1** — scale preset + BPE (M7, frontier E3 graduated): a `--preset`
+(ctx 64 / d_model 64 / 8 heads / 4 layers; KV-cached generation **23×**
+faster than uncached at T=64) with `--heads`/`--kv-heads`/`--layers`
+overrides; an opt-in **simple BPE tokenizer** (`--bpe K`, ≤512 merges; pure
+i64, bit-reproducible cross-arch; byte-level stays the default — ADR 0006);
+checkpoint format **v3** (records the tokenizer; v1/v2 still load) with a
+well-founded-DAG + bounded-expansion guard on hostile merge tables; **`--eval`**
+(bits-per-byte, tokenizer-comparable); toolchain pin 6.1.33 → 6.1.34.
+Byte-vs-BPE measured at iso-compute on the vidya corpus (X003: BPE reaches
+−11 to −13% bits/byte). A run without the new flags is behaviorally identical
+to 0.7.0. (0.7.0 — inference efficiency (M6, E1+E2): KV-cached generation
+(6.2×) + GQA, checkpoint v2, pin 6.1.31 → 6.1.33. 0.6.0 — AGNOS kernel port
+(M5), bit-for-bit checkpoint vs Linux. 0.5.1 — standards conformance. 0.5.0 —
+aarch64 validation, NaN/inf guard, soak, crash-atomic save. 0.4.0: 4-wide
+SIMD matmul, ~2.27× faster. 0.3.0: corpus loading, checkpoints +
+deterministic resume. 0.2.0: stacked layers, grad clipping, LR schedule.)
 
 ## Toolchain
 
-- **Cyrius pin**: `6.1.33` (in `cyrius.cyml [package].cyrius`) — bumped from
-  6.1.31 during M6: cycc 6.1.32 fixed attn11's agnos argv-capture issue
-  (r15-parked init rsp; the old `_agnos_init_rsp` global is gone), and a
-  new-compiler/old-lib mismatch reproduces `argc()==0` under the kernel —
-  the run gate caught it. Pin and `lib/` snapshot must move together.
+- **Cyrius pin**: `6.1.34` (in `cyrius.cyml [package].cyrius`) — bumped from
+  6.1.33 during M7, with the matching `lib/` snapshot. The pin and snapshot
+  must always move together: cycc 6.1.32 fixed attn11's agnos argv-capture
+  issue (r15-parked init rsp; the old `_agnos_init_rsp` global is gone) during
+  M6, and a new-compiler/old-lib mismatch reproduces `argc()==0` under the
+  kernel — the run gate caught it. (`docs/architecture/002` retired at ≥6.1.32.)
 
 ## Performance
 
-4-wide SIMD (`f64v_fmadd`) matmul. Default config, x86_64:
+4-wide SIMD (`f64v_fmadd`) matmul. x86_64:
 
-- Training: fwd+bwd step ~3.7 ms, **~4 350 tokens/sec** (b=16) — unchanged
-  from 0.6.0 within noise.
-- Generation (0.7.0): uncached 1 050 579 ns/token → **KV-cached 170 392
-  ns/token (6.2×, 951 → 5 868 tok/s)**, greedy, default config.
+- Training (default config): fwd+bwd step ~3.7 ms, **~4 300 tokens/sec**
+  (b=16) — unchanged from 0.6.0 within noise. Preset (ctx 64 / d_model 64):
+  fwd+bwd ~63 ms, ~1 000 tok/s — ~17× the default step for 5.2× the params
+  and 4× the context.
+- Generation, default config (0.7.0): uncached 1 050 579 ns/token →
+  **KV-cached 170 392 ns/token (6.2×, 951 → 5 868 tok/s)**, greedy.
+- Generation, **preset** (0.7.1): uncached 15 564 530 ns/token → **KV-cached
+  672 747 ns/token (23×, 64 → 1 486 tok/s)** — the context-shift re-prime
+  amortizes over T/2 = 32 tokens at ctx 64.
 - KV cache bytes (default config): 24 576 at `nkv=4` → 12 288 (`nkv=2`) →
   6 144 (`nkv=1`).
+- BPE merge training (`--bpe K`): one-shot ~110 ms for 256 KB at K=128.
 
 See [`benchmarks.md`](../benchmarks.md) + [`../../bench-history.csv`](../../bench-history.csv).
 
@@ -45,10 +56,17 @@ End-to-end, on Linux x86_64, **aarch64** (cross-build + qemu; all checks pass
 on both), and **the AGNOS kernel** (ring-3, booted in QEMU; bit-for-bit
 checkpoint vs Linux at fixed CPU — `scripts/agnos-smoke.sh`):
 
-- Char-level tokenizer over an embedded corpus
+- **Byte-level adaptive tokenizer** (default) + opt-in **simple BPE**
+  (`--bpe K`, ≤512 merges; 0.7.1, ADR 0006): merges layer on the byte base
+  vocab, frozen deterministic tie-break, pure i64 (bit-reproducible
+  cross-arch), decode via a precomputed flat span table (no recursion)
 - Token + learned positional embeddings
 - **`n_layers` stacked** pre-norm Transformer blocks, each:
   `LayerNorm → causal multi-head self-attention → residual → LayerNorm → MLP (GELU) → residual`
+- **Scale `--preset`** (0.7.1): ctx 64 / d_model 64 / 8 heads / 4 layers,
+  with `--heads`/`--kv-heads`/`--layers` overrides for fresh models
+  (magnitude-capped + alloc-pre-flighted in `model_init`, mirroring the
+  checkpoint loader — file and CLI config gates share one invariant)
 - **Grouped-query attention** (0.7.0): `n_kv_heads ≤ n_heads` shares K/V
   heads across query-head groups (`nkv = nh` = classic MHA, the default;
   `nkv = 1` = MQA); K/V projections are `C × Ckv`
@@ -66,11 +84,17 @@ checkpoint vs Linux at fixed CPU — `scripts/agnos-smoke.sh`):
   window fills; **bit-identical** to the uncached reference path; greedy +
   temperature sampling
 - **Corpus from file/stdin** (`--corpus`/`--stdin`): `O_NOFOLLOW`, `fstat`
-  size-cap, byte-level adaptive vocab
-- **Checkpoints** (`--save`/`--load`): validated v2 header (all checked before
-  allocation; v1 still loads as `nkv=nh`) + bit-for-bit **deterministic
-  resume**; **crash-atomic save** (temp + fsync + rename)
-- CLI: `--corpus --stdin --load --save --steps --gen-only`
+  size-cap, byte-level adaptive vocab (raw bytes retained for BPE re-encode)
+- **`--eval`** (0.7.1): one deterministic, RNG-neutral pass over the corpus →
+  CE/token + **bits-per-byte** (tokenizer-comparable); runs after `--save`,
+  so checkpoints are bit-identical with or without it
+- **Checkpoints** (`--save`/`--load`): validated **v3** header — tokenizer
+  triple + merge table validated as a well-founded DAG with bounded expansion,
+  all checked before allocation; **v1/v2 still load** (byte-level) — +
+  bit-for-bit **deterministic resume** (BPE re-encodes the retained corpus);
+  **crash-atomic save** (temp + fsync + rename)
+- CLI: `--corpus --stdin --load --save --steps --gen-only --preset --heads
+  --kv-heads --layers --bpe --eval`
 
 Default run (`./build/attn11`, 3 layers): loss `~3.2 → ~0.13` over 2000 steps;
 sampled output reproduces real corpus phrases.
@@ -93,6 +117,11 @@ sampled output reproduces real corpus phrases.
 | lr schedule | warmup 100 → cosine | base 3e-3 → min 3e-4  |
 | steps/batch | 2000 / 16 |                               |
 
+`--preset` overrides to C 64 / T 64 / nh 8 / NL 4 (205 760 params at the
+embedded corpus); `--heads`/`--kv-heads`/`--layers` override individual dims
+(magnitude-capped: nh|C, nkv|nh, NL ≤ 128, C ≤ 4096, T ≤ 8192). `--bpe K`
+raises V to `base + K` (≤ 768).
+
 ## Source (`src/`, ~1500 LOC)
 
 - `tensor.cyr` — f64-array helpers, deterministic PRNG (xorshift64 + splitmix
@@ -107,38 +136,57 @@ sampled output reproduces real corpus phrases.
 - `model.cyr` — per-layer packed parameters (block stride + `_o_*`/`PL`/`GL`
   helpers, Ckv-dependent), per-layer activation caches, embeddings, tied head,
   full N-layer forward/backward, grad clipping, Adam; KV caches +
-  `model_fwd_row` (cached row) + `model_eval_window` (uncached eval reference)
-- `train.cyr` — byte-level tokenizer, corpus (embedded/file/stdin), batch
-  sampling, LR schedule, resumable training loop, KV-cached generation
-  (`gen_prime`/`gen_decode` + context-shift)
-- `persist.cyr` — validated v2 checkpoint serialize/load (v1 accepted)
-- `main.cyr` — CLI arg parsing + orchestration
+  `model_fwd_row` (cached row) + `model_eval_window` (uncached eval reference);
+  `model_config_ok` (magnitude + divisibility caps) + `model_alloc_bytes`
+  pre-flight guard the fresh-model path
+- `train.cyr` — byte + **BPE** tokenizer (`bpe_learn`/`tok_encode`/
+  `bpe_build_spans`/`tok_emit`), corpus (embedded/file/stdin, raw bytes
+  retained), batch sampling, LR schedule, resumable training loop, KV-cached
+  generation (`gen_prime`/`gen_decode` + context-shift), `eval_corpus`
+  (CE/token + bits-per-byte)
+- `persist.cyr` — validated **v3** checkpoint serialize/load (tokenizer triple
+  + merge-table DAG/expansion validation; v1/v2 accepted as byte-level)
+- `main.cyr` — CLI arg parsing (incl. `--preset`/`--heads`/`--kv-heads`/
+  `--layers`/`--bpe`/`--eval`, null-guarded `_atoi`) + orchestration
 
 ## Tests
 
-- `tests/attn11.tcyr` — **161 checks**: finite-difference gradient checks
+- `tests/attn11.tcyr` — **242 checks**: finite-difference gradient checks
   (every op incl. dropout; attention at head dims 6/8/10 and GQA/MQA at
   `nkv ∈ {1, 2, nh}` incl. `dWk`/`dWv`/`dbv`; the `|dbk| ≈ 0`
   softmax-shift-invariance pin; 2-layer full model at MHA and GQA), the SIMD
   bit-contract, the **parameter-layout tiling pin** (FD is blind to offset
   aliasing), the **alloc-accounting pin** (`model_alloc_bytes` ==
-  `model_init`), resume-determinism (dropout off/on + MQA), checkpoint
-  rejection smokes (+ `-18` pre-alloc bound, `-19` rng=0) + v2/GQA
-  round-trip + **v1-compat load**, the **KV bit-identity suite** (prefill at
-  every prefix + decode across context-shifts, greedy + temperature, at
-  hd ∈ {4, 6, 8, 10} × nkv ∈ {1, 2, nh} incl. odd-T shifts), a **soak/leak**
-  test and a **NaN guard** test. All pass on x86_64 AND aarch64
+  `model_init`, incl. V=300), the **config-magnitude-cap pin**
+  (`model_config_ok` rejects out-of-range V/C/T/NL — the `--layers`
+  heap-OOB regression), resume-determinism (dropout off/on + MQA + BPE),
+  checkpoint rejection smokes (+ `-18` pre-alloc bound, `-19` rng=0, the v3
+  `-32…-39` matrix incl. the merge-table forgery cascade) + v2/GQA/**v3**
+  round-trip + **v1/v2-compat load**, the **BPE suite** (known-merge,
+  round-trip, cross-arch determinism, generation bit-identity), the
+  **eval/bits-per-byte** determinism + RNG-neutrality pin, the **KV
+  bit-identity suite** (prefill at every prefix + decode across
+  context-shifts, greedy + temperature, at hd ∈ {4, 6, 8, 10} ×
+  nkv ∈ {1, 2, nh} incl. odd-T shifts, **preset shape**, and V=300), a
+  **soak/leak** test and a **NaN guard** test. All pass on x86_64 AND aarch64
   (`cyrius test`; aarch64 via qemu).
 - `tests/attn11.bcyr` — benchmark harness (training timings + tokens/sec,
-  generation cached/uncached, KV bytes per nkv, MQA timings).
-- `tests/attn11.fcyr` — fuzz harness: 500 mutated-checkpoint rounds (v2
-  header fields incl. nkv/step) + 100 random corpora; loaders reject
-  malformed input without crashing.
-- The M2 (persistence), M3 (SIMD), M5 (AGNOS port), and M6 (KV-cache/GQA)
-  code each passed an adversarial multi-agent review; all confirmed findings
-  fixed and regression-tested. M6's review (50 agents, 15 raw → 9 confirmed)
-  also drove the checkpoint pre-allocation bound and config-invariant
-  hardening. See CHANGELOG + [`../audit/2026-06-11-kv-gqa-audit.md`](../audit/2026-06-11-kv-gqa-audit.md).
+  generation cached/uncached, KV bytes per nkv, MQA timings, **preset
+  train+gen**, **`bpe_learn` cost**).
+- `tests/attn11.fcyr` — fuzz harness: 500 mutated-checkpoint rounds (v2/v3
+  header fields incl. nkv/step) + **500 BPE-image rounds** (merge-slot
+  clobber, (V,Vb,K) triple inconsistency, expansion-bomb rewrite) + 100
+  random corpora + a **BPE round-trip** property; loaders reject malformed
+  input without crashing.
+- The M2 (persistence), M3 (SIMD), M5 (AGNOS port), M6 (KV-cache/GQA), and
+  **M7 (BPE/preset/v3)** code each passed an adversarial multi-agent review;
+  all confirmed findings fixed and regression-tested. M6's review (50 agents,
+  15 raw → 9 confirmed) drove the checkpoint pre-allocation bound; M7's review
+  (9 agents, 1 raw → 1 confirmed) caught the **`--layers` heap-OOB** (the
+  fresh-model config path had regressed the loader's alloc-cap invariant) —
+  fixed by capping dims + an alloc pre-flight in `model_init`. See CHANGELOG +
+  [`../audit/2026-06-11-m7-bpe-audit.md`](../audit/2026-06-11-m7-bpe-audit.md)
+  + [`../audit/2026-06-11-kv-gqa-audit.md`](../audit/2026-06-11-kv-gqa-audit.md).
 - The M5 run gate (`scripts/agnos-smoke.sh`) is a developer-side check (needs
   the agnos/gnoboot/agnoshi sibling repos); CI gates the `--agnos` build +
   static-ELF shape only.
@@ -156,13 +204,21 @@ _None yet._
 
 ## Next
 
-See [`roadmap.md`](roadmap.md). M6 (0.7.0) complete: KV-cached generation +
-GQA, both gates green. Next is either **E3 (scale preset + BPE)** as 0.8.0 —
-the ctx-64/d_model-64 preset the vidya run motivated (X001), making
-byte-vs-BPE measurable at iso-compute — or straight to **M7 (0.9.0 → v1.0.0):
-freeze & consumer** (freeze the config/CLI surface, land the vidya example
-pipeline against a tagged build, final audit, first non-prerelease tag).
-Loose ends: an `attn11` row upstream in `agnos/scripts/stage-tools.sh`; BPE
-tokenizer folded into frontier-track E3. (The cycc argv-capture issue is
-**resolved** — fixed upstream in 6.1.32, pin bumped to 6.1.33,
-`docs/architecture/002` retired as a load-bearing rule.)
+See [`roadmap.md`](roadmap.md). M7 (0.7.1) complete: scale `--preset` +
+opt-in BPE + checkpoint v3 + `--eval`, all gates green on x86_64/aarch64
+incl. the adversarial review (the `--layers` heap-OOB caught + fixed) and the
+X003 byte-vs-BPE iso-compute comparison (BPE −11 to −13% bits/byte). The
+remaining pre-v1 ladder:
+
+1. **M8 (v0.8.0)** — security sweep: web-researched CVE/0-day survey mapped
+   onto attn11's surfaces, dispositions in `docs/audit/`, repairs +
+   fuzz extensions. **← next.**
+2. **M9 (v0.8.x)** — performance: LM-head SIMD, packed tanh, matmul tiling,
+   batched prefill — one lever per release, benched against the CSV.
+3. **M10 (v0.9.0)** — freeze/docs/cleanup + the vidya example pipeline, so
+   **v1.0.0 is a clean cut** (final audit + tag only).
+
+Loose ends: an `attn11` row upstream in `agnos/scripts/stage-tools.sh`
+(folds into M10 cleanup). The pin and `lib/` snapshot must move together on
+every bump (now 6.1.34). (The cycc argv-capture issue is **resolved** — fixed
+upstream in 6.1.32; `docs/architecture/002` retired as a load-bearing rule.)

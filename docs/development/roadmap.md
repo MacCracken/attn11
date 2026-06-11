@@ -139,16 +139,87 @@ them before the M7 freeze means the frozen surface includes them).
 - Bonus discovery: the K bias has exactly zero gradient (softmax
   shift-invariance) — pinned by a dedicated check.
 
-### M7 — Freeze & consumer (v0.9.0 → v1.0.0)
+### M7 — Scale preset + BPE (v0.7.1) — ✅ shipped 2026-06-11 (frontier E3 graduated)
 
-- Freeze the config/CLI surface; finalize docs (guides + a runnable example).
-- Land one downstream consumer or example pipeline against a tagged build.
-  **Leading candidate**: the vidya corpus pipeline — train on
-  `vidya/content/**/cyrius.cyr` (~488 KB, 74 files) via `--corpus`, checkpoint,
-  sample; first run logged in [`experiments.md`](experiments.md) (loss 4.76
-  random → ~1.55 @ 8k steps; samples reproduce Cyrius idiom). Documents the
-  "curated small corpus" workflow end-to-end against a tagged build.
-- Security audit (`docs/audit/`); tag **v1.0.0** (first non-prerelease).
+Straight from what the vidya run (X001) exposed — small, additive, freeze-safe:
+
+- ✅ **`--preset`** for ctx 64 / d_model 64 (8 heads, 4 layers; the other
+  shapes reachable via new `--heads`/`--kv-heads`/`--layers` overrides).
+  Re-benched as predicted: the context-shift re-prime amortizes over 32
+  tokens at T=64, so KV-cached generation widens from 6.2× to **23×** over
+  uncached (64 → 1 486 tok/s).
+- ✅ **Simple BPE tokenizer** (`--bpe K`, K ≤ 512; revisits ADR 0002 → ADR
+  0006; byte-level stays the default). Pure-i64 deterministic merge training
+  (frozen tie-break, pinned cross-arch by an exact-merge-sequence test);
+  decode via a precomputed span table (no recursion); ~110 ms one-shot cost
+  at 256 KB / K=128.
+- ✅ **Checkpoint v3** records the tokenizer (kind + base vocab + merge
+  table); v1/v2 still load (byte-level); the loader validates hostile merge
+  tables as a well-founded DAG with bounded expansion (-37/-38) before any
+  allocation — same discipline as v1→v2.
+- ✅ **`--eval`** (deterministic, RNG-neutral): CE/token + **bits-per-byte**,
+  the tokenizer-comparable metric for X003.
+- **Gates met**: grad checks + the bit-identity gate green at the preset
+  config (and at V=300, past the old byte cap) — 242 checks on x86_64 AND
+  aarch64/qemu; checkpoint v3 with v1/v2 compat covered by round-trip +
+  rejection tests and 500 dedicated fuzz rounds (merge-slot clobber, triple
+  inconsistency, expansion bombs); byte-vs-BPE at iso-compute logged as
+  **X003** in [`experiments.md`](experiments.md). An adversarial review of the
+  diff caught + fixed a `--layers` heap-OOB (the fresh-config path had skipped
+  the loader's alloc cap) — see [`../audit/2026-06-11-m7-bpe-audit.md`](../audit/2026-06-11-m7-bpe-audit.md).
+
+### M8 — Security sweep (v0.8.0)
+
+A research-driven hardening release — survey the world first, then repair:
+
+- **Survey**: web research of current CVEs / 0-day classes relevant to
+  attn11's shape — hostile-file parser bugs (checkpoint/corpus loaders),
+  integer-overflow-to-OOB patterns, allocator abuse, ML model-file
+  deserialization CVEs (a rich genre), and supply-chain/toolchain exposure
+  (the cyrius pin + `lib/` snapshot, CI actions).
+- **Map** every relevant class onto attn11's surfaces and record the
+  disposition in `docs/audit/` — negative results included; the trail is the
+  point.
+- **Repair** whatever maps; extend the fuzz harness where a class suggests
+  new mutations; regression-test every fix.
+- **Gates**: a dated CVE-survey audit in `docs/audit/` with per-class
+  dispositions; fuzz extended accordingly; all repairs regression-tested.
+
+### M9 — Performance (v0.8.x)
+
+The accumulated perf levers, landed one at a time against
+[`bench-history.csv`](../../bench-history.csv) (numbers or it didn't happen):
+
+- Vectorize the tied LM head (matters as vocab grows — 117 symbols on vidya).
+- A packed `tanh` approximation for GELU (its share grows as matmul shrinks).
+- Cache-blocking / register-tiling the matmul for the ctx-64/d_model-64
+  preset sizes.
+- Batched prefill (a window forward that also fills the K/V caches) if the
+  context-shift re-prime dominates at larger T.
+- **Gates per item**: documented before → after in
+  [`benchmarks.md`](../benchmarks.md) + the CSV; grad checks and the
+  bit-identity gate stay green (`docs/architecture/003` — kernel changes
+  must land in BOTH forward paths or neither).
+
+### M10 — Freeze, docs & cleanup (v0.9.0)
+
+Everything required so the v1.0.0 cut is a tag, not a scramble:
+
+- Freeze the config/CLI surface; document every flag and config knob as
+  final — no planned breaking changes past this point.
+- Docs audit: ADRs current, `sources.md` complete, guides runnable,
+  `state.md` refreshed, loose ends closed (the `attn11` row in
+  `agnos/scripts/stage-tools.sh`, stale TODOs).
+- Land the example pipeline / consumer against a tagged build: the vidya
+  corpus workflow (X001) end-to-end — train on
+  `vidya/content/**/cyrius.cyr` via `--corpus`, checkpoint, sample.
+- Cleanup: dead code, naming consistency, deferred lint items.
+
+### v1.0.0 — the clean cut
+
+When every v1.0 criterion above holds: final security audit in
+`docs/audit/`, then tag **v1.0.0** (first non-prerelease). No new features
+ride this tag — anything not finished by 0.9.0 waits for v1.x.
 
 ## Beyond v1.0 — the frontier track (experiments)
 
@@ -166,14 +237,12 @@ them before the M7 freeze means the frozen surface includes them).
 Ordered by (value ÷ risk), each independently shippable:
 
 - ~~**E1 — KV-cached generation.**~~ ✅ Graduated into **M6 (v0.7.0)** — gates
-  met (bit-identity + 5.9× tokens/sec).
+  met (bit-identity + 6.2× tokens/sec).
 - ~~**E2 — GQA/MQA config.**~~ ✅ Graduated into **M6 (v0.7.0)** — gates met
   (grad checks at `n_kv_heads ∈ {1, 2, nh}`; KV bytes in the bench).
-- **E3 — Scale preset + BPE.** A `--preset` for ctx 64 / d_model 64 (whole
-  statements instead of 16-char fragments — the honest lever the vidya run
-  exposed), plus the long-deferred simple BPE tokenizer. The survey's
-  data-efficiency thesis makes byte-vs-BPE-at-iso-compute a measurable
-  experiment on the vidya corpus.
+- ~~**E3 — Scale preset + BPE.**~~ ✅ Graduated into **M7 (v0.7.1)** — gates
+  met (preset bit-identity + 23× cached generation; BPE deterministic
+  cross-arch; byte-vs-BPE at iso-compute logged as X003).
 - **E4 — A second sequence-mixer family (linear attention → selective SSM).**
   The survey's structural shift: hybrids with ~10–25% attention layers beat
   pure transformers. Ladder: (a) a gated linear-attention/RetNet-style block
@@ -195,9 +264,11 @@ Ordered by (value ÷ risk), each independently shippable:
   where defined; accuracy vs f64 baseline; the i64-add matmul benched
   against SIMD f64.
 
-Sequencing intent: E1–E2 shipped pre-freeze as M6 (v0.7.0); E3 is the
-remaining pre-/post-freeze candidate (small, additive); E4–E6 are v2-track
-(new model families) and may fork the architecture config.
+Sequencing intent: E1–E2 shipped pre-freeze as M6 (v0.7.0); E3 shipped as M7
+(v0.7.1). The remaining pre-freeze ladder is fixed: **0.8.0 security sweep →
+0.8.x performance → 0.9.0 freeze/docs/cleanup → v1.0.0 clean cut** (M8–M10
+above). E4–E6 are v2-track (new model families), may fork the architecture
+config, and do not ride any 0.x release.
 
 ## Out of scope (for v1.0)
 
