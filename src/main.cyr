@@ -195,7 +195,8 @@ fn main(): i64 {
         if (rc < 0) { puts("attn11: checkpoint load failed (code "); fmt_int(rc); puts(")\n"); return 1; }
         puts("attn11: resumed from checkpoint at step "); fmt_int(g_step); _putc(10);
     } else {
-        model_init_arch(V, cfg_c, cfg_t, cfg_nh, cfg_nkv, cfg_nl, CFG_ATTN_BIAS(), CFG_DROPOUT(), CFG_SEED(), cfg_attn_kind, cfg_latent_dim);
+        model_init_arch(V, cfg_c, cfg_t, cfg_nh, cfg_nkv, cfg_nl,
+                        CFG_ATTN_BIAS(), CFG_DROPOUT(), CFG_SEED(), cfg_attn_kind, cfg_latent_dim);
     }
 
     puts("attn11 — transformer training in Cyrius\n");
