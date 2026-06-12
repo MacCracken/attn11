@@ -217,17 +217,18 @@ _None yet._
 
 ## Next
 
-See [`roadmap.md`](roadmap.md). **M9 (v0.8.x) — performance — in progress**,
-one lever per release benched against the CSV:
+See [`roadmap.md`](roadmap.md). **M9 (v0.8.x) — performance — concluded.**
+The **SIMD tied LM head** (0.8.1, 2.7× at V=768) was the one clean win; the
+other three roadmap levers were prototyped and **rejected by measurement**
+(X004): GELU-tanh marginal (~1–2%, `exp` is cheap), matmul cache-blocking
+*slower* (matrices are cache-resident), batched prefill *no win* (~1%; the
+re-prime is irreducible work, not overhead). The residual matmul gap to SIMD
+peak is structural (the SIMD-var-reassign rule + 2-wide `f64v_fmadd`) and needs
+toolchain support, not a v0.8.x change.
 
-1. ✅ **0.8.1 — SIMD tied LM head** (2.7× at V=768).
-2. **next** — a packed `tanh` for GELU (its ~16% share grows as matmul + the
-   head get faster).
-3. then — matmul cache-blocking / register-tiling for the preset sizes; a
-   batched prefill if the context-shift re-prime dominates at larger T.
-
-Then **M10 (v0.9.0)** — freeze/docs/cleanup + the vidya example pipeline, so
-**v1.0.0 is a clean cut** (final audit + tag only).
+**Next — M10 (v0.9.0)**: freeze the config/CLI surface, finish docs, land the
+vidya example pipeline (X001) against a tagged build — so **v1.0.0 is a clean
+cut** (final audit + tag only).
 
 Loose ends: an `attn11` row upstream in `agnos/scripts/stage-tools.sh`
 (folds into M10 cleanup). The pin and `lib/` snapshot must move together on

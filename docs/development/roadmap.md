@@ -206,15 +206,30 @@ The accumulated perf levers, landed one at a time against
   the vocab (negligible at V=25, ~17% of the forward at BPE-scale). Bit-identity
   gate unaffected (shared kernel); a C=6 tail test (mutation-verified) covers
   the new `C % 4 ≠ 0` path. See [`benchmarks.md`](../benchmarks.md).
-- A packed `tanh` approximation for GELU (its share grows as matmul shrinks).
-- Cache-blocking / register-tiling the matmul for the ctx-64/d_model-64
-  preset sizes.
-- Batched prefill (a window forward that also fills the K/V caches) if the
-  context-shift re-prime dominates at larger T.
+- ❌ **Packed `tanh` for GELU** — profiled, **NOT shipped** (X004): the exact
+  one-exp `tanh` is only ~15% faster per call (noisy) — `f64_exp` is cheap on
+  this toolchain — and GELU is ~8% of a step, so the win is ~1–2%, below
+  step-bench noise.
+- ❌ **Matmul cache-blocking / register-tiling** — profiled, **NOT shipped**
+  (X004): an m-blocked `linear_fwd` is bit-identical but **~15% slower** at the
+  preset shape — attn11's weight matrices are cache-resident, so blocking only
+  adds accumulator traffic. (Attention Q·K/P·V were already 4-wide; the head
+  was the lone scalar kernel.)
+- ❌ **Batched prefill** — prototyped, **NOT shipped** (X004): a batched n-row
+  window forward vs the `keep` single-row re-prime benched **~1% (within
+  noise)** at n=32. The re-prime's cost is irreducible *work* (the n-row causal
+  forward — same MACs either way), not per-call overhead, so batching saves
+  nothing at this scale.
 - **Gates per item**: documented before → after in
   [`benchmarks.md`](../benchmarks.md) + the CSV; grad checks and the
   bit-identity gate stay green (`docs/architecture/003` — kernel changes
   must land in BOTH forward paths or neither).
+
+**M9 concluded (0.8.1).** The LM head was the one clean win; all three other
+levers were measured and rejected (GELU-tanh marginal, matmul-blocking slower,
+batched prefill no win — X004). The residual matmul gap to SIMD peak is
+structural (the SIMD-var-reassign rule + 2-wide `f64v_fmadd` lowering) and
+needs toolchain support, not a v0.8.x code change. Next: **M10**.
 
 ### M10 — Freeze, docs & cleanup (v0.9.0)
 
