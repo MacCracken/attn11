@@ -654,30 +654,34 @@ fn test_ckpt_gqa_roundtrip(): i64 {
     return 0;
 }
 
-# Older checkpoint versions must still load. A byte-kind v3 body (vocab +
-# params) is bit-identical to v1/v2's, so older images are pure header
-# shifts of the v3 the serializer now emits: v2 (pre-BPE, 13 fields) drops
-# [13..15]; v1 (pre-GQA, 12 fields) also drops [12] (nkv) and loads as full
-# MHA (nkv = nh, under which the v2/v3 parameter layout is identical).
+# Older checkpoint versions must still load. A byte-kind, default-descriptor v4
+# body (vocab + params) is bit-identical to v1/v2/v3's, so older images are pure
+# header shifts of the v4 the serializer now emits: v3 (pre-MLA, 16 fields) drops
+# the descriptor [16..19]; v2 (pre-BPE, 13 fields) also drops [13..15]; v1
+# (pre-GQA, 12 fields) also drops [12] (nkv) and loads as full MHA (nkv = nh,
+# under which the parameter layout is identical across all versions). dropped is
+# computed off CKPT_HDR() so a future header bump shifts this automatically.
 fn _ckpt_compat_check(ver, hdr_fields): i64 {
     var V = build_corpus();
     model_init(V, 8, 4, 2, 2, 1, 0, f64_from(0), 6);
     var np = g_NP;
     var snap = t_alloc(np); t_copy(snap, g_params, np);
     var sz = ckpt_size();
-    var v3 = alloc(sz); ckpt_serialize(v3);
-    var dropped = 16 - hdr_fields;
+    var cur = alloc(sz); ckpt_serialize(cur);
+    var dropped = CKPT_HDR() - hdr_fields;
     var szo = sz - dropped * 8;
     var old = alloc(szo);
     var i = 0;
-    while (i < hdr_fields) { store64(old + i * 8, load64(v3 + i * 8)); i = i + 1; }
+    while (i < hdr_fields) { store64(old + i * 8, load64(cur + i * 8)); i = i + 1; }
     store64(old + 1 * 8, ver);
-    while (i < szo / 8) { store64(old + i * 8, load64(v3 + (i + dropped) * 8)); i = i + 1; }
+    while (i < szo / 8) { store64(old + i * 8, load64(cur + (i + dropped) * 8)); i = i + 1; }
     model_init(V, 8, 4, 2, 2, 1, 0, f64_from(0), 777);  # scramble
     assert(ckpt_load_buf(old, szo) == 0, "old-version checkpoint loads");
     assert(g_nkv == g_nh, "old version loads as full MHA (nkv = nh)");
     assert(g_bpe_on == 0, "old version loads as byte-level tokenizer");
     assert(g_bpe_nmerges == 0, "old version loads with zero merges");
+    assert(g_attn_kind == 0, "old version loads as mha (default descriptor)");
+    assert(g_pos_kind == 0, "old version loads as learned-abs (default descriptor)");
     var mism = 0; i = 0;
     while (i < np) {
         if (load64(g_params + i * 8) != load64(snap + i * 8)) { mism = mism + 1; }
@@ -688,6 +692,7 @@ fn _ckpt_compat_check(ver, hdr_fields): i64 {
 }
 fn test_ckpt_v1_compat(): i64 { return _ckpt_compat_check(1, 12); }
 fn test_ckpt_v2_compat(): i64 { return _ckpt_compat_check(2, 13); }
+fn test_ckpt_v3_compat(): i64 { return _ckpt_compat_check(3, CKPT_HDR_V3()); }
 
 # With a corpus already loaded, a checkpoint whose vocab differs must be
 # rejected (-15) rather than silently mis-indexing g_data.
@@ -697,7 +702,7 @@ fn test_ckpt_vocab_mismatch(): i64 {
     var sz = ckpt_size();
     var ck = alloc(sz); ckpt_serialize(ck);
     # corrupt the first vocab entry so it no longer matches the loaded corpus
-    var off = 16 * 8;                        # CKPT_HDR fields, then vocab[0]
+    var off = CKPT_HDR() * 8;                # header fields, then vocab[0]
     store64(ck + off, (load64(ck + off) + 1) % 256);
     assert(ckpt_load_buf(ck, sz) == (0 - 15), "vocab-mismatch rejected (-15)");
     return 0;
@@ -742,7 +747,7 @@ fn test_ckpt_v3_roundtrip(): i64 {
     var np = g_NP;
     var snap = t_alloc(np); t_copy(snap, g_params, np);
     var sz = ckpt_size();
-    assert(sz == (16 + B + 2 * nm + 3 * np) * 8, "v3 size accounts header+base+merges+params");
+    assert(sz == (CKPT_HDR() + B + 2 * nm + 3 * np) * 8, "checkpoint size accounts header+base+merges+params");
     var ck = alloc(sz); ckpt_serialize(ck);
     # scramble: fresh byte-level corpus state + different-seed model
     build_corpus();
@@ -817,29 +822,65 @@ fn test_ckpt_v3_reject(): i64 {
     # byte-level kind cannot carry merges
     t_copy(bad, ck, sz / 8); store64(bad + 13 * 8, 0);
     assert(ckpt_load_buf(bad, sz) == (0 - 36), "tok_kind=0 with K>0 rejected (-36)");
-    # merge-table well-foundedness: self, forward, negative refs
-    t_copy(bad, ck, sz / 8); store64(bad + (16 + B) * 8, B);
+    # merge-table well-foundedness: self, forward, negative refs (the table now
+    # follows the v4 header at CKPT_HDR() + B)
+    t_copy(bad, ck, sz / 8); store64(bad + (CKPT_HDR() + B) * 8, B);
     assert(ckpt_load_buf(bad, sz) == (0 - 37), "merge 0 self-reference rejected (-37)");
-    t_copy(bad, ck, sz / 8); store64(bad + (16 + B) * 8, B + 3);
+    t_copy(bad, ck, sz / 8); store64(bad + (CKPT_HDR() + B) * 8, B + 3);
     assert(ckpt_load_buf(bad, sz) == (0 - 37), "merge 0 forward reference rejected (-37)");
-    t_copy(bad, ck, sz / 8); store64(bad + (16 + B + 1) * 8, 0 - 2);
+    t_copy(bad, ck, sz / 8); store64(bad + (CKPT_HDR() + B + 1) * 8, 0 - 2);
     assert(ckpt_load_buf(bad, sz) == (0 - 37), "merge 0 negative reference rejected (-37)");
     # expansion bomb: chained self-doubling merges, header fully consistent —
     # only the length recurrence can catch this (2^(j+1) bytes at merge j)
     t_copy(bad, ck, sz / 8);
-    store64(bad + (16 + B) * 8, 0); store64(bad + (16 + B + 1) * 8, 0);
+    store64(bad + (CKPT_HDR() + B) * 8, 0); store64(bad + (CKPT_HDR() + B + 1) * 8, 0);
     var j = 1;
     while (j < 7) {
-        store64(bad + (16 + B + 2 * j) * 8, B + j - 1);
-        store64(bad + (16 + B + 2 * j + 1) * 8, B + j - 1);
+        store64(bad + (CKPT_HDR() + B + 2 * j) * 8, B + j - 1);
+        store64(bad + (CKPT_HDR() + B + 2 * j + 1) * 8, B + j - 1);
         j = j + 1;
     }
     assert(ckpt_load_buf(bad, sz) == (0 - 38), "expansion bomb rejected (-38)");
-    # a v3 header on a buffer too short for it
-    assert(ckpt_load_buf(ck, 13 * 8) == (0 - 1), "v3 header on 13-field buffer rejected (-1)");
+    # a v4 header on a buffer too short for it
+    assert(ckpt_load_buf(ck, 13 * 8) == (0 - 1), "header on 13-field buffer rejected (-1)");
     # version forged down to 2: the v2 size formula no longer matches
     t_copy(bad, ck, sz / 8); store64(bad + 1 * 8, 2);
     assert(ckpt_load_buf(bad, sz) == (0 - 11), "BPE image forged to v2 rejected by size (-11)");
+    return 0;
+}
+
+# v4 architecture descriptor (M12, ADR 0007): a byte-level checkpoint records
+# the reserved descriptor [16..19] defaulting to mha / learned-abs / 0 / 0, and
+# round-trips it. Only the defaults are accepted today — any non-default value
+# is rejected pre-allocation (-40..-43), exactly like every other header field.
+fn test_ckpt_v4_descriptor(): i64 {
+    var V = build_corpus();
+    model_init(V, 8, 4, 2, 2, 1, 0, f64_from(0), 23);
+    var sz = ckpt_size();
+    var ck = alloc(sz); ckpt_serialize(ck);
+    # the serializer emits v4 with the default descriptor
+    assert(load64(ck + 1 * 8) == 4, "serializer writes version 4");
+    assert(load64(ck + 16 * 8) == 0, "attn_kind defaults to mha (0)");
+    assert(load64(ck + 17 * 8) == 0, "pos_kind defaults to learned-abs (0)");
+    assert(load64(ck + 18 * 8) == 0, "latent_dim defaults to 0");
+    assert(load64(ck + 19 * 8) == 0, "rope_dim defaults to 0");
+    # round-trip restores the descriptor into the globals
+    model_init(V, 8, 4, 2, 2, 1, 0, f64_from(0), 47);   # scramble
+    assert(ckpt_load_buf(ck, sz) == 0, "v4 default-descriptor checkpoint loads");
+    assert(g_attn_kind == 0, "attn_kind restored");
+    assert(g_pos_kind == 0, "pos_kind restored");
+    assert(g_latent_dim == 0, "latent_dim restored");
+    assert(g_rope_dim == 0, "rope_dim restored");
+    # every reserved field rejects a non-default value before allocating
+    var bad = alloc(sz);
+    t_copy(bad, ck, sz / 8); store64(bad + 16 * 8, 1);
+    assert(ckpt_load_buf(bad, sz) == (0 - 40), "attn_kind != mha rejected (-40)");
+    t_copy(bad, ck, sz / 8); store64(bad + 17 * 8, 1);
+    assert(ckpt_load_buf(bad, sz) == (0 - 41), "pos_kind != learned rejected (-41)");
+    t_copy(bad, ck, sz / 8); store64(bad + 18 * 8, 8);
+    assert(ckpt_load_buf(bad, sz) == (0 - 42), "latent_dim != 0 rejected (-42)");
+    t_copy(bad, ck, sz / 8); store64(bad + 19 * 8, 8);
+    assert(ckpt_load_buf(bad, sz) == (0 - 43), "rope_dim != 0 rejected (-43)");
     return 0;
 }
 
@@ -1221,6 +1262,8 @@ fn main(): i64 {
     test_ckpt_gqa_roundtrip();
     test_ckpt_v1_compat();
     test_ckpt_v2_compat();
+    test_ckpt_v3_compat();
+    test_ckpt_v4_descriptor();
     test_ckpt_vocab_mismatch();
     test_group("bpe tokenizer");
     test_bpe_known();

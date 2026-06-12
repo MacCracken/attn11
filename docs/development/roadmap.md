@@ -1,6 +1,7 @@
 # attn11 — Roadmap
 
-> Milestone plan through v1.0. State lives in [`state.md`](state.md);
+> Milestone plan through v1.0 and the 1.x architecture arc (M11+). State lives
+> in [`state.md`](state.md);
 > this file is the sequencing — what ships, in what order, against
 > what gates. Every milestone keeps the invariant: **all backward passes
 > stay grad-checked** (`cyrius test` green) and **src lints clean**.
@@ -261,7 +262,158 @@ release-hygiene fixes (`--save` exit code, `version-bump.sh` CFG_VERSION,
 SECURITY wording) landed. 248 tests green on x86_64 + aarch64, all gates pass,
 version surfaces consistent. Cut as **v1.0.0** — the first non-prerelease. No
 features ride this tag; the surface is frozen ([`../STABILITY.md`](../STABILITY.md)).
-Anything past here is v1.x (additive) or the v2-track frontier below.
+Anything past here is v1.x (additive) — the architecture arc below (M11+); there
+is no v2 fork.
+
+### M11 — The extraction (v1.1.0) — ✅ shipped 2026-06-12
+
+The first post-1.0 minor — additive/internal, the frozen surface untouched. The
+reusable numeric core was lifted out of attn11 into two sovereign sibling
+libraries, which attn11 now consumes and dogfoods:
+
+- ✅ **Tensor storage + BLAS-1 + dense matmul (and its gradient) →
+  [rosnet](https://github.com/MacCracken/rosnet) 0.1.0** — `t_alloc`/`t_zero`/
+  `tget`/`tset`, `t_axpy`/`t_scale`/`t_sum`, `f64_is_finite`, `t_randn`, and
+  `linear_fwd`/`linear_bwd`. Matmul + its backward are pure linear algebra
+  (`dx = dy·Wᵀ`, `dW = xᵀ·dy`), reusable beyond ML — so they belong in the
+  tensor lib, not the model.
+- ✅ **Deterministic statistical PRNG →
+  [tyche](https://github.com/MacCracken/tyche) 0.1.0** — `rng_seed`/`rng_u64`/
+  `rng_uniform`/`rng_normal` + the `_rng_state` stream (attn11 still reads/writes
+  it directly for crash-atomic save + bit-for-bit resume).
+- ✅ Model-specific differentiable layers (LayerNorm/GELU/dropout/softmax CE)
+  stay in `src/ops.cyr`; `src/tensor.cyr` keeps only attn11-local float printing.
+- **Gates met**: byte-identical training/sampling, same CLI, v3 checkpoint
+  unchanged, **248** grad-check/property tests green — attn11's grad-checks now
+  double as rosnet's gradient validation and tyche's RNG-state validation. Still
+  **no BLAS/libc/autodiff** (both libs are pure-Cyrius `f64`-in-`i64`,
+  sovereign-ecosystem). attn11 is the **reference consumer**, satisfying the
+  v1.0 "one consumer green" criterion. Pin held at 6.1.37.
+
+## The 1.x architecture arc (M12+)
+
+Past 1.0 the surface is **additive-only**, so the frontier experiments below
+ship as opt-in 1.x minors — **not** a v2 fork. Each adds new `--flags` and a new
+checkpoint version (prior versions always load), leaves the default run
+byte-identical, and keeps every invariant: hand-derived backward,
+finite-difference grad-checked, CPU `f64`, no deps. This is exactly how
+KV-cache/GQA (M6) and BPE (M7) landed additively pre-freeze — the same
+freeze-safe pattern, now applied past the 1.0 line. Each milestone graduates a
+frontier experiment (E-series below), is independently shippable, and bumps the
+checkpoint version with permanent back-compat. The build order is a value÷risk
+call, **not** a dependency chain — the axes (attention, FFN, sequence-mixer,
+objective, precision) are orthogonal and re-orderable.
+
+### M12 — Multi-Head Latent Attention + positional-encoding switch (v1.2.0) — E7
+
+The **KV-cache evolution**. MLA caches one **low-rank latent** `c_KV` per token
+(a down-projection `C → d_c`, `d_c ≪ C`) and up-projects to per-head K/V on
+read, instead of caching full per-head K/V (MHA) or shared K/V heads (GQA). It
+is the next step on the **shrink-the-KV-cache** axis M6 opened (E1 cache +
+E2 GQA), and the survey's "KV cache is the central inference object" thesis made
+concrete. Decision recorded in **ADR 0007**.
+
+**Two orthogonal config axes** land here, both opt-in, both defaulting to the
+current model so a no-flag run is byte-identical:
+
+- `--attn-kind {mha, gqa, mla}` — the attention/KV variant (`gqa` already
+  exists via `--kv-heads`; `mha` is today's default; `mla` is new).
+- `--pos-kind {learned, rope, rope-decoupled}` — the positional scheme. attn11
+  uses learned **absolute** embeddings (`learned`, the default), which pin
+  cached rows to positions and enable the context-shift re-prime (ADR 0005).
+  RoPE is **relative** and mutually exclusive with learned-abs (you pick one).
+  *Coupled* `rope` rotates per-head K directly — simplest, but in MLA it breaks
+  the up-projection absorption, so it forfeits part of the cache win. *Decoupled*
+  `rope-decoupled` (DeepSeek-V2) carries position on a separate small dimension
+  that bypasses compression — the faithful, cache-efficient MLA combo.
+
+**Staged increments** (each additive, each its own grad-check / bit-identity
+gate; ONE change at a time):
+
+1. **Descriptor scaffolding (begun)** — checkpoint **v4** reserves the
+   architecture-descriptor header fields `attn_kind`, `pos_kind`, `latent_dim`
+   (`d_c`), `rope_dim` (`d_rope`), all defaulting to `mha`/`learned`/`0`/`0`;
+   v1/v2/v3 still load (synthesizing the defaults). Only the default descriptor
+   is accepted until each feature below fills its field, so "update later" is
+   pure value-fill with **no further format bump** across the whole MLA+RoPE
+   ladder. Reserving the fields now is the cheap forward-compat move; it ships
+   ahead of any math.
+2. **MLA core** — `--attn-kind mla --latent-dim d_c` at `--pos-kind learned`
+   (the honest, grad-checkable core: pure low-rank KV compression, learned-abs
+   positions kept). Latent down/up projections are plain linear layers, so the
+   backward is matmul-backward (rosnet).
+3. **Coupled RoPE** (optional, independent of MLA) — `--pos-kind rope` on dense
+   MHA first; RoPE has no learned params, so the grad-check is just the
+   rotation's backward. Valuable on its own (relative positions, length
+   extrapolation); could split out as its own milestone if wanted before MLA.
+4. **Decoupled RoPE** (optional) — `--pos-kind rope-decoupled` for MLA, the
+   faithful cache-efficient form, built on (3).
+
+- **Gates**: latent down/up-projection backward grad-checked; RoPE rotation
+  backward grad-checked; cached vs uncached generation **bit-identical** across
+  context-shifts (the M6 KV bit-identity gate, extended per `--attn-kind` /
+  `--pos-kind` value); **KV-cache-bytes table** vs GQA/MQA (the headline
+  compression number, mirroring X002); perplexity vs iso-param GQA on the vidya
+  corpus. Logged as an X-series entry.
+
+### M13 — Mixture of Experts (v1.3.0) — E8
+
+**Sparse FFN.** The dense GELU MLP in each block becomes **N experts** with a
+top-`K` router, decoupling parameter count from per-token FLOPs. The deliverable
+is the **expert-density sweep** so density is a chooseable knob, not a hardcode.
+
+- New `--experts N` for **N ∈ {1 (dense baseline), 8, 16, 32, 64, 128, 256}**,
+  `--expert-topk K` (active experts/token, default top-2), each expert reusing
+  the `F = 4·C` width. A linear gate `C → N` + softmax selects the top-K; expert
+  outputs are gate-weighted so the router is differentiable through the combine
+  weights.
+- **The hard grad-check (why this earns a milestone):** the router. Top-K
+  selection is discrete — differentiate the soft gate weights (straight-through
+  for the hard pick), and the **load-balancing auxiliary loss** (Switch-style,
+  to stop expert collapse) gets its own finite-difference check. A router
+  backward without a passing grad check is incomplete.
+- Deterministic routing: the argmax / top-K tie-break is a **frozen** rule
+  (bit-reproducible cross-arch, same discipline as the BPE merge tie-break,
+  ADR 0006).
+- Checkpoint **v5** (router gate + per-expert weights + `experts`/`topk`); prior
+  versions load.
+- **Gates**: router + aux-loss backward grad-checked; the **density-sweep
+  experiment** (X-series) reports, for each N, bits/byte on vidya, active vs
+  total params, and **expert utilization** (routing-entropy / load-balance) — so
+  "choose the expert density" is backed by numbers. Honest caveat: at attn11's
+  reference scale (C = 32–64, tiny corpus) N = 256 is wildly over-parameterized;
+  the value is the **grad-checked reference** that sparse routing learns + the
+  sweep's density/quality/utilization curve, not a quality win at this scale —
+  the same framing as GQA's value here (X002 #2).
+
+### M14 — A second sequence-mixer family (v1.4.0) — E4
+### M15 — Char-diffusion objective (v1.5.0) — E5
+### M16 — Ternary (BitNet) training (v1.6.0) — E6
+
+The original frontier ladder, now sequenced as 1.x minors after MLA + MoE — full
+specs in the E4–E6 catalog below. These are the biggest architectural departures
+(a non-attention mixer, a non-AR objective, sub-`f64` weights), so they ride
+later in the arc; each keeps the same opt-in-flag + new-checkpoint-version +
+grad-check discipline.
+
+### M17 — Reinforcement learning (v1.7.0) — E9
+
+**Last in the chain, by design.** RL is an orthogonal *training-objective* layer,
+not an architecture: it runs on whatever trunk exists (any `--attn-kind` /
+mixer / precision), so it graduates after the architecture families are in
+place and can fine-tune the best of them. The reference target is **policy
+gradient (REINFORCE)** at char scale: sample a rollout from the current policy,
+score it with a deterministic reward function, and weight the log-prob gradient
+by `(R − b)` (advantage, `b` a moving-average baseline). The gradient
+`∇ log π(a)·(R − b)` **reuses the existing softmax-CE backward** reweighted per
+token — so the hand-derived backward is a small, grad-checkable delta over the
+supervised path, exactly attn11's wheelhouse. Reward is a simple in-process
+function at this scale (e.g. "is the sample valid-Cyrius / matches a target
+pattern / hits a length target"), not a learned reward model. Gate: the
+reward-weighted backward grad-checked against finite differences; a documented
+RL-vs-SFT comparison (does the policy move toward the reward) logged as an
+X-series entry. PPO/GRPO (clipped ratio, group baselines) noted as a heavier
+follow-on only if REINFORCE earns it.
 
 ## Beyond v1.0 — the frontier track (experiments)
 
@@ -305,12 +457,38 @@ Ordered by (value ÷ risk), each independently shippable:
   collapses to integer adds. Gate: STE backward documented + grad-checked
   where defined; accuracy vs f64 baseline; the i64-add matmul benched
   against SIMD f64.
+- **E7 — Multi-Head Latent Attention + positional-encoding switch.** Graduates
+  into **M12 (v1.2.0)**; decision in **ADR 0007**. The attention/KV-cache axis
+  (continues E1 + E2): cache a low-rank latent `c_KV` per token, up-project to
+  per-head K/V on read — plus a `--pos-kind {learned, rope, rope-decoupled}`
+  switch (learned-abs default; coupled/decoupled RoPE for the faithful MLA).
+  Gate: latent-projection + RoPE-rotation backward grad-checked;
+  cached-vs-uncached bit-identity; KV-cache-bytes vs GQA; perplexity vs iso-param
+  GQA on vidya.
+- **E8 — Mixture of Experts (sparse FFN).** Graduates into **M13 (v1.3.0)**. The
+  FFN axis: an N-expert top-K router replacing the dense MLP, swept over
+  **N ∈ {8, 16, 32, 64, 128, 256}**. Gate: router + load-balance-aux backward
+  grad-checked; deterministic frozen tie-break; density sweep (bits/byte, active
+  vs total params, expert utilization) logged.
+- **E9 — Reinforcement learning (policy gradient).** Graduates into
+  **M17 (v1.7.0)** — last in the chain. An orthogonal *objective* layer (runs on
+  any trunk): REINFORCE with a deterministic reward, the log-prob gradient
+  reweighted by advantage `(R − b)` — a small grad-checkable delta over the
+  softmax-CE backward. Gate: reward-weighted backward grad-checked; RL-vs-SFT
+  reward-movement logged.
 
-Sequencing intent: E1–E2 shipped pre-freeze as M6 (v0.7.0); E3 shipped as M7
-(v0.7.1). The remaining pre-freeze ladder is fixed: **0.8.0 security sweep →
-0.8.x performance → 0.9.0 freeze/docs/cleanup → v1.0.0 clean cut** (M8–M10
-above). E4–E6 are v2-track (new model families), may fork the architecture
-config, and do not ride any 0.x release.
+Sequencing intent: E1–E2 shipped pre-freeze as M6 (v0.7.0); E3 as M7 (v0.7.1);
+the v0.8–v1.0 ladder (security → perf → freeze → clean cut) shipped as M8–M10.
+Past 1.0, the remaining experiments ship as **additive 1.x minors** (not a v2
+fork — see "The 1.x architecture arc" above): **E7 → M12 (v1.2.0, MLA + pos-kind),
+E8 → M13 (v1.3.0, MoE), E4 → M14 (v1.4.0, mixers), E5 → M15 (v1.5.0, diffusion),
+E6 → M16 (v1.6.0, ternary), E9 → M17 (v1.7.0, RL)**. The order is value÷risk —
+MLA continues shipped KV-cache infra (lowest risk), MoE is the requested
+scale-up knob, the mixer/objective/precision departures ride later, and RL is
+last because it is an objective layer over a finished trunk — and is
+re-orderable, since the axes are orthogonal. Each is opt-in config + a new
+checkpoint version with permanent back-compat, so the frozen 1.0 surface is
+never broken.
 
 ## Out of scope (for v1.0)
 

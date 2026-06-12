@@ -58,8 +58,8 @@ fn main(): i64 {
             store8(work + off, (load8(work + off) ^ (fz_pos() & 0xFF)) & 0xFF);
         } elif (mode == 1) {                  # truncate to a random length
             mlen = fz_pos() % (sz + 1);
-        } elif (mode == 2) {                  # wild value into a config/state field (2..15)
-            var fld = 2 + (fz_pos() % 14);
+        } elif (mode == 2) {                  # wild value into a header field (2..CKPT_HDR()-1, incl. v4 descriptor)
+            var fld = 2 + (fz_pos() % (CKPT_HDR() - 2));
             store64(work + fld * 8, fz_next());
         } elif (mode == 3) {                  # clobber the magic
             store64(work, fz_next());
@@ -71,7 +71,7 @@ fn main(): i64 {
             store64(work + 9 * 8, 4194304 + (fz_pos() % 3));# np (cap 4M) — stresses size arithmetic + check order
         } else {                              # fully random header
             var k = 0;
-            while (k < 16) { store64(work + k * 8, fz_next()); k = k + 1; }
+            while (k < CKPT_HDR()) { store64(work + k * 8, fz_next()); k = k + 1; }
         }
         var rc = ckpt_load_buf(work, mlen);
         if (rc < 0) { rejected = rejected + 1; }
@@ -102,17 +102,17 @@ fn main(): i64 {
             store8(bwork + boff, (load8(bwork + boff) ^ (fz_pos() & 0xFF)) & 0xFF);
         } elif (bmode == 1) {                 # truncate
             bmlen = fz_pos() % (bsz + 1);
-        } elif (bmode == 2) {                 # wild config/tokenizer field
-            var bfld = 2 + (fz_pos() % 14);
+        } elif (bmode == 2) {                 # wild config/tokenizer/descriptor field
+            var bfld = 2 + (fz_pos() % (CKPT_HDR() - 2));
             store64(bwork + bfld * 8, fz_next());
         } elif (bmode == 3) {                 # clobber the magic
             store64(bwork, fz_next());
         } elif (bmode == 4) {                 # fully random header
             var bk = 0;
-            while (bk < 16) { store64(bwork + bk * 8, fz_next()); bk = bk + 1; }
+            while (bk < CKPT_HDR()) { store64(bwork + bk * 8, fz_next()); bk = bk + 1; }
         } elif (bmode == 5) {                 # clobber one merge slot
             var slot = fz_pos() % (2 * Kb);
-            store64(bwork + (16 + Bb + slot) * 8, fz_next());
+            store64(bwork + (CKPT_HDR() + Bb + slot) * 8, fz_next());
         } elif (bmode == 6) {                 # inconsistent OR max-boundary (V, Vb, K) triple
             var pick = fz_pos() % 4;
             if (pick == 0) { store64(bwork + 2 * 8, 1 + (fz_pos() % 1024)); }
@@ -128,8 +128,8 @@ fn main(): i64 {
             while (bj < Kb) {
                 var ref = 0;
                 if (bj > 0) { ref = Bb + bj - 1; }
-                store64(bwork + (16 + Bb + 2 * bj) * 8, ref);
-                store64(bwork + (16 + Bb + 2 * bj + 1) * 8, ref);
+                store64(bwork + (CKPT_HDR() + Bb + 2 * bj) * 8, ref);
+                store64(bwork + (CKPT_HDR() + Bb + 2 * bj + 1) * 8, ref);
                 bj = bj + 1;
             }
         }

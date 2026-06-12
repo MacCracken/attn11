@@ -31,6 +31,19 @@ var g_dropout = 0;    # residual dropout probability (f64 bit pattern; 0 = off)
 var g_training = 1;    # dropout active only when training
 var g_step = 0;        # completed Adam update count (for resume + checkpoints)
 
+# ---- architecture descriptor (M12 scaffolding; checkpoint v4, ADR 0007) -----
+# Reserved opt-in axes, defaulting to the current model so a no-flag run and
+# every existing checkpoint stay byte-identical. Only the defaults are accepted
+# until MLA / RoPE fill them.
+#   g_attn_kind  0 = mha (today)        1 = mla            (reserved)
+#   g_pos_kind   0 = learned-abs (today) 1 = rope  2 = rope-decoupled (reserved)
+#   g_latent_dim d_c   (MLA latent width; 0 until MLA)
+#   g_rope_dim   d_rope (decoupled-RoPE width; 0 until decoupled RoPE)
+var g_attn_kind = 0;
+var g_pos_kind = 0;
+var g_latent_dim = 0;
+var g_rope_dim = 0;
+
 # ---- packed parameter vectors ----------------------------------------------
 var g_params = 0;
 var g_grads = 0;
@@ -203,6 +216,9 @@ fn model_init(V, C, T, nh, nkv, NL, attn_bias, dropout, seed): i64 {
     }
     g_V = V; g_C = C; g_T = T; g_nh = nh; g_nkv = nkv; g_NL = NL; g_F = 4 * C;
     g_attn_bias = attn_bias; g_dropout = dropout; g_training = 1; g_step = 0;
+    # default architecture descriptor (mha / learned-abs); a checkpoint load
+    # overrides these from its validated v4 header (ADR 0007)
+    g_attn_kind = 0; g_pos_kind = 0; g_latent_dim = 0; g_rope_dim = 0;
     var F = g_F;
     g_NP = _emb_end() + NL * _blk() + 2 * C;
 

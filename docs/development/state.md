@@ -5,17 +5,24 @@
 
 ## Version
 
-**1.0.0** — the clean cut, **first non-prerelease**. A complete, from-scratch,
-dependency-free GPT-style transformer in Cyrius (forward + hand-derived,
-grad-checked backprop + Adam + the full training loop on raw f64, no
-BLAS/libc/autodiff). The surface is frozen ([`STABILITY.md`](../STABILITY.md));
-past 1.0 it is additive-only. No features over 0.9.0 — the **final audit** (5
+**1.1.0** — *the extraction*. attn11 becomes the **reference consumer** of its
+own numeric core: tensor storage + BLAS-1 + dense matmul (and its gradient)
+lifted to [rosnet](https://github.com/MacCracken/rosnet) 0.1.0, the deterministic
+statistical PRNG to [tyche](https://github.com/MacCracken/tyche) 0.1.0 — both
+resolved via `cyrius deps` (pinned in `cyrius.lock`). **Additive/internal**:
+byte-identical training/sampling, same CLI, v3 checkpoint unchanged, the frozen
+1.0 surface intact; all **248** grad-check/property tests green (they now double
+as rosnet's gradient validation + tyche's RNG-state validation). Still **no
+BLAS/libc/autodiff** — both libs are pure-Cyrius `f64`-in-`i64`,
+sovereign-ecosystem. Toolchain pinned at cyrius 6.1.37.
+(1.0.0 — the clean cut, **first non-prerelease**: the **final audit** (5
 adversarial dimensions: hostile-input, math, memory, frozen-surface, release —
 **go on all five, 0 blockers**;
 [`../audit/2026-06-11-v1.0-final-audit.md`](../audit/2026-06-11-v1.0-final-audit.md))
 plus release-hygiene fixes (`--save` exits non-zero on failure; `version-bump.sh`
-updates `CFG_VERSION`; SECURITY wording). Toolchain pinned at cyrius 6.1.37.
-(0.9.0 — freeze, docs & cleanup (M10): the user-facing surface declared
+updates `CFG_VERSION`; SECURITY wording); no features over 0.9.0, the surface
+declared frozen ([`STABILITY.md`](../STABILITY.md)), additive-only past 1.0.
+0.9.0 — freeze, docs & cleanup (M10): the user-facing surface declared
 **frozen** ([`STABILITY.md`](../STABILITY.md)); CLI hardened (`--help`/
 `--version`, rejects unknown args + missing flag values); 5-dimension docs
 audit; dead code removed (`secure_write_file`/`f_println_lbl`/`CFG_NKV`); the
@@ -146,10 +153,11 @@ raises V to `base + K` (≤ 768).
 
 ## Source (`src/`, ~1500 LOC)
 
-- `tensor.cyr` — f64-array helpers, deterministic PRNG (xorshift64 + splitmix
-  seeding, Marsaglia-polar normal), float printing
-- `ops.cyr` — linear, layernorm, GELU (tanh approx), softmax cross-entropy
-  (forward + backward)
+- `tensor.cyr` — attn11-local float printing (`f_print`) + `_putc`/`puts` (40
+  lines); the f64-array helpers + dense matmul moved to **rosnet**, the PRNG to
+  **tyche** (1.1.0 extraction)
+- `ops.cyr` — layernorm, GELU (tanh approx), softmax cross-entropy (forward +
+  backward); `linear_fwd`/`linear_bwd` now resolve from **rosnet**
 - `attn.cyr` — causal multi-head/GQA self-attention (forward + backward), one
   pre-allocated arena for caches + temporaries; `attn_fwd_row` (KV-cached
   single-row forward, bit-identical per row to `attn_fwd`)
@@ -225,6 +233,12 @@ Direct (declared in `cyrius.cyml`):
 
 - stdlib — string, fmt, alloc, io, vec, str, syscalls, assert, bench, math,
   ganita, args
+- **[rosnet](https://github.com/MacCracken/rosnet) 0.1.0** — tensor storage +
+  BLAS-1 + dense matmul/gradient (`linear_fwd`/`linear_bwd`, `t_*`); 1.1.0
+  extraction, pinned in `cyrius.lock`
+- **[tyche](https://github.com/MacCracken/tyche) 0.1.0** — deterministic
+  statistical PRNG (`rng_seed`/`rng_u64`/`rng_uniform`/`rng_normal`); 1.1.0
+  extraction, pinned in `cyrius.lock`
 
 ## Consumers
 
@@ -232,20 +246,23 @@ _None yet._
 
 ## Next
 
-See [`roadmap.md`](roadmap.md). **M10 (v0.9.0) — freeze, docs & cleanup —
-done.** The surface is frozen ([`STABILITY.md`](../STABILITY.md)), the CLI
-hardened, the docs audited, dead code removed, the vidya example landed, and
-the pin moved to 6.1.37. (M9 concluded at 0.8.1 — the SIMD LM head was its one
-win; the other three levers were measured and rejected, X004.)
+See [`roadmap.md`](roadmap.md). **v1.0.0 (clean cut) and v1.1.0 (the extraction)
+shipped.** The surface is frozen ([`STABILITY.md`](../STABILITY.md)) and
+additive-only past 1.0; the numeric core now lives in **rosnet** + **tyche**,
+with attn11 as the reference consumer.
 
-**Next — v1.0.0, the clean cut.** Per the roadmap: a final security audit in
-`docs/audit/`, then tag **v1.0.0** (first non-prerelease). No new features ride
-it — the surface is frozen. After v1.0, the frontier track (E4–E6: alternative
-sequence mixers, AR-vs-diffusion, i64 quantization) is v2-track.
+**Next — the 1.x architecture arc** (roadmap M12+): the frontier experiments,
+re-scoped from a v2 fork to **additive 1.x minors** (opt-in flags + new
+checkpoint versions, default run byte-identical). In value÷risk order:
+**M12 (v1.2.0) — Multi-Head Latent Attention** (E7; the low-rank-latent
+evolution of the M6 KV cache, `--attn-kind mla`, checkpoint v4), then
+**M13 (v1.3.0) — Mixture of Experts** (E8; sparse FFN with the
+`--experts {8,16,32,64,128,256}` density sweep, checkpoint v5), then E4–E6
+(mixers / diffusion / ternary) as M14–M16.
 
 Loose ends: an `attn11` row upstream in `agnos/scripts/stage-tools.sh`
 (`stage_one attn11 src/main.cyr attn11`) — a cross-repo edit (agnos maintainer's
 side). The pin and `lib/` snapshot move together on every bump (now **6.1.37**,
-resynced via `cyrius update`). (The cycc argv-capture issue is **resolved** —
-fixed upstream in 6.1.32; `docs/architecture/002` retired as a load-bearing
-rule.)
+resynced via `cyrius update`); rosnet/tyche resolve via `cyrius deps` (pinned in
+`cyrius.lock`). (The cycc argv-capture issue is **resolved** — fixed upstream in
+6.1.32; `docs/architecture/002` retired as a load-bearing rule.)

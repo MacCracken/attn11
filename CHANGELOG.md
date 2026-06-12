@@ -4,6 +4,37 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+**M12 groundwork — the 1.x architecture arc begins.** Roadmap + ADR for the
+post-1.1 minors, and the first additive code increment (checkpoint v4 reserves
+the architecture descriptor ahead of the math). No behavior, math, or default-run
+change; the frozen 1.0 surface is intact.
+
+### Added
+- **Checkpoint v4 — architecture descriptor (ADR 0007).** The header reserves
+  four fields — `attn_kind`, `pos_kind`, `latent_dim` (`d_c`), `rope_dim`
+  (`d_rope`) — defaulting to the current MHA / learned-absolute transformer.
+  Saves now write v4; **v1/v2/v3 still load** (synthesizing the default
+  descriptor). Only the default descriptor is accepted today (new hostile-input
+  reject codes `-40..-43`); each gate relaxes when MLA / RoPE fills its field, so
+  the whole MLA + positional-encoding ladder is pure value-fill with **no further
+  format bump**. A default-descriptor v4 is a byte-identical resume of a v3.
+- Tests: `test_ckpt_v3_compat` (v3 images still load now that the serializer
+  emits v4) and `test_ckpt_v4_descriptor` (round-trip + `-40..-43` rejection); the
+  fuzz harness extended to the v4 header (descriptor fields + the merge table's
+  new offset, both keyed off `CKPT_HDR()`). **248 → 273** grad-check/property
+  checks green on x86_64; fuzz green (500 + 500 rounds).
+
+### Docs
+- **The 1.x architecture arc mapped** (`docs/development/roadmap.md`): M11
+  (extraction, 1.1.0) backfilled, then **M12 MLA + positional-encoding switch**
+  (v1.2.0, E7) → **M13 Mixture of Experts** with the 8→256 expert-density sweep
+  (v1.3.0, E8) → M14–M16 (mixers / diffusion / ternary, E4–E6) → **M17
+  reinforcement learning** (v1.7.0, E9). Each is additive opt-in config, not a v2
+  fork. `state.md` refreshed to 1.1.0.
+- **ADR 0007** — multi-head latent attention + a `--pos-kind
+  {learned, rope, rope-decoupled}` switch (learned-abs default; coupled vs.
+  decoupled RoPE explained), and the reserve-the-v4-descriptor-now decision.
+
 ## [1.1.0] - 2026-06-12
 
 **The extraction — attn11 becomes the reference consumer.** The reusable numeric

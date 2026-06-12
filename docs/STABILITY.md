@@ -57,14 +57,20 @@ them requires a rebuild. Their *values* are the frozen defaults:
 | attention bias | on | — (rebuild) |
 | residual dropout | 0.0 | — (rebuild) |
 
-## Checkpoint format (frozen)
+## Checkpoint format (frozen contract: load-compatibility)
 
-Format **v3** (native-endian i64 blob; records the tokenizer). Saves always
-write v3. **v1 (≤0.6.0) and v2 (0.7.0) still load** and always will — backward
-load-compatibility is part of the contract. Checkpoints are **not** portable
-across architectures (raw native-endian `f64`); that is by design (ADR 0004)
-and frozen. The hostile-input validation surface (codes documented in
-`src/persist.cyr`) is frozen in behavior, additive in new codes.
+Native-endian i64 blob; records the tokenizer (since v3) and the architecture
+descriptor (since v4). **v1 (≤0.6.0), v2 (0.7.0), and v3 (1.0/1.1) all still
+load** and always will — backward load-compatibility is part of the contract.
+The save format advances additively (the post-1.0 additive-only rule): saves
+currently write **v4** (adds the reserved `attn_kind`/`pos_kind`/`latent_dim`/
+`rope_dim` descriptor, ADR 0007, defaulting to the current MHA / learned-absolute
+model — a default-descriptor v4 is a byte-identical resume of a v3). The *exact
+save version* is not itself frozen (it advances additively); what is frozen is
+that older images keep loading. Checkpoints are **not** portable across
+architectures (raw native-endian `f64`); that is by design (ADR 0004) and frozen.
+The hostile-input validation surface (codes documented in `src/persist.cyr`) is
+frozen in behavior, additive in new codes (`-40..-43` are the v4 descriptor).
 
 ## Not part of the contract
 
