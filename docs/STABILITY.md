@@ -10,7 +10,7 @@
 
 ## CLI flags (frozen, runtime)
 
-All 14 behavioral flags below are stable. A run with **no flags** trains on the
+All 16 behavioral flags below are stable. A run with **no flags** trains on the
 embedded corpus and samples; that behavior is frozen.
 
 | flag | meaning |
@@ -27,15 +27,20 @@ embedded corpus and samples; that behavior is frozen.
 | `--layers N` | transformer blocks (1..128) |
 | `--attn-kind K` | attention variant: `mha` (default) or `mla` (latent KV); `mla` forces full heads (1.2.0) |
 | `--latent-dim N` | MLA latent width `d_c` (`1..d_model`; default `d_model/2`); only with `--attn-kind mla` (1.2.0) |
+| `--pos-kind K` | positions: `learned` (default), `rope` (coupled, mha/gqa, even head dim) (1.2.2), or `rope-decoupled` (mla) (1.2.3) |
+| `--rope-dim N` | decoupled-RoPE channel width `d_rope` (even, `2..d_model`; default ~`hd/2`); only with `--pos-kind rope-decoupled` (1.2.3) |
 | `--bpe K` | learn K BPE merges first (1..512; byte-level is the default) |
 | `--eval` | print CE/token + bits-per-byte after training/save |
 
 Plus `--help`/`-h` and `--version` (informational). The parser **rejects
 unknown arguments** and a value-flag given without a value — both exit non-zero
-with usage. Config flags (`--preset`/`--heads`/`--kv-heads`/`--layers`/`--bpe`)
-shape a **fresh** model; under `--load` the checkpoint's config and tokenizer
-win. Magnitude caps (frozen, enforced in `model_config_ok`): d_model ≤ 4096,
-ctx ≤ 8192, layers ≤ 128, vocab ≤ 768; `heads | d_model`, `kv-heads | heads`.
+with usage. Config flags (`--preset`/`--heads`/`--kv-heads`/`--layers`/
+`--attn-kind`/`--latent-dim`/`--pos-kind`/`--rope-dim`/`--bpe`) shape a **fresh**
+model; under `--load` the checkpoint's config and tokenizer win. Magnitude caps
+(frozen, enforced in `model_config_ok`): d_model ≤ 4096, ctx ≤ 8192, layers ≤ 128,
+vocab ≤ 768; `heads | d_model`, `kv-heads | heads`; MLA forces `kv-heads = heads`
+and `1 ≤ d_c ≤ d_model`; coupled RoPE requires an even head dim on `mha`/`gqa`;
+decoupled RoPE requires `mla` and an even `2 ≤ d_rope ≤ d_model`.
 
 ## Config knobs (compile-time constants — frozen defaults)
 
@@ -65,11 +70,13 @@ Native-endian i64 blob; records the tokenizer (since v3) and the architecture
 descriptor (since v4). **v1 (≤0.6.0), v2 (0.7.0), and v3 (1.0/1.1) all still
 load** and always will — backward load-compatibility is part of the contract.
 The save format advances additively (the post-1.0 additive-only rule): saves
-currently write **v4** (adds the reserved `attn_kind`/`pos_kind`/`latent_dim`/
-`rope_dim` descriptor, ADR 0007, defaulting to the current MHA / learned-absolute
-model — a default-descriptor v4 is a byte-identical resume of a v3). The *exact
-save version* is not itself frozen (it advances additively); what is frozen is
-that older images keep loading. Checkpoints are **not** portable across
+currently write **v4** (the `attn_kind`/`pos_kind`/`latent_dim`/`rope_dim`
+architecture descriptor, ADR 0007). `attn_kind = 1` (MLA, 1.2.0), `pos_kind = 1`
+(coupled RoPE, 1.2.2), and `pos_kind = 2` + a non-zero `rope_dim` (decoupled RoPE
+for MLA, 1.2.3) are all accepted values. A default-descriptor v4 (`mha`/`learned`)
+is a byte-identical resume of a v3. The *exact save version* is
+not itself frozen (it advances additively); what is frozen is that older images
+keep loading. Checkpoints are **not** portable across
 architectures (raw native-endian `f64`); that is by design (ADR 0004) and frozen.
 The hostile-input validation surface (codes documented in `src/persist.cyr`) is
 frozen in behavior, additive in new codes (`-40..-43` are the v4 descriptor).

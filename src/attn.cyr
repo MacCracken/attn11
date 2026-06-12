@@ -654,3 +654,317 @@ fn attn_mla_bwd(Wq, Wdkv, Wuk, Wuv, Wo, x, dout, dx,
     }
     return 0;
 }
+
+# ---- decoupled-RoPE attention core (MLA, M12 increment 5; ADR 0007) ----------
+# DeepSeek-V2 decoupled RoPE (arXiv:2405.04434): the score splits into a CONTENT
+# term over the compressed per-head K (Qc·Kc, dim hd) plus a POSITION term over a
+# separate rope channel (Qr·Kr, dim d_rope), summed and scaled by
+# 1/sqrt(hd + d_rope). The rope channel carries position OUTSIDE the latent —
+# Qr is per-head (nh blocks of d_rope), Kr is SHARED across heads (one d_rope row
+# per token) and computed from x directly — so the latent stays absorbable and
+# the cache stays small (latent d_c + the shared d_rope, vs full K/V). V is
+# content-only (no rope part), so the PV step is unchanged. Scalar dots (d_rope
+# and hd are small); its own kernel because the two-term score + different scale
+# differ from attn_core. Qr/Kr arrive ALREADY rotated (RoPE applied before this).
+fn attn_dec_core_fwd(Qc, Kc, Vc, Qr, Kr, Pc, concat, T, C, nh, d_rope): i64 {
+    var hd = C / nh;
+    var dr = nh * d_rope;                # Qr row stride (per-head rope blocks)
+    var scale = f64_div(f64_from(1), f64_sqrt(f64_from(hd + d_rope)));
+    t_zero(Pc, nh * T * T);
+    var h = 0;
+    while (h < nh) {
+        var base = h * hd;               # content block in Qc/Kc/concat
+        var rbase = h * d_rope;          # this head's rope block in Qr (Kr is shared)
+        var i = 0;
+        while (i < T) {
+            var prow = Pc + (h * T + i) * T * 8;
+            var qb = Qc + (i * C + base) * 8;
+            var qrb = Qr + (i * dr + rbase) * 8;
+            var j = 0;
+            while (j <= i) {
+                var dot = f64_from(0);
+                var kb = Kc + (j * C + base) * 8;
+                var d = 0;
+                while (d < hd) { dot = f64_add(dot, f64_mul(load64(qb + d * 8), load64(kb + d * 8))); d = d + 1; }
+                var krb = Kr + (j * d_rope) * 8;
+                var e = 0;
+                while (e < d_rope) { dot = f64_add(dot, f64_mul(load64(qrb + e * 8), load64(krb + e * 8))); e = e + 1; }
+                store64(prow + j * 8, f64_mul(dot, scale));
+                j = j + 1;
+            }
+            # softmax over j = 0..i
+            var mx = load64(prow);
+            j = 1;
+            while (j <= i) { var s = load64(prow + j * 8); if (f64_gt(s, mx) == 1) { mx = s; } j = j + 1; }
+            var sum = f64_from(0);
+            j = 0;
+            while (j <= i) {
+                var ex = f64_exp(f64_sub(load64(prow + j * 8), mx));
+                store64(prow + j * 8, ex); sum = f64_add(sum, ex); j = j + 1;
+            }
+            var inv = f64_div(f64_from(1), sum);
+            j = 0;
+            while (j <= i) { store64(prow + j * 8, f64_mul(load64(prow + j * 8), inv)); j = j + 1; }
+            # concat[i,base+d] = sum_j P[i,j] * Vc[j,base+d]   (content-only V)
+            var cb = concat + (i * C + base) * 8;
+            var dz = 0;
+            while (dz < hd) { store64(cb + dz * 8, f64_from(0)); dz = dz + 1; }
+            j = 0;
+            while (j <= i) {
+                var pij = load64(prow + j * 8);
+                var vb = Vc + (j * C + base) * 8;
+                var d = 0;
+                while (d < hd) {
+                    store64(cb + d * 8, f64_add(load64(cb + d * 8), f64_mul(pij, load64(vb + d * 8))));
+                    d = d + 1;
+                }
+                j = j + 1;
+            }
+            i = i + 1;
+        }
+        h = h + 1;
+    }
+    return 0;
+}
+
+# Backward of attn_dec_core_fwd. dconcat -> dQc/dKc/dVc (content) + dQr/dKr (rope).
+# dKr accumulates ACROSS heads (the rope key is shared) — the head loop is
+# sequential, so the order is deterministic. Mirror of the forward; the only new
+# terms vs attn_core_bwd are the rope dot's contributions to dQr/dKr.
+fn attn_dec_core_bwd(Qc, Kc, Vc, Qr, Kr, Pc, dconcat, dQc, dKc, dVc, dQr, dKr, dprow, T, C, nh, d_rope): i64 {
+    var hd = C / nh;
+    var dr = nh * d_rope;
+    var scale = f64_div(f64_from(1), f64_sqrt(f64_from(hd + d_rope)));
+    t_zero(dQc, T * C);
+    t_zero(dKc, T * C);
+    t_zero(dVc, T * C);
+    t_zero(dQr, T * dr);
+    t_zero(dKr, T * d_rope);
+    var h = 0;
+    while (h < nh) {
+        var base = h * hd;
+        var rbase = h * d_rope;
+        var i = 0;
+        while (i < T) {
+            var prow = Pc + (h * T + i) * T * 8;
+            var dcb = dconcat + (i * C + base) * 8;
+            # dP[i,j] = sum_d dconcat[i,base+d]*Vc[j,base+d]; dVc[j,base+d] += P[i,j]*dconcat[i,base+d]
+            var j = 0;
+            while (j <= i) {
+                var pij = load64(prow + j * 8);
+                var vb = Vc + (j * C + base) * 8;
+                var dvb = dVc + (j * C + base) * 8;
+                var dpj = f64_from(0);
+                var d = 0;
+                while (d < hd) {
+                    var dcd = load64(dcb + d * 8);
+                    dpj = f64_add(dpj, f64_mul(dcd, load64(vb + d * 8)));
+                    store64(dvb + d * 8, f64_add(load64(dvb + d * 8), f64_mul(pij, dcd)));
+                    d = d + 1;
+                }
+                store64(dprow + j * 8, dpj);
+                j = j + 1;
+            }
+            # softmax backward: dscore[j] = P[j]*(dP[j] - sum_k P[k]*dP[k])
+            var dotPdP = f64_from(0);
+            j = 0;
+            while (j <= i) {
+                dotPdP = f64_add(dotPdP, f64_mul(load64(prow + j * 8), load64(dprow + j * 8)));
+                j = j + 1;
+            }
+            var dqb = dQc + (i * C + base) * 8;
+            var qb = Qc + (i * C + base) * 8;
+            var dqrb = dQr + (i * dr + rbase) * 8;
+            var qrb = Qr + (i * dr + rbase) * 8;
+            j = 0;
+            while (j <= i) {
+                var ds = f64_mul(scale, f64_mul(load64(prow + j * 8), f64_sub(load64(dprow + j * 8), dotPdP)));
+                # content: dQc[i,base+d] += ds*Kc[j,base+d]; dKc[j,base+d] += ds*Qc[i,base+d]
+                var kb = Kc + (j * C + base) * 8;
+                var dkb = dKc + (j * C + base) * 8;
+                var d = 0;
+                while (d < hd) {
+                    store64(dqb + d * 8, f64_add(load64(dqb + d * 8), f64_mul(ds, load64(kb + d * 8))));
+                    store64(dkb + d * 8, f64_add(load64(dkb + d * 8), f64_mul(ds, load64(qb + d * 8))));
+                    d = d + 1;
+                }
+                # rope: dQr[i,rbase+e] += ds*Kr[j,e]; dKr[j,e] += ds*Qr[i,rbase+e]  (dKr shared)
+                var krb = Kr + (j * d_rope) * 8;
+                var dkrb = dKr + (j * d_rope) * 8;
+                var e = 0;
+                while (e < d_rope) {
+                    store64(dqrb + e * 8, f64_add(load64(dqrb + e * 8), f64_mul(ds, load64(krb + e * 8))));
+                    store64(dkrb + e * 8, f64_add(load64(dkrb + e * 8), f64_mul(ds, load64(qrb + e * 8))));
+                    e = e + 1;
+                }
+                j = j + 1;
+            }
+            i = i + 1;
+        }
+        h = h + 1;
+    }
+    return 0;
+}
+
+# ---- forward (MLA + decoupled RoPE) -----------------------------------------
+# Content path is MLA (down C->d_c, up d_c->C, full heads); the rope path adds
+# Qr = RoPE(x @ W_QR)  (C -> nh*d_rope, per-head) and the SHARED
+# Kr = RoPE(x @ W_KR)  (C -> d_rope) computed from x directly. W_QR/W_KR are
+# bias-free. c (latent) and kr (rope key) are the caller-owned cache buffers.
+fn attn_mla_dec_fwd(Wq, bq, Wdkv, Wuk, buk, Wuv, buv, Wqr, Wkr, Wo, bo,
+                    x, out, ar, c, qr, kr, T, C, nh, d_c, d_rope): i64 {
+    var Qc = _at_Qc(ar);
+    var Kc = _at_Kc(ar, T, C);
+    var Vc = _at_Vc(ar, T, C, C);
+    var Pc = _at_Pc(ar, T, C, C);
+    var concat = _at_concat(ar, T, C, nh, C);
+    linear_fwd(x, Wq, bq, Qc, T, C, C);            # content query
+    linear_fwd(x, Wdkv, 0, c, T, C, d_c);          # latent
+    linear_fwd(c, Wuk, buk, Kc, T, d_c, C);        # content key (up)
+    linear_fwd(c, Wuv, buv, Vc, T, d_c, C);        # value (up)
+    linear_fwd(x, Wqr, 0, qr, T, C, nh * d_rope);  # rope query (per-head)
+    linear_fwd(x, Wkr, 0, kr, T, C, d_rope);       # rope key (shared)
+    rope_apply_fwd(qr, T, 0, nh * d_rope, nh);     # rotate each head's d_rope block
+    rope_apply_fwd(kr, T, 0, d_rope, 1);           # rotate the shared d_rope block
+    attn_dec_core_fwd(Qc, Kc, Vc, qr, kr, Pc, concat, T, C, nh, d_rope);
+    linear_fwd(concat, Wo, bo, out, T, C, C);
+    return 0;
+}
+
+# ---- backward (MLA + decoupled RoPE) ----------------------------------------
+# Mirror of attn_mla_dec_fwd. dlat1/dlat2: T*d_c scratch; dqr: T*nh*d_rope; dkr:
+# T*d_rope. dx = dx_q + dx_c + dx_qr + dx_kr. Every step is matmul-backward over
+# the caches; the only hand-derived piece is attn_dec_core_bwd.
+fn attn_mla_dec_bwd(Wq, Wdkv, Wuk, Wuv, Wqr, Wkr, Wo, x, dout, dx,
+                    dWq, dbq, dWdkv, dWuk, dbuk, dWuv, dbuv, dWqr, dWkr, dWo, dbo,
+                    ar, c, qr, kr, dlat1, dlat2, dqr, dkr, T, C, nh, d_c, d_rope): i64 {
+    var Qc = _at_Qc(ar);
+    var Kc = _at_Kc(ar, T, C);
+    var Vc = _at_Vc(ar, T, C, C);
+    var Pc = _at_Pc(ar, T, C, C);
+    var concat = _at_concat(ar, T, C, nh, C);
+    var dconcat = _at_dconcat(ar, T, C, nh, C);
+    var dQc = _at_dQ(ar, T, C, nh, C);
+    var dKc = _at_dK(ar, T, C, nh, C);
+    var dVc = _at_dV(ar, T, C, nh, C);
+    var dxq = _at_dxq(ar, T, C, nh, C);
+    var dxk = _at_dxk(ar, T, C, nh, C);
+    var dxv = _at_dxv(ar, T, C, nh, C);
+    var dprow = _at_dprow(ar, T, C, nh, C);
+    # 1. out = concat @ Wo
+    linear_bwd(concat, Wo, dout, dconcat, dWo, dbo, T, C, C);
+    # 2. decoupled core: dconcat -> dQc/dKc/dVc (content) + dqr/dkr (rope)
+    attn_dec_core_bwd(Qc, Kc, Vc, qr, kr, Pc, dconcat, dQc, dKc, dVc, dqr, dkr, dprow, T, C, nh, d_rope);
+    # 3. undo the rope rotation on the rope-path gradients
+    rope_apply_bwd(dqr, T, 0, nh * d_rope, nh);
+    rope_apply_bwd(dkr, T, 0, d_rope, 1);
+    # 4. up-projections K=c@W_UK, V=c@W_UV -> dW_UK/dW_UV, dbuk/dbuv, dc
+    linear_bwd(c, Wuk, dKc, dlat1, dWuk, dbuk, T, d_c, C);
+    linear_bwd(c, Wuv, dVc, dlat2, dWuv, dbuv, T, d_c, C);
+    var idx = 0;
+    while (idx < T * d_c) {                        # dc = dc_from_K + dc_from_V
+        store64(dlat1 + idx * 8, f64_add(load64(dlat1 + idx * 8), load64(dlat2 + idx * 8)));
+        idx = idx + 1;
+    }
+    # 5. down-projection c=x@W_DKV -> dW_DKV, dx-from-c
+    linear_bwd(x, Wdkv, dlat1, dxk, dWdkv, 0, T, C, d_c);
+    # 6. content query Qc=x@Wq -> dWq, dbq, dx-from-q
+    linear_bwd(x, Wq, dQc, dxq, dWq, dbq, T, C, C);
+    # 7. rope query Qr=x@Wqr -> dWqr, dx-from-qr
+    linear_bwd(x, Wqr, dqr, dxv, dWqr, 0, T, C, nh * d_rope);
+    # 8. dx = dx_q + dx_c + dx_qr
+    idx = 0;
+    while (idx < T * C) {
+        store64(dx + idx * 8, f64_add(f64_add(load64(dxq + idx * 8), load64(dxk + idx * 8)), load64(dxv + idx * 8)));
+        idx = idx + 1;
+    }
+    # 9. rope key Kr=x@Wkr -> dWkr, dx-from-kr (reuse dxq); dx += dx_kr
+    linear_bwd(x, Wkr, dkr, dxq, dWkr, 0, T, C, d_rope);
+    idx = 0;
+    while (idx < T * C) {
+        store64(dx + idx * 8, f64_add(load64(dx + idx * 8), load64(dxq + idx * 8)));
+        idx = idx + 1;
+    }
+    return 0;
+}
+
+# ---- decoupled single-row attention core (cached decode) --------------------
+# The single-row mirror of attn_dec_core_fwd: ONE query (content q_row + rope
+# qr_row) attends cache rows 0..pos using content Kc/Vc + the shared rope key Kr
+# (one d_rope row per token). Same two-term score / scale as the batch core, so
+# decode is bit-identical to the uncached reference per row.
+fn attn_dec_core_fwd_row(q_row, Kc, Vc, qr_row, Kr, prow, concat_row, pos, C, nh, d_rope): i64 {
+    var hd = C / nh;
+    var scale = f64_div(f64_from(1), f64_sqrt(f64_from(hd + d_rope)));
+    var h = 0;
+    while (h < nh) {
+        var base = h * hd;
+        var rbase = h * d_rope;
+        var qb = q_row + base * 8;
+        var qrb = qr_row + rbase * 8;
+        var j = 0;
+        while (j <= pos) {
+            var dot = f64_from(0);
+            var kb = Kc + (j * C + base) * 8;
+            var d = 0;
+            while (d < hd) { dot = f64_add(dot, f64_mul(load64(qb + d * 8), load64(kb + d * 8))); d = d + 1; }
+            var krb = Kr + (j * d_rope) * 8;
+            var e = 0;
+            while (e < d_rope) { dot = f64_add(dot, f64_mul(load64(qrb + e * 8), load64(krb + e * 8))); e = e + 1; }
+            store64(prow + j * 8, f64_mul(dot, scale));
+            j = j + 1;
+        }
+        var mx = load64(prow);
+        j = 1;
+        while (j <= pos) { var s = load64(prow + j * 8); if (f64_gt(s, mx) == 1) { mx = s; } j = j + 1; }
+        var sum = f64_from(0);
+        j = 0;
+        while (j <= pos) {
+            var ex = f64_exp(f64_sub(load64(prow + j * 8), mx));
+            store64(prow + j * 8, ex); sum = f64_add(sum, ex); j = j + 1;
+        }
+        var inv = f64_div(f64_from(1), sum);
+        j = 0;
+        while (j <= pos) { store64(prow + j * 8, f64_mul(load64(prow + j * 8), inv)); j = j + 1; }
+        var cb = concat_row + base * 8;
+        var dz = 0;
+        while (dz < hd) { store64(cb + dz * 8, f64_from(0)); dz = dz + 1; }
+        j = 0;
+        while (j <= pos) {
+            var pij = load64(prow + j * 8);
+            var vb = Vc + (j * C + base) * 8;
+            var d = 0;
+            while (d < hd) {
+                store64(cb + d * 8, f64_add(load64(cb + d * 8), f64_mul(pij, load64(vb + d * 8))));
+                d = d + 1;
+            }
+            j = j + 1;
+        }
+        h = h + 1;
+    }
+    return 0;
+}
+
+# ---- cached single-row forward, MLA + decoupled RoPE (inference, M12 incr 5) -
+# The persistent cache stores the latent c (d_c) AND the shared rope key kr
+# (d_rope) per token. Process position `pos`: append c and the rotated kr, build
+# the content query q_row + rotated rope query qr_row, up-project the cached
+# latents 0..pos to K/V scratch, then run the decoupled single-row core. Each
+# rotation is computed DIRECTLY from the absolute position, so a decoded row is
+# bit-identical to the uncached reference (docs/architecture/003, /005).
+fn attn_mla_dec_fwd_row(Wq, bq, Wdkv, Wuk, buk, Wuv, buv, Wqr, Wkr, Wo, bo, x_row, out_row,
+                        c_cache, kr_cache, Kc, Vc, qr_row, prow, concat_row, q_row, pos, C, nh, d_c, d_rope): i64 {
+    var n = pos + 1;
+    var dr = nh * d_rope;
+    linear_fwd(x_row, Wq, bq, q_row, 1, C, C);                       # content query
+    linear_fwd(x_row, Wdkv, 0, c_cache + pos * d_c * 8, 1, C, d_c);  # latent append
+    linear_fwd(x_row, Wqr, 0, qr_row, 1, C, dr);                     # rope query
+    linear_fwd(x_row, Wkr, 0, kr_cache + pos * d_rope * 8, 1, C, d_rope);  # rope key append
+    rope_apply_fwd(qr_row, 1, pos, dr, nh);                          # rotate query by pos
+    rope_apply_fwd(kr_cache + pos * d_rope * 8, 1, pos, d_rope, 1);  # rotate this key row by pos
+    linear_fwd(c_cache, Wuk, buk, Kc, n, d_c, C);                   # up-project latents 0..pos -> Kc
+    linear_fwd(c_cache, Wuv, buv, Vc, n, d_c, C);                   # -> Vc
+    attn_dec_core_fwd_row(q_row, Kc, Vc, qr_row, kr_cache, prow, concat_row, pos, C, nh, d_rope);
+    linear_fwd(concat_row, Wo, bo, out_row, 1, C, C);
+    return 0;
+}

@@ -4,6 +4,57 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.2.3] - 2026-06-12
+
+**Decoupled RoPE (M12 increment 5) — closes M12.** `--pos-kind rope-decoupled`
+adds the faithful DeepSeek-V2 decoupled RoPE for MLA (arXiv:2405.04434): position
+rides a **separate `d_rope` channel** that bypasses the latent compression, so the
+latent stays absorbable and the cache stays small. The attention score splits
+into a CONTENT term (over the compressed per-head K) plus a POSITION term (over
+the rope channel), summed and scaled by `1/sqrt(hd + d_rope)`. Opt-in, additive —
+a no-flag run is byte-identical; v4 value-fills the reserved `pos_kind = 2` +
+`rope_dim` fields (no format bump). With this, M12's `--pos-kind` switch
+(`learned` / `rope` / `rope-decoupled`) is complete.
+
+### Added
+- **`--pos-kind rope-decoupled` + `--rope-dim N`** (MLA-only; `d_rope` even,
+  `2..d_model`, default ~`hd/2`). Two new bias-free projections per block:
+  `W_QR` (per-head rope query, `C → nh·d_rope`) and `W_KR` (the **shared** rope
+  key, `C → d_rope`, computed from `x` directly). Both rope parts are RoPE-rotated
+  by absolute position; the shared `K^R` is one `d_rope` row per token.
+- **Decoupled attention core** (`attn_dec_core_fwd`/`attn_dec_core_bwd`,
+  `attn_mla_dec_fwd`/`attn_mla_dec_bwd`, `attn.cyr`): the two-term score with the
+  shared rope key (`dKr` accumulates across heads). Reuses the `rope_apply_*`
+  rotation primitives from 1.2.2; the novel hand-derived piece is the decoupled
+  softmax/PV backward, grad-checked **bit-tight** in isolation
+  (`test_attention_mla_dec`, dWqr/dWkr ~1e-6/1e-8) + full-model wiring
+  (`test_model_mla_dec`).
+- **Latent + rope KV-cache decode** (`attn_mla_dec_fwd_row`): the persistent cache
+  holds the latent `c` (`d_c`) **and** the shared rope key `K^R` (`d_rope`) per
+  token; each is rotated per absolute position on read. Cached-vs-uncached
+  **bit-identity** gate across context-shifts (`test_kv_dec`, greedy + temperature,
+  incl. a non-even content head dim and a degenerate 2-token window).
+- **Layout / alloc / checkpoint** — `W_QR`/`W_KR` tile the block after the
+  up-projections (FD-blind layout pin `test_param_layout_mla_dec`); alloc
+  accounting covers the new caches (`test_alloc_accounting`); v4 `pos_kind = 2`
+  round-trips with `rope_dim` (`test_ckpt_dec`) + hostile rejections (decoupled on
+  non-MLA → `-41`, odd / out-of-range `d_rope` → `-43`). **470 → 572** checks green
+  on x86_64 AND aarch64/qemu; fuzz + lint green.
+
+### Changed
+- The checkpoint loader accepts `pos_kind = 2` + a non-zero even `rope_dim` on an
+  MLA image (bounded `2..C` before allocation). `ckpt_expected_np` and
+  `model_alloc_bytes` gain the decoupled (`W_QR`/`W_KR` + the rope caches) terms.
+- `kv_cache_bytes()` reports `NL·T·(d_c + d_rope)·8` for decoupled MLA — at
+  `d_c = 16`, `d_rope = 4` that is **7680 bytes** (latent 6144 + rope 1536), still
+  ~3.2× under MHA's 24576, now carrying relative position faithfully.
+
+### Notes
+- The decoupled reference materializes K/V from the latent each step (like 1.2.1);
+  the absorption compute optimization remains future work.
+- M12 is complete (MLA core + latent cache + coupled + decoupled RoPE). Next on
+  the arc is **M13 — Mixture of Experts** (`--experts`, checkpoint v5).
+
 ## [1.2.2] - 2026-06-12
 
 **Coupled RoPE (M12 increment 4) — the positional-encoding switch opens.**

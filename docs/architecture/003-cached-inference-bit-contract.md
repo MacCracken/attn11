@@ -5,12 +5,16 @@
 
 - the **batch path** — `model_forward` (training) / `model_eval_window`
   (generation reference): every op over all `n` window rows;
-- the **row path** — `model_fwd_row` + `attn_fwd_row` (KV-cached generation):
-  the same ops over exactly one new row, attending over cached K/V.
+- the **row path** — `model_fwd_row` + an attention-kind-specific row function
+  over exactly one new row: `attn_fwd_row` (MHA/GQA, full-K/V cache) or
+  `attn_mla_fwd_row` (MLA, latent cache — 1.2.1), each calling the shared
+  `attn_core_fwd_row`. Coupled RoPE (1.2.2) rides inside both, rotating the new
+  row's Q/K by its absolute position (`docs/architecture/005`).
 
-`test_kv_generation` pins the contract (logits compared bit-for-bit at every
-prefix length and across context-shifts). It holds for a non-obvious reason,
-and it constrains every future kernel change.
+`test_kv_generation` pins the MHA/GQA contract; `test_kv_mla` and `test_kv_rope`
+pin the MLA and RoPE variants — logits compared bit-for-bit at every prefix
+length and across context-shifts. It holds for a non-obvious reason, and it
+constrains every future kernel change (and every new `--attn-kind`/`--pos-kind`).
 
 ## Why bit-identity is even possible
 

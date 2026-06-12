@@ -74,7 +74,10 @@ learned absolute embeddings (you pick one; ADR 0007). Parameter-free, so the
 only new gradient is the rotation's transpose; the cos/sin are computed without
 the x86-only trig builtins (Maclaurin on `θ_k ∈ (0,1]` + complex binary
 exponentiation — see `docs/architecture/005`). Coupled RoPE is the dense-MHA/GQA
-rung; the decoupled variant for MLA is reserved (ADR 0007).
+rung; the **decoupled** variant for MLA (`--pos-kind rope-decoupled`, 1.2.3,
+`attn_dec_core_*`/`attn_mla_dec_*`) carries position on a separate `d_rope` channel
+per DeepSeek-V2 (arXiv:2405.04434, above) — the score splits into content + a
+shared-key rope term scaled by `1/sqrt(hd + d_rope)`.
 
 ### KV-cache inference (cache K/V per position, one row per decoded token)
 **Pope, R., Douglas, S., Chowdhery, A., et al. (2022).** "Efficiently Scaling

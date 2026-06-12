@@ -26,12 +26,17 @@ attn11 --preset              ctx 64 / d_model 64 / 8 heads / 4 layers (default: 
 attn11 --heads N             override attention heads (must divide d_model)
 attn11 --kv-heads N          override K/V heads (< heads = GQA, 1 = MQA)
 attn11 --layers N            override transformer blocks
+attn11 --attn-kind K         attention variant: mha (default) or mla (latent KV)
+attn11 --latent-dim N        MLA latent width d_c (1..d_model; default d_model/2)
+attn11 --pos-kind K          positions: learned (default), rope (coupled, mha/gqa) or rope-decoupled (mla)
+attn11 --rope-dim N          decoupled-RoPE channel width d_rope (even, 2..d_model; default ~hd/2)
 attn11 --bpe K               learn K BPE merges first (1..512; default is byte-level)
 attn11 --eval                print CE/token + bits-per-byte after training/save
 ```
 
-Config flags (`--preset`/`--heads`/`--kv-heads`/`--layers`/`--bpe`) shape a
-**fresh** model; under `--load` the checkpoint's config and tokenizer win.
+Config flags (`--preset`/`--heads`/`--kv-heads`/`--layers`/`--attn-kind`/
+`--latent-dim`/`--pos-kind`/`--rope-dim`/`--bpe`) shape a **fresh** model; under
+`--load` the checkpoint's config and tokenizer win.
 Magnitude caps (enforced in `model_config_ok`, else a clean abort): d_model
 ≤ 4096, ctx ≤ 8192, `--layers` 1..128, vocab ≤ 768; `--heads` must divide
 d_model and `--kv-heads` must divide `--heads`. See
@@ -55,9 +60,12 @@ attn11 --preset --bpe 256 --corpus mytext.txt --steps 4000 --eval  # BPE
 Sampling is **KV-cached** (0.7.0): the prompt prefills per-layer K/V caches
 and each generated token costs one cached row instead of a window recompute
 (~6× faster at ctx 16, ~23× at the ctx-64 preset; bit-identical to the
-uncached reference — see ADR 0005). Checkpoints from earlier formats (v1
-≤ 0.6.0, v2 = 0.7.0) still load; saves write v3 (which records the
-tokenizer — see ADR 0006).
+uncached reference — see ADR 0005). MLA caches a low-rank latent instead of
+full K/V (1.2.1) and coupled RoPE (`--pos-kind rope`, 1.2.2) rotates Q/K by
+position — both also bit-identical cached-vs-uncached. Checkpoints from earlier
+formats (v1 ≤ 0.6.0, v2 = 0.7.0, v3 = 1.0/1.1) still load; saves write **v4**
+(which records the tokenizer and the architecture descriptor — see ADR 0006 and
+ADR 0007).
 
 ## Layout
 

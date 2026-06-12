@@ -5,26 +5,33 @@
 
 ## Version
 
-**1.2.2** — *Coupled RoPE* (M12 increment 4; ADR 0007). `--pos-kind {learned,
-rope}` adds rotary positional embeddings (RoFormer, arXiv:2104.09864) on dense
-MHA/GQA: `rope_apply_fwd`/`rope_apply_bwd` rotate Q/K by absolute position
-(interleaved pairs `(2k,2k+1)` by `m·θ_k`, `θ_k = 10000^(-2k/hd)`) so the score
-depends only on the relative offset `m-n`. **Parameter-free** — the rotation's
-transpose is the only new gradient (grad-checked **bit-exact** in isolation +
-a relative-position invariance pin; attention-with-RoPE incl. the now-real
-K-bias gradient; full-model wiring; cached-vs-uncached **bit-identity** across
-context-shifts). Mutually exclusive with learned-abs (under RoPE the posemb is
-off-path → exactly zero gradient). **Portable trig**: `f64_sin`/`f64_cos` are
-x86-only, so cos/sin come from a Maclaurin series (`θ_k ∈ (0,1]`, no range
-reduction) + complex binary-exponentiation to the position — pure `f64`,
-deterministic, bit-identical batch-vs-cached
-([`../architecture/005-rope-portable-trig.md`](../architecture/005-rope-portable-trig.md)).
-Coupled RoPE is MHA/GQA only with even head dim; MLA + RoPE (decoupled) is the
-1.2.3 rung. v4 `pos_kind=1` round-trips; `np`/layout unchanged (no params).
-Overhead: training step +2.3%, cached gen +10%/token. **470** grad-check/property
-tests green on x86_64 AND aarch64/qemu; fuzz + lint green. Toolchain pinned at
-cyrius 6.1.37.
-(1.2.1 — *MLA latent KV-cache decode* (M12.2): the cached single-row MLA decode
+**1.2.3** — *Decoupled RoPE* (M12 increment 5, **closes M12**; ADR 0007).
+`--pos-kind rope-decoupled --rope-dim d_rope` adds the faithful DeepSeek-V2
+decoupled RoPE for MLA (arXiv:2405.04434): position rides a **separate `d_rope`
+channel** that bypasses the latent compression. The score splits into a CONTENT
+term (compressed per-head K, dim `hd`) + a POSITION term (rope channel, dim
+`d_rope`), summed and scaled by `1/sqrt(hd + d_rope)`. Two bias-free projections
+per block — `W_QR` (per-head rope query `C→nh·d_rope`) + `W_KR` (the **shared**
+rope key `C→d_rope`, from `x` directly) — both RoPE-rotated by position (reusing
+1.2.2's `rope_apply_*`). The novel hand-derived piece is the decoupled softmax/PV
+backward (shared `K^R` → `dKr` accumulates across heads), grad-checked **bit-tight**
+in isolation (`test_attention_mla_dec`) + full-model + cached-vs-uncached
+**bit-identity** across context-shifts (`test_kv_dec`). The decode cache holds the
+latent `c` **and** the shared `K^R`: `kv_cache_bytes = NL·T·(d_c + d_rope)·8` —
+**7680 B** at `d_c=16, d_rope=4` (latent 6144 + rope 1536), ~3.2× under MHA,
+carrying relative position faithfully. v4 value-fills `pos_kind=2` + `rope_dim`
+(round-trips + hostile rejections, `test_ckpt_dec`); no format bump. **M12's
+`--pos-kind` switch is now complete** (learned / rope / rope-decoupled). **572**
+grad-check/property tests green on x86_64 AND aarch64/qemu; fuzz + lint green.
+Toolchain pinned at cyrius 6.1.37.
+(1.2.2 — *Coupled RoPE* (M12 increment 4): `--pos-kind rope` rotates Q/K by
+absolute position on dense MHA/GQA (`rope_apply_fwd`/`rope_apply_bwd`,
+interleaved pairs, RoFormer arXiv:2104.09864) so the score depends only on `m-n`.
+Parameter-free (grad-checked bit-exact + relative-position pin + cached bit-
+identity); posemb off-path → zero gradient. Portable trig (Maclaurin + complex
+binary-exponentiation; `f64_sin`/`f64_cos` are x86-only —
+[`../architecture/005-rope-portable-trig.md`](../architecture/005-rope-portable-trig.md)).
+1.2.1 — *MLA latent KV-cache decode* (M12.2): the cached single-row MLA decode
 path (`attn_mla_fwd_row`) stores ONE low-rank latent `c` (`d_c` per token,
 per-layer `LA_c`) instead of full per-head K/V, up-projecting on read.
 `attn_core_fwd_row` extracted so MHA/GQA and MLA share the cached single-row
@@ -147,11 +154,12 @@ checkpoint vs Linux at fixed CPU — `scripts/agnos-smoke.sh`):
 - **`--eval`** (0.7.1): one deterministic, RNG-neutral pass over the corpus →
   CE/token + **bits-per-byte** (tokenizer-comparable); runs after `--save`,
   so checkpoints are bit-identical with or without it
-- **Checkpoints** (`--save`/`--load`): validated **v3** header — tokenizer
-  triple + merge table validated as a well-founded DAG with bounded expansion,
-  all checked before allocation; **v1/v2 still load** (byte-level) — +
-  bit-for-bit **deterministic resume** (BPE re-encodes the retained corpus);
-  **crash-atomic save** (temp + fsync + rename)
+- **Checkpoints** (`--save`/`--load`): validated **v4** header — tokenizer
+  triple + merge table validated as a well-founded DAG with bounded expansion +
+  the architecture descriptor (`attn_kind`/`pos_kind`/`latent_dim`/`rope_dim`),
+  all checked before allocation; **v1/v2/v3 still load** — + bit-for-bit
+  **deterministic resume** (BPE re-encodes the retained corpus); **crash-atomic
+  save** (temp + fsync + rename)
 - **Multi-head latent attention** (1.2.0, `--attn-kind mla`, ADR 0007): K/V
   factored through a low-rank latent (down `C→d_c`, up `d_c→C`; `--latent-dim`,
   default `d_model/2`; full heads). Shares the extracted `attn_core_*` kernel with
@@ -168,10 +176,17 @@ checkpoint vs Linux at fixed CPU — `scripts/agnos-smoke.sh`):
   absolute position so the score depends on `m-n` only (RoFormer). Parameter-free;
   mutually exclusive with learned-abs (posemb off-path → zero gradient). Portable
   trig (no x86-only `f64_sin`/`f64_cos`; `docs/architecture/005`). Even head dim,
-  MHA/GQA only (MLA+RoPE = decoupled, 1.2.3). Grad-checked + cached/uncached
-  bit-identical; `np`/layout unchanged.
+  MHA/GQA only. Grad-checked + cached/uncached bit-identical; `np`/layout unchanged.
+- **Decoupled RoPE** (1.2.3, `--pos-kind rope-decoupled --rope-dim d_rope`, ADR
+  0007, **closes M12**): the faithful DeepSeek-V2 form for MLA — position on a
+  separate `d_rope` channel (`W_QR` per-head query + `W_KR` shared key, bias-free,
+  RoPE-rotated), score = content + position, scale `1/sqrt(hd+d_rope)`. The decode
+  cache holds the latent + the shared `K^R` (`kv_cache_bytes = NL·T·(d_c+d_rope)·8`,
+  7680 B at d_c=16/d_rope=4). New decoupled core (`attn_dec_core_*`,
+  `attn_mla_dec_*`); grad-checked per-op + full-model + cached/uncached
+  bit-identical; v4 carries `pos_kind=2`/`rope_dim`.
 - CLI: `--corpus --stdin --load --save --steps --gen-only --preset --heads
-  --kv-heads --layers --attn-kind --latent-dim --pos-kind --bpe --eval`
+  --kv-heads --layers --attn-kind --latent-dim --pos-kind --rope-dim --bpe --eval`
 
 Default run (`./build/attn11`, 3 layers): loss `~3.2 → ~0.13` over 2000 steps;
 sampled output reproduces real corpus phrases.
@@ -219,7 +234,10 @@ learned-abs positions for coupled RoPE — parameter-free, so `params` is unchan
   coupled **RoPE** (1.2.2) `rope_apply_fwd`/`rope_apply_bwd` (gated by `pos_kind`
   in `attn_fwd`/`attn_bwd`/`attn_fwd_row`) with portable trig
   (`_rope_unit_cossin`/`_rope_pow` — Maclaurin + complex binary-exponentiation,
-  no x86-only `f64_sin`/`f64_cos`; `docs/architecture/005`)
+  no x86-only `f64_sin`/`f64_cos`; `docs/architecture/005`); plus the **decoupled
+  RoPE** core (1.2.3) `attn_dec_core_fwd`/`bwd` + `attn_mla_dec_fwd`/`bwd` +
+  `attn_mla_dec_fwd_row` (two-term content+position score, shared `K^R`, the
+  latent+rope decode cache)
 - `fileio.cyr` — secure file I/O (`O_NOFOLLOW`, `fstat` size, looped read/write),
   stdin reader
 - `model.cyr` — per-layer packed parameters (block stride + `_o_*`/`PL`/`GL`
@@ -241,16 +259,17 @@ learned-abs positions for coupled RoPE — parameter-free, so `params` is unchan
   (CE/token + bits-per-byte)
 - `persist.cyr` — validated **v4** checkpoint serialize/load (tokenizer triple +
   merge-table DAG/expansion validation + the v4 architecture descriptor, codes
-  `-40..-43`; `ckpt_expected_np_arch` mirrors the MLA layout; `pos_kind=1` (RoPE)
-  accepted on even-hd MHA images, `pos_kind=2`/`rope_dim≠0` reserved; v1/v2/v3
+  `-40..-43`; `ckpt_expected_np_arch` mirrors the MLA/decoupled layout; `pos_kind=1`
+  (coupled RoPE) accepted on even-hd MHA images, `pos_kind=2`+`rope_dim` (decoupled)
+  accepted on MLA images with even `2≤d_rope≤C` — bounded before alloc; v1/v2/v3
   accepted)
 - `main.cyr` — CLI arg parsing (incl. `--preset`/`--heads`/`--kv-heads`/
-  `--layers`/`--attn-kind`/`--latent-dim`/`--pos-kind`/`--bpe`/`--eval`,
+  `--layers`/`--attn-kind`/`--latent-dim`/`--pos-kind`/`--rope-dim`/`--bpe`/`--eval`,
   null-guarded `_atoi`) + orchestration
 
 ## Tests
 
-- `tests/attn11.tcyr` — **470 checks**: finite-difference gradient checks
+- `tests/attn11.tcyr` — **572 checks**: finite-difference gradient checks
   (every op incl. dropout; attention at head dims 6/8/10 and GQA/MQA at
   `nkv ∈ {1, 2, nh}` incl. `dWk`/`dWv`/`dbv`; the `|dbk| ≈ 0`
   softmax-shift-invariance pin; 2-layer full model at MHA and GQA), the **MLA
@@ -282,8 +301,14 @@ learned-abs positions for coupled RoPE — parameter-free, so `params` is unchan
   hd ∈ {6,8,10} × MHA/GQA/MQA incl. the now-real K-bias gradient;
   `test_model_rope` — full-model wiring + posemb-zero-gradient pin; `test_kv_rope`
   — cached-vs-uncached bit-identity across shifts; `test_ckpt_rope` — v4
-  `pos_kind=1` round-trip + odd-hd/mla+rope/`pos_kind=2` rejections;
-  config-cap rope gates), a
+  `pos_kind=1` round-trip + odd-hd/mla+rope rejections;
+  config-cap rope gates), the **decoupled RoPE suite** (1.2.3: `test_attention_mla_dec`
+  — per-op decoupled grad-check (dWqr/dWkr + the shared-Kr backward, tight 1e-4) at
+  3 d_c/d_rope configs; `test_model_mla_dec` — full-model wiring; `test_kv_dec` —
+  cached-vs-uncached bit-identity across shifts incl. a non-even content head dim;
+  `test_param_layout_mla_dec` — the W_QR/W_KR aliasing pin; `test_ckpt_dec` — v4
+  `pos_kind=2`/`rope_dim` round-trip + decoupled hostile rejections; alloc-accounting
+  + config-cap decoupled gates), a
   **soak/leak** test and a **NaN guard** test. All pass on x86_64 AND aarch64
   (`cyrius test`; aarch64 via qemu).
 - `tests/attn11.bcyr` — benchmark harness (training timings + tokens/sec,
@@ -332,18 +357,14 @@ _None yet._
 ## Next
 
 See [`roadmap.md`](roadmap.md). **v1.0.0 (clean cut), v1.1.0 (extraction),
-v1.2.0 (MLA core), v1.2.1 (MLA latent KV-cache decode), and v1.2.2 (coupled RoPE)
-shipped.** The surface is frozen ([`STABILITY.md`](../STABILITY.md)) and
-additive-only past 1.0; the numeric core lives in **rosnet** + **tyche**. MLA
-(`--attn-kind mla`) and coupled RoPE (`--pos-kind rope`) are the new architecture
-axes on the 1.x arc (checkpoint v4). M12 is complete bar its **last rung**:
-decoupled RoPE for MLA.
+v1.2.0 (MLA core), v1.2.1 (MLA latent KV-cache decode), v1.2.2 (coupled RoPE), and
+v1.2.3 (decoupled RoPE) shipped — M12 is complete.** The surface is frozen
+([`STABILITY.md`](../STABILITY.md)) and additive-only past 1.0; the numeric core
+lives in **rosnet** + **tyche**. The 1.x architecture arc now has the full
+attention/position axes: `--attn-kind {mha, mla}` × `--pos-kind {learned, rope,
+rope-decoupled}` (checkpoint v4).
 
 **Next on the 1.x architecture arc** (roadmap):
-- **M12 increment 5 (v1.2.3) — decoupled RoPE** (`--pos-kind rope-decoupled`):
-  the faithful cache-efficient DeepSeek form for MLA — position on a separate
-  `d_rope` channel that bypasses the latent compression (fills the reserved v4
-  `rope_dim` field). Closes M12.
 - **M13 (v1.3.0) — Mixture of Experts** (E8; sparse FFN with the
   `--experts {8,16,32,64,128,256}` density sweep, checkpoint v5), then E4–E6
   (mixers / diffusion / ternary) as M14–M16, and **M17** reinforcement learning

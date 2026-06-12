@@ -295,3 +295,44 @@ the training step ~2% (attention's rotation is small against the matmuls).
 3. RoPE on MLA is intentionally **rejected** here — the faithful form is decoupled
    RoPE on a separate `d_rope` channel (1.2.3, the last M12 rung). Coupled RoPE in
    MLA would forfeit the up-projection absorption (ADR 0007).
+
+## X008 — decoupled RoPE: the faithful MLA + position combo (M12 incr 5, v1.2.3) (2026-06-12)
+
+**Setup**: 1.2.3, default config (d_model 32, ctx 16, 4 heads, 3 layers), MLA at
+d_c = 16 + decoupled RoPE at d_rope = 4, x86_64. Records the correctness landing +
+the cache footprint; closes M12 (the `--pos-kind` switch).
+
+**Correctness** (grad-checks, both arches):
+- Per-op decoupled backward bit-tight: dWqr ~1e-6, dWkr ~1e-8 (the shared rope-key
+  gradient, which accumulates across heads), content path ~1e-7, dbuk ≈ 0 (the
+  up-K bias stays softmax-shift-invariant — the rope term doesn't touch it).
+- Full-model wiring green (~1e-3, the composition bound); cached-vs-uncached
+  **bit-identity** across context-shifts (greedy + temperature), including a
+  non-even content head dim (the rotation lives on d_rope, not hd).
+- v4 `pos_kind=2`/`rope_dim` round-trips; hostile rejections (decoupled on non-MLA,
+  odd/out-of-range d_rope) gated before allocation. **470 → 572** checks, x86_64 +
+  aarch64/qemu.
+
+**Cache footprint** (`./build/bench`, NL=3 T=16 C=32, d_c=16, d_rope=4):
+
+| cache kind                        | total bytes | vs MHA |
+|-----------------------------------|-------------|--------|
+| MHA full K/V (nkv=4)              | 24 576      | 1.0×   |
+| MLA latent (learned/coupled)      | 6 144       | 4.0×   |
+| **MLA + decoupled** (latent + K^R)| **7 680**   | **3.2×** |
+
+Decoupled adds the shared rope key K^R (`NL·T·d_rope·8` = 1 536 B) on top of the
+latent (6 144 B). It is the faithful DeepSeek-V2 form — position rides a separate
+channel that bypasses the latent, so the latent stays absorbable (the compute
+optimization, future work) and the cache stays far under full K/V while carrying
+**relative** position (vs learned-absolute MLA).
+
+**Takeaways**:
+1. The decoupled core is the only new hand-derived math on the whole M12 ladder
+   beyond the 1.2.2 rotation; it grad-checks bit-tight in isolation and composes.
+2. The `--attn-kind` × `--pos-kind` matrix is now complete: {mha, mla} ×
+   {learned, rope, rope-decoupled}, each opt-in, each with a cached bit-identity
+   gate, the default run byte-identical. M12 closed.
+3. A perplexity comparison (decoupled vs coupled vs learned MLA on the vidya
+   corpus) pairs with the X003/X006 setups; left as a follow-on since the
+   correctness + footprint gates (the shippable deliverables) are met.

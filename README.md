@@ -45,7 +45,8 @@ cyrius test                               # grad checks + smoke tests
 
 See [`docs/guides/getting-started.md`](docs/guides/getting-started.md) for the
 full CLI (`--corpus`, `--load`/`--save` checkpoints, `--preset`, `--bpe`,
-`--eval`, …) and [`docs/STABILITY.md`](docs/STABILITY.md) for the frozen surface.
+`--eval`, and the architecture axes `--attn-kind` (MLA), `--pos-kind` (RoPE), …)
+and [`docs/STABILITY.md`](docs/STABILITY.md) for the frozen surface.
 
 ## Model size
 

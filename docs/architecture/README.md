@@ -20,10 +20,11 @@ Not decisions (those live in [`../adr/`](../adr/)) and not guides (those live in
   **Affects**: every entry file (`src/main.cyr`, `src/test.cyr`,
   `tests/attn11.{tcyr,bcyr,fcyr}`, `docs/examples/minimal_train.cyr`).
 - [003 — The cached-inference bit contract](003-cached-inference-bit-contract.md) —
-  the KV-cached row path (`attn_fwd_row`/`model_fwd_row`) must stay
-  arithmetically identical, per row, to the batch path; what that forbids
-  when changing kernels. **Affects**: `src/attn.cyr`, `src/model.cyr`,
-  `src/ops.cyr` — any forward-kernel change.
+  every KV-cached row path (`attn_fwd_row` for MHA/GQA, `attn_mla_fwd_row` for
+  MLA, both via `attn_core_fwd_row`, with RoPE riding inside) must stay
+  arithmetically identical, per row, to its batch path; what that forbids when
+  changing kernels. **Affects**: `src/attn.cyr`, `src/model.cyr`, `src/ops.cyr`
+  — any forward-kernel change, and every new `--attn-kind`/`--pos-kind`.
 - [004 — Harness include sets](004-harness-include-sets.md) — the bench
   (`tests/attn11.bcyr`) is the only entry point that omits `persist.cyr`, and
   cyrius compiles an undefined function to a runtime *trap* (not a build

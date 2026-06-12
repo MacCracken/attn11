@@ -79,7 +79,7 @@ fn _atoi(s): i64 {
 }
 
 # Kept in sync with the VERSION file (CI's docs job gates the match).
-fn CFG_VERSION(): i64 { return "1.2.2"; }
+fn CFG_VERSION(): i64 { return "1.2.3"; }
 
 fn usage(): i64 {
     puts("attn11 — a from-scratch GPT-style transformer, trained, in Cyrius\n");
@@ -96,7 +96,8 @@ fn usage(): i64 {
     puts("  --layers N      transformer blocks (1..128)\n");
     puts("  --attn-kind K   attention variant: mha (default) or mla (latent KV)\n");
     puts("  --latent-dim N  MLA latent width d_c (1..d_model; default d_model/2)\n");
-    puts("  --pos-kind K    positions: learned (default) or rope (coupled RoPE, mha/gqa, even head dim)\n");
+    puts("  --pos-kind K    positions: learned (default), rope (coupled, mha/gqa), or rope-decoupled (mla)\n");
+    puts("  --rope-dim N    decoupled-RoPE channel width d_rope (even, 2..d_model; default ~hd/2)\n");
     puts("  --bpe K         learn K BPE merges first (1..512; byte-level is the default)\n");
     puts("  --eval          print CE/token + bits-per-byte after training/save\n");
     puts("  --help, -h      show this help and exit\n");
@@ -124,7 +125,8 @@ fn main(): i64 {
     var cfg_c = CFG_C(); var cfg_t = CFG_T(); var cfg_nh = CFG_NH();
     var cfg_nl = CFG_NL(); var cfg_nkv = 0;
     var cfg_attn_kind = 0; var cfg_latent_dim = 0;   # mla off; d_c resolved post-parse
-    var cfg_pos_kind = 0;                            # 0 = learned-abs (default), 1 = coupled RoPE
+    var cfg_pos_kind = 0;                            # 0 = learned-abs, 1 = coupled RoPE, 2 = decoupled
+    var cfg_rope_dim = 0;                            # d_rope; resolved post-parse for rope-decoupled
     var use_bpe = 0; var bpe_k = 0; var do_eval = 0;
     var i = 1;
     while (i < argc()) {
@@ -152,8 +154,10 @@ fn main(): i64 {
             i = i + 1; var pk = _av(i, a);
             if (streq(pk, "learned") == 1) { cfg_pos_kind = 0; }
             elif (streq(pk, "rope") == 1) { cfg_pos_kind = 1; }
-            else { puts("attn11: --pos-kind must be learned or rope\n"); return 1; }
+            elif (streq(pk, "rope-decoupled") == 1) { cfg_pos_kind = 2; }
+            else { puts("attn11: --pos-kind must be learned, rope, or rope-decoupled\n"); return 1; }
         }
+        elif (streq(a, "--rope-dim") == 1) { i = i + 1; cfg_rope_dim = _atoi(_av(i, a)); }
         elif (streq(a, "--bpe") == 1) { use_bpe = 1; i = i + 1; bpe_k = _atoi(_av(i, a)); }
         elif (streq(a, "--eval") == 1) { do_eval = 1; }
         else { puts("attn11: unknown argument "); puts(a); _putc(10); usage(); return 1; }
@@ -182,6 +186,32 @@ fn main(): i64 {
             puts("attn11: --pos-kind rope needs an even head dim (d_model / heads)\n");
             return 1;
         }
+    }
+    # Decoupled RoPE (1.2.3) is MLA-only with a separate EVEN d_rope channel. Default
+    # d_rope to the even part of hd/2 (DeepSeek uses d_rope < d_head); --rope-dim
+    # overrides. Resolved post-parse so --preset's C/heads are final.
+    if ((cfg_pos_kind == 2) && (load_path == 0)) {
+        if (cfg_attn_kind != 1) {
+            puts("attn11: --pos-kind rope-decoupled requires --attn-kind mla\n");
+            return 1;
+        }
+        if (cfg_rope_dim == 0) {
+            var hd = cfg_c / cfg_nh;
+            var dr = hd / 2;
+            dr = dr - (dr % 2);                       # round down to even
+            if (dr < 2) { dr = 2; }
+            cfg_rope_dim = dr;
+        }
+        if (((cfg_rope_dim % 2) != 0) || (cfg_rope_dim < 2) || (cfg_rope_dim > cfg_c)) {
+            puts("attn11: --rope-dim must be even, 2..d_model\n");
+            return 1;
+        }
+    }
+    # --rope-dim only applies to decoupled RoPE; a clean CLI error beats letting
+    # model_init's config gate sys_exit with a generic message (the fresh path).
+    if ((cfg_rope_dim != 0) && (cfg_pos_kind != 2) && (load_path == 0)) {
+        puts("attn11: --rope-dim requires --pos-kind rope-decoupled\n");
+        return 1;
     }
     # K is the experiment's key variable — a silent default would hide it
     if ((use_bpe == 1) && ((bpe_k < 1) || (bpe_k > BPE_MAX_MERGES()))) {
@@ -217,7 +247,8 @@ fn main(): i64 {
         puts("attn11: resumed from checkpoint at step "); fmt_int(g_step); _putc(10);
     } else {
         model_init_arch(V, cfg_c, cfg_t, cfg_nh, cfg_nkv, cfg_nl,
-                        CFG_ATTN_BIAS(), CFG_DROPOUT(), CFG_SEED(), cfg_attn_kind, cfg_latent_dim, cfg_pos_kind);
+                        CFG_ATTN_BIAS(), CFG_DROPOUT(), CFG_SEED(),
+                        cfg_attn_kind, cfg_latent_dim, cfg_pos_kind, cfg_rope_dim);
     }
 
     puts("attn11 — transformer training in Cyrius\n");
@@ -229,6 +260,7 @@ fn main(): i64 {
     puts(" layers="); fmt_int(g_NL);
     if (g_attn_kind == 1) { puts(" attn=mla(d_c="); fmt_int(g_latent_dim); puts(")"); }
     if (g_pos_kind == 1) { puts(" pos=rope"); }
+    if (g_pos_kind == 2) { puts(" pos=rope-decoupled(d_rope="); fmt_int(g_rope_dim); puts(")"); }
     puts(" params="); fmt_int(g_NP); _putc(10);
     puts("  tokenizer=");
     if (g_bpe_on == 1) { puts("bpe(merges="); fmt_int(g_bpe_nmerges); puts(")"); }

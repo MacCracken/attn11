@@ -336,7 +336,7 @@ fn test_rope_op(): i64 {
 # pins that the learned posemb is OFF the RoPE path (exactly zero gradient).
 fn test_model_rope(): i64 {
     var V = 5; var C = 8; var T = 3; var nh = 2; var NL = 2;   # hd = C/nh = 4 (even)
-    model_init_arch(V, C, T, nh, nh, NL, 1, f64_from(0), 7, 0, 0, 1);   # mha + rope, biases on
+    model_init_arch(V, C, T, nh, nh, NL, 1, f64_from(0), 7, 0, 0, 1, 0);   # mha + rope, biases on
     store64(A_tokens + 0, 1); store64(A_tokens + 8, 3); store64(A_tokens + 16, 0);
     store64(A_targets + 0, 3); store64(A_targets + 8, 0); store64(A_targets + 16, 4);
     model_forward(); model_zero_grads(); model_backward();
@@ -456,6 +456,87 @@ fn test_attention_mla(): i64 {
     return 0;
 }
 
+# Per-op grad check for MLA + decoupled RoPE (pos_kind=2, M12 increment 5;
+# ADR 0007). Isolates attn_mla_dec_fwd/bwd: the two-term score (content Qc·Kc +
+# rope Qr·Kr, scale 1/sqrt(hd+d_rope)), the SHARED rope key Kr (dKr accumulates
+# across heads), and the W_QR/W_KR rope projections (bias-free). dR = d_rope.
+fn attn_mla_dec_loss(Wq, bq, Wdkv, Wuk, buk, Wuv, buv, Wqr, Wkr, Wo, bo, x, out, dout, ar, c, qr, kr, T, C, nh, d_c, dR): i64 {
+    attn_mla_dec_fwd(Wq, bq, Wdkv, Wuk, buk, Wuv, buv, Wqr, Wkr, Wo, bo, x, out, ar, c, qr, kr, T, C, nh, d_c, dR);
+    return dotsum(dout, out, T * C);
+}
+fn attn_mla_dec_ng(p, np, n, Wq, bq, Wdkv, Wuk, buk, Wuv, buv, Wqr, Wkr, Wo, bo, x, out, dout, ar, c, qr, kr, T, C, nh, d_c, dR): i64 {
+    var eps = _eps(); var te = f64_mul(f64_from(2), eps); var i = 0;
+    while (i < n) {
+        var o = load64(p + i * 8);
+        store64(p + i * 8, f64_add(o, eps)); var lp = attn_mla_dec_loss(Wq, bq, Wdkv, Wuk, buk, Wuv, buv, Wqr, Wkr, Wo, bo, x, out, dout, ar, c, qr, kr, T, C, nh, d_c, dR);
+        store64(p + i * 8, f64_sub(o, eps)); var lm = attn_mla_dec_loss(Wq, bq, Wdkv, Wuk, buk, Wuv, buv, Wqr, Wkr, Wo, bo, x, out, dout, ar, c, qr, kr, T, C, nh, d_c, dR);
+        store64(p + i * 8, o); store64(np + i * 8, f64_div(f64_sub(lp, lm), te)); i = i + 1;
+    }
+    return 0;
+}
+fn _attn_mla_dec_check(T, C, nh, d_c, dR): i64 {
+    var CC = C * C; var TC = T * C; var Cd = C * d_c; var dC = d_c * C; var Td = T * d_c;
+    var CR = C * nh * dR; var Ckr = C * dR; var Tqr = T * nh * dR; var Tkr = T * dR;
+    var Wq = t_alloc(CC); var Wdkv = t_alloc(Cd); var Wuk = t_alloc(dC); var Wuv = t_alloc(dC);
+    var Wqr = t_alloc(CR); var Wkr = t_alloc(Ckr); var Wo = t_alloc(CC);
+    var bq = t_alloc(C); var buk = t_alloc(C); var buv = t_alloc(C); var bo = t_alloc(C);
+    var x = t_alloc(TC); var out = t_alloc(TC); var dout = t_alloc(TC);
+    var c = t_alloc(Td); var qr = t_alloc(Tqr); var kr = t_alloc(Tkr);
+    var std = f64_div(f64_from(1), f64_from(2));
+    t_randn(Wq, CC, std); t_randn(Wdkv, Cd, std); t_randn(Wuk, dC, std); t_randn(Wuv, dC, std);
+    t_randn(Wqr, CR, std); t_randn(Wkr, Ckr, std); t_randn(Wo, CC, std);
+    t_randn(bq, C, std); t_randn(buk, C, std); t_randn(buv, C, std); t_randn(bo, C, std);
+    t_randn(x, TC, f64_from(1)); t_randn(dout, TC, f64_from(1));
+    var ar = t_alloc(attn_arena_size(T, C, nh, nh));
+    var dx = t_alloc(TC); var dlat1 = t_alloc(Td); var dlat2 = t_alloc(Td);
+    var dqr = t_alloc(Tqr); var dkr = t_alloc(Tkr);
+    var dWq = t_alloc(CC); var dWdkv = t_alloc(Cd); var dWuk = t_alloc(dC); var dWuv = t_alloc(dC);
+    var dWqr = t_alloc(CR); var dWkr = t_alloc(Ckr); var dWo = t_alloc(CC);
+    var dbq = t_alloc(C); var dbuk = t_alloc(C); var dbuv = t_alloc(C); var dbo = t_alloc(C);
+    attn_mla_dec_fwd(Wq, bq, Wdkv, Wuk, buk, Wuv, buv, Wqr, Wkr, Wo, bo, x, out, ar, c, qr, kr, T, C, nh, d_c, dR);
+    attn_mla_dec_bwd(Wq, Wdkv, Wuk, Wuv, Wqr, Wkr, Wo, x, dout, dx, dWq, dbq, dWdkv, dWuk, dbuk, dWuv, dbuv, dWqr, dWkr, dWo, dbo, ar, c, qr, kr, dlat1, dlat2, dqr, dkr, T, C, nh, d_c, dR);
+    var nWq = t_alloc(CC); attn_mla_dec_ng(Wq, nWq, CC, Wq, bq, Wdkv, Wuk, buk, Wuv, buv, Wqr, Wkr, Wo, bo, x, out, dout, ar, c, qr, kr, T, C, nh, d_c, dR);
+    var nWdkv = t_alloc(Cd); attn_mla_dec_ng(Wdkv, nWdkv, Cd, Wq, bq, Wdkv, Wuk, buk, Wuv, buv, Wqr, Wkr, Wo, bo, x, out, dout, ar, c, qr, kr, T, C, nh, d_c, dR);
+    var nWuk = t_alloc(dC); attn_mla_dec_ng(Wuk, nWuk, dC, Wq, bq, Wdkv, Wuk, buk, Wuv, buv, Wqr, Wkr, Wo, bo, x, out, dout, ar, c, qr, kr, T, C, nh, d_c, dR);
+    var nWuv = t_alloc(dC); attn_mla_dec_ng(Wuv, nWuv, dC, Wq, bq, Wdkv, Wuk, buk, Wuv, buv, Wqr, Wkr, Wo, bo, x, out, dout, ar, c, qr, kr, T, C, nh, d_c, dR);
+    var nWqr = t_alloc(CR); attn_mla_dec_ng(Wqr, nWqr, CR, Wq, bq, Wdkv, Wuk, buk, Wuv, buv, Wqr, Wkr, Wo, bo, x, out, dout, ar, c, qr, kr, T, C, nh, d_c, dR);
+    var nWkr = t_alloc(Ckr); attn_mla_dec_ng(Wkr, nWkr, Ckr, Wq, bq, Wdkv, Wuk, buk, Wuv, buv, Wqr, Wkr, Wo, bo, x, out, dout, ar, c, qr, kr, T, C, nh, d_c, dR);
+    var nWo = t_alloc(CC); attn_mla_dec_ng(Wo, nWo, CC, Wq, bq, Wdkv, Wuk, buk, Wuv, buv, Wqr, Wkr, Wo, bo, x, out, dout, ar, c, qr, kr, T, C, nh, d_c, dR);
+    var ndx = t_alloc(TC); attn_mla_dec_ng(x, ndx, TC, Wq, bq, Wdkv, Wuk, buk, Wuv, buv, Wqr, Wkr, Wo, bo, x, out, dout, ar, c, qr, kr, T, C, nh, d_c, dR);
+    var nbq = t_alloc(C); attn_mla_dec_ng(bq, nbq, C, Wq, bq, Wdkv, Wuk, buk, Wuv, buv, Wqr, Wkr, Wo, bo, x, out, dout, ar, c, qr, kr, T, C, nh, d_c, dR);
+    var nbuv = t_alloc(C); attn_mla_dec_ng(buv, nbuv, C, Wq, bq, Wdkv, Wuk, buk, Wuv, buv, Wqr, Wkr, Wo, bo, x, out, dout, ar, c, qr, kr, T, C, nh, d_c, dR);
+    var nbo = t_alloc(C); attn_mla_dec_ng(bo, nbo, C, Wq, bq, Wdkv, Wuk, buk, Wuv, buv, Wqr, Wkr, Wo, bo, x, out, dout, ar, c, qr, kr, T, C, nh, d_c, dR);
+    var atol = 10000;   # same 1e-4 bound as MLA: the K/rope paths are a matmul deep
+    check("mla-dec dx", dx, ndx, TC, atol);
+    check("mla-dec dWq", dWq, nWq, CC, atol);
+    check("mla-dec dWdkv", dWdkv, nWdkv, Cd, atol);
+    check("mla-dec dWuk", dWuk, nWuk, dC, atol);
+    check("mla-dec dWuv", dWuv, nWuv, dC, atol);
+    check("mla-dec dWqr", dWqr, nWqr, CR, atol);
+    check("mla-dec dWkr", dWkr, nWkr, Ckr, atol);
+    check("mla-dec dWo", dWo, nWo, CC, atol);
+    check("mla-dec dbq", dbq, nbq, C, atol);
+    check("mla-dec dbuv", dbuv, nbuv, C, atol);
+    check("mla-dec dbo", dbo, nbo, C, atol);
+    # buk stays softmax-shift-invariant (the rope term doesn't touch it): true dbuk = 0
+    var mxbk = f64_from(0); var bi = 0;
+    while (bi < C) {
+        var av = f64_abs(load64(dbuk + bi * 8));
+        if (f64_gt(av, mxbk) == 1) { mxbk = av; }
+        bi = bi + 1;
+    }
+    print("mla-dec dbuk |max|=", 20); f_print(mxbk, 12); _putc(10);
+    assert(f64_lt(mxbk, f64_div(f64_from(1), f64_from(10000000000))) == 1,
+           "mla-dec dbuk ~ 0 (softmax shift-invariance)");
+    return 0;
+}
+fn test_attention_mla_dec(): i64 {
+    _attn_mla_dec_check(3, 16, 2, 8, 4);    # hd=8, d_c=8, d_rope=4
+    _attn_mla_dec_check(4, 8, 2, 6, 2);     # hd=4, d_c=6, d_rope=2 (full-model config)
+    _attn_mla_dec_check(3, 16, 4, 12, 4);   # hd=4, nh=4 (per-head rope), d_c=12 non-square
+    return 0;
+}
+
 # dropout: verify dropout_bwd matches finite differences of dropout_apply with a
 # FIXED mask (the mask is generated once and held constant, so forward is
 # deterministic).
@@ -556,7 +637,7 @@ fn test_model_gqa(): i64 {
 # passing FD check confirms the whole MLA path end to end.
 fn test_model_mla(): i64 {
     var V = 5; var C = 8; var T = 3; var nh = 4; var NL = 2; var dc = 6;
-    model_init_arch(V, C, T, nh, nh, NL, 1, f64_from(0), 11, 1, dc, 0);   # MLA, full heads, biases on
+    model_init_arch(V, C, T, nh, nh, NL, 1, f64_from(0), 11, 1, dc, 0, 0);   # MLA, full heads, biases on
     store64(A_tokens + 0, 1); store64(A_tokens + 8, 3); store64(A_tokens + 16, 0);
     store64(A_targets + 0, 3); store64(A_targets + 8, 0); store64(A_targets + 16, 4);
     model_forward(); model_zero_grads(); model_backward();
@@ -584,6 +665,39 @@ fn test_model_mla(): i64 {
     check("mla model L0 dbk", abk0, nbk0, C, 1000);
     check("mla model L1 dWo", aWo1, nWo1, Cc, 1000);
     check("mla model L0 dWq", aWq0, nWq0, Cc, 1000);
+    return 0;
+}
+
+# Full-model grad check with MLA + decoupled RoPE (pos_kind=2, M12 incr 5): the
+# decoupled rope projections (W_QR per-head, W_KR shared) compose through the
+# residual stack with the latent path. dWqr/dWkr are the new gradients; the
+# tight proof is the per-op test_attention_mla_dec (1e-4) — this is the
+# composition/wiring check (1e-3, like test_model_mla).
+fn test_model_mla_dec(): i64 {
+    var V = 5; var C = 8; var T = 3; var nh = 2; var NL = 2; var dc = 6; var dR = 2;
+    model_init_arch(V, C, T, nh, nh, NL, 1, f64_from(0), 13, 1, dc, 2, dR);   # MLA + decoupled rope
+    store64(A_tokens + 0, 1); store64(A_tokens + 8, 3); store64(A_tokens + 16, 0);
+    store64(A_targets + 0, 3); store64(A_targets + 8, 0); store64(A_targets + 16, 4);
+    model_forward(); model_zero_grads(); model_backward();
+    var Cc = C * C; var Cd = C * dc; var dC = dc * C; var CR = C * nh * dR; var Ckr = C * dR;
+    var aWqr0 = t_alloc(CR); t_copy(aWqr0, GL(0, _o_Wqr()), CR);
+    var aWkr1 = t_alloc(Ckr); t_copy(aWkr1, GL(1, _o_Wkr()), Ckr);
+    var aWdkv0 = t_alloc(Cd); t_copy(aWdkv0, GL(0, _o_Wdkv()), Cd);
+    var aWuk1 = t_alloc(dC); t_copy(aWuk1, GL(1, _o_Wuk()), dC);
+    var aWo0 = t_alloc(Cc); t_copy(aWo0, GL(0, _o_Wo()), Cc);
+    var aWq1 = t_alloc(Cc); t_copy(aWq1, GL(1, _o_Wq()), Cc);
+    var nWqr0 = t_alloc(CR); model_ng(PL(0, _o_Wqr()), nWqr0, CR);
+    var nWkr1 = t_alloc(Ckr); model_ng(PL(1, _o_Wkr()), nWkr1, Ckr);
+    var nWdkv0 = t_alloc(Cd); model_ng(PL(0, _o_Wdkv()), nWdkv0, Cd);
+    var nWuk1 = t_alloc(dC); model_ng(PL(1, _o_Wuk()), nWuk1, dC);
+    var nWo0 = t_alloc(Cc); model_ng(PL(0, _o_Wo()), nWo0, Cc);
+    var nWq1 = t_alloc(Cc); model_ng(PL(1, _o_Wq()), nWq1, Cc);
+    check("mla-dec model L0 dWqr", aWqr0, nWqr0, CR, 1000);
+    check("mla-dec model L1 dWkr", aWkr1, nWkr1, Ckr, 1000);
+    check("mla-dec model L0 dWdkv", aWdkv0, nWdkv0, Cd, 1000);
+    check("mla-dec model L1 dWuk", aWuk1, nWuk1, dC, 1000);
+    check("mla-dec model L0 dWo", aWo0, nWo0, Cc, 1000);
+    check("mla-dec model L1 dWq", aWq1, nWq1, Cc, 1000);
     return 0;
 }
 
@@ -763,7 +877,7 @@ fn test_param_layout(): i64 {
 # grad checks are blind to offset aliasing, so the tiling is pinned directly. d_c
 # != C and d_c not dividing C exercises a non-square K/V weight region.
 fn test_param_layout_mla(): i64 {
-    model_init_arch(5, 16, 4, 4, 4, 2, 1, f64_from(0), 3, 1, 6, 0);   # MLA C=16 nh=nkv=4 d_c=6
+    model_init_arch(5, 16, 4, 4, 4, 2, 1, f64_from(0), 3, 1, 6, 0, 0);   # MLA C=16 nh=nkv=4 d_c=6
     var C = g_C; var F = g_F; var dc = g_latent_dim; var Ckv = _Ckv();
     assert(dc == 6, "mla latent dim installed");
     assert(Ckv == C, "mla uses full K/V heads (Ckv == C)");
@@ -790,6 +904,38 @@ fn test_param_layout_mla(): i64 {
     return 0;
 }
 
+# Layout pin for MLA + decoupled RoPE (pos_kind=2): W_QR(C x nh*d_rope) and
+# W_KR(C x d_rope) are inserted after W_UV, before Wo. FD is blind to offset
+# aliasing, so pin the tiling directly (d_c != C, d_rope = 4).
+fn test_param_layout_mla_dec(): i64 {
+    model_init_arch(5, 16, 4, 4, 4, 2, 1, f64_from(0), 3, 1, 6, 2, 4);   # MLA+dec C=16 d_c=6 d_rope=4
+    var C = g_C; var F = g_F; var dc = g_latent_dim; var dR = g_rope_dim; var nh = g_nh; var Ckv = _Ckv();
+    assert(dR == 4, "decoupled rope dim installed");
+    var p = 0;
+    p = _lay(_o_ln1g(), C, p);
+    p = _lay(_o_ln1b(), C, p);
+    p = _lay(_o_Wq(), C * C, p);
+    p = _lay(_o_Wdkv(), C * dc, p);
+    p = _lay(_o_Wuk(), dc * C, p);
+    p = _lay(_o_Wuv(), dc * C, p);
+    p = _lay(_o_Wqr(), C * nh * dR, p);
+    p = _lay(_o_Wkr(), C * dR, p);
+    p = _lay(_o_Wo(), C * C, p);
+    p = _lay(_o_ln2g(), C, p);
+    p = _lay(_o_ln2b(), C, p);
+    p = _lay(_o_Wfc(), C * F, p);
+    p = _lay(_o_bfc(), F, p);
+    p = _lay(_o_Wproj(), F * C, p);
+    p = _lay(_o_bproj(), C, p);
+    assert(p == _blk_base_size(), "mla-dec layout: weights tile _blk_base_size exactly");
+    p = _lay(_o_bq(), C, p);
+    p = _lay(_o_bk(), Ckv, p);
+    p = _lay(_o_bv(), Ckv, p);
+    p = _lay(_o_bo(), C, p);
+    assert(p == _blk(), "mla-dec layout: biases tile _blk exactly");
+    return 0;
+}
+
 # model_alloc_bytes (the checkpoint loader's pre-allocation bound) must
 # mirror model_init's actual allocations — pin the two together. Exact when
 # every t_alloc size is 16-byte aligned; allow small per-alloc slack.
@@ -810,11 +956,19 @@ fn test_alloc_accounting(): i64 {
     assert(delta <= predicted + 8192, "alloc accounting holds at V=300 (over)");
     # MLA pin: the latent buffers (LA_c + D_lat1/D_lat2) must be accounted too
     used0 = alloc_used();
-    model_init_arch(5, 16, 8, 4, 4, 2, 1, f64_from(0), 4, 1, 6, 0);
+    model_init_arch(5, 16, 8, 4, 4, 2, 1, f64_from(0), 4, 1, 6, 0, 0);
     delta = alloc_used() - used0;
-    predicted = model_alloc_bytes_arch(5, 16, 8, 4, 4, 2, g_NP, 1, 6);
+    predicted = model_alloc_bytes_arch(5, 16, 8, 4, 4, 2, g_NP, 1, 6, 0, 0);
     assert(delta >= predicted, "mla alloc accounting (under)");
     assert(delta <= predicted + 8192, "mla alloc accounting (over)");
+    # decoupled-RoPE pin: the rope projections (W_QR/W_KR in np) + the LA_qr/LA_kr
+    # caches + D_qr/D_kr temporaries must all be accounted (pos_kind=2, d_rope=4)
+    used0 = alloc_used();
+    model_init_arch(5, 16, 8, 4, 4, 2, 1, f64_from(0), 4, 1, 6, 2, 4);
+    delta = alloc_used() - used0;
+    predicted = model_alloc_bytes_arch(5, 16, 8, 4, 4, 2, g_NP, 1, 6, 2, 4);
+    assert(delta >= predicted, "mla-dec alloc accounting (under)");
+    assert(delta <= predicted + 8192, "mla-dec alloc accounting (over)");
     return 0;
 }
 
@@ -838,18 +992,24 @@ fn test_config_caps(): i64 {
     assert(model_config_ok(25, 4097, 16, 4, 4, 3) == 0, "C over cap (4097) rejected");
     assert(model_config_ok(25, 32, 8193, 4, 4, 3) == 0, "T over cap (8193) rejected");
     # MLA descriptor (ADR 0007): full heads required, 1 <= d_c <= C, kind in {0,1}
-    assert(model_config_ok_arch(25, 32, 16, 4, 4, 3, 1, 16, 0) == 1, "valid MLA config accepted");
-    assert(model_config_ok_arch(25, 32, 16, 4, 4, 3, 1, 32, 0) == 1, "MLA d_c == C accepted");
-    assert(model_config_ok_arch(25, 32, 16, 4, 2, 3, 1, 16, 0) == 0, "MLA with nkv != nh rejected");
-    assert(model_config_ok_arch(25, 32, 16, 4, 4, 3, 1, 0, 0) == 0, "MLA d_c = 0 rejected");
-    assert(model_config_ok_arch(25, 32, 16, 4, 4, 3, 1, 33, 0) == 0, "MLA d_c > C rejected");
-    assert(model_config_ok_arch(25, 32, 16, 4, 4, 3, 2, 16, 0) == 0, "unknown attn_kind rejected");
+    assert(model_config_ok_arch(25, 32, 16, 4, 4, 3, 1, 16, 0, 0) == 1, "valid MLA config accepted");
+    assert(model_config_ok_arch(25, 32, 16, 4, 4, 3, 1, 32, 0, 0) == 1, "MLA d_c == C accepted");
+    assert(model_config_ok_arch(25, 32, 16, 4, 2, 3, 1, 16, 0, 0) == 0, "MLA with nkv != nh rejected");
+    assert(model_config_ok_arch(25, 32, 16, 4, 4, 3, 1, 0, 0, 0) == 0, "MLA d_c = 0 rejected");
+    assert(model_config_ok_arch(25, 32, 16, 4, 4, 3, 1, 33, 0, 0) == 0, "MLA d_c > C rejected");
+    assert(model_config_ok_arch(25, 32, 16, 4, 4, 3, 2, 16, 0, 0) == 0, "unknown attn_kind rejected");
     # pos_kind descriptor (M12 increment 4): rope (1) on mha with even head dim
-    assert(model_config_ok_arch(25, 32, 16, 4, 4, 3, 0, 0, 1) == 1, "rope on mha (hd=8) accepted");
-    assert(model_config_ok_arch(25, 16, 16, 2, 1, 3, 0, 0, 1) == 1, "rope on mqa (hd=8) accepted");
-    assert(model_config_ok_arch(25, 12, 16, 4, 4, 3, 0, 0, 1) == 0, "rope with odd head dim (hd=3) rejected");
-    assert(model_config_ok_arch(25, 32, 16, 4, 4, 3, 1, 16, 1) == 0, "rope + mla rejected (decoupled is a later rung)");
-    assert(model_config_ok_arch(25, 32, 16, 4, 4, 3, 0, 0, 2) == 0, "pos_kind 2 (rope-decoupled) reserved/rejected");
+    assert(model_config_ok_arch(25, 32, 16, 4, 4, 3, 0, 0, 1, 0) == 1, "rope on mha (hd=8) accepted");
+    assert(model_config_ok_arch(25, 16, 16, 2, 1, 3, 0, 0, 1, 0) == 1, "rope on mqa (hd=8) accepted");
+    assert(model_config_ok_arch(25, 12, 16, 4, 4, 3, 0, 0, 1, 0) == 0, "rope with odd head dim (hd=3) rejected");
+    assert(model_config_ok_arch(25, 32, 16, 4, 4, 3, 1, 16, 1, 0) == 0, "coupled rope + mla rejected (use decoupled)");
+    # pos_kind descriptor (M12 increment 5): decoupled (2) on MLA with even d_rope
+    assert(model_config_ok_arch(25, 32, 16, 4, 4, 3, 1, 16, 2, 4) == 1, "decoupled rope on mla (d_rope=4) accepted");
+    assert(model_config_ok_arch(25, 32, 16, 4, 4, 3, 0, 0, 2, 4) == 0, "decoupled on mha rejected (mla-only)");
+    assert(model_config_ok_arch(25, 32, 16, 4, 4, 3, 1, 16, 2, 3) == 0, "decoupled odd d_rope rejected");
+    assert(model_config_ok_arch(25, 32, 16, 4, 4, 3, 1, 16, 2, 0) == 0, "decoupled d_rope < 2 rejected");
+    assert(model_config_ok_arch(25, 32, 16, 4, 4, 3, 1, 16, 2, 34) == 0, "decoupled d_rope > C rejected");
+    assert(model_config_ok_arch(25, 32, 16, 4, 4, 3, 1, 16, 1, 4) == 0, "non-decoupled with rope_dim != 0 rejected");
     return 0;
 }
 
@@ -954,7 +1114,7 @@ fn test_ckpt_gqa_roundtrip(): i64 {
 # rebuilds with full heads, and the descriptor-consistency gates (-42) fire.
 fn test_ckpt_mla_roundtrip(): i64 {
     var V = build_corpus();
-    model_init_arch(V, 8, 4, 2, 2, 1, 1, f64_from(0), 9, 1, 6, 0);   # MLA d_c=6, biases on
+    model_init_arch(V, 8, 4, 2, 2, 1, 1, f64_from(0), 9, 1, 6, 0, 0);   # MLA d_c=6, biases on
     assert(g_attn_kind == 1, "mla model built");
     assert(g_latent_dim == 6, "mla latent dim set");
     var np = g_NP;
@@ -1227,7 +1387,7 @@ fn test_ckpt_v4_descriptor(): i64 {
 # accept pos_kind=1 ONLY on a dense (mha) image with an EVEN head dim.
 fn test_ckpt_rope(): i64 {
     var V = build_corpus();
-    model_init_arch(V, 16, 4, 2, 2, 1, 1, f64_from(0), 31, 0, 0, 1);   # mha + rope, hd=8
+    model_init_arch(V, 16, 4, 2, 2, 1, 1, f64_from(0), 31, 0, 0, 1, 0);   # mha + rope, hd=8
     assert(g_pos_kind == 1, "rope model built with pos_kind=1");
     var sz = ckpt_size();
     var ck = alloc(sz); ckpt_serialize(ck);
@@ -1242,11 +1402,44 @@ fn test_ckpt_rope(): i64 {
     store64(ck2 + 17 * 8, 1);                             # force pos_kind=rope
     assert(ckpt_load_buf(ck2, sz2) == (0 - 41), "rope with odd head dim rejected (-41)");
     # hostile: pos_kind=1 + attn_kind=1 (MLA) must reject (decoupled is a later rung)
-    model_init_arch(V, 16, 4, 2, 2, 1, 1, f64_from(0), 5, 1, 8, 0);   # MLA image
+    model_init_arch(V, 16, 4, 2, 2, 1, 1, f64_from(0), 5, 1, 8, 0, 0);   # MLA image
     var sz3 = ckpt_size();
     var ck3 = alloc(sz3); ckpt_serialize(ck3);
     store64(ck3 + 17 * 8, 1);                             # force pos_kind=rope on MLA
     assert(ckpt_load_buf(ck3, sz3) == (0 - 41), "rope + mla rejected (-41)");
+    return 0;
+}
+
+# v4 round-trip with MLA + decoupled RoPE (pos_kind=2, rope_dim>0) + the
+# decoupled-specific hostile rejections. The descriptor carries pos_kind=2 and a
+# non-zero rope_dim; np includes W_QR/W_KR; the loader accepts pos_kind=2 ONLY on
+# an MLA image with an even d_rope in [2, C].
+fn test_ckpt_dec(): i64 {
+    var V = build_corpus();
+    model_init_arch(V, 16, 4, 2, 2, 1, 1, f64_from(0), 41, 1, 8, 2, 4);   # MLA + decoupled, d_rope=4
+    assert(g_pos_kind == 2, "decoupled model built with pos_kind=2");
+    assert(g_rope_dim == 4, "decoupled rope_dim=4 installed");
+    var sz = ckpt_size();
+    var ck = alloc(sz); ckpt_serialize(ck);
+    assert(load64(ck + 17 * 8) == 2, "serializer records pos_kind=2");
+    assert(load64(ck + 19 * 8) == 4, "serializer records rope_dim=4");
+    model_init(V, 16, 4, 2, 2, 1, 1, f64_from(0), 77);   # scramble to mha/learned
+    assert(ckpt_load_buf(ck, sz) == 0, "v4 decoupled checkpoint loads");
+    assert(g_pos_kind == 2, "pos_kind=2 restored");
+    assert(g_rope_dim == 4, "rope_dim restored");
+    assert(g_attn_kind == 1, "attn_kind=mla restored");
+    # hostile: pos_kind=2 on a non-MLA image must reject (-41).
+    model_init(V, 16, 4, 2, 2, 1, 1, f64_from(0), 7);    # mha/learned
+    var sz2 = ckpt_size();
+    var ck2 = alloc(sz2); ckpt_serialize(ck2);
+    store64(ck2 + 17 * 8, 2); store64(ck2 + 19 * 8, 4);  # force decoupled on mha
+    assert(ckpt_load_buf(ck2, sz2) == (0 - 41), "decoupled on mha rejected (-41)");
+    # hostile: ODD d_rope on the valid decoupled image (ck) must reject (-43).
+    var ck3 = alloc(sz); t_copy(ck3, ck, sz / 8); store64(ck3 + 19 * 8, 3);  # odd d_rope
+    assert(ckpt_load_buf(ck3, sz) == (0 - 43), "decoupled odd d_rope rejected (-43)");
+    # hostile: rope_dim out of range (> C) must reject (-43).
+    var ck4 = alloc(sz); t_copy(ck4, ck, sz / 8); store64(ck4 + 19 * 8, 64);  # d_rope > C=16
+    assert(ckpt_load_buf(ck4, sz) == (0 - 43), "decoupled d_rope > C rejected (-43)");
     return 0;
 }
 
@@ -1525,7 +1718,7 @@ fn test_kv_generation(): i64 {
 # model is built with model_init_arch(...,1,d_c) (MLA, full heads).
 fn _gen_bits_mla(C, T, nh, NL, d_c, pstep, NG): i64 {
     var V = build_corpus();
-    model_init_arch(V, C, T, nh, nh, NL, 1, f64_from(0), 21, 1, d_c, 0);
+    model_init_arch(V, C, T, nh, nh, NL, 1, f64_from(0), 21, 1, d_c, 0, 0);
     train(8, 8, 2, _lrc(3, 1000), _lrc(3, 10000), 2, f64_from(1), 1000000000);
     g_training = 0;
     var ids = t_alloc(T);
@@ -1602,7 +1795,7 @@ fn test_kv_mla(): i64 {
 # spans nh / GQA / MQA so the rotated K-head sharing is exercised too.
 fn _gen_bits_rope(C, T, nh, nkv, NL, pstep, NG): i64 {
     var V = build_corpus();
-    model_init_arch(V, C, T, nh, nkv, NL, 1, f64_from(0), 21, 0, 0, 1);   # mha/gqa + rope
+    model_init_arch(V, C, T, nh, nkv, NL, 1, f64_from(0), 21, 0, 0, 1, 0);   # mha/gqa + rope
     train(8, 8, 2, _lrc(3, 1000), _lrc(3, 10000), 2, f64_from(1), 1000000000);
     g_training = 0;
     var ids = t_alloc(T);
@@ -1668,6 +1861,80 @@ fn test_kv_rope(): i64 {
     _gen_bits_rope(20, 5, 2, 2, 2, 1, 15);   # hd=10 scalar tail; odd T (shift 2)
     _gen_bits_rope(16, 6, 4, 2, 2, 1, 18);   # hd=4 GQA: 1 < nkv < nh, rotated
     _gen_bits_rope(12, 2, 2, 2, 2, 1, 6);    # degenerate 2-token window (shift 1)
+    return 0;
+}
+
+# M12 increment-5 gate: MLA + decoupled RoPE cached decode must be BIT-IDENTICAL
+# to the uncached reference. The cache holds the latent c AND the shared rope key
+# kr; each is rotated per absolute position on read, the latents up-projected to
+# K/V — so cached row `pos` must match uncached row pos bit-for-bit, including
+# across context-shift re-primes. Same two-way verification (prefill + decode,
+# greedy + temperature) as the MLA/RoPE suites.
+fn _gen_bits_dec(C, T, nh, NL, d_c, d_rope, pstep, NG): i64 {
+    var V = build_corpus();
+    model_init_arch(V, C, T, nh, nh, NL, 1, f64_from(0), 21, 1, d_c, 2, d_rope);   # MLA + decoupled
+    train(8, 8, 2, _lrc(3, 1000), _lrc(3, 10000), 2, f64_from(1), 1000000000);
+    g_training = 0;
+    var ids = t_alloc(T);
+    var i = 0;
+    while (i < T) { store64(ids + i * 8, (i * 3 + 1) % V); i = i + 1; }
+    # (1) prefill logits bits at prefix lengths 1, 1+pstep, ... and T
+    var mism = 0;
+    var m = 1;
+    while (m <= T) {
+        gen_prime(ids, m, 1);
+        var cs = t_alloc(V); t_copy(cs, R_logits, V);
+        gen_prime(ids, m, 0);
+        var urow = A_logits + (m - 1) * g_V * 8;
+        var v = 0;
+        while (v < V) {
+            if (load64(cs + v * 8) != load64(urow + v * 8)) { mism = mism + 1; }
+            v = v + 1;
+        }
+        if ((m < T) && (m + pstep > T)) { m = T; }
+        else { m = m + pstep; }
+    }
+    assert(mism == 0, "mla-dec prefill logits bit-identical at every prefix");
+    # (2) decode across slide boundaries, greedy then temp 0.8
+    var outA = t_alloc(NG); var outB = t_alloc(NG);
+    var fin = t_alloc(V);
+    var tt = 0;
+    while (tt < 2) {
+        var temp = f64_from(0);
+        if (tt == 1) { temp = _lrc(8, 10); }
+        _rng_state = 424242 + tt;
+        gen_prime(ids, T, 1);
+        gen_decode(NG, temp, 1, outA, 0);
+        t_copy(fin, R_logits, V);
+        _rng_state = 424242 + tt;
+        gen_prime(ids, T, 0);
+        gen_decode(NG, temp, 0, outB, 0);
+        var dm = 0;
+        i = 0;
+        while (i < NG) {
+            if (load64(outA + i * 8) != load64(outB + i * 8)) { dm = dm + 1; }
+            i = i + 1;
+        }
+        assert(dm == 0, "mla-dec decode ids identical (cached vs uncached)");
+        var urow2 = A_logits + (G_n - 1) * g_V * 8;
+        var lm = 0;
+        var v2 = 0;
+        while (v2 < V) {
+            if (load64(fin + v2 * 8) != load64(urow2 + v2 * 8)) { lm = lm + 1; }
+            v2 = v2 + 1;
+        }
+        assert(lm == 0, "mla-dec final logits bit-identical after slides");
+        tt = tt + 1;
+    }
+    return 0;
+}
+# d_rope ∈ {2,4}; hd ∈ {4,8} (incl. content head NOT even — the rotation lives on
+# the d_rope channel); odd T (odd GEN_SHIFT); a degenerate 2-token window. NL=2.
+fn test_kv_dec(): i64 {
+    _gen_bits_dec(16, 8, 2, 2, 8, 4, 1, 24);    # hd=8, d_c=8, d_rope=4
+    _gen_bits_dec(16, 4, 4, 2, 12, 2, 1, 12);   # hd=4, nh=4 per-head rope, d_rope=2
+    _gen_bits_dec(12, 7, 2, 2, 6, 2, 1, 21);    # hd=6, odd T (shift 3), d_rope=2
+    _gen_bits_dec(12, 2, 2, 2, 6, 2, 1, 6);     # degenerate 2-token window (shift 1)
     return 0;
 }
 
@@ -1769,6 +2036,7 @@ fn main(): i64 {
     test_group("attention grad-check");
     test_attention();
     test_attention_mla();
+    test_attention_mla_dec();
     test_rope_op();
     test_attention_rope();
     test_group("full-model grad-check");
@@ -1776,6 +2044,7 @@ fn main(): i64 {
     test_model_gqa();
     test_model_mla();
     test_model_rope();
+    test_model_mla_dec();
     test_head_tail();
     test_group("persistence");
     test_resume_determinism();
@@ -1784,12 +2053,14 @@ fn main(): i64 {
     test_ckpt_file_roundtrip();
     test_param_layout();
     test_param_layout_mla();
+    test_param_layout_mla_dec();
     test_alloc_accounting();
     test_config_caps();
     test_ckpt_reject();
     test_ckpt_gqa_roundtrip();
     test_ckpt_mla_roundtrip();
     test_ckpt_rope();
+    test_ckpt_dec();
     test_ckpt_v1_compat();
     test_ckpt_v2_compat();
     test_ckpt_v3_compat();
@@ -1810,6 +2081,7 @@ fn main(): i64 {
     test_kv_vocab300();
     test_kv_mla();
     test_kv_rope();
+    test_kv_dec();
     test_group("robustness");
     test_soak();
     test_nan_guard();

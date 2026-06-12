@@ -61,7 +61,13 @@ fn _Ckv(): i64 { return g_nkv * (g_C / g_nh); }
 # (Wo, ln2, MLP, bias offsets, _blk_base_size, ckpt_expected_np) chains off this
 # single helper, so the layout invariant has one source of truth.
 fn _kv_weight_size(): i64 {
-    if (g_attn_kind == 1) { return g_C * g_latent_dim + 2 * g_latent_dim * g_C; }
+    if (g_attn_kind == 1) {
+        var s = g_C * g_latent_dim + 2 * g_latent_dim * g_C;   # W_DKV + W_UK + W_UV
+        # decoupled RoPE (pos_kind == 2): + W_QR (C x nh*d_rope) + W_KR (C x d_rope),
+        # the bias-free rope projections. d_rope == 0 for coupled/learned MLA.
+        if (g_pos_kind == 2) { s = s + g_C * g_nh * g_rope_dim + g_C * g_rope_dim; }
+        return s;
+    }
     return 2 * g_C * _Ckv();
 }
 # one block, in elements: ln1(2C) + Wq(C^2) + [K/V weight region] + Wo(C^2) +
@@ -86,6 +92,9 @@ fn _o_Wv(): i64 { return 2 * g_C + g_C * g_C + g_C * _Ckv(); }
 fn _o_Wdkv(): i64 { return 2 * g_C + g_C * g_C; }                            # C x d_c
 fn _o_Wuk(): i64 { return 2 * g_C + g_C * g_C + g_C * g_latent_dim; }        # d_c x C
 fn _o_Wuv(): i64 { return 2 * g_C + g_C * g_C + g_C * g_latent_dim + g_latent_dim * g_C; }  # d_c x C
+# decoupled-RoPE rope projections (pos_kind == 2), after the up-projections
+fn _o_Wqr(): i64 { return _o_Wuv() + g_latent_dim * g_C; }              # C x nh*d_rope
+fn _o_Wkr(): i64 { return _o_Wqr() + g_C * g_nh * g_rope_dim; }         # C x d_rope
 fn _o_Wo(): i64 { return 2 * g_C + g_C * g_C + _kv_weight_size(); }
 fn _o_ln2g(): i64 { return _o_Wo() + g_C * g_C; }
 fn _o_ln2b(): i64 { return _o_ln2g() + g_C; }
@@ -144,6 +153,8 @@ var LA_arena = 0; # NL pointers, each attn_arena_size
 var LA_dmask_attn = 0;  # NL pointers, each T*C  (residual dropout mask, attn branch)
 var LA_dmask_mlp = 0;   # NL pointers, each T*C  (residual dropout mask, mlp branch)
 var LA_c = 0;     # MLA only: NL pointers, each T*d_c (the cached latent c_KV)
+var LA_qr = 0;    # decoupled RoPE only: NL pointers, each T*nh*d_rope (rotated rope query)
+var LA_kr = 0;    # decoupled RoPE only: NL pointers, each T*d_rope (rotated shared rope key; cached)
 
 fn La(arr, L): i64 { return load64(arr + L * 8); }
 
@@ -160,6 +171,8 @@ var D_tmp = 0;    # T x C (ln residual-path scratch)
 var D_drop = 0;   # T x C (dropout-adjusted branch gradient)
 var D_lat1 = 0;   # MLA only: T x d_c (dc from W_UK; accumulates dc from W_UV)
 var D_lat2 = 0;   # MLA only: T x d_c (dc from W_UV)
+var D_qr = 0;     # decoupled RoPE only: T x nh*d_rope (rope-query gradient)
+var D_kr = 0;     # decoupled RoPE only: T x d_rope (shared rope-key gradient)
 
 # ---- KV caches + single-row scratch (inference/generation path, E1) ---------
 var KV_K = 0;     # NL pointers, each T x Ckv (per-layer K cache)
@@ -174,6 +187,7 @@ var R_g = 0;      # F  GELU out
 var R_mlp = 0;    # C  mlp out
 var R_f = 0;      # C  final-LN out
 var R_q = 0;      # C  query row
+var R_qr = 0;     # decoupled RoPE only: nh*d_rope  rope-query row scratch
 var R_concat = 0; # C  pre-Wo concat row
 var R_mean = 0; var R_rstd = 0;       # 1 each
 var R_prow = 0;   # T  attention-probability row scratch
@@ -186,11 +200,11 @@ var G_n = 0;      # tokens currently in the window (== valid cache positions)
 # nh, and hd truncates when nh doesn't divide C. The checkpoint loader rejects
 # these (-16); the in-process constructor must too.
 fn model_config_ok(V, C, T, nh, nkv, NL): i64 {
-    return model_config_ok_arch(V, C, T, nh, nkv, NL, 0, 0, 0);   # mha, no latent, learned-abs
+    return model_config_ok_arch(V, C, T, nh, nkv, NL, 0, 0, 0, 0);   # mha, no latent, learned-abs
 }
-# attn_kind/d_c-aware variant (ADR 0007), now also gating pos_kind. model_config_ok
-# delegates with the MHA / learned-abs default so existing callers stay unchanged.
-fn model_config_ok_arch(V, C, T, nh, nkv, NL, attn_kind, d_c, pos_kind): i64 {
+# attn_kind/d_c/pos_kind/d_rope-aware variant (ADR 0007). model_config_ok delegates
+# with the MHA / learned-abs default so existing callers stay unchanged.
+fn model_config_ok_arch(V, C, T, nh, nkv, NL, attn_kind, d_c, pos_kind, d_rope): i64 {
     if ((V < 1) || (C < 1) || (T < 1) || (NL < 1)) { return 0; }
     # Magnitude caps mirror the checkpoint loader's (-4/-5/-7/-8). The fresh
     # path takes CLI-supplied dims (`--layers`, and `--preset`-set C/T) — an
@@ -214,12 +228,22 @@ fn model_config_ok_arch(V, C, T, nh, nkv, NL, attn_kind, d_c, pos_kind): i64 {
     # RoPE. RoPE rotates dimension PAIRS (2k, 2k+1) within each head, so the head
     # dim hd = C/nh must be EVEN; and 1.2.2 ships coupled RoPE on dense MHA/GQA
     # only — MLA + RoPE is the faithful decoupled form (pos_kind 2, a later rung),
-    # so reject mla + rope here. pos_kind 2 (rope-decoupled) is reserved.
-    if ((pos_kind != 0) && (pos_kind != 1)) { return 0; }
+    # so reject mla + rope here. pos_kind 2 = decoupled RoPE for MLA (1.2.3, the
+    # faithful DeepSeek form): a separate even d_rope channel (W_QR/W_KR), so it
+    # requires MLA and an even, in-range d_rope; the content head dim need NOT be
+    # even (the rotation lives on the d_rope channel, not the content head).
+    if ((pos_kind != 0) && (pos_kind != 1) && (pos_kind != 2)) { return 0; }
     if (pos_kind == 1) {
         if (attn_kind != 0) { return 0; }       # coupled RoPE is MHA/GQA only
         if (((C / nh) % 2) != 0) { return 0; }  # even head dim required
     }
+    if (pos_kind == 2) {
+        if (attn_kind != 1) { return 0; }       # decoupled RoPE is MLA-only
+        if ((d_rope < 2) || (d_rope > C)) { return 0; }
+        if ((d_rope % 2) != 0) { return 0; }    # even for the (2k,2k+1) rotation
+    }
+    # rope_dim is 0 unless decoupled (mirrors d_c == 0 unless MLA)
+    if ((pos_kind != 2) && (d_rope != 0)) { return 0; }
     return 1;
 }
 
@@ -228,11 +252,11 @@ fn model_config_ok_arch(V, C, T, nh, nkv, NL, attn_kind, d_c, pos_kind): i64 {
 # the allocator past its cap BEFORE any allocation happens. KEEP IN SYNC with
 # model_init — test_alloc_accounting pins the two together.
 fn model_alloc_bytes(V, C, T, nh, nkv, NL, NP): i64 {
-    return model_alloc_bytes_arch(V, C, T, nh, nkv, NL, NP, 0, 0);   # mha
+    return model_alloc_bytes_arch(V, C, T, nh, nkv, NL, NP, 0, 0, 0, 0);   # mha
 }
-# attn_kind/d_c-aware variant (ADR 0007). model_alloc_bytes delegates with the
-# MHA default so existing callers/tests are unchanged.
-fn model_alloc_bytes_arch(V, C, T, nh, nkv, NL, NP, attn_kind, d_c): i64 {
+# attn_kind/d_c/pos_kind/d_rope-aware variant (ADR 0007). model_alloc_bytes
+# delegates with the MHA default so existing callers/tests are unchanged.
+fn model_alloc_bytes_arch(V, C, T, nh, nkv, NL, NP, attn_kind, d_c, pos_kind, d_rope): i64 {
     var F = 4 * C;
     var Ckv = nkv * (C / nh);
     var asz = attn_arena_size(T, C, nh, nkv);
@@ -246,6 +270,13 @@ fn model_alloc_bytes_arch(V, C, T, nh, nkv, NL, NP, attn_kind, d_c): i64 {
     # MLA latent buffers (ADR 0007): LA_c pointer array (NL) + per-layer latent c
     # (NL * T*d_c) + the two shared down/up backward temporaries (2 * T*d_c).
     if (attn_kind == 1) { e = e + NL + NL * T * d_c + 2 * T * d_c; }
+    # decoupled-RoPE buffers (pos_kind == 2): LA_qr + LA_kr pointer arrays (2*NL) +
+    # per-layer rope query/key (NL * (T*nh*d_rope + T*d_rope)) + the two shared
+    # backward temporaries D_qr (T*nh*d_rope) + D_kr (T*d_rope).
+    if (pos_kind == 2) {
+        e = e + 2 * NL + NL * (T * nh * d_rope + T * d_rope) + T * nh * d_rope + T * d_rope;
+        e = e + nh * d_rope;   # R_qr single-row scratch
+    }
     return e * 8;
 }
 
@@ -261,21 +292,20 @@ fn CKPT_MAX_MODEL_BYTES(): i64 { return 134217728; }
 # model_init builds the default MHA/GQA transformer; model_init_arch (below) adds
 # the attn_kind / latent-dim axis (ADR 0007). Existing callers use model_init.
 fn model_init(V, C, T, nh, nkv, NL, attn_bias, dropout, seed): i64 {
-    return model_init_arch(V, C, T, nh, nkv, NL, attn_bias, dropout, seed, 0, 0, 0);
+    return model_init_arch(V, C, T, nh, nkv, NL, attn_bias, dropout, seed, 0, 0, 0, 0);
 }
-fn model_init_arch(V, C, T, nh, nkv, NL, attn_bias, dropout, seed, attn_kind, d_c, pos_kind): i64 {
-    if (model_config_ok_arch(V, C, T, nh, nkv, NL, attn_kind, d_c, pos_kind) == 0) {
+fn model_init_arch(V, C, T, nh, nkv, NL, attn_bias, dropout, seed, attn_kind, d_c, pos_kind, d_rope): i64 {
+    if (model_config_ok_arch(V, C, T, nh, nkv, NL, attn_kind, d_c, pos_kind, d_rope) == 0) {
         puts("attn11: model_init: invalid config (need nh | C, nkv | nh, nkv <= nh; ");
-        puts("mla: nkv == nh, 1 <= d_c <= C; rope: mha + even hd)\n");
+        puts("mla: nkv == nh, 1 <= d_c <= C; rope: mha + even hd; rope-decoupled: mla + even d_rope)\n");
         sys_exit(1);
     }
     g_V = V; g_C = C; g_T = T; g_nh = nh; g_nkv = nkv; g_NL = NL; g_F = 4 * C;
     g_attn_bias = attn_bias; g_dropout = dropout; g_training = 1; g_step = 0;
-    # architecture descriptor (ADR 0007). g_attn_kind/g_latent_dim must be set
-    # BEFORE g_NP, since _blk()->_kv_weight_size() reads them. pos_kind carries the
-    # positional scheme (0 = learned-abs, 1 = coupled RoPE); rope_dim stays 0 until
-    # decoupled RoPE (a later rung).
-    g_attn_kind = attn_kind; g_pos_kind = pos_kind; g_latent_dim = d_c; g_rope_dim = 0;
+    # architecture descriptor (ADR 0007). g_attn_kind/g_latent_dim/g_pos_kind/
+    # g_rope_dim must be set BEFORE g_NP, since _blk()->_kv_weight_size() reads
+    # them (decoupled RoPE adds W_QR/W_KR to the block when pos_kind == 2).
+    g_attn_kind = attn_kind; g_pos_kind = pos_kind; g_latent_dim = d_c; g_rope_dim = d_rope;
     var F = g_F;
     g_NP = _emb_end() + NL * _blk() + 2 * C;
 
@@ -284,7 +314,7 @@ fn model_init_arch(V, C, T, nh, nkv, NL, attn_bias, dropout, seed, attn_kind, d_
     # shape-valid config can still imply a model larger than the allocator cap.
     # Reject BEFORE any allocation so a hostile --layers/--preset combination
     # aborts cleanly instead of through an oversized/undersized t_alloc.
-    if (model_alloc_bytes_arch(V, C, T, nh, nkv, NL, g_NP, attn_kind, d_c) > CKPT_MAX_MODEL_BYTES()) {
+    if (model_alloc_bytes_arch(V, C, T, nh, nkv, NL, g_NP, attn_kind, d_c, pos_kind, d_rope) > CKPT_MAX_MODEL_BYTES()) {
         puts("attn11: model_init: config exceeds the 128 MB model-allocation cap\n");
         sys_exit(1);
     }
@@ -312,6 +342,11 @@ fn model_init_arch(V, C, T, nh, nkv, NL, attn_bias, dropout, seed, attn_kind, d_
             t_randn(PL(L, _o_Wdkv()), C * d_c, std);
             t_randn(PL(L, _o_Wuk()), d_c * C, std);
             t_randn(PL(L, _o_Wuv()), d_c * C, std);
+            # decoupled RoPE: the rope projections W_QR (C->nh*d_rope) + W_KR (C->d_rope)
+            if (pos_kind == 2) {
+                t_randn(PL(L, _o_Wqr()), C * nh * d_rope, std);
+                t_randn(PL(L, _o_Wkr()), C * d_rope, std);
+            }
         } else {
             t_randn(PL(L, _o_Wk()), C * Ckv, std);
             t_randn(PL(L, _o_Wv()), C * Ckv, std);
@@ -340,6 +375,7 @@ fn model_init_arch(V, C, T, nh, nkv, NL, attn_bias, dropout, seed, attn_kind, d_
     LA_arena = t_alloc(NL);
     LA_dmask_attn = t_alloc(NL); LA_dmask_mlp = t_alloc(NL);
     if (attn_kind == 1) { LA_c = t_alloc(NL); }
+    if (pos_kind == 2) { LA_qr = t_alloc(NL); LA_kr = t_alloc(NL); }
     var i = 0;
     while (i < NL + 1) { store64(LA_resid + i * 8, t_alloc(TC)); i = i + 1; }
     var TF = T * F; var asz = attn_arena_size(T, C, nh, nkv);
@@ -358,6 +394,10 @@ fn model_init_arch(V, C, T, nh, nkv, NL, attn_bias, dropout, seed, attn_kind, d_
         store64(LA_dmask_attn + L * 8, t_alloc(TC));
         store64(LA_dmask_mlp + L * 8, t_alloc(TC));
         if (attn_kind == 1) { store64(LA_c + L * 8, t_alloc(T * d_c)); }
+        if (pos_kind == 2) {
+            store64(LA_qr + L * 8, t_alloc(T * nh * d_rope));
+            store64(LA_kr + L * 8, t_alloc(T * d_rope));
+        }
         L = L + 1;
     }
 
@@ -366,6 +406,7 @@ fn model_init_arch(V, C, T, nh, nkv, NL, attn_bias, dropout, seed, attn_kind, d_
     D_xmid = t_alloc(TC); D_a = t_alloc(TC); D_b = t_alloc(TC);
     D_g = t_alloc(TF); D_fc = t_alloc(TF); D_tmp = t_alloc(TC); D_drop = t_alloc(TC);
     if (attn_kind == 1) { D_lat1 = t_alloc(T * d_c); D_lat2 = t_alloc(T * d_c); }
+    if (pos_kind == 2) { D_qr = t_alloc(T * nh * d_rope); D_kr = t_alloc(T * d_rope); }
 
     # KV caches + single-row scratch (generation)
     var TKv = T * Ckv;
@@ -382,14 +423,20 @@ fn model_init_arch(V, C, T, nh, nkv, NL, attn_bias, dropout, seed, attn_kind, d_
     R_mean = t_alloc(1); R_rstd = t_alloc(1);
     R_prow = t_alloc(T); R_logits = t_alloc(V);
     G_win = t_alloc(T);
+    if (pos_kind == 2) { R_qr = t_alloc(nh * d_rope); }   # decoupled rope-query row scratch
     return 0;
 }
 
 # bytes held by the persistent per-token decode cache. MHA/GQA store full K/V
 # (the E2 lever: scales with nkv). MLA (M12.2) stores only the low-rank latent
 # `c` (d_c per token per layer), NOT full K/V — the headline compression number.
+# Decoupled-RoPE MLA (M12 incr 5) also caches the shared rope key K^R (d_rope per
+# token per layer), so the cache is d_c + d_rope per token.
 fn kv_cache_bytes(): i64 {
-    if (g_attn_kind == 1) { return g_NL * g_T * g_latent_dim * 8; }
+    if (g_attn_kind == 1) {
+        if (g_pos_kind == 2) { return g_NL * g_T * (g_latent_dim + g_rope_dim) * 8; }
+        return g_NL * g_T * g_latent_dim * 8;
+    }
     return 2 * g_NL * g_T * _Ckv() * 8;
 }
 
@@ -541,9 +588,16 @@ fn model_forward(): i64 {
         var a = La(LA_a, L);
         ln_fwd(xin, PL(L, _o_ln1g()), PL(L, _o_ln1b()), a, La(LA_m1, L), La(LA_r1, L), T, C);
         if (g_attn_kind == 1) {
-            attn_mla_fwd(PL(L, _o_Wq()), P_bq(L), PL(L, _o_Wdkv()), PL(L, _o_Wuk()), P_bk(L),
-                         PL(L, _o_Wuv()), P_bv(L), PL(L, _o_Wo()), P_bo(L),
-                         a, A_attn, La(LA_arena, L), La(LA_c, L), T, C, nh, g_latent_dim);
+            if (g_pos_kind == 2) {
+                attn_mla_dec_fwd(PL(L, _o_Wq()), P_bq(L), PL(L, _o_Wdkv()), PL(L, _o_Wuk()), P_bk(L),
+                                 PL(L, _o_Wuv()), P_bv(L), PL(L, _o_Wqr()), PL(L, _o_Wkr()), PL(L, _o_Wo()), P_bo(L),
+                                 a, A_attn, La(LA_arena, L), La(LA_c, L), La(LA_qr, L), La(LA_kr, L),
+                                 T, C, nh, g_latent_dim, g_rope_dim);
+            } else {
+                attn_mla_fwd(PL(L, _o_Wq()), P_bq(L), PL(L, _o_Wdkv()), PL(L, _o_Wuk()), P_bk(L),
+                             PL(L, _o_Wuv()), P_bv(L), PL(L, _o_Wo()), P_bo(L),
+                             a, A_attn, La(LA_arena, L), La(LA_c, L), T, C, nh, g_latent_dim);
+            }
         } else {
             attn_fwd(PL(L, _o_Wq()), P_bq(L), PL(L, _o_Wk()), P_bk(L),
                      PL(L, _o_Wv()), P_bv(L), PL(L, _o_Wo()), P_bo(L),
@@ -604,10 +658,20 @@ fn model_fwd_row(tok, pos): i64 {
             # La(LA_c, L) is the persistent d_c-wide cache; the arena's Kc/Vc
             # region serves as the transient up-projection scratch (Ckv == C).
             var ar = La(LA_arena, L);
-            attn_mla_fwd_row(PL(L, _o_Wq()), P_bq(L), PL(L, _o_Wdkv()), PL(L, _o_Wuk()), P_bk(L),
-                             PL(L, _o_Wuv()), P_bv(L), PL(L, _o_Wo()), P_bo(L),
-                             R_a, R_attn, La(LA_c, L), _at_Kc(ar, g_T, C), _at_Vc(ar, g_T, C, C),
-                             R_prow, R_concat, R_q, pos, C, g_nh, g_latent_dim);
+            if (g_pos_kind == 2) {
+                # decoupled RoPE (M12 incr 5): cache the latent c AND the shared
+                # rope key kr (La(LA_kr, L)); rotate per absolute position on read.
+                attn_mla_dec_fwd_row(PL(L, _o_Wq()), P_bq(L), PL(L, _o_Wdkv()), PL(L, _o_Wuk()), P_bk(L),
+                                     PL(L, _o_Wuv()), P_bv(L), PL(L, _o_Wqr()), PL(L, _o_Wkr()),
+                                     PL(L, _o_Wo()), P_bo(L),
+                                     R_a, R_attn, La(LA_c, L), La(LA_kr, L), _at_Kc(ar, g_T, C), _at_Vc(ar, g_T, C, C),
+                                     R_qr, R_prow, R_concat, R_q, pos, C, g_nh, g_latent_dim, g_rope_dim);
+            } else {
+                attn_mla_fwd_row(PL(L, _o_Wq()), P_bq(L), PL(L, _o_Wdkv()), PL(L, _o_Wuk()), P_bk(L),
+                                 PL(L, _o_Wuv()), P_bv(L), PL(L, _o_Wo()), P_bo(L),
+                                 R_a, R_attn, La(LA_c, L), _at_Kc(ar, g_T, C), _at_Vc(ar, g_T, C, C),
+                                 R_prow, R_concat, R_q, pos, C, g_nh, g_latent_dim);
+            }
         } else {
             attn_fwd_row(PL(L, _o_Wq()), P_bq(L), PL(L, _o_Wk()), P_bk(L),
                          PL(L, _o_Wv()), P_bv(L), PL(L, _o_Wo()), P_bo(L),
@@ -650,9 +714,16 @@ fn model_eval_window(n): i64 {
         var a = La(LA_a, L);
         ln_fwd(xin, PL(L, _o_ln1g()), PL(L, _o_ln1b()), a, La(LA_m1, L), La(LA_r1, L), n, C);
         if (g_attn_kind == 1) {
-            attn_mla_fwd(PL(L, _o_Wq()), P_bq(L), PL(L, _o_Wdkv()), PL(L, _o_Wuk()), P_bk(L),
-                         PL(L, _o_Wuv()), P_bv(L), PL(L, _o_Wo()), P_bo(L),
-                         a, A_attn, La(LA_arena, L), La(LA_c, L), n, C, nh, g_latent_dim);
+            if (g_pos_kind == 2) {
+                attn_mla_dec_fwd(PL(L, _o_Wq()), P_bq(L), PL(L, _o_Wdkv()), PL(L, _o_Wuk()), P_bk(L),
+                                 PL(L, _o_Wuv()), P_bv(L), PL(L, _o_Wqr()), PL(L, _o_Wkr()), PL(L, _o_Wo()), P_bo(L),
+                                 a, A_attn, La(LA_arena, L), La(LA_c, L), La(LA_qr, L), La(LA_kr, L),
+                                 n, C, nh, g_latent_dim, g_rope_dim);
+            } else {
+                attn_mla_fwd(PL(L, _o_Wq()), P_bq(L), PL(L, _o_Wdkv()), PL(L, _o_Wuk()), P_bk(L),
+                             PL(L, _o_Wuv()), P_bv(L), PL(L, _o_Wo()), P_bo(L),
+                             a, A_attn, La(LA_arena, L), La(LA_c, L), n, C, nh, g_latent_dim);
+            }
         } else {
             attn_fwd(PL(L, _o_Wq()), P_bq(L), PL(L, _o_Wk()), P_bk(L),
                      PL(L, _o_Wv()), P_bv(L), PL(L, _o_Wo()), P_bo(L),
@@ -703,11 +774,21 @@ fn model_backward(): i64 {
         # attention: d(attn branch output) = D_xmid; back through its dropout, then attn.
         dropout_bwd(La(LA_dmask_attn, L), D_xmid, D_drop, TC);
         if (g_attn_kind == 1) {
-            attn_mla_bwd(PL(L, _o_Wq()), PL(L, _o_Wdkv()), PL(L, _o_Wuk()), PL(L, _o_Wuv()), PL(L, _o_Wo()),
-                         La(LA_a, L), D_drop, D_a,
-                         GL(L, _o_Wq()), G_bq(L), GL(L, _o_Wdkv()), GL(L, _o_Wuk()), G_bk(L),
-                         GL(L, _o_Wuv()), G_bv(L), GL(L, _o_Wo()), G_bo(L),
-                         La(LA_arena, L), La(LA_c, L), D_lat1, D_lat2, T, C, nh, g_latent_dim);
+            if (g_pos_kind == 2) {
+                attn_mla_dec_bwd(PL(L, _o_Wq()), PL(L, _o_Wdkv()), PL(L, _o_Wuk()), PL(L, _o_Wuv()),
+                                 PL(L, _o_Wqr()), PL(L, _o_Wkr()), PL(L, _o_Wo()),
+                                 La(LA_a, L), D_drop, D_a,
+                                 GL(L, _o_Wq()), G_bq(L), GL(L, _o_Wdkv()), GL(L, _o_Wuk()), G_bk(L),
+                                 GL(L, _o_Wuv()), G_bv(L), GL(L, _o_Wqr()), GL(L, _o_Wkr()), GL(L, _o_Wo()), G_bo(L),
+                                 La(LA_arena, L), La(LA_c, L), La(LA_qr, L), La(LA_kr, L), D_lat1, D_lat2, D_qr, D_kr,
+                                 T, C, nh, g_latent_dim, g_rope_dim);
+            } else {
+                attn_mla_bwd(PL(L, _o_Wq()), PL(L, _o_Wdkv()), PL(L, _o_Wuk()), PL(L, _o_Wuv()), PL(L, _o_Wo()),
+                             La(LA_a, L), D_drop, D_a,
+                             GL(L, _o_Wq()), G_bq(L), GL(L, _o_Wdkv()), GL(L, _o_Wuk()), G_bk(L),
+                             GL(L, _o_Wuv()), G_bv(L), GL(L, _o_Wo()), G_bo(L),
+                             La(LA_arena, L), La(LA_c, L), D_lat1, D_lat2, T, C, nh, g_latent_dim);
+            }
         } else {
             attn_bwd(PL(L, _o_Wq()), PL(L, _o_Wk()), PL(L, _o_Wv()), PL(L, _o_Wo()),
                      La(LA_a, L), D_drop, D_a,

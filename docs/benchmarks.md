@@ -158,6 +158,24 @@ matmuls); cached decode pays ~10%/token. The cached-vs-uncached bit-identity
 contract is unaffected (`test_kv_rope`). Full trail:
 [experiments.md X007](development/experiments.md).
 
+## Decoupled RoPE — the cache footprint (1.2.3, M12 increment 5)
+
+`--pos-kind rope-decoupled` (MLA) caches the latent `c` (`d_c`) **and** the shared
+rope key `K^R` (`d_rope`) per token. Default config, `d_c = 16`, `d_rope = 4`
+(`./build/bench`):
+
+| cache kind                         | total bytes | vs MHA |
+|------------------------------------|-------------|--------|
+| MHA full K/V (nkv=4)               | 24 576      | 1.0×   |
+| MLA latent (learned / coupled)     | 6 144       | 4.0×   |
+| **MLA + decoupled** (latent + K^R) | **7 680**   | **3.2×** |
+
+The rope channel adds `NL·T·d_rope·8` = 1 536 B on top of the latent — the price
+of carrying **relative** position faithfully (vs learned-absolute MLA) while
+keeping the cache far under full K/V. Cached decode benches ~229 µs/token at the
+default config (the extra rope projections + the two-term score). Full trail:
+[experiments.md X008](development/experiments.md).
+
 ## SIMD tied LM head (0.8.0 → 0.8.1, M9 lever 1)
 
 `head_fwd_row` (the weight-tied output projection, `logits(V) = f_row(C) @
