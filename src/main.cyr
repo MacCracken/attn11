@@ -79,7 +79,7 @@ fn _atoi(s): i64 {
 }
 
 # Kept in sync with the VERSION file (CI's docs job gates the match).
-fn CFG_VERSION(): i64 { return "1.1.0"; }
+fn CFG_VERSION(): i64 { return "1.2.0"; }
 
 fn usage(): i64 {
     puts("attn11 — a from-scratch GPT-style transformer, trained, in Cyrius\n");
@@ -94,6 +94,8 @@ fn usage(): i64 {
     puts("  --heads N       attention heads (must divide d_model)\n");
     puts("  --kv-heads N    K/V heads (must divide heads; 1 = MQA; default = heads)\n");
     puts("  --layers N      transformer blocks (1..128)\n");
+    puts("  --attn-kind K   attention variant: mha (default) or mla (latent KV)\n");
+    puts("  --latent-dim N  MLA latent width d_c (1..d_model; default d_model/2)\n");
     puts("  --bpe K         learn K BPE merges first (1..512; byte-level is the default)\n");
     puts("  --eval          print CE/token + bits-per-byte after training/save\n");
     puts("  --help, -h      show this help and exit\n");
@@ -120,6 +122,7 @@ fn main(): i64 {
     # --preset/--heads never clobber an explicit --kv-heads.
     var cfg_c = CFG_C(); var cfg_t = CFG_T(); var cfg_nh = CFG_NH();
     var cfg_nl = CFG_NL(); var cfg_nkv = 0;
+    var cfg_attn_kind = 0; var cfg_latent_dim = 0;   # mla off; d_c resolved post-parse
     var use_bpe = 0; var bpe_k = 0; var do_eval = 0;
     var i = 1;
     while (i < argc()) {
@@ -136,12 +139,29 @@ fn main(): i64 {
         elif (streq(a, "--heads") == 1) { i = i + 1; cfg_nh = _atoi(_av(i, a)); }
         elif (streq(a, "--kv-heads") == 1) { i = i + 1; cfg_nkv = _atoi(_av(i, a)); }
         elif (streq(a, "--layers") == 1) { i = i + 1; cfg_nl = _atoi(_av(i, a)); }
+        elif (streq(a, "--attn-kind") == 1) {
+            i = i + 1; var ak = _av(i, a);
+            if (streq(ak, "mha") == 1) { cfg_attn_kind = 0; }
+            elif (streq(ak, "mla") == 1) { cfg_attn_kind = 1; }
+            else { puts("attn11: --attn-kind must be mha or mla\n"); return 1; }
+        }
+        elif (streq(a, "--latent-dim") == 1) { i = i + 1; cfg_latent_dim = _atoi(_av(i, a)); }
         elif (streq(a, "--bpe") == 1) { use_bpe = 1; i = i + 1; bpe_k = _atoi(_av(i, a)); }
         elif (streq(a, "--eval") == 1) { do_eval = 1; }
         else { puts("attn11: unknown argument "); puts(a); _putc(10); usage(); return 1; }
         i = i + 1;
     }
     if (cfg_nkv == 0) { cfg_nkv = cfg_nh; }
+    # MLA uses full heads (the cache compression is the latent, not head-sharing);
+    # force nkv = nh and default d_c to C/2 (~4x KV-cache cut vs MHA's 2*Ckv) when
+    # --latent-dim is unspecified. Resolved post-parse so --preset's C is final.
+    if (cfg_attn_kind == 1) {
+        cfg_nkv = cfg_nh;
+        if (cfg_latent_dim == 0) {
+            cfg_latent_dim = cfg_c / 2;
+            if (cfg_latent_dim < 1) { cfg_latent_dim = 1; }
+        }
+    }
     # K is the experiment's key variable — a silent default would hide it
     if ((use_bpe == 1) && ((bpe_k < 1) || (bpe_k > BPE_MAX_MERGES()))) {
         puts("attn11: --bpe needs a merge count in 1..512\n");
@@ -175,7 +195,7 @@ fn main(): i64 {
         if (rc < 0) { puts("attn11: checkpoint load failed (code "); fmt_int(rc); puts(")\n"); return 1; }
         puts("attn11: resumed from checkpoint at step "); fmt_int(g_step); _putc(10);
     } else {
-        model_init(V, cfg_c, cfg_t, cfg_nh, cfg_nkv, cfg_nl, CFG_ATTN_BIAS(), CFG_DROPOUT(), CFG_SEED());
+        model_init_arch(V, cfg_c, cfg_t, cfg_nh, cfg_nkv, cfg_nl, CFG_ATTN_BIAS(), CFG_DROPOUT(), CFG_SEED(), cfg_attn_kind, cfg_latent_dim);
     }
 
     puts("attn11 — transformer training in Cyrius\n");
@@ -185,6 +205,7 @@ fn main(): i64 {
     puts(" heads="); fmt_int(g_nh);
     puts(" kv_heads="); fmt_int(g_nkv);
     puts(" layers="); fmt_int(g_NL);
+    if (g_attn_kind == 1) { puts(" attn=mla(d_c="); fmt_int(g_latent_dim); puts(")"); }
     puts(" params="); fmt_int(g_NP); _putc(10);
     puts("  tokenizer=");
     if (g_bpe_on == 1) { puts("bpe(merges="); fmt_int(g_bpe_nmerges); puts(")"); }

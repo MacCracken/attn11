@@ -330,24 +330,26 @@ current model so a no-flag run is byte-identical:
 **Staged increments** (each additive, each its own grad-check / bit-identity
 gate; ONE change at a time):
 
-1. **Descriptor scaffolding (begun)** — checkpoint **v4** reserves the
-   architecture-descriptor header fields `attn_kind`, `pos_kind`, `latent_dim`
-   (`d_c`), `rope_dim` (`d_rope`), all defaulting to `mha`/`learned`/`0`/`0`;
-   v1/v2/v3 still load (synthesizing the defaults). Only the default descriptor
-   is accepted until each feature below fills its field, so "update later" is
-   pure value-fill with **no further format bump** across the whole MLA+RoPE
-   ladder. Reserving the fields now is the cheap forward-compat move; it ships
-   ahead of any math.
-2. **MLA core** — `--attn-kind mla --latent-dim d_c` at `--pos-kind learned`
-   (the honest, grad-checkable core: pure low-rank KV compression, learned-abs
-   positions kept). Latent down/up projections are plain linear layers, so the
-   backward is matmul-backward (rosnet).
-3. **Coupled RoPE** (optional, independent of MLA) — `--pos-kind rope` on dense
-   MHA first; RoPE has no learned params, so the grad-check is just the
-   rotation's backward. Valuable on its own (relative positions, length
-   extrapolation); could split out as its own milestone if wanted before MLA.
-4. **Decoupled RoPE** (optional) — `--pos-kind rope-decoupled` for MLA, the
-   faithful cache-efficient form, built on (3).
+1. ✅ **Descriptor scaffolding** (1.1.x groundwork) — checkpoint **v4** reserves
+   `attn_kind`, `pos_kind`, `latent_dim` (`d_c`), `rope_dim` (`d_rope`),
+   defaulting to `mha`/`learned`/`0`/`0`; v1/v2/v3 still load. Pure forward-compat
+   ahead of the math; no further format bump across the whole MLA+RoPE ladder.
+2. ✅ **MLA core** (**v1.2.0**) — `--attn-kind mla --latent-dim d_c` at
+   learned-abs positions: low-rank KV factorization (down `C→d_c`, up `d_c→C`),
+   full heads. A shared `attn_core_fwd`/`attn_core_bwd` was extracted so MHA and
+   MLA run the identical softmax/PV kernel; the MLA backward composes from
+   `linear_bwd` + the core (no novel math). Grad-checked per-op (tight) +
+   full-model; checkpoint round-trips; trains (loss ↓) and samples.
+3. **Latent KV-cache decode** (**M12.2**, the deferred gate) — a cached single-row
+   MLA path that stores the `d_c` latent per token (not full K/V), with the
+   cached-vs-uncached **bit-identity** gate and the **KV-cache-bytes table** vs
+   GQA/MQA (the headline compression number). 1.2.0 generates MLA via the
+   uncached reference path; this adds the inference win on top.
+4. **Coupled RoPE** (optional) — `--pos-kind rope` on dense MHA; RoPE has no
+   learned params, so the grad-check is just the rotation's backward. Valuable on
+   its own; could split into its own milestone.
+5. **Decoupled RoPE** (optional) — `--pos-kind rope-decoupled` for MLA, the
+   faithful cache-efficient form, built on (4).
 
 - **Gates**: latent down/up-projection backward grad-checked; RoPE rotation
   backward grad-checked; cached vs uncached generation **bit-identical** across

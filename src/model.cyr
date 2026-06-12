@@ -52,13 +52,23 @@ var g_adam_v = 0;
 
 # ---- parameter layout (element offsets) ------------------------------------
 fn _emb_end(): i64 { return g_V * g_C + g_T * g_C; }
-# K/V projection width: nkv heads of dim C/nh (== C when nkv == nh)
+# K/V projection width: nkv heads of dim C/nh (== C when nkv == nh; == C for MLA,
+# which uses full heads — the cache compression is the latent, not head-sharing).
 fn _Ckv(): i64 { return g_nkv * (g_C / g_nh); }
-# one block, in elements: ln1(2C) + Wq(C^2) + Wk(C*Ckv) + Wv(C*Ckv) + Wo(C^2) +
+# Size (elements) of the K/V WEIGHT region between Wq and Wo — the ONE place the
+# attention variant changes the block layout (ADR 0007). MHA/GQA: Wk(C*Ckv) +
+# Wv(C*Ckv). MLA: W_DKV(C*d_c) + W_UK(d_c*C) + W_UV(d_c*C). Everything downstream
+# (Wo, ln2, MLP, bias offsets, _blk_base_size, ckpt_expected_np) chains off this
+# single helper, so the layout invariant has one source of truth.
+fn _kv_weight_size(): i64 {
+    if (g_attn_kind == 1) { return g_C * g_latent_dim + 2 * g_latent_dim * g_C; }
+    return 2 * g_C * _Ckv();
+}
+# one block, in elements: ln1(2C) + Wq(C^2) + [K/V weight region] + Wo(C^2) +
 # ln2(2C) + Wfc(CF) + bfc(F) + Wproj(FC) + bproj(C); plus 2C+2Ckv for attention
 # biases (bq,bk,bv,bo) when enabled, appended after bproj so the weight offsets
-# below are unaffected.
-fn _blk_base_size(): i64 { return 5 * g_C + 2 * g_C * g_C + 2 * g_C * _Ckv() + 2 * g_C * g_F + g_F; }
+# below are unaffected. For MLA, Ckv == C so the bias region is 4C, same as full MHA.
+fn _blk_base_size(): i64 { return 5 * g_C + 2 * g_C * g_C + _kv_weight_size() + 2 * g_C * g_F + g_F; }
 fn _blk(): i64 {
     if (g_attn_bias == 1) { return _blk_base_size() + 2 * g_C + 2 * _Ckv(); }
     return _blk_base_size();
@@ -71,8 +81,13 @@ fn _o_ln1b(): i64 { return g_C; }
 fn _o_Wq(): i64 { return 2 * g_C; }
 fn _o_Wk(): i64 { return 2 * g_C + g_C * g_C; }
 fn _o_Wv(): i64 { return 2 * g_C + g_C * g_C + g_C * _Ckv(); }
-fn _o_Wo(): i64 { return 2 * g_C + g_C * g_C + 2 * g_C * _Ckv(); }
-fn _o_ln2g(): i64 { return 2 * g_C + 2 * g_C * g_C + 2 * g_C * _Ckv(); }
+# MLA K/V weight offsets (attn_kind == mla): one down-projection then two
+# up-projections occupy the same region MHA's Wk/Wv do.
+fn _o_Wdkv(): i64 { return 2 * g_C + g_C * g_C; }                            # C x d_c
+fn _o_Wuk(): i64 { return 2 * g_C + g_C * g_C + g_C * g_latent_dim; }        # d_c x C
+fn _o_Wuv(): i64 { return 2 * g_C + g_C * g_C + g_C * g_latent_dim + g_latent_dim * g_C; }  # d_c x C
+fn _o_Wo(): i64 { return 2 * g_C + g_C * g_C + _kv_weight_size(); }
+fn _o_ln2g(): i64 { return _o_Wo() + g_C * g_C; }
 fn _o_ln2b(): i64 { return _o_ln2g() + g_C; }
 fn _o_Wfc(): i64 { return _o_ln2g() + 2 * g_C; }
 fn _o_bfc(): i64 { return _o_Wfc() + g_C * g_F; }
@@ -128,6 +143,7 @@ var LA_m2 = 0; var LA_r2 = 0;         # NL pointers, each T
 var LA_arena = 0; # NL pointers, each attn_arena_size
 var LA_dmask_attn = 0;  # NL pointers, each T*C  (residual dropout mask, attn branch)
 var LA_dmask_mlp = 0;   # NL pointers, each T*C  (residual dropout mask, mlp branch)
+var LA_c = 0;     # MLA only: NL pointers, each T*d_c (the cached latent c_KV)
 
 fn La(arr, L): i64 { return load64(arr + L * 8); }
 
@@ -142,6 +158,8 @@ var D_g = 0;      # T x F
 var D_fc = 0;     # T x F
 var D_tmp = 0;    # T x C (ln residual-path scratch)
 var D_drop = 0;   # T x C (dropout-adjusted branch gradient)
+var D_lat1 = 0;   # MLA only: T x d_c (dc from W_UK; accumulates dc from W_UV)
+var D_lat2 = 0;   # MLA only: T x d_c (dc from W_UV)
 
 # ---- KV caches + single-row scratch (inference/generation path, E1) ---------
 var KV_K = 0;     # NL pointers, each T x Ckv (per-layer K cache)
@@ -168,6 +186,11 @@ var G_n = 0;      # tokens currently in the window (== valid cache positions)
 # nh, and hd truncates when nh doesn't divide C. The checkpoint loader rejects
 # these (-16); the in-process constructor must too.
 fn model_config_ok(V, C, T, nh, nkv, NL): i64 {
+    return model_config_ok_arch(V, C, T, nh, nkv, NL, 0, 0);   # mha, no latent
+}
+# attn_kind/d_c-aware variant (ADR 0007). model_config_ok delegates with the
+# MHA default so existing callers/tests are unchanged.
+fn model_config_ok_arch(V, C, T, nh, nkv, NL, attn_kind, d_c): i64 {
     if ((V < 1) || (C < 1) || (T < 1) || (NL < 1)) { return 0; }
     # Magnitude caps mirror the checkpoint loader's (-4/-5/-7/-8). The fresh
     # path takes CLI-supplied dims (`--layers`, and `--preset`-set C/T) — an
@@ -179,6 +202,14 @@ fn model_config_ok(V, C, T, nh, nkv, NL): i64 {
     if ((V > BPE_VMAX()) || (C > 4096) || (T > 8192) || (NL > 128)) { return 0; }
     if ((nh < 1) || (nh > C) || ((C % nh) != 0)) { return 0; }
     if ((nkv < 1) || (nkv > nh) || ((nh % nkv) != 0)) { return 0; }
+    # MLA (attn_kind == 1): full heads — the cache compression is the latent, not
+    # head-sharing — and a positive low-rank d_c bounded by C (so C*d_c <= C*C,
+    # already inside the alloc budget). mha (0) ignores d_c.
+    if ((attn_kind != 0) && (attn_kind != 1)) { return 0; }
+    if (attn_kind == 1) {
+        if (nkv != nh) { return 0; }
+        if ((d_c < 1) || (d_c > C)) { return 0; }
+    }
     return 1;
 }
 
@@ -187,6 +218,11 @@ fn model_config_ok(V, C, T, nh, nkv, NL): i64 {
 # the allocator past its cap BEFORE any allocation happens. KEEP IN SYNC with
 # model_init — test_alloc_accounting pins the two together.
 fn model_alloc_bytes(V, C, T, nh, nkv, NL, NP): i64 {
+    return model_alloc_bytes_arch(V, C, T, nh, nkv, NL, NP, 0, 0);   # mha
+}
+# attn_kind/d_c-aware variant (ADR 0007). model_alloc_bytes delegates with the
+# MHA default so existing callers/tests are unchanged.
+fn model_alloc_bytes_arch(V, C, T, nh, nkv, NL, NP, attn_kind, d_c): i64 {
     var F = 4 * C;
     var Ckv = nkv * (C / nh);
     var asz = attn_arena_size(T, C, nh, nkv);
@@ -197,6 +233,9 @@ fn model_alloc_bytes(V, C, T, nh, nkv, NL, NP): i64 {
     e = e + NL * (5 * T * C + 2 * T * F + 4 * T + asz + 2 * T * Ckv);  # per-layer caches + arena + KV
     e = e + T * V + 7 * T * C + 2 * T * F;            # gradient temporaries
     e = e + 9 * C + 2 * F + 2 + T + V + T;            # single-row scratch + G_win
+    # MLA latent buffers (ADR 0007): LA_c pointer array (NL) + per-layer latent c
+    # (NL * T*d_c) + the two shared down/up backward temporaries (2 * T*d_c).
+    if (attn_kind == 1) { e = e + NL + NL * T * d_c + 2 * T * d_c; }
     return e * 8;
 }
 
@@ -209,16 +248,22 @@ fn CKPT_MAX_MODEL_BYTES(): i64 { return 134217728; }
 # ---- init ------------------------------------------------------------------
 # attn_bias: 1 to give Q/K/V/O biases. dropout: residual dropout prob (f64).
 # nkv: K/V heads (must divide nh; pass nh for classic multi-head attention).
+# model_init builds the default MHA/GQA transformer; model_init_arch (below) adds
+# the attn_kind / latent-dim axis (ADR 0007). Existing callers use model_init.
 fn model_init(V, C, T, nh, nkv, NL, attn_bias, dropout, seed): i64 {
-    if (model_config_ok(V, C, T, nh, nkv, NL) == 0) {
-        puts("attn11: model_init: invalid config (need nh | C, nkv | nh, nkv <= nh, all dims >= 1)\n");
+    return model_init_arch(V, C, T, nh, nkv, NL, attn_bias, dropout, seed, 0, 0);
+}
+fn model_init_arch(V, C, T, nh, nkv, NL, attn_bias, dropout, seed, attn_kind, d_c): i64 {
+    if (model_config_ok_arch(V, C, T, nh, nkv, NL, attn_kind, d_c) == 0) {
+        puts("attn11: model_init: invalid config (need nh | C, nkv | nh, nkv <= nh; mla: nkv == nh, 1 <= d_c <= C)\n");
         sys_exit(1);
     }
     g_V = V; g_C = C; g_T = T; g_nh = nh; g_nkv = nkv; g_NL = NL; g_F = 4 * C;
     g_attn_bias = attn_bias; g_dropout = dropout; g_training = 1; g_step = 0;
-    # default architecture descriptor (mha / learned-abs); a checkpoint load
-    # overrides these from its validated v4 header (ADR 0007)
-    g_attn_kind = 0; g_pos_kind = 0; g_latent_dim = 0; g_rope_dim = 0;
+    # architecture descriptor (ADR 0007). g_attn_kind/g_latent_dim must be set
+    # BEFORE g_NP, since _blk()->_kv_weight_size() reads them. pos_kind/rope_dim
+    # stay at the learned-absolute default until RoPE lands.
+    g_attn_kind = attn_kind; g_pos_kind = 0; g_latent_dim = d_c; g_rope_dim = 0;
     var F = g_F;
     g_NP = _emb_end() + NL * _blk() + 2 * C;
 
@@ -227,7 +272,7 @@ fn model_init(V, C, T, nh, nkv, NL, attn_bias, dropout, seed): i64 {
     # shape-valid config can still imply a model larger than the allocator cap.
     # Reject BEFORE any allocation so a hostile --layers/--preset combination
     # aborts cleanly instead of through an oversized/undersized t_alloc.
-    if (model_alloc_bytes(V, C, T, nh, nkv, NL, g_NP) > CKPT_MAX_MODEL_BYTES()) {
+    if (model_alloc_bytes_arch(V, C, T, nh, nkv, NL, g_NP, attn_kind, d_c) > CKPT_MAX_MODEL_BYTES()) {
         puts("attn11: model_init: config exceeds the 128 MB model-allocation cap\n");
         sys_exit(1);
     }
@@ -250,12 +295,19 @@ fn model_init(V, C, T, nh, nkv, NL, attn_bias, dropout, seed): i64 {
         t_fill(PL(L, _o_ln1g()), C, f64_from(1));
         t_fill(PL(L, _o_ln2g()), C, f64_from(1));
         t_randn(PL(L, _o_Wq()), C * C, std);
-        t_randn(PL(L, _o_Wk()), C * Ckv, std);
-        t_randn(PL(L, _o_Wv()), C * Ckv, std);
+        if (attn_kind == 1) {
+            # MLA: down-projection C->d_c, then two up-projections d_c->C
+            t_randn(PL(L, _o_Wdkv()), C * d_c, std);
+            t_randn(PL(L, _o_Wuk()), d_c * C, std);
+            t_randn(PL(L, _o_Wuv()), d_c * C, std);
+        } else {
+            t_randn(PL(L, _o_Wk()), C * Ckv, std);
+            t_randn(PL(L, _o_Wv()), C * Ckv, std);
+        }
         t_randn(PL(L, _o_Wo()), C * C, rstd);     # residual projection
         t_randn(PL(L, _o_Wfc()), C * F, std);
         t_randn(PL(L, _o_Wproj()), F * C, rstd);  # residual projection
-        # biases (bfc, bproj) and ln betas already zero
+        # biases (bfc, bproj, attn biases) and ln betas already zero
         L = L + 1;
     }
     t_fill(P_lnfg(), C, f64_from(1));
@@ -275,6 +327,7 @@ fn model_init(V, C, T, nh, nkv, NL, attn_bias, dropout, seed): i64 {
     LA_m2 = t_alloc(NL); LA_r2 = t_alloc(NL);
     LA_arena = t_alloc(NL);
     LA_dmask_attn = t_alloc(NL); LA_dmask_mlp = t_alloc(NL);
+    if (attn_kind == 1) { LA_c = t_alloc(NL); }
     var i = 0;
     while (i < NL + 1) { store64(LA_resid + i * 8, t_alloc(TC)); i = i + 1; }
     var TF = T * F; var asz = attn_arena_size(T, C, nh, nkv);
@@ -292,6 +345,7 @@ fn model_init(V, C, T, nh, nkv, NL, attn_bias, dropout, seed): i64 {
         store64(LA_arena + L * 8, t_alloc(asz));
         store64(LA_dmask_attn + L * 8, t_alloc(TC));
         store64(LA_dmask_mlp + L * 8, t_alloc(TC));
+        if (attn_kind == 1) { store64(LA_c + L * 8, t_alloc(T * d_c)); }
         L = L + 1;
     }
 
@@ -299,6 +353,7 @@ fn model_init(V, C, T, nh, nkv, NL, attn_bias, dropout, seed): i64 {
     D_logits = t_alloc(TV); D_f = t_alloc(TC); D_resid = t_alloc(TC);
     D_xmid = t_alloc(TC); D_a = t_alloc(TC); D_b = t_alloc(TC);
     D_g = t_alloc(TF); D_fc = t_alloc(TF); D_tmp = t_alloc(TC); D_drop = t_alloc(TC);
+    if (attn_kind == 1) { D_lat1 = t_alloc(T * d_c); D_lat2 = t_alloc(T * d_c); }
 
     # KV caches + single-row scratch (generation)
     var TKv = T * Ckv;
@@ -455,9 +510,15 @@ fn model_forward(): i64 {
         var xin = La(LA_resid, L);
         var a = La(LA_a, L);
         ln_fwd(xin, PL(L, _o_ln1g()), PL(L, _o_ln1b()), a, La(LA_m1, L), La(LA_r1, L), T, C);
-        attn_fwd(PL(L, _o_Wq()), P_bq(L), PL(L, _o_Wk()), P_bk(L),
-                 PL(L, _o_Wv()), P_bv(L), PL(L, _o_Wo()), P_bo(L),
-                 a, A_attn, La(LA_arena, L), T, C, nh, g_nkv);
+        if (g_attn_kind == 1) {
+            attn_mla_fwd(PL(L, _o_Wq()), P_bq(L), PL(L, _o_Wdkv()), PL(L, _o_Wuk()), P_bk(L),
+                         PL(L, _o_Wuv()), P_bv(L), PL(L, _o_Wo()), P_bo(L),
+                         a, A_attn, La(LA_arena, L), La(LA_c, L), T, C, nh, g_latent_dim);
+        } else {
+            attn_fwd(PL(L, _o_Wq()), P_bq(L), PL(L, _o_Wk()), P_bk(L),
+                     PL(L, _o_Wv()), P_bv(L), PL(L, _o_Wo()), P_bo(L),
+                     a, A_attn, La(LA_arena, L), T, C, nh, g_nkv);
+        }
         # residual dropout on the attention branch
         dropout_gen_mask(La(LA_dmask_attn, L), TC, g_dropout, g_training);
         dropout_apply(A_attn, La(LA_dmask_attn, L), A_attn, TC);
@@ -542,9 +603,15 @@ fn model_eval_window(n): i64 {
         var xin = La(LA_resid, L);
         var a = La(LA_a, L);
         ln_fwd(xin, PL(L, _o_ln1g()), PL(L, _o_ln1b()), a, La(LA_m1, L), La(LA_r1, L), n, C);
-        attn_fwd(PL(L, _o_Wq()), P_bq(L), PL(L, _o_Wk()), P_bk(L),
-                 PL(L, _o_Wv()), P_bv(L), PL(L, _o_Wo()), P_bo(L),
-                 a, A_attn, La(LA_arena, L), n, C, nh, g_nkv);
+        if (g_attn_kind == 1) {
+            attn_mla_fwd(PL(L, _o_Wq()), P_bq(L), PL(L, _o_Wdkv()), PL(L, _o_Wuk()), P_bk(L),
+                         PL(L, _o_Wuv()), P_bv(L), PL(L, _o_Wo()), P_bo(L),
+                         a, A_attn, La(LA_arena, L), La(LA_c, L), n, C, nh, g_latent_dim);
+        } else {
+            attn_fwd(PL(L, _o_Wq()), P_bq(L), PL(L, _o_Wk()), P_bk(L),
+                     PL(L, _o_Wv()), P_bv(L), PL(L, _o_Wo()), P_bo(L),
+                     a, A_attn, La(LA_arena, L), n, C, nh, g_nkv);
+        }
         var xmid = La(LA_xmid, L);
         var i = 0;
         while (i < nC) { store64(xmid + i * 8, f64_add(load64(xin + i * 8), load64(A_attn + i * 8))); i = i + 1; }
@@ -589,11 +656,19 @@ fn model_backward(): i64 {
         t_add_into(D_xmid, D_tmp, TC);
         # attention: d(attn branch output) = D_xmid; back through its dropout, then attn.
         dropout_bwd(La(LA_dmask_attn, L), D_xmid, D_drop, TC);
-        attn_bwd(PL(L, _o_Wq()), PL(L, _o_Wk()), PL(L, _o_Wv()), PL(L, _o_Wo()),
-                 La(LA_a, L), D_drop, D_a,
-                 GL(L, _o_Wq()), G_bq(L), GL(L, _o_Wk()), G_bk(L),
-                 GL(L, _o_Wv()), G_bv(L), GL(L, _o_Wo()), G_bo(L),
-                 La(LA_arena, L), T, C, nh, g_nkv);
+        if (g_attn_kind == 1) {
+            attn_mla_bwd(PL(L, _o_Wq()), PL(L, _o_Wdkv()), PL(L, _o_Wuk()), PL(L, _o_Wuv()), PL(L, _o_Wo()),
+                         La(LA_a, L), D_drop, D_a,
+                         GL(L, _o_Wq()), G_bq(L), GL(L, _o_Wdkv()), GL(L, _o_Wuk()), G_bk(L),
+                         GL(L, _o_Wuv()), G_bv(L), GL(L, _o_Wo()), G_bo(L),
+                         La(LA_arena, L), La(LA_c, L), D_lat1, D_lat2, T, C, nh, g_latent_dim);
+        } else {
+            attn_bwd(PL(L, _o_Wq()), PL(L, _o_Wk()), PL(L, _o_Wv()), PL(L, _o_Wo()),
+                     La(LA_a, L), D_drop, D_a,
+                     GL(L, _o_Wq()), G_bq(L), GL(L, _o_Wk()), G_bk(L),
+                     GL(L, _o_Wv()), G_bv(L), GL(L, _o_Wo()), G_bo(L),
+                     La(LA_arena, L), T, C, nh, g_nkv);
+        }
         ln_bwd(xin, PL(L, _o_ln1g()), D_a, La(LA_m1, L), La(LA_r1, L), D_tmp, GL(L, _o_ln1g()), GL(L, _o_ln1b()), T, C);
         # d_xin = d_xmid (residual) + D_tmp (ln1 path) ; becomes next D_resid
         t_copy(D_resid, D_xmid, TC);

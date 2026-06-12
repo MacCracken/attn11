@@ -52,6 +52,17 @@ Used in: `src/attn.cyr`, `src/model.cyr` — `1 < nkv < nh`: each group of
 `nh/nkv` query heads shares one K/V head (`Ckv = nkv·hd`-wide K/V
 projections, grouped `dK`/`dV` accumulation in the hand-derived backward).
 
+### Multi-head latent attention (MLA — low-rank K/V latent)
+**DeepSeek-AI (2024).** "DeepSeek-V2: A Strong, Economical, and Efficient
+Mixture-of-Experts Language Model." arXiv:[2405.04434](https://arxiv.org/abs/2405.04434).
+Used in: `src/attn.cyr` (`attn_mla_fwd`/`attn_mla_bwd`), `src/model.cyr`
+(`--attn-kind mla`) — K/V are factored through a shared low-rank latent
+(down-projection `C → d_c`, up-projections `d_c → C`) instead of projected from
+`x` directly, with full heads (`nkv = nh`). attn11 keeps learned-absolute
+positions for the reference MLA (the decoupled-RoPE variant is reserved; see
+ADR 0007). The latent down/up projections reuse the grad-checked `linear`
+backward, so the MLA gradient adds no novel hand-derived math.
+
 ### KV-cache inference (cache K/V per position, one row per decoded token)
 **Pope, R., Douglas, S., Chowdhery, A., et al. (2022).** "Efficiently Scaling
 Transformer Inference." *MLSys 2023.* arXiv:[2211.05102](https://arxiv.org/abs/2211.05102).

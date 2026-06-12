@@ -4,36 +4,52 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-**M12 groundwork — the 1.x architecture arc begins.** Roadmap + ADR for the
-post-1.1 minors, and the first additive code increment (checkpoint v4 reserves
-the architecture descriptor ahead of the math). No behavior, math, or default-run
-change; the frozen 1.0 surface is intact.
+## [1.2.0] - 2026-06-12
+
+**Multi-Head Latent Attention (M12) — the first new architecture on the 1.x arc.**
+`--attn-kind mla` adds DeepSeek-V2-style MLA (arXiv:2405.04434): K and V are
+factored through a low-rank latent (down-project `C → d_c`, up-project `d_c → C`)
+instead of projected from `x` directly. Opt-in and additive — a no-flag run is a
+byte-identical MHA transformer, and the frozen 1.0 surface is intact (ADR 0007).
 
 ### Added
-- **Checkpoint v4 — architecture descriptor (ADR 0007).** The header reserves
-  four fields — `attn_kind`, `pos_kind`, `latent_dim` (`d_c`), `rope_dim`
-  (`d_rope`) — defaulting to the current MHA / learned-absolute transformer.
-  Saves now write v4; **v1/v2/v3 still load** (synthesizing the default
-  descriptor). Only the default descriptor is accepted today (new hostile-input
-  reject codes `-40..-43`); each gate relaxes when MLA / RoPE fills its field, so
-  the whole MLA + positional-encoding ladder is pure value-fill with **no further
-  format bump**. A default-descriptor v4 is a byte-identical resume of a v3.
-- Tests: `test_ckpt_v3_compat` (v3 images still load now that the serializer
-  emits v4) and `test_ckpt_v4_descriptor` (round-trip + `-40..-43` rejection); the
-  fuzz harness extended to the v4 header (descriptor fields + the merge table's
-  new offset, both keyed off `CKPT_HDR()`). **248 → 273** grad-check/property
-  checks green on x86_64; fuzz green (500 + 500 rounds).
+- **`--attn-kind {mha, mla}` + `--latent-dim N`.** MLA uses full heads
+  (`nkv = nh`; the compression is the latent, not head-sharing); `d_c` defaults to
+  `d_model/2` (~4× the cached-KV footprint reduction it will enable). The latent
+  down/up projections are plain linear layers, so the backward is matmul-backward
+  with **no novel hand-derived math**.
+- **Shared attention core.** `attn_core_fwd`/`attn_core_bwd` extracted from
+  `attn_fwd`/`attn_bwd`; MHA/GQA and MLA run the **identical** softmax/PV kernel
+  (one source of truth, `docs/architecture/003`). MHA/GQA stays bit-identical
+  (grad-checks unchanged).
+- **Grad checks.** Per-op MLA backward (`test_attention_mla`, tight 1e-4) +
+  full-model MLA (`test_model_mla`) + the MLA parameter-layout pin
+  (`test_param_layout_mla`, the FD-blind-aliasing guard) + alloc-accounting and
+  config-cap pins. The latent down/up/output gradients land ~1e-8.
+- **Checkpoint v4 fills the descriptor.** The reserved `attn_kind`/`latent_dim`
+  fields (added as groundwork ahead of the math) now carry MLA; round-trips
+  bit-for-bit (`test_ckpt_mla_roundtrip`), rebuilds with full heads, and the
+  `-40`/`-42` gates enforce descriptor consistency (`d_c ∈ [1, C]`, full heads).
+  **v1/v2/v3 still load.** Hostile-input fuzz extended to the v4 descriptor.
+
+### Changed
+- Checkpoint header is **v4**: saves record the architecture descriptor
+  (`attn_kind`, `pos_kind`, `latent_dim`, `rope_dim`). A default-descriptor v4 is
+  a byte-identical resume of a v3. New reject codes `-40..-43`.
+- `248 → 351` grad-check/property tests green on x86_64; fuzz + lint green.
+
+### Notes / deferred
+- **MLA generation uses the uncached reference forward** (`model_eval_window`);
+  the **latent KV-cache decode path** — the inference compression win, its
+  bit-identity gate, and the KV-bytes table — is the **M12.2** follow-on. MLA
+  *trains*, checkpoints, and samples here; the cache is additive on top.
+- `--pos-kind` (coupled/decoupled RoPE) remains reserved in v4 (ADR 0007); the
+  flag and math land in a later M12 increment.
 
 ### Docs
-- **The 1.x architecture arc mapped** (`docs/development/roadmap.md`): M11
-  (extraction, 1.1.0) backfilled, then **M12 MLA + positional-encoding switch**
-  (v1.2.0, E7) → **M13 Mixture of Experts** with the 8→256 expert-density sweep
-  (v1.3.0, E8) → M14–M16 (mixers / diffusion / ternary, E4–E6) → **M17
-  reinforcement learning** (v1.7.0, E9). Each is additive opt-in config, not a v2
-  fork. `state.md` refreshed to 1.1.0.
-- **ADR 0007** — multi-head latent attention + a `--pos-kind
-  {learned, rope, rope-decoupled}` switch (learned-abs default; coupled vs.
-  decoupled RoPE explained), and the reserve-the-v4-descriptor-now decision.
+- **ADR 0007** (MLA + positional-encoding switch) and the **1.x architecture-arc
+  roadmap** (M12 → M17, E7–E9 incl. MoE's 8→256 sweep and late-chain RL).
+- DeepSeek-V2 (2405.04434) added to `docs/sources.md`.
 
 ## [1.1.0] - 2026-06-12
 

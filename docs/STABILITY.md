@@ -10,7 +10,7 @@
 
 ## CLI flags (frozen, runtime)
 
-All 12 behavioral flags below are stable. A run with **no flags** trains on the
+All 14 behavioral flags below are stable. A run with **no flags** trains on the
 embedded corpus and samples; that behavior is frozen.
 
 | flag | meaning |
@@ -25,6 +25,8 @@ embedded corpus and samples; that behavior is frozen.
 | `--heads N` | attention heads (must divide d_model) |
 | `--kv-heads N` | K/V heads (must divide heads; `1` = MQA; default = heads) |
 | `--layers N` | transformer blocks (1..128) |
+| `--attn-kind K` | attention variant: `mha` (default) or `mla` (latent KV); `mla` forces full heads (1.2.0) |
+| `--latent-dim N` | MLA latent width `d_c` (`1..d_model`; default `d_model/2`); only with `--attn-kind mla` (1.2.0) |
 | `--bpe K` | learn K BPE merges first (1..512; byte-level is the default) |
 | `--eval` | print CE/token + bits-per-byte after training/save |
 

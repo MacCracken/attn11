@@ -5,17 +5,26 @@
 
 ## Version
 
-**1.1.0** — *the extraction*. attn11 becomes the **reference consumer** of its
-own numeric core: tensor storage + BLAS-1 + dense matmul (and its gradient)
-lifted to [rosnet](https://github.com/MacCracken/rosnet) 0.1.0, the deterministic
-statistical PRNG to [tyche](https://github.com/MacCracken/tyche) 0.1.0 — both
-resolved via `cyrius deps` (pinned in `cyrius.lock`). **Additive/internal**:
-byte-identical training/sampling, same CLI, v3 checkpoint unchanged, the frozen
-1.0 surface intact; all **248** grad-check/property tests green (they now double
-as rosnet's gradient validation + tyche's RNG-state validation). Still **no
-BLAS/libc/autodiff** — both libs are pure-Cyrius `f64`-in-`i64`,
-sovereign-ecosystem. Toolchain pinned at cyrius 6.1.37.
-(1.0.0 — the clean cut, **first non-prerelease**: the **final audit** (5
+**1.2.0** — *Multi-Head Latent Attention* (M12, the first new architecture on the
+1.x arc; ADR 0007). `--attn-kind mla` factors K/V through a low-rank latent
+(down `C→d_c`, up `d_c→C`, `--latent-dim`; full heads), the DeepSeek-V2
+parameterization (arXiv:2405.04434). A shared `attn_core_fwd`/`attn_core_bwd` was
+extracted so MHA/GQA and MLA run the **identical** softmax/PV kernel; the MLA
+backward composes from `linear_bwd` + the core (no novel hand-derived math).
+**Opt-in/additive**: a no-flag run is a byte-identical MHA transformer.
+Grad-checked per-op (tight) + full-model; **checkpoint v4** records the
+architecture descriptor (`attn_kind`/`latent_dim`), round-trips bit-for-bit, and
+v1/v2/v3 still load. MLA *trains* (loss ↓) + checkpoints + samples; its
+**latent KV-cache** decode (the inference compression win + bit-identity + the
+KV-bytes table) is the **M12.2** follow-on — 1.2.0 generates MLA via the uncached
+reference path. **351** grad-check/property tests green on x86_64; fuzz + lint
+green. Toolchain pinned at cyrius 6.1.37.
+(1.1.0 — *the extraction*: the reusable numeric core lifted to **rosnet** 0.1.0
+(tensor/BLAS-1/matmul + gradient) and **tyche** 0.1.0 (deterministic PRNG),
+resolved via `cyrius deps`; additive/internal, byte-identical, attn11 the
+reference consumer. Still no BLAS/libc/autodiff (both libs pure-Cyrius
+`f64`-in-`i64`).
+1.0.0 — the clean cut, **first non-prerelease**: the **final audit** (5
 adversarial dimensions: hostile-input, math, memory, frozen-surface, release —
 **go on all five, 0 blockers**;
 [`../audit/2026-06-11-v1.0-final-audit.md`](../audit/2026-06-11-v1.0-final-audit.md))
@@ -122,8 +131,13 @@ checkpoint vs Linux at fixed CPU — `scripts/agnos-smoke.sh`):
   all checked before allocation; **v1/v2 still load** (byte-level) — +
   bit-for-bit **deterministic resume** (BPE re-encodes the retained corpus);
   **crash-atomic save** (temp + fsync + rename)
+- **Multi-head latent attention** (1.2.0, `--attn-kind mla`, ADR 0007): K/V
+  factored through a low-rank latent (down `C→d_c`, up `d_c→C`; `--latent-dim`,
+  default `d_model/2`; full heads). Shares the extracted `attn_core_*` kernel with
+  MHA/GQA; grad-checked per-op + full-model; checkpoint v4 carries the descriptor.
+  Trains + checkpoints + samples (uncached); the latent KV-cache decode is M12.2.
 - CLI: `--corpus --stdin --load --save --steps --gen-only --preset --heads
-  --kv-heads --layers --bpe --eval`
+  --kv-heads --layers --attn-kind --latent-dim --bpe --eval`
 
 Default run (`./build/attn11`, 3 layers): loss `~3.2 → ~0.13` over 2000 steps;
 sampled output reproduces real corpus phrases.
@@ -149,7 +163,9 @@ sampled output reproduces real corpus phrases.
 `--preset` overrides to C 64 / T 64 / nh 8 / NL 4 (205 760 params at the
 embedded corpus); `--heads`/`--kv-heads`/`--layers` override individual dims
 (magnitude-capped: nh|C, nkv|nh, NL ≤ 128, C ≤ 4096, T ≤ 8192). `--bpe K`
-raises V to `base + K` (≤ 768).
+raises V to `base + K` (≤ 768). `--attn-kind mla --latent-dim d_c` (1 ≤ d_c ≤ C,
+default C/2) swaps the K/V projections for the low-rank latent (37 952 params at
+d_c=16 vs MHA's 39 488).
 
 ## Source (`src/`, ~1500 LOC)
 
@@ -158,39 +174,48 @@ raises V to `base + K` (≤ 768).
   **tyche** (1.1.0 extraction)
 - `ops.cyr` — layernorm, GELU (tanh approx), softmax cross-entropy (forward +
   backward); `linear_fwd`/`linear_bwd` now resolve from **rosnet**
-- `attn.cyr` — causal multi-head/GQA self-attention (forward + backward), one
-  pre-allocated arena for caches + temporaries; `attn_fwd_row` (KV-cached
+- `attn.cyr` — the shared attention core `attn_core_fwd`/`attn_core_bwd` (causal
+  scaled-dot-product softmax/PV), wrapped by `attn_fwd`/`attn_bwd` (MHA/GQA
+  projections) and `attn_mla_fwd`/`attn_mla_bwd` (MLA low-rank latent down/up
+  projections; 1.2.0); one pre-allocated arena; `attn_fwd_row` (KV-cached
   single-row forward, bit-identical per row to `attn_fwd`)
 - `fileio.cyr` — secure file I/O (`O_NOFOLLOW`, `fstat` size, looped read/write),
   stdin reader
 - `model.cyr` — per-layer packed parameters (block stride + `_o_*`/`PL`/`GL`
-  helpers, Ckv-dependent), per-layer activation caches, embeddings, tied head,
-  full N-layer forward/backward, grad clipping, Adam; KV caches +
-  `model_fwd_row` (cached row) + `model_eval_window` (uncached eval reference);
-  `model_config_ok` (magnitude + divisibility caps) + `model_alloc_bytes`
-  pre-flight guard the fresh-model path
+  helpers; one `_kv_weight_size()` branches the K/V region MHA↔MLA, ADR 0007),
+  per-layer activation caches (+ the MLA latent `LA_c`), embeddings, tied head,
+  full N-layer forward/backward (`attn_kind`-branched), grad clipping, Adam; KV
+  caches + `model_fwd_row` (cached row) + `model_eval_window` (uncached eval +
+  MLA generation); `model_init_arch`/`model_config_ok_arch`/`model_alloc_bytes_arch`
+  carry the descriptor (the `_arch` forms; the old names delegate as MHA)
 - `train.cyr` — byte + **BPE** tokenizer (`bpe_learn`/`tok_encode`/
   `bpe_build_spans`/`tok_emit`), corpus (embedded/file/stdin, raw bytes
   retained), batch sampling, LR schedule, resumable training loop, KV-cached
   generation (`gen_prime`/`gen_decode` + context-shift), `eval_corpus`
   (CE/token + bits-per-byte)
-- `persist.cyr` — validated **v3** checkpoint serialize/load (tokenizer triple
-  + merge-table DAG/expansion validation; v1/v2 accepted as byte-level)
+- `persist.cyr` — validated **v4** checkpoint serialize/load (tokenizer triple +
+  merge-table DAG/expansion validation + the v4 architecture descriptor, codes
+  `-40..-43`; `ckpt_expected_np_arch` mirrors the MLA layout; v1/v2/v3 accepted)
 - `main.cyr` — CLI arg parsing (incl. `--preset`/`--heads`/`--kv-heads`/
-  `--layers`/`--bpe`/`--eval`, null-guarded `_atoi`) + orchestration
+  `--layers`/`--attn-kind`/`--latent-dim`/`--bpe`/`--eval`, null-guarded `_atoi`)
+  + orchestration
 
 ## Tests
 
-- `tests/attn11.tcyr` — **248 checks**: finite-difference gradient checks
+- `tests/attn11.tcyr` — **351 checks**: finite-difference gradient checks
   (every op incl. dropout; attention at head dims 6/8/10 and GQA/MQA at
   `nkv ∈ {1, 2, nh}` incl. `dWk`/`dWv`/`dbv`; the `|dbk| ≈ 0`
-  softmax-shift-invariance pin; 2-layer full model at MHA and GQA), the SIMD
+  softmax-shift-invariance pin; 2-layer full model at MHA and GQA), the **MLA
+  suite** (1.2.0: per-op `attn_mla_fwd`/`bwd` grad-check at 3 latent configs
+  incl. the `|dbuk| ≈ 0` shift-invariance pin, full-model MLA grad-check, the
+  **MLA parameter-layout/alloc/config pins**, and the v4 MLA checkpoint
+  round-trip + `-42` descriptor-consistency rejections), the SIMD
   bit-contract, the **SIMD-LM-head tail pin** (`C % 4 ≠ 0` at C=6 vs a scalar
   dot — mutation-verified; no other config exercises it), the **parameter-layout tiling pin** (FD is blind to offset
-  aliasing), the **alloc-accounting pin** (`model_alloc_bytes` ==
-  `model_init`, incl. V=300), the **config-magnitude-cap pin**
-  (`model_config_ok` rejects out-of-range V/C/T/NL — the `--layers`
-  heap-OOB regression), resume-determinism (dropout off/on + MQA + BPE), the
+  aliasing, MHA + MLA), the **alloc-accounting pin** (`model_alloc_bytes` ==
+  `model_init`, incl. V=300 + MLA), the **config-magnitude-cap pin**
+  (`model_config_ok` rejects out-of-range V/C/T/NL + the MLA `d_c`/`nkv` gates —
+  the `--layers` heap-OOB regression), resume-determinism (dropout off/on + MQA + BPE), the
   **file-path round-trip** (`ckpt_save_file`/`ckpt_load_file` — the in-memory
   tests never touched the file loader; pins `_file_size`/`fdatasync`, the M8
   aarch64 save fix), checkpoint rejection smokes (+ `-18` pre-alloc bound,
@@ -246,19 +271,22 @@ _None yet._
 
 ## Next
 
-See [`roadmap.md`](roadmap.md). **v1.0.0 (clean cut) and v1.1.0 (the extraction)
-shipped.** The surface is frozen ([`STABILITY.md`](../STABILITY.md)) and
-additive-only past 1.0; the numeric core now lives in **rosnet** + **tyche**,
-with attn11 as the reference consumer.
+See [`roadmap.md`](roadmap.md). **v1.0.0 (clean cut), v1.1.0 (extraction), and
+v1.2.0 (MLA core) shipped.** The surface is frozen
+([`STABILITY.md`](../STABILITY.md)) and additive-only past 1.0; the numeric core
+lives in **rosnet** + **tyche**, and MLA is the first new architecture on the 1.x
+arc (`--attn-kind mla`, checkpoint v4).
 
-**Next — the 1.x architecture arc** (roadmap M12+): the frontier experiments,
-re-scoped from a v2 fork to **additive 1.x minors** (opt-in flags + new
-checkpoint versions, default run byte-identical). In value÷risk order:
-**M12 (v1.2.0) — Multi-Head Latent Attention** (E7; the low-rank-latent
-evolution of the M6 KV cache, `--attn-kind mla`, checkpoint v4), then
-**M13 (v1.3.0) — Mixture of Experts** (E8; sparse FFN with the
-`--experts {8,16,32,64,128,256}` density sweep, checkpoint v5), then E4–E6
-(mixers / diffusion / ternary) as M14–M16.
+**Next on the 1.x architecture arc** (roadmap):
+- **M12.2 — the MLA latent KV-cache decode** (the deferred M12 gate): a cached
+  single-row path storing the `d_c` latent per token, the cached-vs-uncached
+  bit-identity gate, and the KV-cache-bytes table vs GQA/MQA. 1.2.0 generates MLA
+  via the uncached reference path; this is the inference compression win on top.
+- **M13 (v1.3.0) — Mixture of Experts** (E8; sparse FFN with the
+  `--experts {8,16,32,64,128,256}` density sweep, checkpoint v5), then E4–E6
+  (mixers / diffusion / ternary) as M14–M16, and **M17** reinforcement learning
+  (E9). The `--pos-kind` RoPE rungs (ADR 0007) are reserved in v4 and land in a
+  later M12 increment.
 
 Loose ends: an `attn11` row upstream in `agnos/scripts/stage-tools.sh`
 (`stage_one attn11 src/main.cyr attn11`) — a cross-repo edit (agnos maintainer's

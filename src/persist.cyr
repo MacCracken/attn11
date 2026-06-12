@@ -47,19 +47,23 @@ fn CKPT_MAX_BYTES(): i64 { return 134217728; }        # 128 MB file cap
 
 # Parameter count for a config, computed without touching globals (used to
 # validate a checkpoint header before we trust it). Mirrors model.cyr's layout.
-# M12/ADR 0007 NOTE: this is descriptor-INDEPENDENT today because the loader
-# forces d_c == 0 / attn_kind == mha (-42/-40). When MLA lands and -40/-42 are
-# relaxed, the latent down/up projections enter the block layout — this function
-# AND model_alloc_bytes must both gain a (attn_kind, d_c) branch, and d_c/d_rope
-# must be magnitude-capped BEFORE they enter any product (bound-before-alloc; the
-# `--layers` heap-OOB lesson). The -10/-11/-18 gates depend on this staying exact.
+# ckpt_expected_np delegates with the MHA default so existing callers/tests are
+# unchanged; ckpt_expected_np_arch carries the (attn_kind, d_c) descriptor and
+# mirrors _kv_weight_size (the K/V weight region is the only variant-dependent
+# part). d_c is magnitude-capped by the loader (1..C) BEFORE reaching this, so
+# C*d_c <= C*C — no overflow (bound-before-alloc; the `--layers` heap-OOB lesson).
 fn ckpt_expected_np(V, C, T, nh, NL, bias, nkv): i64 {
+    return ckpt_expected_np_arch(V, C, T, nh, NL, bias, nkv, 0, 0);   # mha
+}
+fn ckpt_expected_np_arch(V, C, T, nh, NL, bias, nkv, attn_kind, d_c): i64 {
     var F = 4 * C;
     var Ckv = nkv * (C / nh);
     var emb = V * C + T * C;
-    var blkbase = 5 * C + 2 * C * C + 2 * C * Ckv + 2 * C * F + F;
+    var kvw = 2 * C * Ckv;                          # MHA/GQA: Wk + Wv
+    if (attn_kind == 1) { kvw = C * d_c + 2 * d_c * C; }   # MLA: W_DKV + W_UK + W_UV
+    var blkbase = 5 * C + 2 * C * C + kvw + 2 * C * F + F;
     var blk = blkbase;
-    if (bias == 1) { blk = blkbase + 2 * C + 2 * Ckv; }
+    if (bias == 1) { blk = blkbase + 2 * C + 2 * Ckv; }    # MLA: Ckv == C, so 4C, same as full MHA
     return emb + NL * blk + 2 * C;
 }
 
@@ -179,10 +183,10 @@ fn ckpt_load_buf(buf, len): i64 {
     if ((tok_kind == 0) && (K != 0)) { return 0 - 36; }
     # M12 architecture descriptor (v4; ADR 0007). v1/v2/v3 carry no descriptor
     # and synthesize the default MHA / learned-abs transformer, so they cannot
-    # hit -40..-43. Only the default descriptor is accepted until MLA/RoPE fill
-    # these fields — each gate below relaxes when its feature lands. Validated
-    # BEFORE allocation, like every other header field. d_c/d_rope are reserved
-    # latent widths (0 today); when MLA lands they feed ckpt_expected_np.
+    # hit -40..-43. attn_kind 1 (MLA) is now accepted; pos_kind/rope still
+    # reserved (0 until RoPE lands). Validated BEFORE allocation, like every
+    # other header field — d_c is capped to [1, C] so it cannot overflow the
+    # np/size/alloc gates below (bound-before-alloc).
     var attn_kind = 0;
     var pos_kind = 0;
     var d_c = 0;
@@ -193,17 +197,23 @@ fn ckpt_load_buf(buf, len): i64 {
         d_c = load64(buf + 18 * 8);
         d_rope = load64(buf + 19 * 8);
     }
-    if (attn_kind != 0) { return 0 - 40; }   # 0 = mha; 1 = mla reserved (M12.2)
+    if ((attn_kind != 0) && (attn_kind != 1)) { return 0 - 40; }   # 0 = mha, 1 = mla
     if (pos_kind != 0) { return 0 - 41; }    # 0 = learned; 1 = rope, 2 = rope-decoupled reserved
-    if (d_c != 0) { return 0 - 42; }         # latent_dim reserved (0 until MLA)
     if (d_rope != 0) { return 0 - 43; }      # rope_dim reserved (0 until decoupled RoPE)
-    var expnp = ckpt_expected_np(V, C, T, nh, NL, bias, nkv);
+    if (attn_kind == 1) {
+        # MLA: full heads (compression is the latent), low-rank 1 <= d_c <= C
+        if (nkv != nh) { return 0 - 40; }
+        if ((d_c < 1) || (d_c > C)) { return 0 - 42; }
+    } else {
+        if (d_c != 0) { return 0 - 42; }     # mha must not carry a latent dim
+    }
+    var expnp = ckpt_expected_np_arch(V, C, T, nh, NL, bias, nkv, attn_kind, d_c);
     if ((np < 1) || (np > CKPT_MAX_NP())) { return 0 - 13; }
     if (np != expnp) { return 0 - 10; }
     # shape-valid is not enough: the nh*T*T attention arenas (independent of
     # np) and the 4 parameter vectors must also fit the allocator. Reject any
     # config whose model_init total would exceed the cap — BEFORE allocating.
-    if (model_alloc_bytes(V, C, T, nh, nkv, NL, np) > CKPT_MAX_MODEL_BYTES()) { return 0 - 18; }
+    if (model_alloc_bytes_arch(V, C, T, nh, nkv, NL, np, attn_kind, d_c) > CKPT_MAX_MODEL_BYTES()) { return 0 - 18; }
     var need = (hdr + Vb + 2 * K + 3 * np) * 8;
     if (len != need) { return 0 - 11; }
     # base vocab bytes must be valid 0..255
@@ -262,7 +272,7 @@ fn ckpt_load_buf(buf, len): i64 {
     }
     # validated — build the model and restore state
     var was_bpe = g_bpe_on;
-    model_init(V, C, T, nh, nkv, NL, bias, drop, 1);
+    model_init_arch(V, C, T, nh, nkv, NL, bias, drop, 1, attn_kind, d_c);
     g_vocab = t_alloc(256);
     g_char2id = t_alloc(256);
     i = 0;

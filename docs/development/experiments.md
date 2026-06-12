@@ -174,3 +174,35 @@ contraction (`attn_fwd`/`attn_fwd_row`) and all of `linear` were already
    run-to-run noise (the step bench varies ±2–3%), so a lever must show clearly
    in isolation to be worth a release. Prototyping each candidate *before*
    committing (as here) is what kept three non-wins out of the release log.
+
+## X005 — MLA lands and learns (E7 → M12, v1.2.0) (2026-06-12)
+
+**Setup**: 1.2.0, default config (d_model 32, ctx 16, 4 heads, 3 layers, biases
+on), embedded corpus (vocab 25), seed 1337, 600 steps, x86_64. MHA baseline vs
+MLA (`--attn-kind mla`) at d_c = 16 (= C/2). This entry records the
+correctness/sanity landing, not an iso-compute tokenizer comparison.
+
+**Result** (step-500 train loss):
+
+| attn | d_c | params | step-500 loss |
+|------|-----|--------|---------------|
+| mha  | —   | 39 488 | **0.179** |
+| mla  | 16  | 37 952 (−3.9%) | **0.211** |
+
+MLA factors K/V through the low-rank latent (W_DKV: C→d_c, W_UK/W_UV: d_c→C),
+trimming the per-block K/V weights from `2·C·Ckv` to `3·C·d_c` (−1 536 params at
+d_c=16). It trains to a comparable loss with fewer parameters — the constrained
+low-rank K/V is slightly less expressive at iso-config, as expected; MLA's payoff
+is the **cached-KV** footprint (`d_c` per token vs `2·Ckv`), which the M12.2
+latent-cache decode path will realize and measure.
+
+**Takeaways**:
+1. The MLA forward/backward is correct: per-op grad-check tight (≤1e-4), the full
+   model composes, the checkpoint round-trips, and training converges — MLA is a
+   real, trainable architecture in attn11, not just a parameterization.
+2. The headline cache-compression number (KV-bytes vs GQA/MQA, cached-vs-uncached
+   bit-identity) is **not** in 1.2.0 — generation uses the uncached reference
+   path. The iso-param MLA-vs-GQA perplexity comparison on the vidya corpus
+   (roadmap M12 gate) and the KV-bytes table are the M12.2 follow-on.
+3. Method: deterministic (fixed seed), so both rows reproduce bit-for-bit —
+   `./build/attn11 [--attn-kind mla --latent-dim 16] --steps 600`.
