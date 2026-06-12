@@ -199,11 +199,3 @@ fn f_print(val, dec): i64 {
     }
     return 0;
 }
-
-# print "label: value\n"
-fn f_println_lbl(label, val, dec): i64 {
-    print(label, strlen(label));
-    f_print(val, dec);
-    _putc(10);
-    return 0;
-}

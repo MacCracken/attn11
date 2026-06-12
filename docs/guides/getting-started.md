@@ -32,6 +32,10 @@ attn11 --eval                print CE/token + bits-per-byte after training/save
 
 Config flags (`--preset`/`--heads`/`--kv-heads`/`--layers`/`--bpe`) shape a
 **fresh** model; under `--load` the checkpoint's config and tokenizer win.
+Magnitude caps (enforced in `model_config_ok`, else a clean abort): d_model
+≤ 4096, ctx ≤ 8192, `--layers` 1..128, vocab ≤ 768; `--heads` must divide
+d_model and `--kv-heads` must divide `--heads`. See
+[`../STABILITY.md`](../STABILITY.md) for the full frozen surface.
 
 Example — train on your own text, checkpoint, then resume:
 

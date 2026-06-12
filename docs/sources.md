@@ -100,6 +100,15 @@ Used in: `src/ops.cyr` (`gelu_fwd`/`gelu_bwd`). The tanh approximation
 `0.5·x·(1 + tanh(√(2/π)·(x + 0.044715·x³)))` and the constant `0.044715` are from
 that paper (also the form used by GPT-2).
 
+### Dropout (inverted residual dropout)
+**Srivastava, N., Hinton, G., Krizhevsky, A., Sutskever, I., Salakhutdinov, R.
+(2014).** "Dropout: A Simple Way to Prevent Neural Networks from Overfitting."
+*JMLR* 15(56):1929–1958. <https://jmlr.org/papers/v15/srivastava14a.html>.
+Used in: `src/ops.cyr` (`dropout_gen_mask`/`dropout_apply`/`dropout_bwd`) —
+inverted dropout (kept units scaled by `1/(1−p)` so the forward expectation is
+unchanged and inference needs no rescaling); applied to the residual stream,
+config-gated, and disabled in eval/generation so grad checks stay deterministic.
+
 ### Softmax cross-entropy (max-subtraction for numerical stability)
 **Goodfellow, I., Bengio, Y., Courville, A. (2016).** *Deep Learning*, MIT Press,
 §4.1 (softmax stability) and §6.2.2 (cross-entropy). <https://www.deeplearningbook.org/>.

@@ -4,6 +4,50 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-06-11
+
+**Freeze, docs & cleanup (roadmap M10).** The run-up to the v1.0.0 clean cut:
+the user-facing surface is now declared **frozen** (additive-only past v1.0),
+the CLI is hardened, the docs audited, and the vidya example pipeline landed.
+A no-flag run, the checkpoint format, and training behavior are unchanged.
+
+### Added
+- **`docs/STABILITY.md`** — the frozen-surface contract: the 12 CLI flags
+  (additive-only), the compile-time `CFG_*` knobs and their frozen default
+  values, checkpoint format v3 (v1/v2 load forever), the magnitude caps, and
+  an explicit "not part of the contract" list.
+- **`--help`/`-h` and `--version`** flags; the parser now **rejects unknown
+  arguments** and **errors on a value-flag given without a value** (both exit
+  non-zero with usage) instead of silently ignoring them — robustness expected
+  of a frozen CLI. (`--version` is gated against `VERSION` in CI.)
+- **The vidya example pipeline** (`docs/examples/vidya-pipeline.md`): preset +
+  the 488 KB vidya corpus → train (loss 2.12 → **1.089** at 4000 steps,
+  bits/byte **1.760**) → checkpoint (~5 MB, reloads bit-for-bit) → sample,
+  with a BPE variant. The "curated small corpus" workflow against a tagged
+  build (X001/X003).
+
+### Changed
+- **Toolchain pin `6.1.34` → `6.1.37`** (`cyrius update` resynced the `lib/`
+  snapshot; pin and snapshot move together). 248 checks green on both arches +
+  the agnos build; no drift warning.
+- Docs audit (5-dimension multi-agent sweep): ADR 0005 generation figure
+  corrected to the bench of record (6.2×); architecture note 001 now lists the
+  M9-vectorized LM head among the SIMD paths; `sources.md` gains the missing
+  dropout citation (Srivastava et al. 2014); `benchmarks.md` records the M9
+  perf-lever outcomes (X004) instead of listing rejected levers as open work;
+  ADR 0006↔0002 amendment link made bidirectional; getting-started/README gain
+  the magnitude caps + a STABILITY pointer.
+
+### Removed
+- Dead code: `secure_write_file` (superseded by the crash-atomic writer),
+  `f_println_lbl`, and the unused `CFG_NKV` accessor.
+
+### Notes
+- Cross-repo loose end (not in this tree): attn11 still needs a row in
+  `agnos/scripts/stage-tools.sh` — `stage_one attn11 src/main.cyr attn11` —
+  to stage `/bin/attn11` on the AGNOS rootfs. That is the agnos maintainer's
+  edit.
+
 ## [0.8.1] - 2026-06-11
 
 **Performance — SIMD tied LM head (roadmap M9, lever 1).** The first of the

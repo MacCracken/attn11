@@ -5,15 +5,21 @@
 
 ## Version
 
-**0.8.1** — performance, M9 lever 1 (SIMD tied LM head): `head_fwd_row` (the
-weight-tied output projection, `O(V·C)` per row, run in every training forward
-and every generated token) was a scalar dot product while the matmul has been
-4-wide since 0.4.0. Vectorized with the same `f64v_fmadd` accumulator + tail —
-**2.7×** at V=768 (`head_fwd` 9.7 → 3.59 ms). The win scales with the vocab
-(negligible at the V=25 default — default training unchanged; ~17% of the
-forward at BPE-scale). Shared kernel, so the cached-vs-uncached bit-identity
-gate is unaffected; a mutation-verified C=6 test covers the new `C % 4 ≠ 0`
-tail. (0.8.0 — security sweep (M8): a survey→map hardening release;
+**0.9.0** — freeze, docs & cleanup (M10): the run-up to the v1.0.0 clean cut.
+The user-facing surface is **frozen** ([`STABILITY.md`](../STABILITY.md):
+12 additive-only CLI flags, the compile-time `CFG_*` knobs, checkpoint v3 with
+permanent v1/v2 load-compat); the CLI is hardened (`--help`/`--version`,
+rejects unknown args + missing flag values — CI-gated `--version`); the docs
+were audited by a 5-dimension multi-agent sweep (ADR 0005 perf, note 001 SIMD
+head, dropout citation, benchmarks↔X004, links) and dead code removed
+(`secure_write_file`/`f_println_lbl`/`CFG_NKV`); the **vidya example pipeline**
+landed ([`examples/vidya-pipeline.md`](../examples/vidya-pipeline.md): preset +
+488 KB corpus → loss 1.089, bits/byte 1.760 → 5 MB checkpoint → sample); and
+the toolchain pin moved **6.1.34 → 6.1.37** (`lib/` resynced). A no-flag run,
+the checkpoint format, and training behavior are unchanged. (0.8.1 —
+performance, M9 lever 1: SIMD tied LM head, **2.7×** at V=768; the three other
+M9 levers were measured and rejected (X004). 0.8.0 — security sweep (M8): a
+survey→map hardening release;
 checkpoint **format immunity** to the model-file-deser RCE genre confirmed; a
 dropped `_file_size` arg crashing every **AGNOS `--load`** and checkpoint
 **save broken on the aarch64 lane** (qemu `fsync` → `fdatasync`) both fixed;
@@ -31,12 +37,14 @@ deterministic resume. 0.2.0: stacked layers, grad clipping, LR schedule.)
 
 ## Toolchain
 
-- **Cyrius pin**: `6.1.34` (in `cyrius.cyml [package].cyrius`) — bumped from
-  6.1.33 during M7, with the matching `lib/` snapshot. The pin and snapshot
-  must always move together: cycc 6.1.32 fixed attn11's agnos argv-capture
-  issue (r15-parked init rsp; the old `_agnos_init_rsp` global is gone) during
-  M6, and a new-compiler/old-lib mismatch reproduces `argc()==0` under the
-  kernel — the run gate caught it. (`docs/architecture/002` retired at ≥6.1.32.)
+- **Cyrius pin**: `6.1.37` (in `cyrius.cyml [package].cyrius`) — bumped from
+  6.1.34 during M10 (`cyrius update` resynced the `lib/` snapshot; 248 checks
+  green on both arches + the agnos build). The pin and snapshot must always
+  move together: cycc 6.1.32 fixed attn11's agnos argv-capture issue
+  (r15-parked init rsp; the old `_agnos_init_rsp` global is gone) during M6,
+  and a new-compiler/old-lib mismatch reproduces `argc()==0` under the kernel —
+  the run gate caught it, so every pin bump is followed by `cyrius update`.
+  (`docs/architecture/002` retired at ≥6.1.32.)
 
 ## Performance
 
@@ -217,20 +225,20 @@ _None yet._
 
 ## Next
 
-See [`roadmap.md`](roadmap.md). **M9 (v0.8.x) — performance — concluded.**
-The **SIMD tied LM head** (0.8.1, 2.7× at V=768) was the one clean win; the
-other three roadmap levers were prototyped and **rejected by measurement**
-(X004): GELU-tanh marginal (~1–2%, `exp` is cheap), matmul cache-blocking
-*slower* (matrices are cache-resident), batched prefill *no win* (~1%; the
-re-prime is irreducible work, not overhead). The residual matmul gap to SIMD
-peak is structural (the SIMD-var-reassign rule + 2-wide `f64v_fmadd`) and needs
-toolchain support, not a v0.8.x change.
+See [`roadmap.md`](roadmap.md). **M10 (v0.9.0) — freeze, docs & cleanup —
+done.** The surface is frozen ([`STABILITY.md`](../STABILITY.md)), the CLI
+hardened, the docs audited, dead code removed, the vidya example landed, and
+the pin moved to 6.1.37. (M9 concluded at 0.8.1 — the SIMD LM head was its one
+win; the other three levers were measured and rejected, X004.)
 
-**Next — M10 (v0.9.0)**: freeze the config/CLI surface, finish docs, land the
-vidya example pipeline (X001) against a tagged build — so **v1.0.0 is a clean
-cut** (final audit + tag only).
+**Next — v1.0.0, the clean cut.** Per the roadmap: a final security audit in
+`docs/audit/`, then tag **v1.0.0** (first non-prerelease). No new features ride
+it — the surface is frozen. After v1.0, the frontier track (E4–E6: alternative
+sequence mixers, AR-vs-diffusion, i64 quantization) is v2-track.
 
 Loose ends: an `attn11` row upstream in `agnos/scripts/stage-tools.sh`
-(folds into M10 cleanup). The pin and `lib/` snapshot must move together on
-every bump (now 6.1.34). (The cycc argv-capture issue is **resolved** — fixed
-upstream in 6.1.32; `docs/architecture/002` retired as a load-bearing rule.)
+(`stage_one attn11 src/main.cyr attn11`) — a cross-repo edit (agnos maintainer's
+side). The pin and `lib/` snapshot move together on every bump (now **6.1.37**,
+resynced via `cyrius update`). (The cycc argv-capture issue is **resolved** —
+fixed upstream in 6.1.32; `docs/architecture/002` retired as a load-bearing
+rule.)

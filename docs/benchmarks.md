@@ -131,12 +131,25 @@ KV bit-identity gate, and resume-determinism stay green on x86_64 and aarch64;
 a new `head SIMD == scalar dot (C=6 tail)` test exercises the `C % 4 ≠ 0` tail
 that no other config hits (mutation-verified to catch a dropped tail).
 
-## Next perf levers (roadmap M9, v0.8.x)
+## M9 perf levers — outcome (concluded at 0.8.1)
 
-- ~~Vectorize the tied LM head~~ ✅ **0.8.1** (2.7× at V=768; above).
-- A packed `tanh` approximation for GELU (its ~16% share grows now that matmul
-  and the head are faster).
-- Cache-blocking / register-tiling the matmul for larger `d_model`.
-- A batched prefill (a window forward that also fills the K/V caches, instead
-  of `keep` single-row calls) if the context-shift re-prime cost starts to
-  matter at larger T.
+One lever per release, each measured before shipping (full trail in
+[experiments.md X004](development/experiments.md)):
+
+- ~~Vectorize the tied LM head~~ ✅ **0.8.1** (2.7× at V=768; above) — the one
+  win.
+- ❌ Packed `tanh` for GELU — **rejected**: the exact one-exp form is only
+  ~15% faster per call (noisy) and GELU is ~8% of a step, so ~1–2% — below
+  step-bench noise (`f64_exp` is cheap on this toolchain).
+- ❌ Matmul cache-blocking / register-tiling — **rejected**: an m-blocked
+  `linear_fwd` is bit-identical but ~15% *slower* at the preset shape; attn11's
+  weight matrices are cache-resident, so blocking only adds accumulator traffic.
+- ❌ Batched prefill — **rejected**: a batched window forward vs `keep`
+  single-row re-prime benched ~1% (within noise); the re-prime is irreducible
+  work, not call overhead.
+
+The residual matmul gap to SIMD peak (~10–15%) is structural — the
+memory-accumulator pattern forced by the never-reassign-a-SIMD-var rule
+([architecture/001](architecture/001-tensors-and-floats.md)) and the 2-wide
+`f64v_fmadd` lowering — and would need toolchain support (true AVX/FMA
+builtins), not a v0.8.x code change.

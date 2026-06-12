@@ -231,19 +231,25 @@ batched prefill no win — X004). The residual matmul gap to SIMD peak is
 structural (the SIMD-var-reassign rule + 2-wide `f64v_fmadd` lowering) and
 needs toolchain support, not a v0.8.x code change. Next: **M10**.
 
-### M10 — Freeze, docs & cleanup (v0.9.0)
+### M10 — Freeze, docs & cleanup (v0.9.0) — ✅ shipped 2026-06-11
 
 Everything required so the v1.0.0 cut is a tag, not a scramble:
 
-- Freeze the config/CLI surface; document every flag and config knob as
-  final — no planned breaking changes past this point.
-- Docs audit: ADRs current, `sources.md` complete, guides runnable,
-  `state.md` refreshed, loose ends closed (the `attn11` row in
-  `agnos/scripts/stage-tools.sh`, stale TODOs).
-- Land the example pipeline / consumer against a tagged build: the vidya
-  corpus workflow (X001) end-to-end — train on
-  `vidya/content/**/cyrius.cyr` via `--corpus`, checkpoint, sample.
-- Cleanup: dead code, naming consistency, deferred lint items.
+- ✅ **Froze the config/CLI surface** — [`STABILITY.md`](../STABILITY.md):
+  12 additive-only CLI flags, the compile-time `CFG_*` knobs with their frozen
+  values, checkpoint v3 with permanent v1/v2 load-compat, the magnitude caps,
+  and an explicit not-in-the-contract list. The CLI gained `--help`/`--version`
+  and now rejects unknown args + missing flag values (CI-gated `--version`).
+- ✅ **Docs audit** (5-dimension multi-agent sweep): ADR 0005 perf figure,
+  note 001 SIMD-head listing, the missing dropout citation, benchmarks↔X004,
+  the 0006↔0002 bidirectional link, README/getting-started caps. Pin moved
+  6.1.34 → **6.1.37** (`lib/` resynced).
+- ✅ **Vidya example pipeline** — [`examples/vidya-pipeline.md`](../examples/vidya-pipeline.md):
+  preset + the 488 KB corpus → loss **1.089** (4000 steps), bits/byte **1.760**
+  → ~5 MB checkpoint (reloads bit-for-bit) → sample, with a BPE variant.
+- ✅ **Cleanup**: dead code removed (`secure_write_file`/`f_println_lbl`/
+  `CFG_NKV`); no TODOs/FIXME remain in `src`/`tests`/`docs`. Loose end left:
+  the cross-repo `agnos/scripts/stage-tools.sh` attn11 row (maintainer's edit).
 
 ### v1.0.0 — the clean cut
 

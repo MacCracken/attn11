@@ -199,4 +199,6 @@ jobs:
           fi
           [ "$FILE_VERSION" = "$CYML_VERSION" ] || { echo "VERSION ($FILE_VERSION) != cyrius.cyml ($CYML_RAW)"; exit 1; }
           grep -q "$FILE_VERSION" CHANGELOG.md || { echo "version $FILE_VERSION not in CHANGELOG.md"; exit 1; }
-          echo "Version consistent: $FILE_VERSION (cyml: $CYML_RAW)"
+          # the --version flag (CFG_VERSION in src/main.cyr) must report VERSION
+          grep -q "return \"$FILE_VERSION\"" src/main.cyr || { echo "src/main.cyr CFG_VERSION != VERSION ($FILE_VERSION)"; exit 1; }
+          echo "Version consistent: $FILE_VERSION (cyml: $CYML_RAW, --version OK)"

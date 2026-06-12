@@ -71,7 +71,8 @@ analytic gradient. Pass threshold is max relative error `< 1e-5` per op
 
 ## SIMD matmul
 
-The matmul hot paths (`linear_fwd`/`linear_bwd`, attention per-head loops) are
+The matmul hot paths (`linear_fwd`/`linear_bwd`, attention per-head loops, and
+the tied LM head `head_fwd_row` since 0.8.1) are
 vectorized 4-wide with the packed `f64v_fmadd(out, a, b, c, lanes)` builtin
 (`out = a*b + c`, `out` may alias `c`). Two non-obvious rules, learned the hard
 way:
@@ -84,9 +85,11 @@ way:
 
 On this toolchain `f64v_fmadd` lowers to `mulpd`+`addpd` (two roundings), so the
 **AXPY** paths (forward `y`, `dW`, attention AV/`dQ`/`dK`/`dV`) are bit-identical
-to scalar; the **dot** paths (`dx`, attention scores/`dP`) use a 4-lane tree
-reduction and so differ only at the rounding level. `test_simd_contract` pins
-the `f64v_fmadd`==scalar contract so a future fused-FMA toolchain is caught.
+to scalar; the **dot** paths (`dx`, the tied head `head_fwd_row`, attention
+scores/`dP`) use a 4-lane tree reduction and so differ only at the rounding
+level — gradients/logits stay within tolerance, and a C=6 tail test pins the
+head's `C % 4 ≠ 0` path. `test_simd_contract` pins the `f64v_fmadd`==scalar
+contract so a future fused-FMA toolchain is caught.
 
 ## Gotchas observed in the toolchain
 

@@ -39,8 +39,13 @@ row-major run of `f64` values; shapes are tracked in code. See
 cyrius deps                               # resolve stdlib deps
 cyrius build src/main.cyr build/attn11    # compile to a static ELF
 ./build/attn11                            # train + sample
+./build/attn11 --help                     # the full CLI
 cyrius test                               # grad checks + smoke tests
 ```
+
+See [`docs/guides/getting-started.md`](docs/guides/getting-started.md) for the
+full CLI (`--corpus`, `--load`/`--save` checkpoints, `--preset`, `--bpe`,
+`--eval`, …) and [`docs/STABILITY.md`](docs/STABILITY.md) for the frozen surface.
 
 ## Model size
 

@@ -41,7 +41,7 @@ difference).
 
 ## Consequences
 
-- **Positive** — 5.9× tokens/sec at the default config (971 → 5 771); the
+- **Positive** — 6.2× tokens/sec at the default config (951 → 5 868); the
   speedup grows with `T` (the re-prime amortizes better). The KV cache is now
   a first-class object, which is what makes E2 (GQA) measurable. The
   bit-identity gate doubles as a regression net for every forward kernel.

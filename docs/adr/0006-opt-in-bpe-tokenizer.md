@@ -1,6 +1,7 @@
 # 0006 — Opt-in BPE tokenizer, byte-level default
 
-**Status**: Accepted
+**Status**: Accepted — amends [0002](0002-byte-level-tokenizer-over-bpe.md)
+(adds opt-in BPE; byte-level remains the default 0002 chose)
 **Date**: 2026-06-11
 
 ## Context
