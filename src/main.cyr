@@ -99,9 +99,12 @@ fn usage(): i64 {
     return 0;
 }
 
-# Missing-value error for a value-flag given as the last arg. Returns 1 so the
-# caller can `return _need(flag)`.
-fn _need(flag): i64 { puts("attn11: "); puts(flag); puts(" needs a value\n"); usage(); return 1; }
+# Consume a value-flag's argument: returns argv(idx), or prints an error + usage
+# and exits if the flag was the last arg (no value). Keeps the parse loop short.
+fn _av(idx, flag): i64 {
+    if (idx >= argc()) { puts("attn11: "); puts(flag); puts(" needs a value\n"); usage(); sys_exit(1); }
+    return argv(idx);
+}
 
 fn main(): i64 {
     alloc_init();
@@ -121,17 +124,17 @@ fn main(): i64 {
         var a = argv(i);
         if ((streq(a, "--help") == 1) || (streq(a, "-h") == 1)) { usage(); return 0; }
         elif (streq(a, "--version") == 1) { puts("attn11 "); puts(CFG_VERSION()); _putc(10); return 0; }
-        elif (streq(a, "--corpus") == 1) { i = i + 1; if (i >= argc()) { return _need("--corpus"); } corpus_path = argv(i); }
+        elif (streq(a, "--corpus") == 1) { i = i + 1; corpus_path = _av(i, a); }
         elif (streq(a, "--stdin") == 1) { use_stdin = 1; }
-        elif (streq(a, "--load") == 1) { i = i + 1; if (i >= argc()) { return _need("--load"); } load_path = argv(i); }
-        elif (streq(a, "--save") == 1) { i = i + 1; if (i >= argc()) { return _need("--save"); } save_path = argv(i); }
-        elif (streq(a, "--steps") == 1) { i = i + 1; if (i >= argc()) { return _need("--steps"); } steps = _atoi(argv(i)); }
+        elif (streq(a, "--load") == 1) { i = i + 1; load_path = _av(i, a); }
+        elif (streq(a, "--save") == 1) { i = i + 1; save_path = _av(i, a); }
+        elif (streq(a, "--steps") == 1) { i = i + 1; steps = _atoi(_av(i, a)); }
         elif (streq(a, "--gen-only") == 1) { gen_only = 1; }
         elif (streq(a, "--preset") == 1) { cfg_c = 64; cfg_t = 64; cfg_nh = 8; cfg_nl = 4; }
-        elif (streq(a, "--heads") == 1) { i = i + 1; if (i >= argc()) { return _need("--heads"); } cfg_nh = _atoi(argv(i)); }
-        elif (streq(a, "--kv-heads") == 1) { i = i + 1; if (i >= argc()) { return _need("--kv-heads"); } cfg_nkv = _atoi(argv(i)); }
-        elif (streq(a, "--layers") == 1) { i = i + 1; if (i >= argc()) { return _need("--layers"); } cfg_nl = _atoi(argv(i)); }
-        elif (streq(a, "--bpe") == 1) { use_bpe = 1; i = i + 1; if (i >= argc()) { return _need("--bpe"); } bpe_k = _atoi(argv(i)); }
+        elif (streq(a, "--heads") == 1) { i = i + 1; cfg_nh = _atoi(_av(i, a)); }
+        elif (streq(a, "--kv-heads") == 1) { i = i + 1; cfg_nkv = _atoi(_av(i, a)); }
+        elif (streq(a, "--layers") == 1) { i = i + 1; cfg_nl = _atoi(_av(i, a)); }
+        elif (streq(a, "--bpe") == 1) { use_bpe = 1; i = i + 1; bpe_k = _atoi(_av(i, a)); }
         elif (streq(a, "--eval") == 1) { do_eval = 1; }
         else { puts("attn11: unknown argument "); puts(a); _putc(10); usage(); return 1; }
         i = i + 1;
