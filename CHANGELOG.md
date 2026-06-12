@@ -4,6 +4,42 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-06-12
+
+**The extraction — attn11 becomes the reference consumer.** The reusable numeric
+core is lifted out of attn11 into two sovereign sibling libraries, which attn11
+now consumes and dogfoods. No user-facing change: byte-identical training and
+sampling, same CLI, same checkpoint format, all **248** grad-check/property
+tests green. The frozen 1.0 surface is intact — this release is internal/
+additive, not breaking.
+
+### Changed
+- **Tensor storage / BLAS-1 / dense matmul (+ its gradient) → [rosnet](https://github.com/MacCracken/rosnet) 0.1.0.**
+  `t_alloc`/`t_zero`/`t_fill`/`t_copy`, `tget`/`tset`/`ff`,
+  `t_axpy`/`t_add_into`/`t_scale`/`t_sum`, `f64_is_finite`, `t_randn`, and
+  `linear_fwd`/`linear_bwd` now resolve from `[deps.rosnet]`. Matmul and its
+  backward are pure linear algebra (`dx = dy·Wᵀ`, `dW = xᵀ·dy`), reusable beyond
+  ML — so they belong in the tensor lib, not the model.
+- **Deterministic statistical PRNG → [tyche](https://github.com/MacCracken/tyche) 0.1.0.**
+  `rng_seed`/`rng_u64`/`rng_uniform`/`rng_normal` and the `_rng_state` stream now
+  resolve from `[deps.tyche]`. attn11 still reads/writes `_rng_state` directly for
+  crash-atomic checkpoint save/restore and bit-for-bit resume.
+- `src/tensor.cyr` is reduced to attn11-local float printing (`f_print`); the
+  model-specific differentiable layers (LayerNorm / GELU / dropout / softmax
+  cross-entropy) stay in `src/ops.cyr` — only the general matmul moved out.
+- Building from source now resolves the two sibling libs via `cyrius deps`
+  (fetched + pinned in `cyrius.lock`).
+
+### Unchanged
+- **Still no BLAS / libc / autodiff.** rosnet and tyche are pure-Cyrius `f64`
+  (IEEE-754 bit patterns in `i64`), sovereign-ecosystem libraries — not foreign
+  numeric dependencies. The "assembly-up, everything-is-i64" property holds.
+- User-facing surface, v3 checkpoint format, and runtime behavior are
+  byte-identical to 1.0.0. attn11's own finite-difference grad-checks now double
+  as rosnet's validation (linear / attention / full-model gradients); resume
+  determinism + checkpoint roundtrip validate tyche's RNG state.
+- Toolchain pinned at cyrius 6.1.37.
+
 ## [1.0.0] - 2026-06-11
 
 **The clean cut — first non-prerelease.** attn11 is a complete, from-scratch,
