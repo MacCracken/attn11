@@ -251,11 +251,17 @@ Everything required so the v1.0.0 cut is a tag, not a scramble:
   `CFG_NKV`); no TODOs/FIXME remain in `src`/`tests`/`docs`. Loose end left:
   the cross-repo `agnos/scripts/stage-tools.sh` attn11 row (maintainer's edit).
 
-### v1.0.0 — the clean cut
+### v1.0.0 — the clean cut — ✅ ready 2026-06-11
 
-When every v1.0 criterion above holds: final security audit in
-`docs/audit/`, then tag **v1.0.0** (first non-prerelease). No new features
-ride this tag — anything not finished by 0.9.0 waits for v1.x.
+Every v1.0 criterion held. The final audit — 5 adversarial dimensions
+(hostile-input, math correctness, memory safety, frozen surface, release
+integrity) — returned **go on all five, zero blockers**
+([`../audit/2026-06-11-v1.0-final-audit.md`](../audit/2026-06-11-v1.0-final-audit.md));
+release-hygiene fixes (`--save` exit code, `version-bump.sh` CFG_VERSION,
+SECURITY wording) landed. 248 tests green on x86_64 + aarch64, all gates pass,
+version surfaces consistent. Cut as **v1.0.0** — the first non-prerelease. No
+features ride this tag; the surface is frozen ([`../STABILITY.md`](../STABILITY.md)).
+Anything past here is v1.x (additive) or the v2-track frontier below.
 
 ## Beyond v1.0 — the frontier track (experiments)
 

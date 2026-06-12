@@ -5,18 +5,25 @@
 
 ## Version
 
-**0.9.0** — freeze, docs & cleanup (M10): the run-up to the v1.0.0 clean cut.
-The user-facing surface is **frozen** ([`STABILITY.md`](../STABILITY.md):
-12 additive-only CLI flags, the compile-time `CFG_*` knobs, checkpoint v3 with
-permanent v1/v2 load-compat); the CLI is hardened (`--help`/`--version`,
-rejects unknown args + missing flag values — CI-gated `--version`); the docs
-were audited by a 5-dimension multi-agent sweep (ADR 0005 perf, note 001 SIMD
-head, dropout citation, benchmarks↔X004, links) and dead code removed
-(`secure_write_file`/`f_println_lbl`/`CFG_NKV`); the **vidya example pipeline**
+**1.0.0** — the clean cut, **first non-prerelease**. A complete, from-scratch,
+dependency-free GPT-style transformer in Cyrius (forward + hand-derived,
+grad-checked backprop + Adam + the full training loop on raw f64, no
+BLAS/libc/autodiff). The surface is frozen ([`STABILITY.md`](../STABILITY.md));
+past 1.0 it is additive-only. No features over 0.9.0 — the **final audit** (5
+adversarial dimensions: hostile-input, math, memory, frozen-surface, release —
+**go on all five, 0 blockers**;
+[`../audit/2026-06-11-v1.0-final-audit.md`](../audit/2026-06-11-v1.0-final-audit.md))
+plus release-hygiene fixes (`--save` exits non-zero on failure; `version-bump.sh`
+updates `CFG_VERSION`; SECURITY wording). Toolchain pinned at cyrius 6.1.37.
+(0.9.0 — freeze, docs & cleanup (M10): the user-facing surface declared
+**frozen** ([`STABILITY.md`](../STABILITY.md)); CLI hardened (`--help`/
+`--version`, rejects unknown args + missing flag values); 5-dimension docs
+audit; dead code removed (`secure_write_file`/`f_println_lbl`/`CFG_NKV`); the
+**vidya example pipeline**
 landed ([`examples/vidya-pipeline.md`](../examples/vidya-pipeline.md): preset +
 488 KB corpus → loss 1.089, bits/byte 1.760 → 5 MB checkpoint → sample); and
 the toolchain pin moved **6.1.34 → 6.1.37** (`lib/` resynced). A no-flag run,
-the checkpoint format, and training behavior are unchanged. (0.8.1 —
+the checkpoint format, and training behavior are unchanged. 0.8.1 —
 performance, M9 lever 1: SIMD tied LM head, **2.7×** at V=768; the three other
 M9 levers were measured and rejected (X004). 0.8.0 — security sweep (M8): a
 survey→map hardening release;

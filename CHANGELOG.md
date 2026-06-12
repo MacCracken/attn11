@@ -4,6 +4,47 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-06-11
+
+**The clean cut — first non-prerelease.** attn11 is a complete, from-scratch,
+dependency-free GPT-style transformer in Cyrius: forward pass, hand-derived
+backprop (every op finite-difference grad-checked), Adam, and the full training
+loop on raw `f64` arrays — no BLAS, no libc, no autodiff. The user-facing
+surface is frozen ([`docs/STABILITY.md`](docs/STABILITY.md)); past 1.0 it is
+additive-only. This tag adds **no features** over 0.9.0 — it is the final audit
+plus release-hygiene fixes.
+
+### What attn11 is at 1.0
+- Byte-level (default) + opt-in BPE tokenizer; token + learned positional
+  embeddings; `n_layers` stacked pre-norm blocks
+  (LayerNorm → causal MHA/GQA → residual → LayerNorm → GELU MLP → residual);
+  weight-tied LM head; softmax cross-entropy.
+- **Hand-written backprop through every op** — 248 grad-check/property tests,
+  green on x86_64 **and** aarch64 (qemu). Adam + global-norm clipping +
+  warmup→cosine LR; NaN/inf training guard.
+- 4-wide SIMD matmul / attention / LM head; **KV-cached generation**
+  (bit-identical to the uncached reference) + GQA/MQA; the `--preset` scale
+  config.
+- Validated **v3 checkpoints** (v1/v2 load forever), crash-atomic save,
+  deterministic bit-for-bit resume; `O_NOFOLLOW`/size-capped corpus + checkpoint
+  loaders (structurally immune to the model-file-deserialization-RCE genre).
+- Runs on Linux x86_64, **aarch64** (cross + qemu), and the **AGNOS kernel**
+  (ring-3). Toolchain pinned at cyrius 6.1.37.
+
+### Audit
+- Final v1.0 audit — 5 adversarial dimensions (hostile-input, math correctness,
+  memory safety, frozen surface, release integrity) — returned **go on all
+  five, zero blockers** ([`docs/audit/2026-06-11-v1.0-final-audit.md`](docs/audit/2026-06-11-v1.0-final-audit.md)).
+  Six prior audits (M2/M3/M5/M6/M7/M8 + the M10 freeze sweep) precede it.
+
+### Fixed (release hygiene)
+- `--save` failure now **exits non-zero** (previously printed an error but
+  returned 0 — a script couldn't detect a failed checkpoint write).
+- `scripts/version-bump.sh` now rewrites `src/main.cyr` `CFG_VERSION` (the
+  `--version` flag) so a bump can't leave it stale — CI hard-gates the match.
+- SECURITY.md threat model: present-tense the `--corpus`/`--stdin` wording
+  (corpus loading shipped in 0.3.0, not "a future release").
+
 ## [0.9.0] - 2026-06-11
 
 **Freeze, docs & cleanup (roadmap M10).** The run-up to the v1.0.0 clean cut:

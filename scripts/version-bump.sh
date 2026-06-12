@@ -41,6 +41,13 @@ esac
 # 1. VERSION file (source of truth; cyrius.cyml derives via ${file:VERSION})
 echo "$NEW" > VERSION
 
+# 1b. src/main.cyr CFG_VERSION — the `--version` flag must report VERSION, and
+#     the CI docs job hard-gates the match (greps `return "$VERSION"`). Rewrite
+#     it here so a bump can never leave --version stale.
+if [ -f src/main.cyr ]; then
+    sed -i "s|\(fn CFG_VERSION(): i64 { return \"\)[0-9.]*\(\"; }\)|\1$NEW\2|" src/main.cyr
+fi
+
 # 2. CHANGELOG.md — add a dated stub if no entry for $NEW yet. Inserted right
 #    after the "## [Unreleased]" line. The stub is intentionally empty so the
 #    author writes the actual Added/Changed/Fixed sections — this script only
@@ -67,6 +74,7 @@ echo "$OLD -> $NEW"
 echo ""
 echo "Updated:"
 echo "  VERSION"
+echo "  src/main.cyr (CFG_VERSION / --version)"
 if grep -q "## \[$NEW\]" CHANGELOG.md 2>/dev/null; then
     echo "  CHANGELOG.md ([$NEW] stub)"
 fi

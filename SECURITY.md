@@ -27,8 +27,9 @@ attn11 *does not* defend against:
   (trivially owns the whole address space),
 - remote / network attacks (attn11 has no networking),
 - side channels (timing, cache),
-- adversarial training data once a future release adds file/stdin corpus
-  loading — see below.
+- adversarial *content* in `--corpus`/`--stdin` training data: the bytes are
+  validated and safely tokenized (see below), but their *meaning* is untrusted —
+  attn11 learns whatever you feed it.
 
 ## Attack surfaces & mitigations
 
