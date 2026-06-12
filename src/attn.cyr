@@ -43,10 +43,14 @@ fn _at_dxk(ar, T, C, nh, Ckv): i64 { return ar + (5 * T * C + 4 * T * Ckv + nh *
 fn _at_dxv(ar, T, C, nh, Ckv): i64 { return ar + (6 * T * C + 4 * T * Ckv + nh * T * T) * 8; }
 fn _at_dprow(ar, T, C, nh, Ckv): i64 { return ar + (7 * T * C + 4 * T * Ckv + nh * T * T) * 8; }
 
-# ---- forward ----------------------------------------------------------------
-# x(T,C) -> out(T,C). Fills caches in `ar` for the backward pass.
-# Bias pointers bq/bk/bv/bo may be 0 (no bias). bk/bv have Ckv entries.
-fn attn_fwd(Wq, bq, Wk, bk, Wv, bv, Wo, bo, x, out, ar, T, C, nh, nkv): i64 {
+# ---- shared attention core (post-projection) --------------------------------
+# Given Qc(T,C), Kc(T,Ckv), Vc(T,Ckv) it fills Pc(nh,T,T) and concat(T,C): causal
+# scaled-dot-product, each query head h attending its shared K/V head
+# kvb = (h/gsz)*hd. ONE source of truth for the per-head softmax/PV arithmetic —
+# attn_fwd (MHA/GQA) calls it after the Q/K/V projections, and MLA calls it with
+# nkv = nh / Ckv = C over up-projected full K/V, so the kernel never diverges
+# (docs/architecture/003).
+fn attn_core_fwd(Qc, Kc, Vc, Pc, concat, T, C, nh, nkv): i64 {
     var hd = C / nh;
     var Ckv = nkv * hd;
     var gsz = nh / nkv;             # query heads per K/V head (GQA group size)
@@ -54,15 +58,6 @@ fn attn_fwd(Wq, bq, Wk, bk, Wv, bv, Wo, bo, x, out, ar, T, C, nh, nkv): i64 {
     var scale = f64_div(f64_from(1), f64_sqrt(f64_from(hd)));
     var acc[32];                    # 4-lane dot accumulator
     var pv[32];                     # 4-lane broadcast buffer
-    var Qc = _at_Qc(ar);
-    var Kc = _at_Kc(ar, T, C);
-    var Vc = _at_Vc(ar, T, C, Ckv);
-    var Pc = _at_Pc(ar, T, C, Ckv);
-    var concat = _at_concat(ar, T, C, nh, Ckv);
-
-    linear_fwd(x, Wq, bq, Qc, T, C, C);
-    linear_fwd(x, Wk, bk, Kc, T, C, Ckv);
-    linear_fwd(x, Wv, bv, Vc, T, C, Ckv);
 
     # zero the full probability buffer (upper triangle stays 0)
     t_zero(Pc, nh * T * T);
@@ -141,6 +136,23 @@ fn attn_fwd(Wq, bq, Wk, bk, Wv, bv, Wo, bo, x, out, ar, T, C, nh, nkv): i64 {
         }
         h = h + 1;
     }
+    return 0;
+}
+
+# ---- forward (MHA / GQA) ----------------------------------------------------
+# x(T,C) -> out(T,C). Projects Q/K/V, runs the shared core, applies Wo. Fills
+# caches in `ar` for the backward pass. Bias pointers bq/bk/bv/bo may be 0.
+fn attn_fwd(Wq, bq, Wk, bk, Wv, bv, Wo, bo, x, out, ar, T, C, nh, nkv): i64 {
+    var Ckv = nkv * (C / nh);
+    var Qc = _at_Qc(ar);
+    var Kc = _at_Kc(ar, T, C);
+    var Vc = _at_Vc(ar, T, C, Ckv);
+    var Pc = _at_Pc(ar, T, C, Ckv);
+    var concat = _at_concat(ar, T, C, nh, Ckv);
+    linear_fwd(x, Wq, bq, Qc, T, C, C);
+    linear_fwd(x, Wk, bk, Kc, T, C, Ckv);
+    linear_fwd(x, Wv, bv, Vc, T, C, Ckv);
+    attn_core_fwd(Qc, Kc, Vc, Pc, concat, T, C, nh, nkv);
     linear_fwd(concat, Wo, bo, out, T, C, C);
     return 0;
 }
@@ -241,13 +253,13 @@ fn attn_fwd_row(Wq, bq, Wk, bk, Wv, bv, Wo, bo, x_row, out_row,
     return 0;
 }
 
-# ---- backward ---------------------------------------------------------------
-# dout(T,C) -> dx(T,C); accumulate dWq..dWo and (if non-0) dbq..dbo.
-# Uses caches from attn_fwd. With nkv < nh the gsz query heads of a group all
-# accumulate into the same dK/dV columns — the head loop is sequential, so the
-# accumulation order is deterministic.
-fn attn_bwd(Wq, Wk, Wv, Wo, x, dout, dx,
-            dWq, dbq, dWk, dbk, dWv, dbv, dWo, dbo, ar, T, C, nh, nkv): i64 {
+# ---- shared attention core backward (post-projection) -----------------------
+# dconcat(T,C) + the forward caches -> dQ(T,C), dK(T,Ckv), dV(T,Ckv) (incl. the
+# softmax backward). The mirror of attn_core_fwd; with nkv < nh the gsz query
+# heads of a group all accumulate into the same dK/dV columns — the head loop is
+# sequential, so the accumulation order is deterministic. Shared by attn_bwd
+# (MHA/GQA) and the MLA backward.
+fn attn_core_bwd(Qc, Kc, Vc, Pc, dconcat, dQ, dK, dV, dprow, T, C, nh, nkv): i64 {
     var hd = C / nh;
     var Ckv = nkv * hd;
     var gsz = nh / nkv;
@@ -255,22 +267,6 @@ fn attn_bwd(Wq, Wk, Wv, Wo, x, dout, dx,
     var hd4 = hd - (hd % 4);
     var bb[32];                     # 4-lane broadcast buffer
     var dacc[32];                   # 4-lane dot accumulator
-    var Qc = _at_Qc(ar);
-    var Kc = _at_Kc(ar, T, C);
-    var Vc = _at_Vc(ar, T, C, Ckv);
-    var Pc = _at_Pc(ar, T, C, Ckv);
-    var concat = _at_concat(ar, T, C, nh, Ckv);
-    var dconcat = _at_dconcat(ar, T, C, nh, Ckv);
-    var dQ = _at_dQ(ar, T, C, nh, Ckv);
-    var dK = _at_dK(ar, T, C, nh, Ckv);
-    var dV = _at_dV(ar, T, C, nh, Ckv);
-    var dxq = _at_dxq(ar, T, C, nh, Ckv);
-    var dxk = _at_dxk(ar, T, C, nh, Ckv);
-    var dxv = _at_dxv(ar, T, C, nh, Ckv);
-    var dprow = _at_dprow(ar, T, C, nh, Ckv);
-
-    # 1. out = concat @ Wo
-    linear_bwd(concat, Wo, dout, dconcat, dWo, dbo, T, C, C);
 
     t_zero(dQ, T * C);
     t_zero(dK, T * Ckv);
@@ -350,6 +346,32 @@ fn attn_bwd(Wq, Wk, Wv, Wo, x, dout, dx,
         h = h + 1;
     }
 
+    return 0;
+}
+
+# ---- backward (MHA / GQA) ---------------------------------------------------
+# dout(T,C) -> dx(T,C); accumulate dWq..dWo and (if non-0) dbq..dbo. Back through
+# Wo, the shared core, then the Q/K/V projections. Uses caches from attn_fwd.
+fn attn_bwd(Wq, Wk, Wv, Wo, x, dout, dx,
+            dWq, dbq, dWk, dbk, dWv, dbv, dWo, dbo, ar, T, C, nh, nkv): i64 {
+    var Ckv = nkv * (C / nh);
+    var Qc = _at_Qc(ar);
+    var Kc = _at_Kc(ar, T, C);
+    var Vc = _at_Vc(ar, T, C, Ckv);
+    var Pc = _at_Pc(ar, T, C, Ckv);
+    var concat = _at_concat(ar, T, C, nh, Ckv);
+    var dconcat = _at_dconcat(ar, T, C, nh, Ckv);
+    var dQ = _at_dQ(ar, T, C, nh, Ckv);
+    var dK = _at_dK(ar, T, C, nh, Ckv);
+    var dV = _at_dV(ar, T, C, nh, Ckv);
+    var dxq = _at_dxq(ar, T, C, nh, Ckv);
+    var dxk = _at_dxk(ar, T, C, nh, Ckv);
+    var dxv = _at_dxv(ar, T, C, nh, Ckv);
+    var dprow = _at_dprow(ar, T, C, nh, Ckv);
+    # 1. out = concat @ Wo
+    linear_bwd(concat, Wo, dout, dconcat, dWo, dbo, T, C, C);
+    # 2-4. attention core: dconcat -> dQ, dK, dV (incl. softmax backward)
+    attn_core_bwd(Qc, Kc, Vc, Pc, dconcat, dQ, dK, dV, dprow, T, C, nh, nkv);
     # 5. back through Q=x@Wq, K=x@Wk, V=x@Wv; accumulate dx
     linear_bwd(x, Wq, dQ, dxq, dWq, dbq, T, C, C);
     linear_bwd(x, Wk, dK, dxk, dWk, dbk, T, C, Ckv);
