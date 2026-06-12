@@ -13,7 +13,7 @@
 
 ## Where we are
 
-Current: **v1.2.3**. The v1.0 surface is frozen and additive-only
+Current: **v1.2.4**. The v1.0 surface is frozen and additive-only
 ([`STABILITY.md`](../STABILITY.md)); the reusable numeric core lives in
 **[rosnet](https://github.com/MacCracken/rosnet)** + **[tyche](https://github.com/MacCracken/tyche)**
 (v1.1.0); the **1.x architecture arc** is underway — **M12 is complete**: MLA core

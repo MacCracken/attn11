@@ -5,26 +5,28 @@
 
 ## Version
 
-**1.2.3** — *Decoupled RoPE* (M12 increment 5, **closes M12**; ADR 0007).
-`--pos-kind rope-decoupled --rope-dim d_rope` adds the faithful DeepSeek-V2
-decoupled RoPE for MLA (arXiv:2405.04434): position rides a **separate `d_rope`
-channel** that bypasses the latent compression. The score splits into a CONTENT
-term (compressed per-head K, dim `hd`) + a POSITION term (rope channel, dim
-`d_rope`), summed and scaled by `1/sqrt(hd + d_rope)`. Two bias-free projections
-per block — `W_QR` (per-head rope query `C→nh·d_rope`) + `W_KR` (the **shared**
-rope key `C→d_rope`, from `x` directly) — both RoPE-rotated by position (reusing
-1.2.2's `rope_apply_*`). The novel hand-derived piece is the decoupled softmax/PV
-backward (shared `K^R` → `dKr` accumulates across heads), grad-checked **bit-tight**
-in isolation (`test_attention_mla_dec`) + full-model + cached-vs-uncached
-**bit-identity** across context-shifts (`test_kv_dec`). The decode cache holds the
-latent `c` **and** the shared `K^R`: `kv_cache_bytes = NL·T·(d_c + d_rope)·8` —
-**7680 B** at `d_c=16, d_rope=4` (latent 6144 + rope 1536), ~3.2× under MHA,
-carrying relative position faithfully. v4 value-fills `pos_kind=2` + `rope_dim`
-(round-trips + hostile rejections, `test_ckpt_dec`); no format bump. **M12's
-`--pos-kind` switch is now complete** (learned / rope / rope-decoupled). **572**
-grad-check/property tests green on x86_64 AND aarch64/qemu; fuzz + lint green.
-Toolchain pinned at cyrius 6.1.37.
-(1.2.2 — *Coupled RoPE* (M12 increment 4): `--pos-kind rope` rotates Q/K by
+**1.2.4** — *Toolchain realignment + docs* (maintenance; no feature change). The
+cyrius pin moved **6.1.37 → 6.2.1** to match the installed compiler (`cyrius
+update` resynced the `./lib/` snapshot — pin and snapshot move together); re-
+verified green on the realigned toolchain (**572** checks x86_64 AND aarch64/qemu,
+the `--agnos` static-ELF build, fuzz, lint — `make release` exit 0, no
+shadow/drift warnings). Docs tidied for handoff now that **M12 is complete**: the
+roadmap is forward-facing (M13 leads), `state.md` carries a handoff section, and
+flag/version/pin/count references are swept current. `src/*.cyr` behavior is
+identical to 1.2.3; only the pin, `cyrius.lock`, `VERSION`/`CFG_VERSION`, and docs
+move.
+(1.2.3 — *Decoupled RoPE* (M12 increment 5, **closes M12**; ADR 0007):
+`--pos-kind rope-decoupled --rope-dim d_rope` — the faithful DeepSeek-V2 form for
+MLA (arXiv:2405.04434). Position rides a **separate `d_rope` channel** that
+bypasses the latent; the score = CONTENT (compressed per-head K) + POSITION (rope
+channel), scaled `1/sqrt(hd+d_rope)`. Two bias-free projections — `W_QR`
+(per-head) + the **shared** `W_KR` — both RoPE-rotated. The decoupled softmax/PV
+backward (shared `K^R` → `dKr` accumulates across heads) grad-checked bit-tight in
+isolation + full-model + cached-vs-uncached bit-identity (`test_kv_dec`). Decode
+cache = latent + shared `K^R` (`NL·T·(d_c+d_rope)·8` = **7680 B** at d_c=16/
+d_rope=4, ~3.2× under MHA). v4 value-fills `pos_kind=2`+`rope_dim`; no format bump.
+M12's `--pos-kind` switch complete (learned / rope / rope-decoupled).
+1.2.2 — *Coupled RoPE* (M12 increment 4): `--pos-kind rope` rotates Q/K by
 absolute position on dense MHA/GQA (`rope_apply_fwd`/`rope_apply_bwd`,
 interleaved pairs, RoFormer arXiv:2104.09864) so the score depends only on `m-n`.
 Parameter-free (grad-checked bit-exact + relative-position pin + cached bit-
@@ -88,13 +90,14 @@ deterministic resume. 0.2.0: stacked layers, grad clipping, LR schedule.)
 
 ## Toolchain
 
-- **Cyrius pin**: `6.1.37` (in `cyrius.cyml [package].cyrius`) — bumped from
-  6.1.34 during M10 (`cyrius update` resynced the `lib/` snapshot; 248 checks
-  green on both arches + the agnos build). The pin and snapshot must always
-  move together: cycc 6.1.32 fixed attn11's agnos argv-capture issue
-  (r15-parked init rsp; the old `_agnos_init_rsp` global is gone) during M6,
-  and a new-compiler/old-lib mismatch reproduces `argc()==0` under the kernel —
-  the run gate caught it, so every pin bump is followed by `cyrius update`.
+- **Cyrius pin**: `6.2.1` (in `cyrius.cyml [package].cyrius`) — bumped from
+  6.1.37 in 1.2.4 to realign with the installed cycc (`cyrius update` resynced
+  the `lib/` snapshot; 572 checks green on both arches + the agnos build, no
+  shadow/drift warnings). The pin and snapshot must always move together: cycc
+  6.1.32 fixed attn11's agnos argv-capture issue (r15-parked init rsp; the old
+  `_agnos_init_rsp` global is gone) during M6, and a new-compiler/old-lib
+  mismatch reproduces `argc()==0` under the kernel — the run gate caught it, so
+  **every pin bump is followed by `cyrius update`** and a both-arches retest.
   (`docs/architecture/002` retired at ≥6.1.32.)
 
 ## Performance
@@ -356,23 +359,53 @@ _None yet._
 
 ## Next
 
-See [`roadmap.md`](roadmap.md). **v1.0.0 (clean cut), v1.1.0 (extraction),
-v1.2.0 (MLA core), v1.2.1 (MLA latent KV-cache decode), v1.2.2 (coupled RoPE), and
-v1.2.3 (decoupled RoPE) shipped — M12 is complete.** The surface is frozen
+See [`roadmap.md`](roadmap.md). **Shipped: v1.0.0 (clean cut) → v1.1.0
+(extraction) → v1.2.0–1.2.4 (M12: MLA core, latent KV-cache decode, coupled +
+decoupled RoPE; then 1.2.4 toolchain realign + docs).** The surface is frozen
 ([`STABILITY.md`](../STABILITY.md)) and additive-only past 1.0; the numeric core
 lives in **rosnet** + **tyche**. The 1.x architecture arc now has the full
 attention/position axes: `--attn-kind {mha, mla}` × `--pos-kind {learned, rope,
-rope-decoupled}` (checkpoint v4).
+rope-decoupled}` (checkpoint v4). **M12 is complete.**
 
-**Next on the 1.x architecture arc** (roadmap):
-- **M13 (v1.3.0) — Mixture of Experts** (E8; sparse FFN with the
-  `--experts {8,16,32,64,128,256}` density sweep, checkpoint v5), then E4–E6
-  (mixers / diffusion / ternary) as M14–M16, and **M17** reinforcement learning
-  (E9).
+**Next on the arc — M13 (v1.3.0), Mixture of Experts** (E8; full spec in
+[`roadmap.md`](roadmap.md#m13--mixture-of-experts-v130--e8)): the dense GELU MLP
+becomes N experts + a top-K router, `--experts {1,8,16,32,64,128,256}` /
+`--expert-topk K`, checkpoint **v5** (prior versions load). The earned milestone
+is the **router backward** (discrete top-K → straight-through soft gate +
+Switch-style load-balance aux loss, both grad-checked) with a frozen deterministic
+tie-break, and the density-sweep experiment (bits/byte, active-vs-total params,
+expert utilization). Then E4–E6 (mixers / diffusion / ternary) as M14–M16 and
+**M17** reinforcement learning (E9).
 
-Loose ends: an `attn11` row upstream in `agnos/scripts/stage-tools.sh`
-(`stage_one attn11 src/main.cyr attn11`) — a cross-repo edit (agnos maintainer's
-side). The pin and `lib/` snapshot move together on every bump (now **6.1.37**,
-resynced via `cyrius update`); rosnet/tyche resolve via `cyrius deps` (pinned in
-`cyrius.lock`). (The cycc argv-capture issue is **resolved** — fixed upstream in
-6.1.32; `docs/architecture/002` retired as a load-bearing rule.)
+### Handoff — how to pick this up
+
+- **Build/test/release**: `make check` (lint + x86 grad-checks) for the fast loop;
+  `make release` (lint + x86 + aarch64/qemu + DCE build + fuzz) is the full gate
+  before tagging — both must exit 0. Quick refs at the top of
+  [`CLAUDE.md`](../../CLAUDE.md) (Quick Start). `cyrius deps` resolves rosnet/tyche
+  (pinned in `cyrius.lock`); a no-flag `./build/attn11` trains + samples.
+- **The discipline that matters**: every hand-derived backward lands behind a
+  finite-difference grad-check (`cyrius test`); kernel changes land in BOTH the
+  batch and the cached single-row path or neither (the bit-identity contract,
+  [`../architecture/003`](../architecture/003-cached-inference-bit-contract.md));
+  the pin and `lib/` snapshot move together (`cyrius update` after any bump, then
+  retest both arches); additive-only past 1.0 (new flags + a new checkpoint
+  version with permanent back-compat). New backward op → grad-check it first,
+  then plumb (the M12.5 increments are the worked example: per-op grad-check in
+  isolation, then model wiring, then the cached path + bit-identity).
+- **Where things live**: live state here; forward plan in
+  [`roadmap.md`](roadmap.md); shipped narrative in [`../../CHANGELOG.md`](../../CHANGELOG.md);
+  experiment evidence in [`experiments.md`](experiments.md); decisions in
+  [`../adr/`](../adr/); non-obvious invariants in [`../architecture/`](../architecture/);
+  the frozen surface in [`../STABILITY.md`](../STABILITY.md).
+
+**Loose ends / known items**: (1) an `attn11` row upstream in
+`agnos/scripts/stage-tools.sh` (`stage_one attn11 src/main.cyr attn11`) — a
+cross-repo edit on the agnos maintainer's side, not actionable here. (2) The
+**MLA absorption** compute optimization (fold `W_UK` into `W_Q` to attend latents
+directly, avoiding the per-step K/V re-materialization in 1.2.1/1.2.3) is deferred
+— it reorders accumulation, so it would ride its own bit-identity story. (3) A
+perplexity bake-off (decoupled vs coupled vs learned MLA, and MoE density) on the
+vidya corpus is the natural next X-series entry once M13 lands. The pin is now
+**6.2.1** (realigned 1.2.4, `lib/` resynced); the cycc argv-capture issue is
+resolved upstream (6.1.32; `docs/architecture/002` retired).

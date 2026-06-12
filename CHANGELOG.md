@@ -4,6 +4,33 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.2.4] - 2026-06-12
+
+**Toolchain realignment + docs.** A maintenance release — no feature change, the
+no-flag run and every checkpoint byte-identical. The cyrius pin is realigned to
+the installed compiler, and the docs are tidied for handoff now that M12 is
+complete.
+
+### Changed
+- **Toolchain pin `6.1.37 → 6.2.1`** (`cyrius.cyml [package].cyrius`), with
+  `cyrius update` resyncing the `./lib/` snapshot so the pin and snapshot move
+  together (the standing rule). Re-verified green on the realigned toolchain:
+  **572** checks on x86_64 AND aarch64/qemu, the `--agnos` static-ELF build, fuzz,
+  and lint — `make release` exit 0, no shadow/drift warnings.
+
+### Docs
+- Roadmap trimmed to **forward-facing only** (M12 complete and removed from the
+  milestone list; **M13 — Mixture of Experts** now leads). `state.md` carries a
+  **handoff** section (build/test/release how-to, the invariants that matter, where
+  things live) and a tightened loose-ends list. Flag/version/pin/count references
+  swept current across `STABILITY.md`, `getting-started.md`, the ADR/architecture
+  indices, and `sources.md`.
+
+### Notes
+- No source-behavior change: `src/*.cyr` is identical in effect to 1.2.3 (only the
+  pin, `cyrius.lock`, `VERSION`/`CFG_VERSION`, and docs move). Next on the arc is
+  **M13 — Mixture of Experts** (`--experts`, checkpoint v5).
+
 ## [1.2.3] - 2026-06-12
 
 **Decoupled RoPE (M12 increment 5) — closes M12.** `--pos-kind rope-decoupled`

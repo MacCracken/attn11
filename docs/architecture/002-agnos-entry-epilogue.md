@@ -4,7 +4,7 @@
 workaround at 6.1.31) · **Affects**: every entry file (`src/main.cyr`,
 `src/test.cyr`, `tests/attn11.{tcyr,bcyr,fcyr}`, `docs/examples/minimal_train.cyr`)
 
-> **Resolution (2026-06-11, pin 6.1.31 → 6.1.33; pin is now 6.1.37, see
+> **Resolution (2026-06-11, pin 6.1.31 → 6.1.33; pin is now 6.2.1, see
 > state.md)**: cyrius 6.1.32 fixed the
 > upstream gap attn11 filed — the agnos init rsp is now parked in
 > callee-saved **r15 at the entry landing** (the first runtime instruction,

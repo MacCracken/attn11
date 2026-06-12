@@ -58,10 +58,11 @@ Mixture-of-Experts Language Model." arXiv:[2405.04434](https://arxiv.org/abs/240
 Used in: `src/attn.cyr` (`attn_mla_fwd`/`attn_mla_bwd`), `src/model.cyr`
 (`--attn-kind mla`) — K/V are factored through a shared low-rank latent
 (down-projection `C → d_c`, up-projections `d_c → C`) instead of projected from
-`x` directly, with full heads (`nkv = nh`). attn11 keeps learned-absolute
-positions for the reference MLA (the decoupled-RoPE variant is reserved; see
-ADR 0007). The latent down/up projections reuse the grad-checked `linear`
-backward, so the MLA gradient adds no novel hand-derived math.
+`x` directly, with full heads (`nkv = nh`). The reference MLA defaults to
+learned-absolute positions; coupled (1.2.2) and the faithful decoupled (1.2.3)
+RoPE variants ship too (`--pos-kind`, see the RoPE entry above and ADR 0007). The
+latent down/up projections reuse the grad-checked `linear` backward, so the MLA
+gradient adds no novel hand-derived math.
 
 ### Rotary positional embeddings (RoPE — coupled, relative positions)
 **Su, J., Lu, Y., Pan, S., Murtadha, A., Wen, B., Liu, Y. (2021).** "RoFormer:
