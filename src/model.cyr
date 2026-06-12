@@ -265,7 +265,8 @@ fn model_init(V, C, T, nh, nkv, NL, attn_bias, dropout, seed): i64 {
 }
 fn model_init_arch(V, C, T, nh, nkv, NL, attn_bias, dropout, seed, attn_kind, d_c, pos_kind): i64 {
     if (model_config_ok_arch(V, C, T, nh, nkv, NL, attn_kind, d_c, pos_kind) == 0) {
-        puts("attn11: model_init: invalid config (need nh | C, nkv | nh, nkv <= nh; mla: nkv == nh, 1 <= d_c <= C; rope: mha + even hd)\n");
+        puts("attn11: model_init: invalid config (need nh | C, nkv | nh, nkv <= nh; ");
+        puts("mla: nkv == nh, 1 <= d_c <= C; rope: mha + even hd)\n");
         sys_exit(1);
     }
     g_V = V; g_C = C; g_T = T; g_nh = nh; g_nkv = nkv; g_NL = NL; g_F = 4 * C;
