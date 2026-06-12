@@ -350,11 +350,20 @@ gate; ONE change at a time):
    gives 6144 bytes — **4× under MHA** (24576), MQA's footprint at full head
    expressiveness. The absorption compute optimization (attend latents directly)
    is future work; the reference re-up-projects each step.
-4. **Coupled RoPE** (optional) — `--pos-kind rope` on dense MHA; RoPE has no
-   learned params, so the grad-check is just the rotation's backward. Valuable on
-   its own; could split into its own milestone.
-5. **Decoupled RoPE** (optional) — `--pos-kind rope-decoupled` for MLA, the
-   faithful cache-efficient form, built on (4).
+4. ✅ **Coupled RoPE** (**v1.2.2**) — `--pos-kind {learned, rope}` on dense
+   MHA/GQA (`rope_apply_fwd`/`rope_apply_bwd`): the interleaved-pair rotation of
+   Q/K by absolute position, so the score depends on `m-n` only. Parameter-free
+   — the rotation's transpose is the only new gradient, grad-checked bit-exact in
+   isolation + the relative-position invariance pin (`test_rope_op`),
+   attention-with-RoPE incl. the now-real K-bias gradient (`test_attention_rope`),
+   full-model wiring (`test_model_rope`), and the cached-vs-uncached bit-identity
+   gate across context-shifts (`test_kv_rope`). Portable trig (Maclaurin +
+   complex binary-exponentiation; `f64_sin`/`f64_cos` are x86-only —
+   `docs/architecture/005`). v4 `pos_kind=1` round-trips; `np`/layout unchanged
+   (RoPE has no params). **470 checks** green on x86_64 AND aarch64/qemu.
+5. **Decoupled RoPE** (**v1.2.3**, the last M12 rung) — `--pos-kind rope-decoupled`
+   for MLA, the faithful cache-efficient DeepSeek form, built on (4): position on
+   a separate `d_rope` channel that bypasses the latent compression.
 
 - **Gates**: latent down/up-projection backward grad-checked; RoPE rotation
   backward grad-checked; cached vs uncached generation **bit-identical** across

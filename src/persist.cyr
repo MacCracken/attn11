@@ -198,8 +198,17 @@ fn ckpt_load_buf(buf, len): i64 {
         d_rope = load64(buf + 19 * 8);
     }
     if ((attn_kind != 0) && (attn_kind != 1)) { return 0 - 40; }   # 0 = mha, 1 = mla
-    if (pos_kind != 0) { return 0 - 41; }    # 0 = learned; 1 = rope, 2 = rope-decoupled reserved
+    if ((pos_kind != 0) && (pos_kind != 1)) { return 0 - 41; }   # 0 = learned, 1 = rope; 2 reserved
     if (d_rope != 0) { return 0 - 43; }      # rope_dim reserved (0 until decoupled RoPE)
+    # Coupled RoPE (pos_kind == 1, M12 increment 4) ships on dense MHA/GQA with an
+    # even head dim — the same gate model_config_ok_arch enforces, applied here
+    # before model_init_arch so a hostile descriptor returns -41 rather than
+    # tripping the constructor's sys_exit. MLA + RoPE is the decoupled form (a
+    # later rung), rejected for now.
+    if (pos_kind == 1) {
+        if (attn_kind != 0) { return 0 - 41; }
+        if (((C / nh) % 2) != 0) { return 0 - 41; }
+    }
     if (attn_kind == 1) {
         # MLA: full heads (compression is the latent), low-rank 1 <= d_c <= C
         if (nkv != nh) { return 0 - 40; }
@@ -272,7 +281,7 @@ fn ckpt_load_buf(buf, len): i64 {
     }
     # validated — build the model and restore state
     var was_bpe = g_bpe_on;
-    model_init_arch(V, C, T, nh, nkv, NL, bias, drop, 1, attn_kind, d_c);
+    model_init_arch(V, C, T, nh, nkv, NL, bias, drop, 1, attn_kind, d_c, pos_kind);
     g_vocab = t_alloc(256);
     g_char2id = t_alloc(256);
     i = 0;

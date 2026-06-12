@@ -186,11 +186,11 @@ var G_n = 0;      # tokens currently in the window (== valid cache positions)
 # nh, and hd truncates when nh doesn't divide C. The checkpoint loader rejects
 # these (-16); the in-process constructor must too.
 fn model_config_ok(V, C, T, nh, nkv, NL): i64 {
-    return model_config_ok_arch(V, C, T, nh, nkv, NL, 0, 0);   # mha, no latent
+    return model_config_ok_arch(V, C, T, nh, nkv, NL, 0, 0, 0);   # mha, no latent, learned-abs
 }
-# attn_kind/d_c-aware variant (ADR 0007). model_config_ok delegates with the
-# MHA default so existing callers/tests are unchanged.
-fn model_config_ok_arch(V, C, T, nh, nkv, NL, attn_kind, d_c): i64 {
+# attn_kind/d_c-aware variant (ADR 0007), now also gating pos_kind. model_config_ok
+# delegates with the MHA / learned-abs default so existing callers stay unchanged.
+fn model_config_ok_arch(V, C, T, nh, nkv, NL, attn_kind, d_c, pos_kind): i64 {
     if ((V < 1) || (C < 1) || (T < 1) || (NL < 1)) { return 0; }
     # Magnitude caps mirror the checkpoint loader's (-4/-5/-7/-8). The fresh
     # path takes CLI-supplied dims (`--layers`, and `--preset`-set C/T) — an
@@ -209,6 +209,16 @@ fn model_config_ok_arch(V, C, T, nh, nkv, NL, attn_kind, d_c): i64 {
     if (attn_kind == 1) {
         if (nkv != nh) { return 0; }
         if ((d_c < 1) || (d_c > C)) { return 0; }
+    }
+    # pos_kind (ADR 0007 / M12 increment 4): 0 = learned-abs (default), 1 = coupled
+    # RoPE. RoPE rotates dimension PAIRS (2k, 2k+1) within each head, so the head
+    # dim hd = C/nh must be EVEN; and 1.2.2 ships coupled RoPE on dense MHA/GQA
+    # only — MLA + RoPE is the faithful decoupled form (pos_kind 2, a later rung),
+    # so reject mla + rope here. pos_kind 2 (rope-decoupled) is reserved.
+    if ((pos_kind != 0) && (pos_kind != 1)) { return 0; }
+    if (pos_kind == 1) {
+        if (attn_kind != 0) { return 0; }       # coupled RoPE is MHA/GQA only
+        if (((C / nh) % 2) != 0) { return 0; }  # even head dim required
     }
     return 1;
 }
@@ -251,19 +261,20 @@ fn CKPT_MAX_MODEL_BYTES(): i64 { return 134217728; }
 # model_init builds the default MHA/GQA transformer; model_init_arch (below) adds
 # the attn_kind / latent-dim axis (ADR 0007). Existing callers use model_init.
 fn model_init(V, C, T, nh, nkv, NL, attn_bias, dropout, seed): i64 {
-    return model_init_arch(V, C, T, nh, nkv, NL, attn_bias, dropout, seed, 0, 0);
+    return model_init_arch(V, C, T, nh, nkv, NL, attn_bias, dropout, seed, 0, 0, 0);
 }
-fn model_init_arch(V, C, T, nh, nkv, NL, attn_bias, dropout, seed, attn_kind, d_c): i64 {
-    if (model_config_ok_arch(V, C, T, nh, nkv, NL, attn_kind, d_c) == 0) {
-        puts("attn11: model_init: invalid config (need nh | C, nkv | nh, nkv <= nh; mla: nkv == nh, 1 <= d_c <= C)\n");
+fn model_init_arch(V, C, T, nh, nkv, NL, attn_bias, dropout, seed, attn_kind, d_c, pos_kind): i64 {
+    if (model_config_ok_arch(V, C, T, nh, nkv, NL, attn_kind, d_c, pos_kind) == 0) {
+        puts("attn11: model_init: invalid config (need nh | C, nkv | nh, nkv <= nh; mla: nkv == nh, 1 <= d_c <= C; rope: mha + even hd)\n");
         sys_exit(1);
     }
     g_V = V; g_C = C; g_T = T; g_nh = nh; g_nkv = nkv; g_NL = NL; g_F = 4 * C;
     g_attn_bias = attn_bias; g_dropout = dropout; g_training = 1; g_step = 0;
     # architecture descriptor (ADR 0007). g_attn_kind/g_latent_dim must be set
-    # BEFORE g_NP, since _blk()->_kv_weight_size() reads them. pos_kind/rope_dim
-    # stay at the learned-absolute default until RoPE lands.
-    g_attn_kind = attn_kind; g_pos_kind = 0; g_latent_dim = d_c; g_rope_dim = 0;
+    # BEFORE g_NP, since _blk()->_kv_weight_size() reads them. pos_kind carries the
+    # positional scheme (0 = learned-abs, 1 = coupled RoPE); rope_dim stays 0 until
+    # decoupled RoPE (a later rung).
+    g_attn_kind = attn_kind; g_pos_kind = pos_kind; g_latent_dim = d_c; g_rope_dim = 0;
     var F = g_F;
     g_NP = _emb_end() + NL * _blk() + 2 * C;
 
@@ -469,13 +480,20 @@ fn head_bwd(): i64 {
 fn embed_fwd_n(n): i64 {
     var T = n; var C = g_C;
     var emb = P_tokemb(); var pos = P_posemb(); var x0 = La(LA_resid, 0);
+    # RoPE (g_pos_kind != 0) carries position inside attention (relative), so the
+    # learned ABSOLUTE posemb is not added here — the two schemes are mutually
+    # exclusive (ADR 0007). The posemb parameters stay allocated (layout-stable)
+    # but unused/untrained under RoPE.
+    var add_pos = 1;
+    if (g_pos_kind != 0) { add_pos = 0; }
     var t = 0;
     while (t < T) {
         var tok = load64(A_tokens + t * 8);
         var c = 0;
         while (c < C) {
-            store64(x0 + (t * C + c) * 8, f64_add(load64(emb + (tok * C + c) * 8),
-                                                  load64(pos + (t * C + c) * 8)));
+            var e = load64(emb + (tok * C + c) * 8);
+            if (add_pos == 1) { e = f64_add(e, load64(pos + (t * C + c) * 8)); }
+            store64(x0 + (t * C + c) * 8, e);
             c = c + 1;
         }
         t = t + 1;
@@ -484,10 +502,14 @@ fn embed_fwd_n(n): i64 {
 }
 fn embed_fwd(): i64 { return embed_fwd_n(g_T); }
 
-# d(resid[0]) -> accumulate dtokemb (lookup part) and dposemb
+# d(resid[0]) -> accumulate dtokemb (lookup part) and dposemb. Under RoPE the
+# posemb is not on the forward path, so no gradient flows to it (mirrors
+# embed_fwd_n's add_pos skip) — leaving dposemb untouched keeps it at zero.
 fn embed_bwd(dx0): i64 {
     var T = g_T; var C = g_C;
     var gemb = G_tokemb(); var gpos = G_posemb();
+    var add_pos = 1;
+    if (g_pos_kind != 0) { add_pos = 0; }
     var t = 0;
     while (t < T) {
         var tok = load64(A_tokens + t * 8);
@@ -496,8 +518,10 @@ fn embed_bwd(dx0): i64 {
             var d = load64(dx0 + (t * C + c) * 8);
             var te = gemb + (tok * C + c) * 8;
             store64(te, f64_add(load64(te), d));
-            var pe = gpos + (t * C + c) * 8;
-            store64(pe, f64_add(load64(pe), d));
+            if (add_pos == 1) {
+                var pe = gpos + (t * C + c) * 8;
+                store64(pe, f64_add(load64(pe), d));
+            }
             c = c + 1;
         }
         t = t + 1;
@@ -522,7 +546,7 @@ fn model_forward(): i64 {
         } else {
             attn_fwd(PL(L, _o_Wq()), P_bq(L), PL(L, _o_Wk()), P_bk(L),
                      PL(L, _o_Wv()), P_bv(L), PL(L, _o_Wo()), P_bo(L),
-                     a, A_attn, La(LA_arena, L), T, C, nh, g_nkv);
+                     a, A_attn, La(LA_arena, L), T, C, nh, g_nkv, g_pos_kind);
         }
         # residual dropout on the attention branch
         dropout_gen_mask(La(LA_dmask_attn, L), TC, g_dropout, g_training);
@@ -560,10 +584,15 @@ fn model_forward(): i64 {
 fn model_fwd_row(tok, pos): i64 {
     var C = g_C; var F = g_F;
     var emb = P_tokemb(); var posb = P_posemb();
+    # under RoPE the learned posemb is off the path (positions enter inside
+    # attention); mirror embed_fwd_n so the cached row matches the uncached path.
+    var add_pos = 1;
+    if (g_pos_kind != 0) { add_pos = 0; }
     var c = 0;
     while (c < C) {
-        store64(R_x + c * 8, f64_add(load64(emb + (tok * C + c) * 8),
-                                     load64(posb + (pos * C + c) * 8)));
+        var e = load64(emb + (tok * C + c) * 8);
+        if (add_pos == 1) { e = f64_add(e, load64(posb + (pos * C + c) * 8)); }
+        store64(R_x + c * 8, e);
         c = c + 1;
     }
     var L = 0;
@@ -582,7 +611,7 @@ fn model_fwd_row(tok, pos): i64 {
             attn_fwd_row(PL(L, _o_Wq()), P_bq(L), PL(L, _o_Wk()), P_bk(L),
                          PL(L, _o_Wv()), P_bv(L), PL(L, _o_Wo()), P_bo(L),
                          R_a, R_attn, La(KV_K, L), La(KV_V, L), R_prow, R_concat,
-                         R_q, pos, C, g_nh, g_nkv);
+                         R_q, pos, C, g_nh, g_nkv, g_pos_kind);
         }
         c = 0;
         while (c < C) {
@@ -626,7 +655,7 @@ fn model_eval_window(n): i64 {
         } else {
             attn_fwd(PL(L, _o_Wq()), P_bq(L), PL(L, _o_Wk()), P_bk(L),
                      PL(L, _o_Wv()), P_bv(L), PL(L, _o_Wo()), P_bo(L),
-                     a, A_attn, La(LA_arena, L), n, C, nh, g_nkv);
+                     a, A_attn, La(LA_arena, L), n, C, nh, g_nkv, g_pos_kind);
         }
         var xmid = La(LA_xmid, L);
         var i = 0;
@@ -683,7 +712,7 @@ fn model_backward(): i64 {
                      La(LA_a, L), D_drop, D_a,
                      GL(L, _o_Wq()), G_bq(L), GL(L, _o_Wk()), G_bk(L),
                      GL(L, _o_Wv()), G_bv(L), GL(L, _o_Wo()), G_bo(L),
-                     La(LA_arena, L), T, C, nh, g_nkv);
+                     La(LA_arena, L), T, C, nh, g_nkv, g_pos_kind);
         }
         ln_bwd(xin, PL(L, _o_ln1g()), D_a, La(LA_m1, L), La(LA_r1, L), D_tmp, GL(L, _o_ln1g()), GL(L, _o_ln1b()), T, C);
         # d_xin = d_xmid (residual) + D_tmp (ln1 path) ; becomes next D_resid

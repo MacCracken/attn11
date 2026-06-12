@@ -250,3 +250,48 @@ accumulation and so needs its own bit-identity story.
    half of the M12 gate) pairs naturally with the X003 byte-vs-BPE setup; left as
    a follow-on measurement since the bit-identity + bytes gates (the shippable
    M12.2 deliverables) are met.
+
+## X007 — coupled RoPE: correctness, relative-position, and overhead (M12 incr. 4, v1.2.2) (2026-06-12)
+
+**Setup**: 1.2.2, default config (d_model 32, ctx 16, 4 heads, 3 layers),
+`--pos-kind rope` vs the learned-abs baseline, x86_64. This entry records the
+correctness landing + the rotation overhead, not a perplexity bake-off.
+
+**Correctness** (grad-checks, `cyrius test`, both arches):
+- The rotation backward is **bit-exact** (`rope rotation dX maxrel = 0`) — RoPE
+  is linear and parameter-free, so the transpose rotation IS the gradient.
+- The **relative-position invariance** holds to rounding: `(R_m q)·(R_n k)` at
+  offsets `(2,5)` and `(5,8)` agree to ~1e-15 (`rope rel-pos |s1-s2| ≈ 0`).
+- Attention-with-RoPE: `dWq`/`dWk`/`dx` ~1e-7 (x86); the **K-bias gradient is now
+  real** (a rotated bias is no longer softmax-shift-invariant) and checks at
+  ~2e-7, unlike the learned-abs `|dbk| ≈ 0` no-op.
+- The learned **posemb receives exactly zero gradient** under RoPE (off-path),
+  pinned bit-for-bit.
+- **376 → 470** checks green on x86_64 AND aarch64/qemu.
+
+**Training** (default config, 400 steps, greedy sample): RoPE trains to a
+comparable loss (~0.23 at step 250) and the cached generation reproduces real
+corpus phrases — RoPE is a real, trainable, drop-in positional scheme, not just a
+parameterization.
+
+**Overhead** (default config, `./build/bench`):
+
+| path                | learned-abs | rope     | overhead |
+|---------------------|-------------|----------|----------|
+| fwd+bwd step        | ~3.53 ms    | ~3.61 ms | **+2.3%** |
+| gen cached (ns/tok) | ~163 µs     | ~179 µs  | **+10%**  |
+
+The rotation adds a per-pair Maclaurin cos/sin of the base angle plus a binary
+exponentiation to the position; in the cached decode that lands ~10%/token, in
+the training step ~2% (attention's rotation is small against the matmuls).
+
+**Takeaways**:
+1. Coupled RoPE is correct and portable — the only new gradient (the rotation's
+   transpose) is grad-checked bit-exact, and the relative-position property is
+   pinned directly, independent of the gradient.
+2. The trig is built without the x86-only `f64_sin`/`f64_cos` (Maclaurin on
+   `θ_k ∈ (0,1]` + complex binary-exponentiation), so it runs identically on
+   aarch64 and stays bit-identical cached-vs-uncached (`docs/architecture/005`).
+3. RoPE on MLA is intentionally **rejected** here — the faithful form is decoupled
+   RoPE on a separate `d_rope` channel (1.2.3, the last M12 rung). Coupled RoPE in
+   MLA would forfeit the up-projection absorption (ADR 0007).

@@ -139,10 +139,154 @@ fn attn_core_fwd(Qc, Kc, Vc, Pc, concat, T, C, nh, nkv): i64 {
     return 0;
 }
 
+# ---- rotary positional embedding (RoPE, coupled; ADR 0007 / M12 increment 4) -
+# Source: Su et al. (2021), "RoFormer", arXiv:2104.09864. A position-dependent
+# rotation applied to Q and K AFTER projection, BEFORE the score — so the score
+# (R_m q)·(R_n k) depends only on the relative offset m-n. Parameter-free, so the
+# only new gradient is the rotation's backward. attn11 uses the ORIGINAL
+# interleaved convention: dimension pairs (2k, 2k+1) within each head rotate by
+# angle m·θ_k, θ_k = base^(-2k/hd), base 10000 — so hd must be EVEN (gated in
+# model_config_ok). The angle depends on (position, k, hd) only, not the head
+# index, so all heads share it.
+#
+# PORTABLE TRIG: f64_sin/f64_cos are x86-only builtins (aarch64 has no native
+# trig and v5.6.0 doesn't polyfill it, like the inverse-trig family — ganita
+# note). We never need a general sin/cos: θ_k = base^(-2k/hd) ∈ (0, 1] rad and
+# the multiplier m is an integer, so (1) cos θ_k / sin θ_k come from a Maclaurin
+# series with NO range reduction (θ ≤ 1), then (2) (cos mθ, sin mθ) =
+# (cos θ + i sin θ)^m by binary exponentiation. Pure f64 add/mul/div + f64_sqrt
+# + f64_pow (all aarch64-polyfilled), deterministic on both arches. Because the
+# rotation for absolute position m is computed DIRECTLY from m (not via a
+# row-to-row recurrence), position m yields identical bits in the batch and the
+# single-row cached paths, preserving bit-identity (docs/architecture/003).
+fn ROPE_BASE(): i64 { return f64_from(10000); }
+
+# Maclaurin cos/sin of theta ∈ (0,1] -> unit (cos,sin) into cout/sout. Series
+# through θ^16 (cos) / θ^17 (sin) give ~1e-15 at θ=1; the result is renormalised
+# to exactly unit magnitude so powering it cannot drift the magnitude.
+fn _rope_unit_cossin(theta, cout, sout): i64 {
+    var t2 = f64_mul(theta, theta);
+    var one = f64_from(1);
+    # sin(t) = t·(1 - t²/6(1 - t²/20(1 - t²/42(1 - t²/72(1 - t²/110(1 - t²/156(1 - t²/210(1 - t²/272))))))))
+    var sp = f64_sub(one, f64_div(t2, f64_from(272)));
+    sp = f64_sub(one, f64_mul(f64_div(t2, f64_from(210)), sp));
+    sp = f64_sub(one, f64_mul(f64_div(t2, f64_from(156)), sp));
+    sp = f64_sub(one, f64_mul(f64_div(t2, f64_from(110)), sp));
+    sp = f64_sub(one, f64_mul(f64_div(t2, f64_from(72)), sp));
+    sp = f64_sub(one, f64_mul(f64_div(t2, f64_from(42)), sp));
+    sp = f64_sub(one, f64_mul(f64_div(t2, f64_from(20)), sp));
+    sp = f64_sub(one, f64_mul(f64_div(t2, f64_from(6)), sp));
+    var sv = f64_mul(theta, sp);
+    # cos(t) = 1 - t²/2(1 - t²/12(1 - t²/30(1 - t²/56(1 - t²/90(1 - t²/132(1 - t²/182(1 - t²/240)))))))
+    var cp = f64_sub(one, f64_div(t2, f64_from(240)));
+    cp = f64_sub(one, f64_mul(f64_div(t2, f64_from(182)), cp));
+    cp = f64_sub(one, f64_mul(f64_div(t2, f64_from(132)), cp));
+    cp = f64_sub(one, f64_mul(f64_div(t2, f64_from(90)), cp));
+    cp = f64_sub(one, f64_mul(f64_div(t2, f64_from(56)), cp));
+    cp = f64_sub(one, f64_mul(f64_div(t2, f64_from(30)), cp));
+    cp = f64_sub(one, f64_mul(f64_div(t2, f64_from(12)), cp));
+    var cv = f64_sub(one, f64_mul(f64_div(t2, f64_from(2)), cp));
+    var nrm = f64_div(one, f64_sqrt(f64_add(f64_mul(cv, cv), f64_mul(sv, sv))));
+    store64(cout, f64_mul(cv, nrm));
+    store64(sout, f64_mul(sv, nrm));
+    return 0;
+}
+
+# (cos mθ, sin mθ) = (c0 + i·s0)^m by binary exponentiation, into cout/sout.
+# m == 0 -> (1, 0). Complex multiply (a+ib)(c+id) = (ac-bd) + i(ad+bc).
+fn _rope_pow(c0, s0, m, cout, sout): i64 {
+    var rc = f64_from(1); var rs = f64_from(0);   # identity
+    var bc = c0; var bs = s0;                     # running base
+    var e = m;
+    while (e > 0) {
+        if ((e % 2) == 1) {
+            var nrc = f64_sub(f64_mul(rc, bc), f64_mul(rs, bs));
+            var nrs = f64_add(f64_mul(rc, bs), f64_mul(rs, bc));
+            rc = nrc; rs = nrs;
+        }
+        var sbc = f64_sub(f64_mul(bc, bc), f64_mul(bs, bs));
+        var sbs = f64_add(f64_mul(bc, bs), f64_mul(bs, bc));
+        bc = sbc; bs = sbs;
+        e = e / 2;
+    }
+    store64(cout, rc); store64(sout, rs);
+    return 0;
+}
+
+# Rotate X(rows, width) in place: each row r is at absolute position pos0+r, each
+# head occupies a contiguous hd = width/num_heads block, each (2k,2k+1) pair
+# rotates by (pos0+r)·θ_k. Used for Q (width=C, heads=nh) and K (width=Ckv,
+# heads=nkv) — both with the same hd, hence the same θ_k.
+fn rope_apply_fwd(X, rows, pos0, width, num_heads): i64 {
+    var hd = width / num_heads;
+    var hdp = hd / 2;
+    var base = ROPE_BASE();
+    var cs[32];                     # [c0, s0, c, s] scratch
+    var k = 0;
+    while (k < hdp) {
+        # θ_k = base^(-(2k)/hd); base rotation (cos θ_k, sin θ_k) once per k
+        var ex = f64_div(f64_from(0 - (2 * k)), f64_from(hd));
+        var th = f64_pow(base, ex);
+        _rope_unit_cossin(th, &cs, &cs + 8);
+        var r = 0;
+        while (r < rows) {
+            _rope_pow(load64(&cs), load64(&cs + 8), pos0 + r, &cs + 16, &cs + 24);
+            var c = load64(&cs + 16); var s = load64(&cs + 24);
+            var h = 0;
+            while (h < num_heads) {
+                var p = X + (r * width + h * hd + 2 * k) * 8;
+                var x0 = load64(p); var x1 = load64(p + 8);
+                store64(p,     f64_sub(f64_mul(x0, c), f64_mul(x1, s)));
+                store64(p + 8, f64_add(f64_mul(x0, s), f64_mul(x1, c)));
+                h = h + 1;
+            }
+            r = r + 1;
+        }
+        k = k + 1;
+    }
+    return 0;
+}
+
+# Backward of rope_apply_fwd: the rotation is linear and orthogonal, so the
+# gradient w.r.t. the pre-rotation input is the TRANSPOSE rotation R(-angle).
+# y0 = x0·c - x1·s, y1 = x0·s + x1·c  =>  dx0 = dy0·c + dy1·s, dx1 = dy1·c - dy0·s.
+# In place: dX (= dY on entry) becomes dX (the pre-rotation gradient). Uses the
+# SAME cos/sin path as the forward, so the rotation values match bit-for-bit.
+fn rope_apply_bwd(dX, rows, pos0, width, num_heads): i64 {
+    var hd = width / num_heads;
+    var hdp = hd / 2;
+    var base = ROPE_BASE();
+    var cs[32];                     # [c0, s0, c, s] scratch
+    var k = 0;
+    while (k < hdp) {
+        var ex = f64_div(f64_from(0 - (2 * k)), f64_from(hd));
+        var th = f64_pow(base, ex);
+        _rope_unit_cossin(th, &cs, &cs + 8);
+        var r = 0;
+        while (r < rows) {
+            _rope_pow(load64(&cs), load64(&cs + 8), pos0 + r, &cs + 16, &cs + 24);
+            var c = load64(&cs + 16); var s = load64(&cs + 24);
+            var h = 0;
+            while (h < num_heads) {
+                var p = dX + (r * width + h * hd + 2 * k) * 8;
+                var d0 = load64(p); var d1 = load64(p + 8);
+                store64(p,     f64_add(f64_mul(d0, c), f64_mul(d1, s)));
+                store64(p + 8, f64_sub(f64_mul(d1, c), f64_mul(d0, s)));
+                h = h + 1;
+            }
+            r = r + 1;
+        }
+        k = k + 1;
+    }
+    return 0;
+}
+
 # ---- forward (MHA / GQA) ----------------------------------------------------
 # x(T,C) -> out(T,C). Projects Q/K/V, runs the shared core, applies Wo. Fills
 # caches in `ar` for the backward pass. Bias pointers bq/bk/bv/bo may be 0.
-fn attn_fwd(Wq, bq, Wk, bk, Wv, bv, Wo, bo, x, out, ar, T, C, nh, nkv): i64 {
+# pos_kind: 0 = learned-abs positions applied at the embedding (no rotation here);
+# 1 = coupled RoPE (rotate Q/K by absolute position before the score).
+fn attn_fwd(Wq, bq, Wk, bk, Wv, bv, Wo, bo, x, out, ar, T, C, nh, nkv, pos_kind): i64 {
     var Ckv = nkv * (C / nh);
     var Qc = _at_Qc(ar);
     var Kc = _at_Kc(ar, T, C);
@@ -152,6 +296,10 @@ fn attn_fwd(Wq, bq, Wk, bk, Wv, bv, Wo, bo, x, out, ar, T, C, nh, nkv): i64 {
     linear_fwd(x, Wq, bq, Qc, T, C, C);
     linear_fwd(x, Wk, bk, Kc, T, C, Ckv);
     linear_fwd(x, Wv, bv, Vc, T, C, Ckv);
+    if (pos_kind == 1) {                # coupled RoPE: rotate Q/K (not V) in place
+        rope_apply_fwd(Qc, T, 0, C, nh);
+        rope_apply_fwd(Kc, T, 0, Ckv, nkv);
+    }
     attn_core_fwd(Qc, Kc, Vc, Pc, concat, T, C, nh, nkv);
     linear_fwd(concat, Wo, bo, out, T, C, C);
     return 0;
@@ -254,14 +402,21 @@ fn attn_core_fwd_row(q_row, Kc, Vc, prow, concat_row, pos, C, nh, nkv): i64 {
 #
 # ARITHMETIC CONTRACT: bit-identical per row to attn_fwd — same kernels, same
 # accumulation order (linear_fwd rows are independent, so a 1-row call matches
-# row `pos` of a T-row call bit-for-bit). Pinned by the cached-vs-uncached
-# generation tests in tests/attn11.tcyr.
+# row `pos` of a T-row call bit-for-bit). With coupled RoPE (pos_kind == 1) the
+# query row and the newly-appended K row are rotated by absolute position `pos`
+# (cached K rows 0..pos-1 were rotated when they were appended), matching the
+# uncached path's per-row rotation. Pinned by the cached-vs-uncached generation
+# tests in tests/attn11.tcyr.
 fn attn_fwd_row(Wq, bq, Wk, bk, Wv, bv, Wo, bo, x_row, out_row,
-                Kc, Vc, prow, concat_row, q_row, pos, C, nh, nkv): i64 {
+                Kc, Vc, prow, concat_row, q_row, pos, C, nh, nkv, pos_kind): i64 {
     var Ckv = nkv * (C / nh);
     linear_fwd(x_row, Wq, bq, q_row, 1, C, C);
     linear_fwd(x_row, Wk, bk, Kc + pos * Ckv * 8, 1, C, Ckv);
     linear_fwd(x_row, Wv, bv, Vc + pos * Ckv * 8, 1, C, Ckv);
+    if (pos_kind == 1) {                # coupled RoPE: rotate this row's Q and K
+        rope_apply_fwd(q_row, 1, pos, C, nh);
+        rope_apply_fwd(Kc + pos * Ckv * 8, 1, pos, Ckv, nkv);
+    }
     attn_core_fwd_row(q_row, Kc, Vc, prow, concat_row, pos, C, nh, nkv);
     linear_fwd(concat_row, Wo, bo, out_row, 1, C, C);
     return 0;
@@ -394,7 +549,7 @@ fn attn_core_bwd(Qc, Kc, Vc, Pc, dconcat, dQ, dK, dV, dprow, T, C, nh, nkv): i64
 # dout(T,C) -> dx(T,C); accumulate dWq..dWo and (if non-0) dbq..dbo. Back through
 # Wo, the shared core, then the Q/K/V projections. Uses caches from attn_fwd.
 fn attn_bwd(Wq, Wk, Wv, Wo, x, dout, dx,
-            dWq, dbq, dWk, dbk, dWv, dbv, dWo, dbo, ar, T, C, nh, nkv): i64 {
+            dWq, dbq, dWk, dbk, dWv, dbv, dWo, dbo, ar, T, C, nh, nkv, pos_kind): i64 {
     var Ckv = nkv * (C / nh);
     var Qc = _at_Qc(ar);
     var Kc = _at_Kc(ar, T, C);
@@ -411,8 +566,14 @@ fn attn_bwd(Wq, Wk, Wv, Wo, x, dout, dx,
     var dprow = _at_dprow(ar, T, C, nh, Ckv);
     # 1. out = concat @ Wo
     linear_bwd(concat, Wo, dout, dconcat, dWo, dbo, T, C, C);
-    # 2-4. attention core: dconcat -> dQ, dK, dV (incl. softmax backward)
+    # 2-4. attention core: dconcat -> dQ, dK, dV (incl. softmax backward). Qc/Kc
+    # in the arena are the ROTATED forward values (RoPE rewrote them in place), so
+    # dQ/dK come out w.r.t. the rotated Q/K.
     attn_core_bwd(Qc, Kc, Vc, Pc, dconcat, dQ, dK, dV, dprow, T, C, nh, nkv);
+    if (pos_kind == 1) {               # undo the rotation: dQ/dK -> pre-rotation grad
+        rope_apply_bwd(dQ, T, 0, C, nh);
+        rope_apply_bwd(dK, T, 0, Ckv, nkv);
+    }
     # 5. back through Q=x@Wq, K=x@Wk, V=x@Wv; accumulate dx
     linear_bwd(x, Wq, dQ, dxq, dWq, dbq, T, C, C);
     linear_bwd(x, Wk, dK, dxk, dWk, dbk, T, C, Ckv);

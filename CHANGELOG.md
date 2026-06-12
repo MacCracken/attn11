@@ -4,6 +4,57 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.2.2] - 2026-06-12
+
+**Coupled RoPE (M12 increment 4) — the positional-encoding switch opens.**
+`--pos-kind {learned, rope}` adds rotary positional embeddings (Su et al. 2021,
+RoFormer, arXiv:2104.09864) on dense MHA/GQA: a position-dependent rotation of Q
+and K so the score `(R_m q)·(R_n k)` depends only on the relative offset `m-n`.
+Parameter-free, opt-in, additive — a no-flag run is byte-identical, no
+checkpoint-format change (the reserved v4 `pos_kind` field is value-filled; ADR
+0007). The faithful decoupled-RoPE form for MLA is the next rung (1.2.3).
+
+### Added
+- **`--pos-kind {learned, rope}`.** `learned` (default) keeps the learned
+  absolute embeddings; `rope` rotates Q/K inside attention instead (the two are
+  mutually exclusive — under RoPE the learned posemb is off the path and receives
+  exactly zero gradient, pinned in `test_model_rope`). Coupled RoPE is MHA/GQA
+  only with an EVEN head dim; MLA + RoPE (decoupled) is reserved for 1.2.3.
+- **RoPE rotation** (`rope_apply_fwd`/`rope_apply_bwd` in `attn.cyr`): the
+  original interleaved convention (pairs `(2k, 2k+1)` rotate by `m·θ_k`,
+  `θ_k = 10000^(-2k/hd)`). The backward is the transpose rotation — the only new
+  gradient (the rotation is parameter-free), grad-checked bit-exact in isolation
+  (`test_rope_op`).
+- **Portable trig.** `f64_sin`/`f64_cos` are x86-only builtins (no aarch64
+  polyfill), so RoPE computes `cos θ_k`/`sin θ_k` (with `θ_k ∈ (0,1]`) by a
+  Maclaurin series — no range reduction — then raises `(cos θ + i sin θ)` to the
+  position power by binary exponentiation (pure `f64` + `f64_pow`/`f64_sqrt`,
+  both arch-polyfilled). Computed directly from the absolute position, so the
+  batch and cached single-row paths stay bit-identical
+  (`docs/architecture/005-rope-portable-trig.md`).
+- **Grad checks + bit-identity** — **376 → 470** checks green on x86_64 AND
+  aarch64/qemu: the isolated rotation backward (bit-exact) + the relative-
+  position invariance pin (`test_rope_op`); attention-with-RoPE at `hd ∈ {6,8,10}`
+  × MHA/GQA/MQA, including the now-REAL K-bias gradient (a rotated bias is no
+  longer shift-invariant — `test_attention_rope`); the full-model wiring check
+  (`test_model_rope`); the cached-vs-uncached **bit-identity gate** across
+  context-shifts (`test_kv_rope`); and the v4 `pos_kind=1` checkpoint round-trip +
+  hostile-descriptor rejections (odd head dim, `mla+rope`, reserved `pos_kind=2`).
+
+### Changed
+- The checkpoint loader accepts `pos_kind = 1` (RoPE) on a dense, even-head-dim
+  image; `pos_kind = 2` (rope-decoupled) stays reserved (`-41`), `rope_dim ≠ 0`
+  stays reserved (`-43`). RoPE is parameter-free, so `np` and the parameter
+  layout are unchanged — a v4 RoPE image differs from an mha image by one
+  descriptor field only.
+
+### Notes
+- RoPE cached decode is ~10% slower per token and the training step ~2% slower
+  at the default config (the per-pair rotation: a Maclaurin cos/sin + a
+  binary-exponentiation to the position); benched in `docs/benchmarks.md`.
+- Decoupled RoPE (`--pos-kind rope-decoupled`) for MLA — the faithful
+  cache-efficient DeepSeek form, the last M12 rung — lands in 1.2.3.
+
 ## [1.2.1] - 2026-06-12
 
 **MLA latent KV-cache decode (M12.2) — the deferred M12 gate.** 1.2.0 trained

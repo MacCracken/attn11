@@ -63,6 +63,19 @@ positions for the reference MLA (the decoupled-RoPE variant is reserved; see
 ADR 0007). The latent down/up projections reuse the grad-checked `linear`
 backward, so the MLA gradient adds no novel hand-derived math.
 
+### Rotary positional embeddings (RoPE — coupled, relative positions)
+**Su, J., Lu, Y., Pan, S., Murtadha, A., Wen, B., Liu, Y. (2021).** "RoFormer:
+Enhanced Transformer with Rotary Position Embedding." arXiv:[2104.09864](https://arxiv.org/abs/2104.09864).
+Used in: `src/attn.cyr` (`rope_apply_fwd`/`rope_apply_bwd`), `src/model.cyr`
+(`--pos-kind rope`) — a position-dependent rotation of Q and K (interleaved
+dimension pairs `(2k, 2k+1)` rotated by `m·θ_k`, `θ_k = 10000^(-2k/hd)`) so the
+score depends only on the relative offset `m-n`. Mutually exclusive with the
+learned absolute embeddings (you pick one; ADR 0007). Parameter-free, so the
+only new gradient is the rotation's transpose; the cos/sin are computed without
+the x86-only trig builtins (Maclaurin on `θ_k ∈ (0,1]` + complex binary
+exponentiation — see `docs/architecture/005`). Coupled RoPE is the dense-MHA/GQA
+rung; the decoupled variant for MLA is reserved (ADR 0007).
+
 ### KV-cache inference (cache K/V per position, one row per decoded token)
 **Pope, R., Douglas, S., Chowdhery, A., et al. (2022).** "Efficiently Scaling
 Transformer Inference." *MLSys 2023.* arXiv:[2211.05102](https://arxiv.org/abs/2211.05102).

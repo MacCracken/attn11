@@ -30,3 +30,9 @@ Not decisions (those live in [`../adr/`](../adr/)) and not guides (those live in
   error), so a symbol `model.cyr` references must not live only in
   `persist.cyr` — rebuild **and run** all four harnesses after touching shared
   `src/`. **Affects**: `src/model.cyr`, `tests/attn11.bcyr`.
+- [005 — RoPE's portable trigonometry](005-rope-portable-trig.md) — `f64_sin`/
+  `f64_cos` are x86-only builtins (no aarch64 polyfill), so coupled RoPE builds
+  cos/sin from a Maclaurin series (`θ_k ∈ (0,1]`, no range reduction) + complex
+  binary-exponentiation to the integer position — computed directly from the
+  position so the batch and cached-row paths stay bit-identical (note 003).
+  **Affects**: `src/attn.cyr` (`rope_apply_*`, `_rope_unit_cossin`, `_rope_pow`).

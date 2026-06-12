@@ -139,6 +139,25 @@ optimization (and a further memory win) — future work, since it reorders the
 accumulation and needs its own bit-identity story. Full trail:
 [experiments.md X006](development/experiments.md).
 
+## Coupled RoPE overhead (1.2.2, M12 increment 4)
+
+`--pos-kind rope` rotates Q/K by absolute position inside every attention. The
+rotation is parameter-free but adds, per dimension-pair, a Maclaurin `cos`/`sin`
+of the base angle plus a binary-exponentiation to the position (the portable
+trig path — `f64_sin`/`f64_cos` are x86-only; see
+[architecture/005](architecture/005-rope-portable-trig.md)). Default config,
+vs the learned-abs baseline:
+
+| path                     | learned-abs | rope     | overhead |
+|--------------------------|-------------|----------|----------|
+| fwd+bwd step             | ~3.53 ms    | ~3.61 ms | **+2.3%** |
+| gen cached (ns/token)    | ~163 000    | ~179 000 | **+10%**  |
+
+The training step barely moves (~2%; attention's rotation is small against the
+matmuls); cached decode pays ~10%/token. The cached-vs-uncached bit-identity
+contract is unaffected (`test_kv_rope`). Full trail:
+[experiments.md X007](development/experiments.md).
+
 ## SIMD tied LM head (0.8.0 → 0.8.1, M9 lever 1)
 
 `head_fwd_row` (the weight-tied output projection, `logits(V) = f_row(C) @
