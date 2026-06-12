@@ -109,6 +109,36 @@ tok/s b=16).
 
 History is tracked in [`bench-history.csv`](../bench-history.csv).
 
+## MLA latent KV-cache decode (1.2.1, M12.2)
+
+MLA (`--attn-kind mla`, ADR 0007) stores ONE low-rank latent `c` (`d_c` per
+token per layer) as the persistent decode cache instead of full per-head K/V,
+up-projecting to K/V on read — bit-identical to the uncached reference
+(`test_kv_mla`, both arches). The compression is the headline; at the default
+config (NL=3, T=16, C=32, hd=8), d_c = 16 (= C/2):
+
+| cache kind            | total bytes | vs MHA |
+|-----------------------|-------------|--------|
+| MHA full K/V (nkv=4)  | 24 576      | 1.0×   |
+| GQA (nkv=2)           | 12 288      | 2.0×   |
+| MQA full K/V (nkv=1)  | 6 144       | 4.0×   |
+| **MLA latent** (d_c=16) | **6 144** | **4.0×** |
+
+MLA reaches MQA's footprint (4× under MHA) but keeps **full heads** — d_c is the
+single knob (d_c = 8 → 3 072, 8× under MHA). Greedy decode, default config:
+
+| path | ns/token | tokens/sec |
+|------|----------|------------|
+| uncached MLA (window forward per token) | ~951 700 | ~1 050 |
+| **latent-cache** (row per token + amortized re-prime) | **~206 100** | **~4 852 (~4.6×)** |
+
+The ~4.6× is from not recomputing the window per token; it is **not** at
+MHA-cached parity because the reference re-up-projects the cached latents to K/V
+each step. Absorbing `W_UK` into `W_Q` (attend latents directly) is the compute
+optimization (and a further memory win) — future work, since it reorders the
+accumulation and needs its own bit-identity story. Full trail:
+[experiments.md X006](development/experiments.md).
+
 ## SIMD tied LM head (0.8.0 → 0.8.1, M9 lever 1)
 
 `head_fwd_row` (the weight-tied output projection, `logits(V) = f_row(C) @

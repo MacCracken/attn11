@@ -340,11 +340,16 @@ gate; ONE change at a time):
    MLA run the identical softmax/PV kernel; the MLA backward composes from
    `linear_bwd` + the core (no novel math). Grad-checked per-op (tight) +
    full-model; checkpoint round-trips; trains (loss ↓) and samples.
-3. **Latent KV-cache decode** (**M12.2**, the deferred gate) — a cached single-row
-   MLA path that stores the `d_c` latent per token (not full K/V), with the
-   cached-vs-uncached **bit-identity** gate and the **KV-cache-bytes table** vs
-   GQA/MQA (the headline compression number). 1.2.0 generates MLA via the
-   uncached reference path; this adds the inference win on top.
+3. ✅ **Latent KV-cache decode** (**v1.2.1**, the deferred gate) — a cached
+   single-row MLA path (`attn_mla_fwd_row`) that stores the `d_c` latent per
+   token (not full K/V) in the per-layer `LA_c` buffer and up-projects to K/V on
+   read; `attn_core_fwd_row` extracted so MHA/GQA and MLA share the cached
+   single-row kernel. Cached-vs-uncached **bit-identity** gate green (prefill at
+   every prefix + decode across context-shifts, greedy + temperature; 376 checks
+   on x86_64 AND aarch64/qemu). **KV-cache-bytes table** vs GQA/MQA: `d_c = 16`
+   gives 6144 bytes — **4× under MHA** (24576), MQA's footprint at full head
+   expressiveness. The absorption compute optimization (attend latents directly)
+   is future work; the reference re-up-projects each step.
 4. **Coupled RoPE** (optional) — `--pos-kind rope` on dense MHA; RoPE has no
    learned params, so the grad-check is just the rotation's backward. Valuable on
    its own; could split into its own milestone.

@@ -157,20 +157,15 @@ fn attn_fwd(Wq, bq, Wk, bk, Wv, bv, Wo, bo, x, out, ar, T, C, nh, nkv): i64 {
     return 0;
 }
 
-# ---- cached single-row forward (inference) ----------------------------------
-# E1 (KV-cached generation): process ONE new position `pos` — x_row(1,C) ->
-# out_row(1,C) — appending this position's K/V rows to the caller-owned caches
-# Kc/Vc ((T,Ckv), must already hold positions 0..pos-1) and attending over
-# cache rows 0..pos. Source: Pope et al. (2022), arXiv:2211.05102 (KV-cache
-# inference); see docs/sources.md. Generation-only: writes no backward caches.
-# prow: caller scratch (>= pos+1 f64); concat_row/q_row: C-f64 scratch.
-#
-# ARITHMETIC CONTRACT: bit-identical per row to attn_fwd — same kernels, same
-# accumulation order (linear_fwd rows are independent, so a 1-row call matches
-# row `pos` of a T-row call bit-for-bit). Pinned by the cached-vs-uncached
-# generation tests in tests/attn11.tcyr.
-fn attn_fwd_row(Wq, bq, Wk, bk, Wv, bv, Wo, bo, x_row, out_row,
-                Kc, Vc, prow, concat_row, q_row, pos, C, nh, nkv): i64 {
+# ---- shared single-row attention core (post-projection) ---------------------
+# Given the query row q_row(C) at window position `pos` and the K/V caches
+# Kc/Vc ((>=pos+1, Ckv), holding positions 0..pos), fill concat_row(C): the
+# per-head causal softmax/PV for ONE query attending cache rows 0..pos. The
+# single-row mirror of attn_core_fwd — ONE source of truth for the cached
+# per-head arithmetic (docs/architecture/003): attn_fwd_row (MHA/GQA) calls it
+# after projecting K/V into the cache; attn_mla_fwd_row calls it with nkv = nh /
+# Ckv = C over up-projected full K/V. prow: caller scratch (>= pos+1 f64).
+fn attn_core_fwd_row(q_row, Kc, Vc, prow, concat_row, pos, C, nh, nkv): i64 {
     var hd = C / nh;
     var Ckv = nkv * hd;
     var gsz = nh / nkv;
@@ -178,9 +173,6 @@ fn attn_fwd_row(Wq, bq, Wk, bk, Wv, bv, Wo, bo, x_row, out_row,
     var scale = f64_div(f64_from(1), f64_sqrt(f64_from(hd)));
     var acc[32];                    # 4-lane dot accumulator
     var pv[32];                     # 4-lane broadcast buffer
-    linear_fwd(x_row, Wq, bq, q_row, 1, C, C);
-    linear_fwd(x_row, Wk, bk, Kc + pos * Ckv * 8, 1, C, Ckv);
-    linear_fwd(x_row, Wv, bv, Vc + pos * Ckv * 8, 1, C, Ckv);
     var h = 0;
     while (h < nh) {
         var base = h * hd;          # this query head's block in q_row/concat_row
@@ -249,6 +241,55 @@ fn attn_fwd_row(Wq, bq, Wk, bk, Wv, bv, Wo, bo, x_row, out_row,
         }
         h = h + 1;
     }
+    return 0;
+}
+
+# ---- cached single-row forward, MHA/GQA (inference) --------------------------
+# E1 (KV-cached generation): process ONE new position `pos` — x_row(1,C) ->
+# out_row(1,C) — appending this position's K/V rows to the caller-owned caches
+# Kc/Vc ((T,Ckv), must already hold positions 0..pos-1) and attending over
+# cache rows 0..pos. Source: Pope et al. (2022), arXiv:2211.05102 (KV-cache
+# inference); see docs/sources.md. Generation-only: writes no backward caches.
+# prow: caller scratch (>= pos+1 f64); concat_row/q_row: C-f64 scratch.
+#
+# ARITHMETIC CONTRACT: bit-identical per row to attn_fwd — same kernels, same
+# accumulation order (linear_fwd rows are independent, so a 1-row call matches
+# row `pos` of a T-row call bit-for-bit). Pinned by the cached-vs-uncached
+# generation tests in tests/attn11.tcyr.
+fn attn_fwd_row(Wq, bq, Wk, bk, Wv, bv, Wo, bo, x_row, out_row,
+                Kc, Vc, prow, concat_row, q_row, pos, C, nh, nkv): i64 {
+    var Ckv = nkv * (C / nh);
+    linear_fwd(x_row, Wq, bq, q_row, 1, C, C);
+    linear_fwd(x_row, Wk, bk, Kc + pos * Ckv * 8, 1, C, Ckv);
+    linear_fwd(x_row, Wv, bv, Vc + pos * Ckv * 8, 1, C, Ckv);
+    attn_core_fwd_row(q_row, Kc, Vc, prow, concat_row, pos, C, nh, nkv);
+    linear_fwd(concat_row, Wo, bo, out_row, 1, C, C);
+    return 0;
+}
+
+# ---- cached single-row forward, MLA (inference, M12.2) -----------------------
+# The latent KV-cache decode (ADR 0007): the persistent per-token cache is the
+# low-rank latent `c` (d_c per token), NOT full per-head K/V. Process position
+# `pos`: down-project x_row -> c_row, APPEND it to the caller-owned latent cache
+# c_cache ((T,d_c), holding latents 0..pos-1), then up-project the full cached
+# latent block 0..pos to per-head K/V into the transient scratch Kc/Vc ((T,C))
+# and run the shared single-row core (full heads, Ckv == C). The K/V scratch is
+# decode working set, re-derived from the latents each step (Wuk/Wuv are fixed
+# during generation) — it is not persisted, so the stored cache stays d_c-wide.
+#
+# ARITHMETIC CONTRACT: bit-identical per row to attn_mla_fwd. linear_fwd rows
+# are independent, so the 1-row down-projection at `pos` and the (pos+1)-row
+# up-projection match rows `pos` / `0..pos` of the uncached T-row path bit-for-
+# bit, and the core mirrors attn_core_fwd. Pinned by the MLA cached-vs-uncached
+# generation tests in tests/attn11.tcyr.
+fn attn_mla_fwd_row(Wq, bq, Wdkv, Wuk, buk, Wuv, buv, Wo, bo, x_row, out_row,
+                    c_cache, Kc, Vc, prow, concat_row, q_row, pos, C, nh, d_c): i64 {
+    var n = pos + 1;
+    linear_fwd(x_row, Wq, bq, q_row, 1, C, C);                    # Q = x @ Wq
+    linear_fwd(x_row, Wdkv, 0, c_cache + pos * d_c * 8, 1, C, d_c); # c = x @ W_DKV (append)
+    linear_fwd(c_cache, Wuk, buk, Kc, n, d_c, C);                 # K = c @ W_UK (up, all rows)
+    linear_fwd(c_cache, Wuv, buv, Vc, n, d_c, C);                 # V = c @ W_UV (up, all rows)
+    attn_core_fwd_row(q_row, Kc, Vc, prow, concat_row, pos, C, nh, nh);
     linear_fwd(concat_row, Wo, bo, out_row, 1, C, C);
     return 0;
 }

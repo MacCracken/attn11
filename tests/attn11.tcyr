@@ -1355,6 +1355,84 @@ fn test_kv_generation(): i64 {
     return 0;
 }
 
+# M12.2 gate: the MLA latent KV-cache decode (ADR 0007) must be BIT-IDENTICAL
+# to the uncached MLA reference (model_eval_window). Same two-way verification
+# as the MHA suite — (1) prefill logits at every prefix 1..T, (2) decode ids +
+# final logits across context-shifts, greedy AND temperature — but on the MLA
+# cached path: the persistent cache holds the d_c latent, up-projected to full
+# K/V on read. Pins that the row-wise down/up-projection matches the uncached
+# T-row matmuls bit-for-bit. A separate driver from _gen_bits_cfg because the
+# model is built with model_init_arch(...,1,d_c) (MLA, full heads).
+fn _gen_bits_mla(C, T, nh, NL, d_c, pstep, NG): i64 {
+    var V = build_corpus();
+    model_init_arch(V, C, T, nh, nh, NL, 1, f64_from(0), 21, 1, d_c);
+    train(8, 8, 2, _lrc(3, 1000), _lrc(3, 10000), 2, f64_from(1), 1000000000);
+    g_training = 0;
+    var ids = t_alloc(T);
+    var i = 0;
+    while (i < T) { store64(ids + i * 8, (i * 3 + 1) % V); i = i + 1; }
+    # (1) prefill logits bits at prefix lengths 1, 1+pstep, ... and T
+    var mism = 0;
+    var m = 1;
+    while (m <= T) {
+        gen_prime(ids, m, 1);
+        var cs = t_alloc(V); t_copy(cs, R_logits, V);
+        gen_prime(ids, m, 0);
+        var urow = A_logits + (m - 1) * g_V * 8;
+        var v = 0;
+        while (v < V) {
+            if (load64(cs + v * 8) != load64(urow + v * 8)) { mism = mism + 1; }
+            v = v + 1;
+        }
+        if ((m < T) && (m + pstep > T)) { m = T; }
+        else { m = m + pstep; }
+    }
+    assert(mism == 0, "mla prefill logits bit-identical at every prefix");
+    # (2) decode across slide boundaries, greedy then temp 0.8
+    var outA = t_alloc(NG); var outB = t_alloc(NG);
+    var fin = t_alloc(V);
+    var tt = 0;
+    while (tt < 2) {
+        var temp = f64_from(0);
+        if (tt == 1) { temp = _lrc(8, 10); }
+        _rng_state = 424242 + tt;
+        gen_prime(ids, T, 1);
+        gen_decode(NG, temp, 1, outA, 0);
+        t_copy(fin, R_logits, V);
+        _rng_state = 424242 + tt;
+        gen_prime(ids, T, 0);
+        gen_decode(NG, temp, 0, outB, 0);
+        var dm = 0;
+        i = 0;
+        while (i < NG) {
+            if (load64(outA + i * 8) != load64(outB + i * 8)) { dm = dm + 1; }
+            i = i + 1;
+        }
+        assert(dm == 0, "mla decode ids identical (cached vs uncached)");
+        var urow2 = A_logits + (G_n - 1) * g_V * 8;
+        var lm = 0;
+        var v2 = 0;
+        while (v2 < V) {
+            if (load64(fin + v2 * 8) != load64(urow2 + v2 * 8)) { lm = lm + 1; }
+            v2 = v2 + 1;
+        }
+        assert(lm == 0, "mla final logits bit-identical after slides");
+        tt = tt + 1;
+    }
+    return 0;
+}
+# Configs mirror test_kv_generation's coverage on the MLA path: hd=8 (pure SIMD),
+# hd∈{6,10} (scalar-tail loops), d_c = C/2 / d_c not dividing C / a degenerate
+# 2-token window — plus odd T (odd GEN_SHIFT). NL=2, 3T decode tokens.
+fn test_kv_mla(): i64 {
+    _gen_bits_mla(16, 8, 2, 2, 8, 1, 24);    # hd=8, d_c = C/2
+    _gen_bits_mla(16, 8, 2, 2, 12, 1, 24);   # hd=8, d_c not dividing C
+    _gen_bits_mla(12, 7, 2, 2, 6, 1, 21);    # hd=6 scalar tail; odd T (shift 3)
+    _gen_bits_mla(20, 5, 2, 2, 10, 1, 15);   # hd=10 scalar tail; odd T (shift 2)
+    _gen_bits_mla(12, 2, 2, 2, 4, 1, 6);     # degenerate 2-token window (shift 1)
+    return 0;
+}
+
 # M7 gate: the bit-identity contract at the --preset shape (ctx 64 / d_model
 # 64 / 8 heads / 4 layers). The per-row arithmetic (hd=8) is already pinned
 # above; this pins the preset's window/shift geometry (T=64, GEN_SHIFT 32) and
@@ -1488,6 +1566,7 @@ fn main(): i64 {
     test_kv_generation();
     test_kv_preset();
     test_kv_vocab300();
+    test_kv_mla();
     test_group("robustness");
     test_soak();
     test_nan_guard();

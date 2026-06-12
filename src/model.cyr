@@ -373,8 +373,13 @@ fn model_init_arch(V, C, T, nh, nkv, NL, attn_bias, dropout, seed, attn_kind, d_
     return 0;
 }
 
-# bytes held by the per-layer K/V caches (the E2 lever: scales with nkv)
-fn kv_cache_bytes(): i64 { return 2 * g_NL * g_T * _Ckv() * 8; }
+# bytes held by the persistent per-token decode cache. MHA/GQA store full K/V
+# (the E2 lever: scales with nkv). MLA (M12.2) stores only the low-rank latent
+# `c` (d_c per token per layer), NOT full K/V — the headline compression number.
+fn kv_cache_bytes(): i64 {
+    if (g_attn_kind == 1) { return g_NL * g_T * g_latent_dim * 8; }
+    return 2 * g_NL * g_T * _Ckv() * 8;
+}
 
 # ---- tied LM head ----------------------------------------------------------
 # Weight tying — the token embedding is reused as the output projection:
@@ -564,10 +569,21 @@ fn model_fwd_row(tok, pos): i64 {
     var L = 0;
     while (L < g_NL) {
         ln_fwd(R_x, PL(L, _o_ln1g()), PL(L, _o_ln1b()), R_a, R_mean, R_rstd, 1, C);
-        attn_fwd_row(PL(L, _o_Wq()), P_bq(L), PL(L, _o_Wk()), P_bk(L),
-                     PL(L, _o_Wv()), P_bv(L), PL(L, _o_Wo()), P_bo(L),
-                     R_a, R_attn, La(KV_K, L), La(KV_V, L), R_prow, R_concat,
-                     R_q, pos, C, g_nh, g_nkv);
+        if (g_attn_kind == 1) {
+            # MLA latent KV-cache decode (M12.2): the per-layer latent buffer
+            # La(LA_c, L) is the persistent d_c-wide cache; the arena's Kc/Vc
+            # region serves as the transient up-projection scratch (Ckv == C).
+            var ar = La(LA_arena, L);
+            attn_mla_fwd_row(PL(L, _o_Wq()), P_bq(L), PL(L, _o_Wdkv()), PL(L, _o_Wuk()), P_bk(L),
+                             PL(L, _o_Wuv()), P_bv(L), PL(L, _o_Wo()), P_bo(L),
+                             R_a, R_attn, La(LA_c, L), _at_Kc(ar, g_T, C), _at_Vc(ar, g_T, C, C),
+                             R_prow, R_concat, R_q, pos, C, g_nh, g_latent_dim);
+        } else {
+            attn_fwd_row(PL(L, _o_Wq()), P_bq(L), PL(L, _o_Wk()), P_bk(L),
+                         PL(L, _o_Wv()), P_bv(L), PL(L, _o_Wo()), P_bo(L),
+                         R_a, R_attn, La(KV_K, L), La(KV_V, L), R_prow, R_concat,
+                         R_q, pos, C, g_nh, g_nkv);
+        }
         c = 0;
         while (c < C) {
             store64(R_xmid + c * 8, f64_add(load64(R_x + c * 8), load64(R_attn + c * 8)));

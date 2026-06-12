@@ -4,6 +4,49 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-06-12
+
+**MLA latent KV-cache decode (M12.2) — the deferred M12 gate.** 1.2.0 trained
+and sampled MLA via the uncached reference forward; this adds the inference
+compression win: a cached single-row decode path that stores ONE low-rank
+latent `c` (`d_c` per token per layer) instead of full per-head K/V, and
+up-projects to K/V on read. Additive and bit-identical — no checkpoint-format
+change, the no-flag run untouched (ADR 0007).
+
+### Added
+- **Cached MLA decode** (`attn_mla_fwd_row`). The persistent cache holds the
+  `d_c`-wide latent (the per-layer `LA_c` buffer); each step appends the new
+  latent and re-up-projects the cached block `0..pos` to full K/V into transient
+  scratch (the attention arena), then runs the shared single-row core. The K/V
+  scratch is decode working set, re-derived from the latents — not persisted —
+  so the stored cache stays `d_c`-wide. `--attn-kind mla` now generates through
+  the KV cache like MHA/GQA.
+- **Shared single-row core.** `attn_core_fwd_row` extracted from `attn_fwd_row`;
+  MHA/GQA and MLA run the **identical** cached per-head softmax/PV kernel (one
+  source of truth, `docs/architecture/003`), mirroring the batch-path extraction
+  in 1.2.0. MHA/GQA cached decode stays bit-identical.
+- **Bit-identity gate** (`test_kv_mla`). Cached-vs-uncached MLA verified two
+  ways — prefill logits at every prefix `1..T`, and decode ids + final logits
+  across context-shifts (greedy AND temperature) — at `hd ∈ {6, 8, 10}`,
+  `d_c = C/2` / `d_c` not dividing `C`, odd `T`, and a degenerate 2-token
+  window. **351 → 376** checks green on x86_64 AND aarch64/qemu.
+- **KV-cache-bytes table** (bench): MLA latent vs the MHA/MQA full-K/V baselines
+  at the default config. `d_c = 16` gives **6144 bytes — a 4× reduction** vs
+  MHA's 24576, matching MQA's footprint **at full head expressiveness** (no
+  head-sharing). Cached decode also benches ~4.6× the uncached MLA reference.
+
+### Changed
+- `kv_cache_bytes()` reports the latent footprint (`NL·T·d_c·8`) for MLA, the
+  full-K/V footprint otherwise.
+
+### Notes
+- The reference re-up-projects the cached latents each step, so per-step compute
+  is not yet at MHA-cached parity — the **absorption** optimization (fold `W_UK`
+  into `W_Q` to attend latents directly) is the compute win and is future work;
+  it changes accumulation order, so it would ride its own bit-identity story.
+- Coupled/decoupled RoPE (`--pos-kind`, ADR 0007 increments 4–5) remain reserved
+  in the v4 descriptor and land in a later M12 increment.
+
 ## [1.2.0] - 2026-06-12
 
 **Multi-Head Latent Attention (M12) — the first new architecture on the 1.x arc.**

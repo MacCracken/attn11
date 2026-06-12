@@ -5,20 +5,31 @@
 
 ## Version
 
-**1.2.0** — *Multi-Head Latent Attention* (M12, the first new architecture on the
-1.x arc; ADR 0007). `--attn-kind mla` factors K/V through a low-rank latent
-(down `C→d_c`, up `d_c→C`, `--latent-dim`; full heads), the DeepSeek-V2
-parameterization (arXiv:2405.04434). A shared `attn_core_fwd`/`attn_core_bwd` was
-extracted so MHA/GQA and MLA run the **identical** softmax/PV kernel; the MLA
-backward composes from `linear_bwd` + the core (no novel hand-derived math).
-**Opt-in/additive**: a no-flag run is a byte-identical MHA transformer.
-Grad-checked per-op (tight) + full-model; **checkpoint v4** records the
-architecture descriptor (`attn_kind`/`latent_dim`), round-trips bit-for-bit, and
-v1/v2/v3 still load. MLA *trains* (loss ↓) + checkpoints + samples; its
-**latent KV-cache** decode (the inference compression win + bit-identity + the
-KV-bytes table) is the **M12.2** follow-on — 1.2.0 generates MLA via the uncached
-reference path. **351** grad-check/property tests green on x86_64; fuzz + lint
-green. Toolchain pinned at cyrius 6.1.37.
+**1.2.1** — *MLA latent KV-cache decode* (M12.2, the deferred M12 gate; ADR
+0007). The cached single-row MLA decode path (`attn_mla_fwd_row`): the persistent
+cache stores ONE low-rank latent `c` (`d_c` per token per layer, the per-layer
+`LA_c` buffer) instead of full per-head K/V, and up-projects to K/V on read.
+`attn_core_fwd_row` was extracted so MHA/GQA and MLA share the **identical**
+cached single-row softmax/PV kernel (mirroring 1.2.0's batch-path extraction).
+`--attn-kind mla` now generates through the KV cache like MHA/GQA;
+cached-vs-uncached **bit-identical** (prefill at every prefix + decode across
+context-shifts, greedy + temperature). **Headline**: `kv_cache_bytes` reports the
+latent footprint `NL·T·d_c·8` — at `d_c = 16` that is **6144 bytes, 4× under
+MHA** (24576), MQA's footprint **at full head expressiveness** (no head-sharing);
+cached decode also benches ~4.6× the uncached MLA reference. Additive — no
+checkpoint-format change, the no-flag run untouched. **376** grad-check/property
+tests green on x86_64 AND aarch64/qemu; fuzz + lint green. The absorption compute
+optimization (attend latents directly) is future work. Toolchain pinned at cyrius
+6.1.37.
+(1.2.0 — *Multi-Head Latent Attention* (M12, the first new architecture on the
+1.x arc): `--attn-kind mla` factors K/V through a low-rank latent (down `C→d_c`,
+up `d_c→C`, `--latent-dim`; full heads), the DeepSeek-V2 parameterization
+(arXiv:2405.04434). A shared `attn_core_fwd`/`attn_core_bwd` was extracted so
+MHA/GQA and MLA run the **identical** softmax/PV kernel; the MLA backward composes
+from `linear_bwd` + the core (no novel hand-derived math). **Checkpoint v4**
+records the architecture descriptor (`attn_kind`/`latent_dim`), round-trips
+bit-for-bit, and v1/v2/v3 still load. 1.2.0 generated MLA via the uncached
+reference path; M12.2 (above) added the latent KV-cache decode.)
 (1.1.0 — *the extraction*: the reusable numeric core lifted to **rosnet** 0.1.0
 (tensor/BLAS-1/matmul + gradient) and **tyche** 0.1.0 (deterministic PRNG),
 resolved via `cyrius deps`; additive/internal, byte-identical, attn11 the
@@ -135,7 +146,13 @@ checkpoint vs Linux at fixed CPU — `scripts/agnos-smoke.sh`):
   factored through a low-rank latent (down `C→d_c`, up `d_c→C`; `--latent-dim`,
   default `d_model/2`; full heads). Shares the extracted `attn_core_*` kernel with
   MHA/GQA; grad-checked per-op + full-model; checkpoint v4 carries the descriptor.
-  Trains + checkpoints + samples (uncached); the latent KV-cache decode is M12.2.
+  Trains + checkpoints + samples.
+- **MLA latent KV-cache decode** (1.2.1, M12.2): cached single-row MLA generation
+  (`attn_mla_fwd_row`) stores the `d_c` latent per token (per-layer `LA_c`) and
+  up-projects to K/V on read; `attn_core_fwd_row` shared with the MHA/GQA cached
+  path. Bit-identical to the uncached reference. `kv_cache_bytes` reports the
+  latent footprint — 6144 B at `d_c = 16`, **4× under MHA**, MQA's footprint at
+  full heads. The absorption compute optimization is future work.
 - CLI: `--corpus --stdin --load --save --steps --gen-only --preset --heads
   --kv-heads --layers --attn-kind --latent-dim --bpe --eval`
 
@@ -177,17 +194,22 @@ d_c=16 vs MHA's 39 488).
 - `attn.cyr` — the shared attention core `attn_core_fwd`/`attn_core_bwd` (causal
   scaled-dot-product softmax/PV), wrapped by `attn_fwd`/`attn_bwd` (MHA/GQA
   projections) and `attn_mla_fwd`/`attn_mla_bwd` (MLA low-rank latent down/up
-  projections; 1.2.0); one pre-allocated arena; `attn_fwd_row` (KV-cached
-  single-row forward, bit-identical per row to `attn_fwd`)
+  projections; 1.2.0); one pre-allocated arena; the shared cached single-row core
+  `attn_core_fwd_row`, wrapped by `attn_fwd_row` (MHA/GQA KV cache) and
+  `attn_mla_fwd_row` (1.2.1: latent KV-cache decode — store the `d_c` latent,
+  up-project to K/V on read) — each bit-identical per row to its batch path
 - `fileio.cyr` — secure file I/O (`O_NOFOLLOW`, `fstat` size, looped read/write),
   stdin reader
 - `model.cyr` — per-layer packed parameters (block stride + `_o_*`/`PL`/`GL`
   helpers; one `_kv_weight_size()` branches the K/V region MHA↔MLA, ADR 0007),
-  per-layer activation caches (+ the MLA latent `LA_c`), embeddings, tied head,
-  full N-layer forward/backward (`attn_kind`-branched), grad clipping, Adam; KV
-  caches + `model_fwd_row` (cached row) + `model_eval_window` (uncached eval +
-  MLA generation); `model_init_arch`/`model_config_ok_arch`/`model_alloc_bytes_arch`
-  carry the descriptor (the `_arch` forms; the old names delegate as MHA)
+  per-layer activation caches (+ the MLA latent `LA_c`, doubling as the 1.2.1
+  latent decode cache), embeddings, tied head, full N-layer forward/backward
+  (`attn_kind`-branched), grad clipping, Adam; KV caches + `model_fwd_row`
+  (cached row, `attn_kind`-branched: full-K/V for MHA/GQA, latent for MLA) +
+  `model_eval_window` (uncached eval reference); `kv_cache_bytes` reports the
+  latent footprint for MLA; `model_init_arch`/`model_config_ok_arch`/
+  `model_alloc_bytes_arch` carry the descriptor (the `_arch` forms; the old
+  names delegate as MHA)
 - `train.cyr` — byte + **BPE** tokenizer (`bpe_learn`/`tok_encode`/
   `bpe_build_spans`/`tok_emit`), corpus (embedded/file/stdin, raw bytes
   retained), batch sampling, LR schedule, resumable training loop, KV-cached
@@ -202,7 +224,7 @@ d_c=16 vs MHA's 39 488).
 
 ## Tests
 
-- `tests/attn11.tcyr` — **351 checks**: finite-difference gradient checks
+- `tests/attn11.tcyr` — **376 checks**: finite-difference gradient checks
   (every op incl. dropout; attention at head dims 6/8/10 and GQA/MQA at
   `nkv ∈ {1, 2, nh}` incl. `dWk`/`dWv`/`dbv`; the `|dbk| ≈ 0`
   softmax-shift-invariance pin; 2-layer full model at MHA and GQA), the **MLA
@@ -225,12 +247,16 @@ d_c=16 vs MHA's 39 488).
   **eval/bits-per-byte** determinism + RNG-neutrality pin, the **KV
   bit-identity suite** (prefill at every prefix + decode across
   context-shifts, greedy + temperature, at hd ∈ {4, 6, 8, 10} ×
-  nkv ∈ {1, 2, nh} incl. odd-T shifts, **preset shape**, and V=300), a
+  nkv ∈ {1, 2, nh} incl. odd-T shifts, **preset shape**, and V=300), the
+  **MLA latent KV-cache bit-identity suite** (1.2.1, `test_kv_mla`:
+  cached-vs-uncached prefill + decode across shifts, greedy + temperature, at
+  hd ∈ {6, 8, 10} × `d_c = C/2`/`d_c ∤ C`, odd T, 2-token window), a
   **soak/leak** test and a **NaN guard** test. All pass on x86_64 AND aarch64
   (`cyrius test`; aarch64 via qemu).
 - `tests/attn11.bcyr` — benchmark harness (training timings + tokens/sec,
   generation cached/uncached, KV bytes per nkv, MQA timings, **preset
-  train+gen**, **`bpe_learn` cost**).
+  train+gen**, **MLA latent-cache gen + the cache-bytes table** (latent vs
+  MHA/MQA full-K/V), **`bpe_learn` cost**).
 - `tests/attn11.fcyr` — fuzz harness: 500 mutated-checkpoint rounds (v2/v3
   header fields incl. nkv/step, + a **boundary-combination** mode: every size
   field at/over its cap at once) + **500 BPE-image rounds** (merge-slot
@@ -271,17 +297,15 @@ _None yet._
 
 ## Next
 
-See [`roadmap.md`](roadmap.md). **v1.0.0 (clean cut), v1.1.0 (extraction), and
-v1.2.0 (MLA core) shipped.** The surface is frozen
-([`STABILITY.md`](../STABILITY.md)) and additive-only past 1.0; the numeric core
-lives in **rosnet** + **tyche**, and MLA is the first new architecture on the 1.x
-arc (`--attn-kind mla`, checkpoint v4).
+See [`roadmap.md`](roadmap.md). **v1.0.0 (clean cut), v1.1.0 (extraction),
+v1.2.0 (MLA core), and v1.2.1 (MLA latent KV-cache decode) shipped.** The surface
+is frozen ([`STABILITY.md`](../STABILITY.md)) and additive-only past 1.0; the
+numeric core lives in **rosnet** + **tyche**, and MLA (`--attn-kind mla`,
+checkpoint v4) — now with its latent KV-cache decode — is the first new
+architecture on the 1.x arc. M12 is complete bar the optional `--pos-kind` RoPE
+rungs (reserved in the v4 descriptor; ADR 0007 increments 4–5, a later M12 slot).
 
 **Next on the 1.x architecture arc** (roadmap):
-- **M12.2 — the MLA latent KV-cache decode** (the deferred M12 gate): a cached
-  single-row path storing the `d_c` latent per token, the cached-vs-uncached
-  bit-identity gate, and the KV-cache-bytes table vs GQA/MQA. 1.2.0 generates MLA
-  via the uncached reference path; this is the inference compression win on top.
 - **M13 (v1.3.0) — Mixture of Experts** (E8; sparse FFN with the
   `--experts {8,16,32,64,128,256}` density sweep, checkpoint v5), then E4–E6
   (mixers / diffusion / ternary) as M14–M16, and **M17** reinforcement learning

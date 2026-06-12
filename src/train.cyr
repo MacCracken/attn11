@@ -590,12 +590,11 @@ fn generate(prompt, plen, ngen, temp): i64 {
     }
     if (n < 1) { store64(G_win, 0); n = 1; }   # empty prompt: seed with id 0
     print(prompt, plen);
-    # MLA has no latent KV-cache decode path yet (M12.2), so it generates via the
-    # uncached reference forward (model_eval_window). MHA/GQA use the KV cache.
-    var cached = 1;
-    if (g_attn_kind == 1) { cached = 0; }
-    gen_prime(G_win, n, cached);
-    gen_decode(ngen, temp, cached, 0, 1);
+    # All attention kinds decode through the KV cache: MHA/GQA cache full K/V,
+    # MLA (M12.2) caches the low-rank latent and up-projects on read — both
+    # bit-identical to the uncached reference (pinned in tests/attn11.tcyr).
+    gen_prime(G_win, n, 1);
+    gen_decode(ngen, temp, 1, 0, 1);
     _putc(10);
     return 0;
 }

@@ -206,3 +206,47 @@ latent-cache decode path will realize and measure.
    (roadmap M12 gate) and the KV-bytes table are the M12.2 follow-on.
 3. Method: deterministic (fixed seed), so both rows reproduce bit-for-bit —
    `./build/attn11 [--attn-kind mla --latent-dim 16] --steps 600`.
+
+## X006 — MLA latent KV-cache decode: the compression number (M12.2, v1.2.1) (2026-06-12)
+
+**Setup**: 1.2.1, default config (d_model 32, ctx 16, 4 heads, 3 layers), MLA at
+d_c = 16 (= C/2), x86_64. The M12.2 follow-on X005 deferred: the headline
+cache-bytes table + cached-vs-uncached bit-identity, now realized by the
+`attn_mla_fwd_row` latent decode path. Bench harness numbers (`./build/bench`).
+
+**Result** (persistent decode-cache footprint, NL=3, T=16, C=32, hd=8):
+
+| cache kind          | per-token bytes/layer | total (NL·T) | vs MHA |
+|---------------------|-----------------------|--------------|--------|
+| MHA full K/V (nkv=4)| `2·Ckv·8` = 512       | **24 576**   | 1.0×   |
+| GQA (nkv=2)         | 256                   | 12 288       | 2.0×   |
+| MQA full K/V (nkv=1)| 128                   | 6 144        | 4.0×   |
+| **MLA latent** (d_c=16) | `d_c·8` = 128     | **6 144**    | **4.0×** |
+
+MLA at d_c = C/2 lands on MQA's footprint (4× under MHA) but keeps **full heads**
+(nkv = nh) — MQA gets there by collapsing to a single shared K/V head; MLA gets
+there by low-rank factorization while every query head keeps its own K/V on read.
+The latent is also the single compression knob: d_c = 8 would halve it again to
+3 072 (8× under MHA), d_c trades footprint for K/V rank directly.
+
+**Generation speed** (default config, greedy, NGEN tokens): cached MLA decode
+~4 852 tok/s vs ~1 050 tok/s for the uncached MLA reference (~4.6×). The win is
+from not recomputing the whole window each token; it is **not** at MHA-cached
+parity, because the reference re-up-projects the cached latents to K/V every step
+(O(pos·d_c·C) per step) rather than absorbing W_UK into W_Q to attend the latents
+directly. Absorption is the compute optimization (and a further memory win — no
+materialized K/V working set), deferred as future work because it reorders the
+accumulation and so needs its own bit-identity story.
+
+**Takeaways**:
+1. Bit-identity holds: cached MLA decode == uncached reference at every prefix and
+   across context-shifts, greedy + temperature, on x86_64 AND aarch64/qemu
+   (`test_kv_mla`, 25 asserts; 351→376 checks). The latent path is a drop-in.
+2. The compression is real and tunable via d_c alone — 4× at the default d_c=C/2,
+   matching MQA without sacrificing head count. This is the MLA thesis (the KV
+   cache as the central inference object, E7/ADR 0007) made concrete at reference
+   scale.
+3. The iso-param MLA-vs-GQA perplexity comparison on the vidya corpus (the other
+   half of the M12 gate) pairs naturally with the X003 byte-vs-BPE setup; left as
+   a follow-on measurement since the bit-identity + bytes gates (the shippable
+   M12.2 deliverables) are met.
