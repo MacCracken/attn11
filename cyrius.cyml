@@ -14,4 +14,18 @@ output = "build/attn11"
 
 [deps]
 stdlib = ["string", "fmt", "alloc", "io", "vec", "str", "syscalls", "assert", "bench", "math", "ganita", "args"]
+
+# Extracted at the v1 freeze: the tensor storage / BLAS-1 / matmul (+ gradient)
+# layer -> rosnet; the deterministic statistical PRNG -> tyche. attn11 now
+# consumes both and dogfoods them — its own finite-difference grad-checks
+# validate rosnet's linear, and a byte-identical training run proves the swap.
+[deps.tyche]
+git = "https://github.com/MacCracken/tyche"
+tag = "0.1.0"
+modules = ["dist/tyche.cyr"]
+
+[deps.rosnet]
+git = "https://github.com/MacCracken/rosnet"
+tag = "0.1.0"
+modules = ["dist/rosnet.cyr"]
 ---

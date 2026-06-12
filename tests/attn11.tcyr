@@ -5,6 +5,8 @@
 # The checkpoint round-trip is verified to reproduce training bit-for-bit.
 # Stdlib (assert/math/...) auto-included via cyrius.cyml.
 
+include "lib/tyche.cyr"          # extracted PRNG (rng_*, _rng_state)
+include "lib/rosnet.cyr"         # extracted tensor/BLAS-1/matmul (+ gradient)
 include "src/tensor.cyr"
 include "src/fileio.cyr"
 include "src/ops.cyr"

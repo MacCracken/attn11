@@ -14,6 +14,8 @@
 # Uses its OWN PRNG (model_init reseeds the global _rng_state, so we can't
 # share it). Deterministic seed -> reproducible. Run by `cyrius test`.
 
+include "lib/tyche.cyr"          # extracted PRNG (rng_*, _rng_state)
+include "lib/rosnet.cyr"         # extracted tensor/BLAS-1/matmul (+ gradient)
 include "src/tensor.cyr"
 include "src/fileio.cyr"
 include "src/ops.cyr"

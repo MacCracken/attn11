@@ -5,6 +5,8 @@
 # deltas around N-iteration loops; the ~120 ns/call clock overhead amortizes to
 # nothing against the ms-scale ops measured.
 
+include "lib/tyche.cyr"          # extracted PRNG (rng_*, _rng_state)
+include "lib/rosnet.cyr"         # extracted tensor/BLAS-1/matmul (+ gradient)
 include "src/tensor.cyr"
 include "src/fileio.cyr"
 include "src/ops.cyr"

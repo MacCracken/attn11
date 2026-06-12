@@ -33,6 +33,8 @@
 # (heads not dividing d_model, kv-heads not dividing heads) abort cleanly in
 # model_init.
 
+include "lib/tyche.cyr"          # extracted PRNG (rng_*, _rng_state)
+include "lib/rosnet.cyr"         # extracted tensor/BLAS-1/matmul (+ gradient)
 include "src/tensor.cyr"
 include "src/fileio.cyr"
 include "src/ops.cyr"
