@@ -13,14 +13,16 @@
 
 ## Where we are
 
-Current: **v1.5.0**. The v1.0 surface is frozen and additive-only
+Current: **v1.5.1**. The v1.0 surface is frozen and additive-only
 ([`STABILITY.md`](../STABILITY.md)); the reusable numeric core lives in
 **[rosnet](https://github.com/MacCracken/rosnet)** + **[tyche](https://github.com/MacCracken/tyche)**
 (v1.1.0). The 1.x architecture arc through M14 has shipped (the attention/KV, FFN-
-density, and sequence-mixer axes), and **M15** (the char-diffusion *training
-objective*, v1.5.0) is the first objective departure; **next up is M16** (below).
-For *what* shipped, see [`CHANGELOG.md`](../../CHANGELOG.md) (release narrative),
-[`experiments.md`](experiments.md) (the X-series), and [`state.md`](state.md) (the
+density, and sequence-mixer axes), **M15** (the char-diffusion *training objective*,
+v1.5.0) is the first objective departure, and v1.5.1 added the C4 data-ingestion
+tooling (X016). **Next up is the data-ingestion & curation 1.5.x arc (1.5.2–1.5.5,
+below), then M16.** For *what* shipped, see [`CHANGELOG.md`](../../CHANGELOG.md)
+(release narrative), [`experiments.md`](experiments.md) (the X-series), and
+[`state.md`](state.md) (the
 live snapshot — current flags, counts, perf). This file is the plan ahead only.
 
 ## Versioning
@@ -32,6 +34,70 @@ releases are stable, additive-only tags (no v2 fork is planned — the architect
 arc rides as 1.x minors). The local release gate is `make release` (lint + x86
 grad-checks + aarch64/qemu + DCE build + fuzz + the `make smoke` CLI regression);
 CI mirrors it.
+
+## Data ingestion & curation (the 1.5.x arc) — ships next
+
+> An infra/data sub-arc, not an architecture milestone — it ships BEFORE M16 (it is
+> the immediate next work). The driver (from v1.5.1 / X016): a tiny attn11 is
+> **data-rich and capacity-poor** — 4 MB already exceeds what a 40 K–250 K-param
+> model absorbs (the C4 run saw only ~8% of one epoch in 600 steps), and `g_data`
+> stores **one i64 per token (8 B/token)** against a **256 MB single-allocation cap**
+> (`ALLOC_MAX`), so the corpus ceiling is ~32 MB. So **"data quality > volume"** (the
+> frontier survey) governs the near term, packing buys cheap headroom, and the
+> RAM-independent path (streaming) waits for a model big enough to need it. Each item
+> is tooling/data + a logged X-entry; the no-flag binary stays byte-identical except
+> 1.5.3 (a transparent storage change) and 1.5.5 (the audit).
+
+### 1.5.2 — Quality-curating sampler (sharpen quality)
+
+Upgrade `scripts/c4_sample.py` (and/or a curation layer) from "the first N raw C4
+docs" to a **curated** 4 MB: exact/near-duplicate filtering, **multi-shard sampling**
+for diversity (across shards, not one consecutive run), and length / boilerplate /
+register filters. Tooling + data only — the binary is unchanged. **Gate**: a
+measurable bits/byte improvement at iso-compute vs the raw 4 MB slice, deterministic
++ documented, logged as an X-series entry.
+
+### 1.5.3 — Token-packing unlock
+
+Store the token stream **packed** — `u8` for byte-level (vocab ≤ 256), `u16` for BPE
+(vocab ≤ 768) — instead of one i64 per token, removing the 8× `g_data` bloat and
+lifting the corpus ceiling ~4–8× (to ~64–128 MB) in the same RAM. Touches `g_data` +
+its accessors (the window sampler, `bpe_learn`'s in-place merge rewrite,
+`corpus_set`, `sample_window`/`sample_window_diffusion`) and a `MAX_CORPUS_BYTES`
+raise to the new ceiling. The model / training math is untouched — the same token
+ids feed the same forward. **Gate**: **byte-identical** training (same loss curve) at
+the current corpus size (packing is transparent); a larger corpus loads + trains; the
+alloc-accounting pin + the corpus-load fuzz stay green on x86_64 AND aarch64.
+
+### 1.5.4 — Curation at scale
+
+With 1.5.3's higher ceiling, curate a **larger, multi-source** corpus (e.g. 16–32 MB
+across many C4 shards, optionally mixing registers) and run the scaled
+data + capacity experiment — does more *clean* data + a bigger model move English
+fluency? Tooling + data + a logged run; the binary is unchanged. **Gate**: a
+documented scaled AR (and/or diffusion) run vs the 4 MB baseline at matched compute,
+logged as an X-series entry (an honest result, win or not).
+
+### 1.5.5 — Hardening / audit / security pass (P(-1))
+
+The standard pre-minor hardening (CLAUDE.md P(-1)): cleanliness, a benchmark
+baseline, deep review, and a **security audit** of the surface the 1.5.x arc added —
+the raised corpus cap and the packed-store bounds (1.5.3), the curation scripts'
+input handling (1.5.2/1.5.4), and the diffusion path (1.5.0). Findings →
+tests/benchmarks; report filed in [`../audit/`](../audit/). **Gate**: audit filed,
+findings fixed + regression-tested, `make release` green — closes the 1.5.x arc
+before 1.6.0.
+
+### Streaming token-shard ingestion — 1.6.x (with M16)
+
+The RAM-independent large-corpus path: **pre-encode** a corpus to a token file once,
+then **mmap / sample windows by offset** — decoupling corpus size from RAM (GB+),
+the standard large-corpus training pattern. Sequenced into the **1.6.x group with
+M16**, not the 1.5.x arc, because large-corpus ingestion only pays off once the model
+is big enough to keep absorbing data (a model-scale precondition); it pairs with
+`scripts/c4_sample.py` emitting shards + the one-time pre-encoder. **Gate**:
+byte-identical sampling vs the in-memory path on a small corpus; a GB-scale corpus
+trains within bounded RAM; cross-arch.
 
 ## The 1.x architecture arc
 
@@ -49,9 +115,10 @@ change at a time behind its own grad-check / bit-identity gate.
 > sequence-mixer family (`--attn-kind {lin,ssm}` + the any-mixer per-layer
 > `--attn-every` hybrid), then 1.4.5 hardening + 1.4.6 benchmarking to close the
 > architecture arc, and **M15** the char-diffusion *training objective*
-> (`--objective diffusion`, v1.5.0) — the first objective departure. Detail lives
-> in [`CHANGELOG.md`](../../CHANGELOG.md), ADRs 0007–0013, and
-> [`experiments.md`](experiments.md) (X005–X015). **The plan ahead starts at M16.**
+> (`--objective diffusion`, v1.5.0) — the first objective departure — plus v1.5.1's
+> C4 data-ingestion tooling. Detail lives in [`CHANGELOG.md`](../../CHANGELOG.md),
+> ADRs 0007–0013, and [`experiments.md`](experiments.md) (X005–X016). **The plan
+> ahead is the data-ingestion & curation 1.5.x arc (the section above), then M16.**
 
 ### M16 — Ternary (BitNet-style) training (v1.6.0) — E6
 
@@ -60,6 +127,11 @@ ladder's algorithmic endpoint, and a *natural fit* for an everything-is-i64
 language: ternary matmul collapses to integer adds. **Gate**: the STE backward
 documented + grad-checked where defined; accuracy vs the f64 baseline; the
 i64-add matmul benched against the SIMD-f64 path.
+
+> **The 1.6.x group also folds in streaming token-shard ingestion** (defined in the
+> data-ingestion section above) — the RAM-independent large-corpus path that pays off
+> once a scaled (ternary or larger) model can keep absorbing data. Sequencing within
+> the group is TBD.
 
 ### M17 — Reinforcement learning (v1.7.0) — E9
 
@@ -162,10 +234,15 @@ gets reported, no dropped or cherry-picked rows (the "no silent caps" discipline
 ## Sequencing intent
 
 The remaining order is **value ÷ risk** and re-orderable (the axes are
-orthogonal): the *training-objective* and *precision* departures ride next — the
-char-diffusion objective (M15, E5) then ternary training (M16, E6) — with RL (M17,
-E9) last because it is an objective layer over a finished trunk, and the GPU
-*compute* backend (M18, E-infra) sequenced TBD (it unblocks the B4 GPU benchmark).
+orthogonal). Immediately next is the **data-ingestion & curation 1.5.x arc**
+(1.5.2 quality-curating sampler → 1.5.3 token-packing → 1.5.4 curation at scale →
+1.5.5 hardening/audit) — cheap, high-ROW infra that improves the data the *existing*
+models see and lifts the corpus ceiling, before any new model-scale work. Then the
+*precision* departure — **ternary training (M16, E6)** — into whose **1.6.x group**
+the **streaming token-shard** ingestion folds (the RAM-independent large-corpus path,
+which only pays off once a scaled model can absorb it). **RL (M17, E9)** is last
+because it is an objective layer over a finished trunk, and the GPU *compute* backend
+(M18, E-infra) is sequenced TBD (it unblocks the B4 GPU benchmark).
 The E-series is informed by the
 June-2026 frontier survey (`ai-ml-frontier-2026-expanded.docx`, repo root) —
 data quality > volume, the KV cache as the central inference object, SSM/attention

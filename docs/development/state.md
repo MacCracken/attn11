@@ -686,16 +686,21 @@ the FFN-density axis `--experts N --expert-topk K`, **two non-softmax mixers**
 `--attn-every K` (any mix of the four), and the **training-objective axis**
 `--objective {ar, diffusion}`. **M12, M13, M14, and M15 are all complete.**
 
-**Next — M16+.** M12–M15 have shipped: the architecture arc (MLA/RoPE, MoE, the
-mixer family + hybrid) closed at 1.4.6, then M15 (1.5.0) the first *training-
-objective* departure (char-diffusion; X015 logged the honest matched-compute
-AR-vs-diffusion comparison — AR wins at this tiny scale, the super-data-learner
-advantage is a scale phenomenon). Next is **M16** ternary (BitNet-style) training
-(E6) then **M17** reinforcement learning (E9), per [`roadmap.md`](roadmap.md). Open
-diffusion fast-follows: MLA/MoE/RoPE-diffusion, a stochastic/temperature decode, and
-a scaled (preset / larger-corpus) AR-vs-diffusion run to probe the data-efficiency
-crossover. A vidya-scale bake-off across mixers AND hybrid ratios remains the
-standing X-entry (X010–X014 ran the reference-scale comparisons).
+**Next — the data-ingestion & curation 1.5.x arc, then M16.** M12–M15 shipped: the
+architecture arc (MLA/RoPE, MoE, the mixer family + hybrid) closed at 1.4.6, then
+M15 (1.5.0) the first *training-objective* departure (char-diffusion; X015 — AR wins
+at this tiny scale, the super-data-learner advantage is a scale phenomenon), then
+v1.5.1 the C4 data-ingestion tooling (X016). The immediate next work is the **1.5.x
+data arc** (per [`roadmap.md`](roadmap.md)): **1.5.2** quality-curating sampler
+(dedup / multi-shard / register filters — "data quality > volume") → **1.5.3**
+token-packing unlock (u8/u16 token store vs i64; removes the 8× `g_data` bloat,
+lifts the ~32 MB corpus ceiling 4–8×) → **1.5.4** curation at scale → **1.5.5**
+hardening/audit/security pass (P(-1)) closing the arc. Then **M16** ternary
+(BitNet-style) training (E6), into whose 1.6.x group **streaming token-shard
+ingestion** folds (RAM-independent large corpora — it pays off once a scaled model
+can absorb the data); **M17** RL (E9) last. Open diffusion fast-follows:
+MLA/MoE/RoPE-diffusion, a stochastic/temperature decode, a scaled AR-vs-diffusion
+run. A vidya-scale mixer/hybrid bake-off remains the standing X-entry.
 
 ### Handoff — how to pick this up
 
