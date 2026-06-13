@@ -61,20 +61,14 @@ fn ckpt_expected_np(V, C, T, nh, NL, bias, nkv): i64 {
 fn ckpt_expected_np_arch(V, C, T, nh, NL, bias, nkv, attn_kind, d_c, pos_kind, d_rope): i64 {
     return ckpt_expected_np_moe(V, C, T, nh, NL, bias, nkv, attn_kind, d_c, pos_kind, d_rope, 1, 1);   # dense
 }
-# MoE-aware (M13): the MLP weight region mirrors model.cyr's _mlp_weight_size —
-# dense (Wfc+bfc+Wproj+bproj) or N experts (each that quad) + the router gate(C*N).
+# MoE/mixer-aware (M13/M14). The per-block weight-region arithmetic is shared with
+# model.cyr via the pure _kvw/_mlpw helpers (1.4.1) — ONE source, so a candidate
+# config here is sized exactly as model_init lays it out (test_alloc_accounting +
+# the -10 NP gate pin them). topk does not affect the parameter count.
 fn ckpt_expected_np_moe(V, C, T, nh, NL, bias, nkv, attn_kind, d_c, pos_kind, d_rope, num_experts, topk): i64 {
-    var F = 4 * C;
     var Ckv = nkv * (C / nh);
     var emb = V * C + T * C;
-    var kvw = 2 * C * Ckv;                          # MHA/GQA: Wk + Wv
-    if (attn_kind == 1) {
-        kvw = C * d_c + 2 * d_c * C;                # MLA: W_DKV + W_UK + W_UV
-        if (pos_kind == 2) { kvw = kvw + C * nh * d_rope + C * d_rope; }   # + W_QR + W_KR (decoupled)
-    }
-    var mlpw = 2 * C * F + F + C;                    # dense: Wfc + bfc + Wproj + bproj
-    if (num_experts > 1) { mlpw = num_experts * (2 * C * F + F + C) + C * num_experts; }   # N experts + gate
-    var blkbase = 4 * C + 2 * C * C + kvw + mlpw;
+    var blkbase = 4 * C + 2 * C * C + _kvw(C, nh, nkv, attn_kind, d_c, pos_kind, d_rope) + _mlpw(C, 4 * C, num_experts);
     var blk = blkbase;
     if (bias == 1) { blk = blkbase + 2 * C + 2 * Ckv; }    # MLA: Ckv == C, so 4C, same as full MHA
     return emb + NL * blk + 2 * C;

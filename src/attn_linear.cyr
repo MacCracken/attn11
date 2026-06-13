@@ -1,0 +1,295 @@
+# attn11 — gated linear attention (RetNet-style retention): a SEQUENCE-MIXER
+# family (M14 rung a, E4; ADR 0009), split out of attn.cyr in 1.4.1 to establish
+# the one-file-per-mixer-family pattern (the M14 selective SSM lands next as its
+# own file). Depends on attn.cyr's arena helpers (_at_*) and rosnet's
+# linear_fwd/linear_bwd — include AFTER src/attn.cyr in each entry file.
+
+# ===========================================================================
+# Gated linear attention (RetNet-style retention) — a second SEQUENCE MIXER
+# (M14, E4). Replaces the softmax/PV core with a causal linear recurrence:
+#
+#   out_t = (1/sqrt(hd)) · Σ_{j≤t} γ_h^{t-j} (q_t · k_j) v_j
+#
+# computed by the constant-state recurrence  S_t = γ_h·S_{t-1} + k_t⊗v_t  (an
+# hd×hd state per head),  out_t = (1/sqrt(hd))·S_t^T q_t.  γ_h is a FIXED per-head
+# decay (parameter-free, like RoPE) — no softmax, no feature map, no normalizer:
+# the decay supplies the recency weighting, and the whole core is multiply/add
+# (so the grad-check is tight and there's no x86-only trig/exp). The decode cache
+# is the constant hd×hd state, NOT a growing K/V (the headline). Reuses the
+# Q/K/V/O projections (MHA layout). Sources: Katharopoulos et al. 2020
+# (arXiv:2006.16236, linear attention as an RNN); Sun et al. 2023 (arXiv:2307.08621,
+# RetNet — the per-head decay / retention). See docs/sources.md + ADR (M14).
+#
+# Hand-derived backward (test_lin_core), no state caching:
+#   dq_t = (1/sqrt(hd))·S_t·dout_t          (forward S-recompute pass)
+#   dk_t = Σ_{t'≥t} (1/sqrt(hd))·γ^{t'-t}·(v_t·dout_{t'})·q_{t'}   (reverse dS pass)
+#   dv_t = Σ_{t'≥t} (1/sqrt(hd))·γ^{t'-t}·(q_{t'}·k_t)·dout_{t'}
+# where the reverse accumulator dS_t = Σ_{t'≥t}(1/sqrt(hd))·γ^{t'-t}·q_{t'}⊗dout_{t'}.
+
+# Fixed per-head decay γ_h = 1 - 2^(-(3+h)), clamped so the shift can't overflow
+# i64 (γ→1 for very high heads — "infinite memory"). Pure f64, cross-arch stable.
+fn _lin_decay(h): i64 {
+    var sh = 3 + h;
+    if (sh > 60) { sh = 60; }
+    var denom = f64_from(1);
+    var i = 0;
+    while (i < sh) { denom = f64_mul(denom, f64_from(2)); i = i + 1; }
+    return f64_sub(f64_from(1), f64_div(f64_from(1), denom));
+}
+
+# Forward. Q,K,V: (T,C) post-projection (per-head blocks of width hd=C/nh).
+# out: (T,C). S: caller scratch >= (C/nh)^2 (the running hd×hd state, reused per
+# head). Causal — out_t depends only on j ≤ t.
+fn lin_core_fwd(Q, K, V, out, S, T, C, nh): i64 {
+    var hd = C / nh;
+    var s = f64_div(f64_from(1), f64_sqrt(f64_from(hd)));
+    var h = 0;
+    while (h < nh) {
+        var g = _lin_decay(h);
+        var base = h * hd;
+        var z = 0;
+        while (z < hd * hd) { store64(S + z * 8, f64_from(0)); z = z + 1; }
+        var t = 0;
+        while (t < T) {
+            var kb = K + (t * C + base) * 8;
+            var vb = V + (t * C + base) * 8;
+            var qb = Q + (t * C + base) * 8;
+            var ob = out + (t * C + base) * 8;
+            # S = γ·S + k_t ⊗ v_t
+            var a = 0;
+            while (a < hd) {
+                var ka = load64(kb + a * 8);
+                var b = 0;
+                while (b < hd) {
+                    var sab = f64_add(f64_mul(g, load64(S + (a * hd + b) * 8)), f64_mul(ka, load64(vb + b * 8)));
+                    store64(S + (a * hd + b) * 8, sab);
+                    b = b + 1;
+                }
+                a = a + 1;
+            }
+            # out_t[b] = s · Σ_a S[a,b] q_t[a]
+            var b2 = 0;
+            while (b2 < hd) {
+                var acc = f64_from(0);
+                var a2 = 0;
+                while (a2 < hd) {
+                    acc = f64_add(acc, f64_mul(load64(S + (a2 * hd + b2) * 8), load64(qb + a2 * 8)));
+                    a2 = a2 + 1;
+                }
+                store64(ob + b2 * 8, f64_mul(s, acc));
+                b2 = b2 + 1;
+            }
+            t = t + 1;
+        }
+        h = h + 1;
+    }
+    return 0;
+}
+
+# Backward. dout(T,C) -> dQ,dK,dV(T,C) [all WRITTEN fresh]. S,dS: caller scratch,
+# each >= (C/nh)^2. Pass 1 (forward) recomputes S_t for dq; pass 2 (reverse)
+# accumulates dS for dk/dv. γ_h is fixed (no gradient).
+fn lin_core_bwd(Q, K, V, dout, dQ, dK, dV, S, dS, T, C, nh): i64 {
+    var hd = C / nh;
+    var s = f64_div(f64_from(1), f64_sqrt(f64_from(hd)));
+    var h = 0;
+    while (h < nh) {
+        var g = _lin_decay(h);
+        var base = h * hd;
+        # ---- pass 1 (forward): recompute S_t, write dq_t = s·S_t·dout_t ----
+        var z = 0;
+        while (z < hd * hd) { store64(S + z * 8, f64_from(0)); z = z + 1; }
+        var t = 0;
+        while (t < T) {
+            var kb = K + (t * C + base) * 8;
+            var vb = V + (t * C + base) * 8;
+            var dob = dout + (t * C + base) * 8;
+            var dqb = dQ + (t * C + base) * 8;
+            var a = 0;
+            while (a < hd) {
+                var ka = load64(kb + a * 8);
+                var b = 0;
+                while (b < hd) {
+                    var sab = f64_add(f64_mul(g, load64(S + (a * hd + b) * 8)), f64_mul(ka, load64(vb + b * 8)));
+                    store64(S + (a * hd + b) * 8, sab);
+                    b = b + 1;
+                }
+                a = a + 1;
+            }
+            a = 0;
+            while (a < hd) {
+                var acc = f64_from(0);
+                var b = 0;
+                while (b < hd) {
+                    acc = f64_add(acc, f64_mul(load64(S + (a * hd + b) * 8), load64(dob + b * 8)));
+                    b = b + 1;
+                }
+                store64(dqb + a * 8, f64_mul(s, acc));
+                a = a + 1;
+            }
+            t = t + 1;
+        }
+        # ---- pass 2 (reverse): dS += s·q_t⊗dout_t ; dk/dv from dS ; decay ----
+        z = 0;
+        while (z < hd * hd) { store64(dS + z * 8, f64_from(0)); z = z + 1; }
+        t = T - 1;
+        while (t >= 0) {
+            var qb = Q + (t * C + base) * 8;
+            var kb = K + (t * C + base) * 8;
+            var vb = V + (t * C + base) * 8;
+            var dob = dout + (t * C + base) * 8;
+            var dkb = dK + (t * C + base) * 8;
+            var dvb = dV + (t * C + base) * 8;
+            var a = 0;
+            while (a < hd) {
+                var sqa = f64_mul(s, load64(qb + a * 8));
+                var b = 0;
+                while (b < hd) {
+                    var dsab = f64_add(load64(dS + (a * hd + b) * 8), f64_mul(sqa, load64(dob + b * 8)));
+                    store64(dS + (a * hd + b) * 8, dsab);
+                    b = b + 1;
+                }
+                a = a + 1;
+            }
+            # dk_t[a] = Σ_b dS[a,b] v_t[b]
+            a = 0;
+            while (a < hd) {
+                var acc = f64_from(0);
+                var b = 0;
+                while (b < hd) {
+                    acc = f64_add(acc, f64_mul(load64(dS + (a * hd + b) * 8), load64(vb + b * 8)));
+                    b = b + 1;
+                }
+                store64(dkb + a * 8, acc);
+                a = a + 1;
+            }
+            # dv_t[b] = Σ_a dS[a,b] k_t[a]
+            var b2 = 0;
+            while (b2 < hd) {
+                var acc = f64_from(0);
+                var a2 = 0;
+                while (a2 < hd) {
+                    acc = f64_add(acc, f64_mul(load64(dS + (a2 * hd + b2) * 8), load64(kb + a2 * 8)));
+                    a2 = a2 + 1;
+                }
+                store64(dvb + b2 * 8, acc);
+                b2 = b2 + 1;
+            }
+            # dS = γ·dS  (carry to t-1)
+            z = 0;
+            while (z < hd * hd) { store64(dS + z * 8, f64_mul(g, load64(dS + z * 8))); z = z + 1; }
+            t = t - 1;
+        }
+        h = h + 1;
+    }
+    return 0;
+}
+
+# ---- gated-linear wrappers (projections + lin_core; reuse the arena) ---------
+# Mirrors attn_fwd/attn_bwd but swaps the softmax core for lin_core and uses full
+# K/V (Ckv == C, nkv == nh — no GQA in the basic linear mixer). Positions enter
+# via the learned-absolute embedding (pos_kind == 0); RoPE is softmax-only. The
+# Q/K/V/O projections + biases are the MHA layout, so the param region, init, and
+# checkpoint are unchanged (this is attn_kind == 2). S/dS scratch live in the arena.
+fn attn_lin_fwd(Wq, bq, Wk, bk, Wv, bv, Wo, bo, x, out, ar, T, C, nh): i64 {
+    var Qc = _at_Qc(ar);
+    var Kc = _at_Kc(ar, T, C);
+    var Vc = _at_Vc(ar, T, C, C);
+    var concat = _at_concat(ar, T, C, nh, C);
+    linear_fwd(x, Wq, bq, Qc, T, C, C);
+    linear_fwd(x, Wk, bk, Kc, T, C, C);
+    linear_fwd(x, Wv, bv, Vc, T, C, C);
+    lin_core_fwd(Qc, Kc, Vc, concat, _at_linS(ar, T, C, nh, C), T, C, nh);
+    linear_fwd(concat, Wo, bo, out, T, C, C);
+    return 0;
+}
+# dout(T,C) -> dx(T,C); accumulate dWq..dWo, dbq..dbo. Back through Wo, the linear
+# core (dconcat -> dQ/dK/dV), then the Q/K/V projections. bk is a REAL gradient
+# here (no softmax shift-invariance — k enters the score linearly).
+fn attn_lin_bwd(Wq, Wk, Wv, Wo, x, dout, dx,
+                dWq, dbq, dWk, dbk, dWv, dbv, dWo, dbo, ar, T, C, nh): i64 {
+    var Qc = _at_Qc(ar);
+    var Kc = _at_Kc(ar, T, C);
+    var Vc = _at_Vc(ar, T, C, C);
+    var concat = _at_concat(ar, T, C, nh, C);
+    var dconcat = _at_dconcat(ar, T, C, nh, C);
+    var dQ = _at_dQ(ar, T, C, nh, C);
+    var dK = _at_dK(ar, T, C, nh, C);
+    var dV = _at_dV(ar, T, C, nh, C);
+    var dxq = _at_dxq(ar, T, C, nh, C);
+    var dxk = _at_dxk(ar, T, C, nh, C);
+    var dxv = _at_dxv(ar, T, C, nh, C);
+    linear_bwd(concat, Wo, dout, dconcat, dWo, dbo, T, C, C);
+    lin_core_bwd(Qc, Kc, Vc, dconcat, dQ, dK, dV,
+                 _at_linS(ar, T, C, nh, C), _at_lindS(ar, T, C, nh, C), T, C, nh);
+    linear_bwd(x, Wq, dQ, dxq, dWq, dbq, T, C, C);
+    linear_bwd(x, Wk, dK, dxk, dWk, dbk, T, C, C);
+    linear_bwd(x, Wv, dV, dxv, dWv, dbv, T, C, C);
+    var idx = 0;
+    while (idx < T * C) {
+        store64(dx + idx * 8, f64_add(f64_add(load64(dxq + idx * 8), load64(dxk + idx * 8)),
+                                      load64(dxv + idx * 8)));
+        idx = idx + 1;
+    }
+    return 0;
+}
+
+# ---- cached single-row gated-linear decode (M14.2) --------------------------
+# ONE recurrence step against the persistent per-head state `state` (nh blocks of
+# hd×hd; the decode cache — CONSTANT size, not a growing K/V). At pos == 0 the
+# state resets, so a fresh window (or a context-shift re-prime) rebuilds it. Each
+# step does the EXACT ops of lin_core_fwd's t-th iteration, so the cached row is
+# bit-identical to the batch scan (test_kv_lin). q,k,v: 1-row (C); out: 1-row (C).
+fn lin_core_fwd_row(q, k, v, out, state, pos, C, nh): i64 {
+    var hd = C / nh;
+    var s = f64_div(f64_from(1), f64_sqrt(f64_from(hd)));
+    var h = 0;
+    while (h < nh) {
+        var g = _lin_decay(h);
+        var base = h * hd;
+        var Sh = state + h * hd * hd * 8;
+        if (pos == 0) {
+            var zz = 0;
+            while (zz < hd * hd) { store64(Sh + zz * 8, f64_from(0)); zz = zz + 1; }
+        }
+        var a = 0;
+        while (a < hd) {
+            var ka = load64(k + (base + a) * 8);
+            var b = 0;
+            while (b < hd) {
+                var sab = f64_add(f64_mul(g, load64(Sh + (a * hd + b) * 8)), f64_mul(ka, load64(v + (base + b) * 8)));
+                store64(Sh + (a * hd + b) * 8, sab);
+                b = b + 1;
+            }
+            a = a + 1;
+        }
+        var b2 = 0;
+        while (b2 < hd) {
+            var acc = f64_from(0);
+            var a2 = 0;
+            while (a2 < hd) {
+                acc = f64_add(acc, f64_mul(load64(Sh + (a2 * hd + b2) * 8), load64(q + (base + a2) * 8)));
+                a2 = a2 + 1;
+            }
+            store64(out + (base + b2) * 8, f64_mul(s, acc));
+            b2 = b2 + 1;
+        }
+        h = h + 1;
+    }
+    return 0;
+}
+
+# Cached linear-attention row: project q/k/v (into arena row-0 slices), advance
+# the persistent state, project out. `state` is the caller-owned per-layer cache.
+fn attn_lin_fwd_row(Wq, bq, Wk, bk, Wv, bv, Wo, bo, x_row, out_row, ar, state, pos, C, nh): i64 {
+    var qc = _at_Qc(ar);
+    var kc = _at_Kc(ar, 1, C);
+    var vc = _at_Vc(ar, 1, C, C);
+    var cc = _at_concat(ar, 1, C, nh, C);
+    linear_fwd(x_row, Wq, bq, qc, 1, C, C);
+    linear_fwd(x_row, Wk, bk, kc, 1, C, C);
+    linear_fwd(x_row, Wv, bv, vc, 1, C, C);
+    lin_core_fwd_row(qc, kc, vc, cc, state, pos, C, nh);
+    linear_fwd(cc, Wo, bo, out_row, 1, C, C);
+    return 0;
+}

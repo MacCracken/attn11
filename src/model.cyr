@@ -73,27 +73,33 @@ fn _Ckv(): i64 { return g_nkv * (g_C / g_nh); }
 # Wv(C*Ckv). MLA: W_DKV(C*d_c) + W_UK(d_c*C) + W_UV(d_c*C). Everything downstream
 # (Wo, ln2, MLP, bias offsets, _blk_base_size, ckpt_expected_np) chains off this
 # single helper, so the layout invariant has one source of truth.
-fn _kv_weight_size(): i64 {
-    if (g_attn_kind == 1) {
-        var s = g_C * g_latent_dim + 2 * g_latent_dim * g_C;   # W_DKV + W_UK + W_UV
-        # decoupled RoPE (pos_kind == 2): + W_QR (C x nh*d_rope) + W_KR (C x d_rope),
-        # the bias-free rope projections. d_rope == 0 for coupled/learned MLA.
-        if (g_pos_kind == 2) { s = s + g_C * g_nh * g_rope_dim + g_C * g_rope_dim; }
+# PURE (descriptor-parameterized) per-block weight-region sizes — the SINGLE
+# source of the block-layout arithmetic, shared by the offset helpers below (via
+# the global wrappers) AND the checkpoint validator (persist.cyr's
+# ckpt_expected_np, which sizes a candidate config before any allocation). A new
+# mixer axis updates the K/V (or a new) region size in ONE place, not in both
+# model.cyr and persist.cyr (the M13/M14 keep-in-sync hazard). 1.4.1.
+fn _kvw(C, nh, nkv, ak, dc, pk, dr): i64 {
+    if (ak == 1) {                                       # MLA: W_DKV + W_UK + W_UV
+        var s = C * dc + 2 * dc * C;
+        if (pk == 2) { s = s + C * nh * dr + C * dr; }   # + decoupled-RoPE W_QR/W_KR
         return s;
     }
-    return 2 * g_C * _Ckv();
+    return 2 * C * (nkv * (C / nh));                      # MHA/GQA/lin: Wk + Wv (Ckv = nkv*hd)
 }
+fn _mlpw(C, F, ne): i64 {
+    if (ne > 1) { return ne * (2 * C * F + F + C) + C * ne; }   # N experts + router gate
+    return 2 * C * F + F + C;                                   # dense Wfc + bfc + Wproj + bproj
+}
+fn _kv_weight_size(): i64 { return _kvw(g_C, g_nh, g_nkv, g_attn_kind, g_latent_dim, g_pos_kind, g_rope_dim); }
 # Size (elements) of the MLP WEIGHT region — the SECOND place an architecture
 # axis changes the block layout (M13, E8). Dense: Wfc(C*F) + bfc(F) + Wproj(F*C)
 # + bproj(C). MoE (g_num_experts > 1): N experts each the dense quad, packed
 # array-of-structs, + the router gate Wg(C*N). Expert 0 starts exactly where the
 # dense Wfc does, so the dense _o_Wfc/_o_bfc/_o_Wproj/_o_bproj offsets stay valid
 # (they describe expert 0); _o_expert(e)/_o_Wgate index the rest.
-fn _moe_estride_blk(): i64 { return _moe_estride(g_C, g_F); }   # per-expert: C*F+F+F*C+C
-fn _mlp_weight_size(): i64 {
-    if (g_num_experts > 1) { return g_num_experts * _moe_estride_blk() + g_C * g_num_experts; }
-    return 2 * g_C * g_F + g_F + g_C;
-}
+fn _moe_estride_blk(): i64 { return _moe_estride(g_C, g_F); }   # per-expert: C*F+F+F*C+C (offset stride)
+fn _mlp_weight_size(): i64 { return _mlpw(g_C, g_F, g_num_experts); }
 # one block, in elements: ln1(2C) + Wq(C^2) + [K/V weight region] + Wo(C^2) +
 # ln2(2C) + [MLP weight region]; plus 2C+2Ckv for attention biases (bq,bk,bv,bo)
 # when enabled, appended after the MLP region so the weight offsets below are
@@ -749,8 +755,100 @@ fn embed_bwd(dx0): i64 {
 }
 
 # ---- full forward: returns mean loss (f64) ---------------------------------
+# ---- attention-sublayer mixer dispatch (1.4.1) ------------------------------
+# ONE branch point each on the mixer kind (g_attn_kind: 0 = mha/gqa, 1 = mla
+# [× g_pos_kind], 2 = gated-linear): the batch forward (shared by model_forward
+# and model_eval_window), the batch backward, and the cached single-row decode.
+# A new mixer (the M14 selective SSM) adds one case in each of these three, not
+# in four functions; the M14 per-layer hybrid flips g_attn_kind to a per-layer
+# lookup HERE and nowhere else.
+fn _attn_block_fwd(L, rows): i64 {
+    var a = La(LA_a, L);
+    if (g_attn_kind == 2) {
+        attn_lin_fwd(PL(L, _o_Wq()), P_bq(L), PL(L, _o_Wk()), P_bk(L),
+                     PL(L, _o_Wv()), P_bv(L), PL(L, _o_Wo()), P_bo(L),
+                     a, A_attn, La(LA_arena, L), rows, g_C, g_nh);
+    } elif (g_attn_kind == 1) {
+        if (g_pos_kind == 2) {
+            attn_mla_dec_fwd(PL(L, _o_Wq()), P_bq(L), PL(L, _o_Wdkv()), PL(L, _o_Wuk()), P_bk(L),
+                             PL(L, _o_Wuv()), P_bv(L), PL(L, _o_Wqr()), PL(L, _o_Wkr()), PL(L, _o_Wo()), P_bo(L),
+                             a, A_attn, La(LA_arena, L), La(LA_c, L), La(LA_qr, L), La(LA_kr, L),
+                             rows, g_C, g_nh, g_latent_dim, g_rope_dim);
+        } else {
+            attn_mla_fwd(PL(L, _o_Wq()), P_bq(L), PL(L, _o_Wdkv()), PL(L, _o_Wuk()), P_bk(L),
+                         PL(L, _o_Wuv()), P_bv(L), PL(L, _o_Wo()), P_bo(L),
+                         a, A_attn, La(LA_arena, L), La(LA_c, L), rows, g_C, g_nh, g_latent_dim);
+        }
+    } else {
+        attn_fwd(PL(L, _o_Wq()), P_bq(L), PL(L, _o_Wk()), P_bk(L),
+                 PL(L, _o_Wv()), P_bv(L), PL(L, _o_Wo()), P_bo(L),
+                 a, A_attn, La(LA_arena, L), rows, g_C, g_nh, g_nkv, g_pos_kind);
+    }
+    return 0;
+}
+fn _attn_block_bwd(L): i64 {
+    if (g_attn_kind == 2) {
+        attn_lin_bwd(PL(L, _o_Wq()), PL(L, _o_Wk()), PL(L, _o_Wv()), PL(L, _o_Wo()),
+                     La(LA_a, L), D_drop, D_a,
+                     GL(L, _o_Wq()), G_bq(L), GL(L, _o_Wk()), G_bk(L),
+                     GL(L, _o_Wv()), G_bv(L), GL(L, _o_Wo()), G_bo(L),
+                     La(LA_arena, L), g_T, g_C, g_nh);
+    } elif (g_attn_kind == 1) {
+        if (g_pos_kind == 2) {
+            attn_mla_dec_bwd(PL(L, _o_Wq()), PL(L, _o_Wdkv()), PL(L, _o_Wuk()), PL(L, _o_Wuv()),
+                             PL(L, _o_Wqr()), PL(L, _o_Wkr()), PL(L, _o_Wo()),
+                             La(LA_a, L), D_drop, D_a,
+                             GL(L, _o_Wq()), G_bq(L), GL(L, _o_Wdkv()), GL(L, _o_Wuk()), G_bk(L),
+                             GL(L, _o_Wuv()), G_bv(L), GL(L, _o_Wqr()), GL(L, _o_Wkr()), GL(L, _o_Wo()), G_bo(L),
+                             La(LA_arena, L), La(LA_c, L), La(LA_qr, L), La(LA_kr, L), D_lat1, D_lat2, D_qr, D_kr,
+                             g_T, g_C, g_nh, g_latent_dim, g_rope_dim);
+        } else {
+            attn_mla_bwd(PL(L, _o_Wq()), PL(L, _o_Wdkv()), PL(L, _o_Wuk()), PL(L, _o_Wuv()), PL(L, _o_Wo()),
+                         La(LA_a, L), D_drop, D_a,
+                         GL(L, _o_Wq()), G_bq(L), GL(L, _o_Wdkv()), GL(L, _o_Wuk()), G_bk(L),
+                         GL(L, _o_Wuv()), G_bv(L), GL(L, _o_Wo()), G_bo(L),
+                         La(LA_arena, L), La(LA_c, L), D_lat1, D_lat2, g_T, g_C, g_nh, g_latent_dim);
+        }
+    } else {
+        attn_bwd(PL(L, _o_Wq()), PL(L, _o_Wk()), PL(L, _o_Wv()), PL(L, _o_Wo()),
+                 La(LA_a, L), D_drop, D_a,
+                 GL(L, _o_Wq()), G_bq(L), GL(L, _o_Wk()), G_bk(L),
+                 GL(L, _o_Wv()), G_bv(L), GL(L, _o_Wo()), G_bo(L),
+                 La(LA_arena, L), g_T, g_C, g_nh, g_nkv, g_pos_kind);
+    }
+    return 0;
+}
+fn _attn_block_fwd_row(L, pos): i64 {
+    if (g_attn_kind == 2) {
+        attn_lin_fwd_row(PL(L, _o_Wq()), P_bq(L), PL(L, _o_Wk()), P_bk(L),
+                         PL(L, _o_Wv()), P_bv(L), PL(L, _o_Wo()), P_bo(L),
+                         R_a, R_attn, La(LA_arena, L), La(g_lin_state, L), pos, g_C, g_nh);
+    } elif (g_attn_kind == 1) {
+        var ar = La(LA_arena, L);
+        if (g_pos_kind == 2) {
+            attn_mla_dec_fwd_row(PL(L, _o_Wq()), P_bq(L), PL(L, _o_Wdkv()), PL(L, _o_Wuk()), P_bk(L),
+                                 PL(L, _o_Wuv()), P_bv(L), PL(L, _o_Wqr()), PL(L, _o_Wkr()),
+                                 PL(L, _o_Wo()), P_bo(L),
+                                 R_a, R_attn, La(LA_c, L), La(LA_kr, L),
+                                 _at_Kc(ar, g_T, g_C), _at_Vc(ar, g_T, g_C, g_C),
+                                 R_qr, R_prow, R_concat, R_q, pos, g_C, g_nh, g_latent_dim, g_rope_dim);
+        } else {
+            attn_mla_fwd_row(PL(L, _o_Wq()), P_bq(L), PL(L, _o_Wdkv()), PL(L, _o_Wuk()), P_bk(L),
+                             PL(L, _o_Wuv()), P_bv(L), PL(L, _o_Wo()), P_bo(L),
+                             R_a, R_attn, La(LA_c, L), _at_Kc(ar, g_T, g_C), _at_Vc(ar, g_T, g_C, g_C),
+                             R_prow, R_concat, R_q, pos, g_C, g_nh, g_latent_dim);
+        }
+    } else {
+        attn_fwd_row(PL(L, _o_Wq()), P_bq(L), PL(L, _o_Wk()), P_bk(L),
+                     PL(L, _o_Wv()), P_bv(L), PL(L, _o_Wo()), P_bo(L),
+                     R_a, R_attn, La(KV_K, L), La(KV_V, L), R_prow, R_concat,
+                     R_q, pos, g_C, g_nh, g_nkv, g_pos_kind);
+    }
+    return 0;
+}
+
 fn model_forward(): i64 {
-    var T = g_T; var C = g_C; var F = g_F; var V = g_V; var nh = g_nh;
+    var T = g_T; var C = g_C; var F = g_F; var V = g_V;
     var TC = T * C;
     g_aux_loss = f64_from(0);   # accumulated across the MoE blocks below (0 if dense)
     embed_fwd();
@@ -759,26 +857,7 @@ fn model_forward(): i64 {
         var xin = La(LA_resid, L);
         var a = La(LA_a, L);
         ln_fwd(xin, PL(L, _o_ln1g()), PL(L, _o_ln1b()), a, La(LA_m1, L), La(LA_r1, L), T, C);
-        if (g_attn_kind == 2) {
-            attn_lin_fwd(PL(L, _o_Wq()), P_bq(L), PL(L, _o_Wk()), P_bk(L),
-                         PL(L, _o_Wv()), P_bv(L), PL(L, _o_Wo()), P_bo(L),
-                         a, A_attn, La(LA_arena, L), T, C, nh);
-        } elif (g_attn_kind == 1) {
-            if (g_pos_kind == 2) {
-                attn_mla_dec_fwd(PL(L, _o_Wq()), P_bq(L), PL(L, _o_Wdkv()), PL(L, _o_Wuk()), P_bk(L),
-                                 PL(L, _o_Wuv()), P_bv(L), PL(L, _o_Wqr()), PL(L, _o_Wkr()), PL(L, _o_Wo()), P_bo(L),
-                                 a, A_attn, La(LA_arena, L), La(LA_c, L), La(LA_qr, L), La(LA_kr, L),
-                                 T, C, nh, g_latent_dim, g_rope_dim);
-            } else {
-                attn_mla_fwd(PL(L, _o_Wq()), P_bq(L), PL(L, _o_Wdkv()), PL(L, _o_Wuk()), P_bk(L),
-                             PL(L, _o_Wuv()), P_bv(L), PL(L, _o_Wo()), P_bo(L),
-                             a, A_attn, La(LA_arena, L), La(LA_c, L), T, C, nh, g_latent_dim);
-            }
-        } else {
-            attn_fwd(PL(L, _o_Wq()), P_bq(L), PL(L, _o_Wk()), P_bk(L),
-                     PL(L, _o_Wv()), P_bv(L), PL(L, _o_Wo()), P_bo(L),
-                     a, A_attn, La(LA_arena, L), T, C, nh, g_nkv, g_pos_kind);
-        }
+        _attn_block_fwd(L, T);
         # residual dropout on the attention branch
         dropout_gen_mask(La(LA_dmask_attn, L), TC, g_dropout, g_training);
         dropout_apply(A_attn, La(LA_dmask_attn, L), A_attn, TC);
@@ -842,38 +921,7 @@ fn model_fwd_row(tok, pos): i64 {
     var L = 0;
     while (L < g_NL) {
         ln_fwd(R_x, PL(L, _o_ln1g()), PL(L, _o_ln1b()), R_a, R_mean, R_rstd, 1, C);
-        if (g_attn_kind == 2) {
-            # gated-linear decode (M14.2): the persistent per-layer state IS the
-            # cache (constant nh*hd^2, not a growing K/V). One recurrence step per
-            # token; pos==0 resets the state (fresh window / context-shift re-prime).
-            attn_lin_fwd_row(PL(L, _o_Wq()), P_bq(L), PL(L, _o_Wk()), P_bk(L),
-                             PL(L, _o_Wv()), P_bv(L), PL(L, _o_Wo()), P_bo(L),
-                             R_a, R_attn, La(LA_arena, L), La(g_lin_state, L), pos, C, g_nh);
-        } elif (g_attn_kind == 1) {
-            # MLA latent KV-cache decode (M12.2): the per-layer latent buffer
-            # La(LA_c, L) is the persistent d_c-wide cache; the arena's Kc/Vc
-            # region serves as the transient up-projection scratch (Ckv == C).
-            var ar = La(LA_arena, L);
-            if (g_pos_kind == 2) {
-                # decoupled RoPE (M12 incr 5): cache the latent c AND the shared
-                # rope key kr (La(LA_kr, L)); rotate per absolute position on read.
-                attn_mla_dec_fwd_row(PL(L, _o_Wq()), P_bq(L), PL(L, _o_Wdkv()), PL(L, _o_Wuk()), P_bk(L),
-                                     PL(L, _o_Wuv()), P_bv(L), PL(L, _o_Wqr()), PL(L, _o_Wkr()),
-                                     PL(L, _o_Wo()), P_bo(L),
-                                     R_a, R_attn, La(LA_c, L), La(LA_kr, L), _at_Kc(ar, g_T, C), _at_Vc(ar, g_T, C, C),
-                                     R_qr, R_prow, R_concat, R_q, pos, C, g_nh, g_latent_dim, g_rope_dim);
-            } else {
-                attn_mla_fwd_row(PL(L, _o_Wq()), P_bq(L), PL(L, _o_Wdkv()), PL(L, _o_Wuk()), P_bk(L),
-                                 PL(L, _o_Wuv()), P_bv(L), PL(L, _o_Wo()), P_bo(L),
-                                 R_a, R_attn, La(LA_c, L), _at_Kc(ar, g_T, C), _at_Vc(ar, g_T, C, C),
-                                 R_prow, R_concat, R_q, pos, C, g_nh, g_latent_dim);
-            }
-        } else {
-            attn_fwd_row(PL(L, _o_Wq()), P_bq(L), PL(L, _o_Wk()), P_bk(L),
-                         PL(L, _o_Wv()), P_bv(L), PL(L, _o_Wo()), P_bo(L),
-                         R_a, R_attn, La(KV_K, L), La(KV_V, L), R_prow, R_concat,
-                         R_q, pos, C, g_nh, g_nkv, g_pos_kind);
-        }
+        _attn_block_fwd_row(L, pos);
         c = 0;
         while (c < C) {
             store64(R_xmid + c * 8, f64_add(load64(R_x + c * 8), load64(R_attn + c * 8)));
@@ -911,7 +959,7 @@ fn model_fwd_row(tok, pos): i64 {
 # no backward caches needed — but it reuses the training activation buffers
 # and the attention arena (an n-row layout fits inside the T-row arena).
 fn model_eval_window(n): i64 {
-    var C = g_C; var F = g_F; var nh = g_nh;
+    var C = g_C; var F = g_F;
     var nC = n * C;
     embed_fwd_n(n);
     var L = 0;
@@ -919,26 +967,7 @@ fn model_eval_window(n): i64 {
         var xin = La(LA_resid, L);
         var a = La(LA_a, L);
         ln_fwd(xin, PL(L, _o_ln1g()), PL(L, _o_ln1b()), a, La(LA_m1, L), La(LA_r1, L), n, C);
-        if (g_attn_kind == 2) {
-            attn_lin_fwd(PL(L, _o_Wq()), P_bq(L), PL(L, _o_Wk()), P_bk(L),
-                         PL(L, _o_Wv()), P_bv(L), PL(L, _o_Wo()), P_bo(L),
-                         a, A_attn, La(LA_arena, L), n, C, nh);
-        } elif (g_attn_kind == 1) {
-            if (g_pos_kind == 2) {
-                attn_mla_dec_fwd(PL(L, _o_Wq()), P_bq(L), PL(L, _o_Wdkv()), PL(L, _o_Wuk()), P_bk(L),
-                                 PL(L, _o_Wuv()), P_bv(L), PL(L, _o_Wqr()), PL(L, _o_Wkr()), PL(L, _o_Wo()), P_bo(L),
-                                 a, A_attn, La(LA_arena, L), La(LA_c, L), La(LA_qr, L), La(LA_kr, L),
-                                 n, C, nh, g_latent_dim, g_rope_dim);
-            } else {
-                attn_mla_fwd(PL(L, _o_Wq()), P_bq(L), PL(L, _o_Wdkv()), PL(L, _o_Wuk()), P_bk(L),
-                             PL(L, _o_Wuv()), P_bv(L), PL(L, _o_Wo()), P_bo(L),
-                             a, A_attn, La(LA_arena, L), La(LA_c, L), n, C, nh, g_latent_dim);
-            }
-        } else {
-            attn_fwd(PL(L, _o_Wq()), P_bq(L), PL(L, _o_Wk()), P_bk(L),
-                     PL(L, _o_Wv()), P_bv(L), PL(L, _o_Wo()), P_bo(L),
-                     a, A_attn, La(LA_arena, L), n, C, nh, g_nkv, g_pos_kind);
-        }
+        _attn_block_fwd(L, n);
         var xmid = La(LA_xmid, L);
         var i = 0;
         while (i < nC) { store64(xmid + i * 8, f64_add(load64(xin + i * 8), load64(A_attn + i * 8))); i = i + 1; }
@@ -966,7 +995,7 @@ fn model_eval_window(n): i64 {
 
 # ---- full backward: fills g_grads (assumes grads already zeroed) -----------
 fn model_backward(): i64 {
-    var T = g_T; var C = g_C; var F = g_F; var V = g_V; var nh = g_nh;
+    var T = g_T; var C = g_C; var F = g_F; var V = g_V;
     var TC = T * C;
     softmax_xent_bwd(A_probs, A_targets, D_logits, T, V);
     head_bwd();                                   # -> D_f ; accum G_tokemb (head)
@@ -1002,35 +1031,7 @@ fn model_backward(): i64 {
         t_add_into(D_xmid, D_tmp, TC);
         # attention: d(attn branch output) = D_xmid; back through its dropout, then attn.
         dropout_bwd(La(LA_dmask_attn, L), D_xmid, D_drop, TC);
-        if (g_attn_kind == 2) {
-            attn_lin_bwd(PL(L, _o_Wq()), PL(L, _o_Wk()), PL(L, _o_Wv()), PL(L, _o_Wo()),
-                         La(LA_a, L), D_drop, D_a,
-                         GL(L, _o_Wq()), G_bq(L), GL(L, _o_Wk()), G_bk(L),
-                         GL(L, _o_Wv()), G_bv(L), GL(L, _o_Wo()), G_bo(L),
-                         La(LA_arena, L), T, C, nh);
-        } elif (g_attn_kind == 1) {
-            if (g_pos_kind == 2) {
-                attn_mla_dec_bwd(PL(L, _o_Wq()), PL(L, _o_Wdkv()), PL(L, _o_Wuk()), PL(L, _o_Wuv()),
-                                 PL(L, _o_Wqr()), PL(L, _o_Wkr()), PL(L, _o_Wo()),
-                                 La(LA_a, L), D_drop, D_a,
-                                 GL(L, _o_Wq()), G_bq(L), GL(L, _o_Wdkv()), GL(L, _o_Wuk()), G_bk(L),
-                                 GL(L, _o_Wuv()), G_bv(L), GL(L, _o_Wqr()), GL(L, _o_Wkr()), GL(L, _o_Wo()), G_bo(L),
-                                 La(LA_arena, L), La(LA_c, L), La(LA_qr, L), La(LA_kr, L), D_lat1, D_lat2, D_qr, D_kr,
-                                 T, C, nh, g_latent_dim, g_rope_dim);
-            } else {
-                attn_mla_bwd(PL(L, _o_Wq()), PL(L, _o_Wdkv()), PL(L, _o_Wuk()), PL(L, _o_Wuv()), PL(L, _o_Wo()),
-                             La(LA_a, L), D_drop, D_a,
-                             GL(L, _o_Wq()), G_bq(L), GL(L, _o_Wdkv()), GL(L, _o_Wuk()), G_bk(L),
-                             GL(L, _o_Wuv()), G_bv(L), GL(L, _o_Wo()), G_bo(L),
-                             La(LA_arena, L), La(LA_c, L), D_lat1, D_lat2, T, C, nh, g_latent_dim);
-            }
-        } else {
-            attn_bwd(PL(L, _o_Wq()), PL(L, _o_Wk()), PL(L, _o_Wv()), PL(L, _o_Wo()),
-                     La(LA_a, L), D_drop, D_a,
-                     GL(L, _o_Wq()), G_bq(L), GL(L, _o_Wk()), G_bk(L),
-                     GL(L, _o_Wv()), G_bv(L), GL(L, _o_Wo()), G_bo(L),
-                     La(LA_arena, L), T, C, nh, g_nkv, g_pos_kind);
-        }
+        _attn_block_bwd(L);
         ln_bwd(xin, PL(L, _o_ln1g()), D_a, La(LA_m1, L), La(LA_r1, L), D_tmp, GL(L, _o_ln1g()), GL(L, _o_ln1b()), T, C);
         # d_xin = d_xmid (residual) + D_tmp (ln1 path) ; becomes next D_resid
         t_copy(D_resid, D_xmid, TC);

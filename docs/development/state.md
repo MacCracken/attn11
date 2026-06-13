@@ -5,7 +5,17 @@
 
 ## Version
 
-**1.4.0** — *Gated linear attention* (M14 rung a, E4, **opens the second
+**1.4.1** — *Refactoring sweep* (maintenance; no behavior change — the no-flag
+run byte-identical, **727** checks unchanged on both arches, every checkpoint
+round-trips). Reorganizes the mixer machinery so the upcoming M14 rungs are cheap:
+(1) the `attn_kind` dispatch is now ONE point each — `_attn_block_fwd`/`_bwd`/
+`_fwd_row` in `model.cyr` (was inlined in four functions); (2) the per-block param
+arithmetic is shared pure helpers `_kvw`/`_mlpw` used by both the offset helpers
+and the checkpoint validator (the model↔persist keep-in-sync hazard is gone);
+(3) the gated-linear mixer moved to its own `attn_linear.cyr` (one-file-per-mixer
+pattern; `attn.cyr` 1266→976); (4) the six `_gen_bits_*` test helpers collapsed
+to one driver. `src/*.cyr` identical in effect to 1.4.0.
+(1.4.0 — *Gated linear attention* (M14 rung a, E4, **opens the second
 sequence-mixer family**; ADR 0009). `--attn-kind lin` swaps the softmax/PV core
 for a causal RetNet-style **retention recurrence** `S_t = γ_h·S_{t-1} + k_t⊗v_t`,
 `out_t = (1/√hd)·S_t^T q_t`, fixed per-head decay `γ_h = 1−2^{−(3+h)}`
@@ -19,7 +29,7 @@ config, 1200 steps): linear **bits/byte 0.239** (vs MHA 0.279, MLA 0.273) at MHA
 exact param count (39 488), with a 6 144 B cache that is **constant in T** (16×
 under MHA at the preset). A no-flag run is byte-identical. Verified green: **727**
 checks x86_64 AND aarch64/qemu, the `--agnos` static-ELF build, fuzz, lint.
-(1.3.0 — *Mixture of Experts* (M13, E8, **opens the FFN-density axis**; ADR
+1.3.0 — *Mixture of Experts* (M13, E8, **opens the FFN-density axis**; ADR
 0008). The dense GELU MLP in each block becomes **N experts + a top-K router**:
 `--experts N --expert-topk K` (N in 1..256, default topk 2; `--experts 1` = the
 byte-identical dense baseline). The milestone is the **router backward** —
@@ -305,10 +315,14 @@ constant `nh·hd²` state instead of a T-growing K/V.
   no x86-only `f64_sin`/`f64_cos`; `docs/architecture/005`); plus the **decoupled
   RoPE** core (1.2.3) `attn_dec_core_fwd`/`bwd` + `attn_mla_dec_fwd`/`bwd` +
   `attn_mla_dec_fwd_row` (two-term content+position score, shared `K^R`, the
-  latent+rope decode cache); plus the **gated-linear** core (1.4.0)
-  `lin_core_fwd`/`bwd` (retention recurrence, fixed per-head decay) +
-  `attn_lin_fwd`/`bwd` wrappers + `lin_core_fwd_row`/`attn_lin_fwd_row` (the
-  constant-state cached decode); `attn_arena_size` carries a `2·hd²` S/dS scratch
+  latent+rope decode cache); `attn_arena_size` carries a `2·hd²` S/dS scratch for
+  the gated-linear core. The pure `_kvw` per-block K/V-region size (1.4.1) is
+  shared with persist's checkpoint validator (one layout source).
+- `attn_linear.cyr` — the **gated-linear** mixer (1.4.0; split out of `attn.cyr`
+  in 1.4.1, the one-file-per-mixer pattern): `lin_core_fwd`/`bwd` (retention
+  recurrence `S_t = γ_h S_{t-1} + k_t⊗v_t`, fixed per-head decay) + `attn_lin_fwd`/
+  `bwd` wrappers + `lin_core_fwd_row`/`attn_lin_fwd_row` (the constant-state cached
+  decode). Included after `attn.cyr` in each entry; the next mixer (SSM) lands here-style.
 - `fileio.cyr` — secure file I/O (`O_NOFOLLOW`, `fstat` size, looped read/write),
   stdin reader
 - `model.cyr` — per-layer packed parameters (block stride + `_o_*`/`PL`/`GL`
@@ -329,9 +343,11 @@ constant `nh·hd²` state instead of a T-growing K/V.
   `model_alloc_bytes_moe`) carry `num_experts`/`topk` (the `_arch` forms delegate as
   dense); the block MLP fwd/bwd + `model_fwd_row` + `model_eval_window` branch on
   `g_num_experts > 1`; `moe_entropy`/`moe_disp_*` report routing-entropy utilization.
-  **Gated linear** (1.4.0): the attention sublayer branches on `g_attn_kind == 2`
-  (`attn_lin_*` in fwd/bwd/eval-window/`model_fwd_row`), the per-layer retention
-  state `g_lin_state` is the constant decode cache, and `kv_cache_bytes` reports it
+  **Gated linear** (1.4.0): the per-layer retention state `g_lin_state` is the
+  constant decode cache, and `kv_cache_bytes` reports it. **Mixer dispatch (1.4.1):**
+  the `g_attn_kind` (0=mha/gqa, 1=mla×pos_kind, 2=gated-linear) branch lives in ONE
+  place each — `_attn_block_fwd`/`_attn_block_bwd`/`_attn_block_fwd_row` — so a new
+  mixer (SSM) or the per-layer hybrid touches those three, not four functions
 - `train.cyr` — byte + **BPE** tokenizer (`bpe_learn`/`tok_encode`/
   `bpe_build_spans`/`tok_emit`), corpus (embedded/file/stdin, raw bytes
   retained), batch sampling, LR schedule, resumable training loop, KV-cached

@@ -11,6 +11,7 @@ include "src/tensor.cyr"
 include "src/fileio.cyr"
 include "src/ops.cyr"
 include "src/attn.cyr"
+include "src/attn_linear.cyr"
 include "src/model.cyr"
 include "src/train.cyr"
 

@@ -4,6 +4,42 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.4.1] - 2026-06-12
+
+**Refactoring sweep — no behavior change.** A maintenance release that reorganizes
+the mixer/attention machinery so the upcoming M14 rungs (a selective SSM, then
+per-layer mixer interleaving) are cheap to add. The no-flag run is byte-identical
+(loss 0.31234/0.22803 at steps 250/500, unchanged), **727 checks** unchanged on
+x86_64 AND aarch64/qemu, and every checkpoint round-trips identically. Each step
+landed behind the green gate (grad-checks + byte-identical default + both arches).
+
+### Changed
+- **One mixer-dispatch point** (`model.cyr`): the `if/elif (attn_kind…)` attention
+  sublayer selection — previously inlined in `model_forward`, `model_eval_window`,
+  `model_backward`, and `model_fwd_row` — is now three helpers (`_attn_block_fwd`,
+  `_attn_block_bwd`, `_attn_block_fwd_row`). A new mixer adds one case in each, not
+  in four functions; the M14 per-layer hybrid flips `g_attn_kind` to a per-layer
+  lookup in one place.
+- **Shared per-block param arithmetic** (`model.cyr` + `persist.cyr`): the K/V and
+  MLP weight-region sizes are now pure descriptor-parameterized helpers
+  (`_kvw`/`_mlpw`), used by both the offset helpers (`_kv_weight_size`/
+  `_mlp_weight_size` wrap them) and the checkpoint validator (`ckpt_expected_np`).
+  One source of the block-layout sizing — the M13/M14 model↔persist keep-in-sync
+  hazard is gone (a new mixer's param region is defined once).
+- **`attn_linear.cyr`**: the gated-linear mixer (`lin_core_*`, `attn_lin_*`) is
+  split out of `attn.cyr` into its own file, establishing the one-file-per-mixer
+  pattern (the M14 selective SSM lands as its own file next). `attn.cyr`
+  1266 → 976 lines; entries gained an `include "src/attn_linear.cyr"`.
+- **Test dedup**: the six near-identical 58-line `_gen_bits_*` cached-vs-uncached
+  bit-identity helpers collapse to one parameterized `_gen_bits` driver + six thin
+  one-line wrappers (call sites unchanged). `attn11.tcyr` −~280 lines.
+
+### Notes
+- Pure reorganization: `src/*.cyr` is identical in effect to 1.4.0 (no new flags,
+  no checkpoint change — saves stay v5). Next: M14 rung (b), a minimal selective
+  SSM (`attn_kind = 3`, `attn_ssm.cyr`), then rung (c), per-layer mixer
+  interleaving + the hybrid-ratio sweep.
+
 ## [1.4.0] - 2026-06-12
 
 **Gated linear attention (M14 rung a, E4) — the arc's first non-softmax sequence
