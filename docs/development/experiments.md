@@ -595,3 +595,46 @@ cheaper than an SSM block. Cached decode advances each block's own state.
 4. The decode cache is now a continuous knob from pure-SSM's 12 288 B (constant in
    T) to pure-MHA's 24 576 B (∝ T): each attention layer added trades constant
    state for T-growing K/V. The hybrid is where that trade is dialed.
+
+## X014 — mixer perf consolidation: latency, cache, and the padding cost (1.4.6) (2026-06-13)
+
+**Setup**: 1.4.6, the dedicated benchmarking release. One canonical `./build/bench`
+run at the default config (V=25, d_model 32, ctx 16, 4 heads, 3 layers), x86_64,
+stable to a few percent. Where X010–X013 measured bits/byte (quality), this
+consolidates the LATENCY + CACHE + PARAM picture across the whole mixer family and
+pins the rung-d padded-layout cost. No code change beyond two param-count prints
+added to the hybrid bench entries.
+
+**Latency + cache + params** (the money table; see docs/benchmarks.md):
+
+| mixer            | step (ns) | step ×MHA | gen (ns/tok) | cache (B) | scaling | params |
+|------------------|-----------|-----------|--------------|-----------|---------|--------|
+| MHA (default)    | 3 572 260 | 1.00×     | 163 030      | 24 576    | ∝ T     | 39 488 |
+| MLA (d_c=16)     | ~3.6e6    | ~1.0×     | ~206 000     | 6 144     | ∝ T     | 37 952 |
+| linear           | 3 781 400 | 1.06×     | 161 310      | 6 144     | const   | 39 488 |
+| SSM (N=16)       | 5 626 938 | 1.58×     | 260 161      | 12 288    | const   | 38 048 |
+| MoE (8 / top-2)  | 6 969 545 | 1.95×     | 275 172      | 24 576    | ∝ T     | 215 648|
+| mha/lin (1/3)    | 3 740 414 | 1.05×     | 164 000      | 12 288    | mixed   | 39 488 |
+| mha/ssm (1/3)    | 4 900 562 | 1.37×     | 228 912      | 16 384    | mixed   | 39 488 |
+
+**Takeaways**:
+1. **The padded hybrid adds NO compute** — only memory. The mha/ssm 1/3 step
+   (4 900 562 ns) matches the per-layer mix (1·MHA + 2·SSM)/3 = 4 942 045 ns to
+   within noise: the zeroed pad is never read (each block's dispatch touches only
+   its own kind's weights), so the rung-d padding costs params + Adam moments, not
+   FLOPs. The mha/ssm hybrid is 39 488 params (vs pure SSM's 38 048, +1 440 / ~4%);
+   the mha/lin hybrid is free (shared layout, no pad).
+2. **linear ≈ MHA in compute, far under in cache.** The retention recurrence is the
+   same order as the attention it replaces (+6% step, decode at parity) but its
+   decode state is constant in T (6 144 B vs MHA's T-growing 24 576 B). SSM is
+   ~1.58× the step (the O(T·C·N) selective scan + Δ/B/C projections) for a
+   constant 12 288 B state.
+3. **The decode cache is a continuous knob** in the hybrid's attention fraction
+   (mha/ssm: 12 288 → 16 384 → 20 480 → 24 576 B from 0/3 to 3/3 attention) — each
+   attention layer trades constant recurrent state for T-growing K/V, at no param
+   cost beyond the pad. This is the survey's hybrid lever made measurable.
+4. **Zero regression to the default path.** The no-flag MHA training step is flat
+   from 0.4.0 through 1.4.6 (~3.6 ms, ~4 450 tok/s b=16; bench-history.csv) — the
+   entire M12–M14 arc (MLA, RoPE, MoE, linear, SSM, hybrid) added five opt-in axes
+   without touching the default run. MoE is the one big-param axis (5.5× params at
+   N=8, ~2× step for top-2) — capacity at near-constant active compute.

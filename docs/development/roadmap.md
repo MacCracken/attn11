@@ -13,9 +13,11 @@
 
 ## Where we are
 
-Current: **v1.4.5** (the P(-1) hardening pass closing the 1.4.x arc — a
-security/correctness audit of the hybrid/v6 surface; one finding, a CLI
-stack-overflow, fixed; `docs/audit/2026-06-13-1.4.x-hardening-audit.md`). The v1.0 surface is frozen and additive-only
+Current: **v1.4.6** (the benchmarking pass closing the 1.4.x arc — the canonical
+mixer/hybrid perf picture in `docs/benchmarks.md` + a current `bench-history.csv`
+row, X014; the padded hybrid layout confirmed memory-only. Preceded by 1.4.5, the
+P(-1) hardening pass — a security/correctness audit; one CLI stack-overflow finding
+fixed). The v1.0 surface is frozen and additive-only
 ([`STABILITY.md`](../STABILITY.md)); the reusable numeric core lives in
 **[rosnet](https://github.com/MacCracken/rosnet)** + **[tyche](https://github.com/MacCracken/tyche)**
 (v1.1.0); the **1.x architecture arc** is underway — **M12, M13, and M14 are
@@ -56,9 +58,10 @@ change at a time behind its own grad-check / bit-identity gate.
 > 0009, X010), the selective SSM (b, v1.4.2, ADR 0010, X011), the per-layer hybrid
 > (c, v1.4.3, ADR 0011, X012), and any-mixer hybrids via a padded stride (d, v1.4.4,
 > ADR 0012, X013) — with 1.4.1 a refactor sweep along the way. See the CHANGELOG
-> and X005–X013 for the shipped narrative. **1.4.5 (P(-1) hardening) closed the
-> arc** — adversarial audit of the hybrid/v6 surface, one CLI finding fixed.
-> **Next: 1.4.6 benchmarking**, then the arc continues below (M15+).
+> and X005–X014 for the shipped narrative. The 1.4.x arc closed with two
+> housekeeping cuts: **1.4.5** (P(-1) hardening — adversarial audit of the hybrid/v6
+> surface, one CLI finding fixed) and **1.4.6** (benchmarking — the canonical
+> mixer/hybrid perf picture, X014). **Next: M15+ (below).**
 
 ### M14 — A second sequence-mixer family (v1.4.0+) — E4
 

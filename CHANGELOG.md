@@ -4,6 +4,38 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.4.6] - 2026-06-13
+
+**Benchmarking pass.** A dedicated perf release: one canonical bench run across the
+whole mixer family on the current binary, the time-series and the perf doc brought
+current (both had stalled — the CSV at 0.9.0, `docs/benchmarks.md` had no
+MoE/linear/SSM/hybrid sections), and the rung-d padded-layout cost pinned. No
+behavior change — measurement + docs, plus two param-count prints in the bench.
+
+### Added
+- **`docs/benchmarks.md`** — the missing sections: MoE (1.3.0), the sequence-mixer
+  family (linear/SSM, 1.4.0/1.4.2), and the per-layer hybrid + padded layout
+  (1.4.3/1.4.4), with a unified comparison table (step time, cached-decode latency,
+  decode-cache bytes, scaling, params) from one canonical run, and the
+  attention-fraction cache curve.
+- **`bench-history.csv`** — a current `1.4.6` row (the time series was stale at
+  0.9.0). The default-config training step is flat from 0.4.0 → 1.4.6 (~3.6 ms,
+  ~4 450 tok/s b=16): the M12–M14 arc added five opt-in axes with zero regression
+  to the no-flag path.
+- **`X014`** (experiments ledger) — perf consolidation: the latency/cache/param
+  table across all mixers + the headline finding that the **rung-d padding is
+  memory-only** (the mha/ssm 1/3 hybrid step, 4.90 ms, equals the per-layer mix
+  (1·MHA + 2·SSM)/3 = 4.94 ms — the zeroed pad is never read, so it costs params +
+  Adam moments, not FLOPs).
+- Bench harness: param-count prints for the two hybrid entries (quantifying the
+  padding cost — mha/ssm +1 440 params / ~4% vs pure SSM; mha/lin free).
+
+### Notes
+- Confirmed: linear ≈ MHA in step/decode (constant-T cache); SSM ~1.58× the step
+  (the O(T·C·N) scan) for a constant C·N cache; MoE ~1.95× the step at top-2 with
+  5.5× the params (N=8). Numbers are the default config (V=25, C=32, T=16, NL=3),
+  x86_64, stable to a few percent.
+
 ## [1.4.5] - 2026-06-13
 
 **Hardening pass (P(-1)) — closes the 1.4.x arc.** A security/correctness audit of

@@ -220,3 +220,87 @@ memory-accumulator pattern forced by the never-reassign-a-SIMD-var rule
 ([architecture/001](architecture/001-tensors-and-floats.md)) and the 2-wide
 `f64v_fmadd` lowering — and would need toolchain support (true AVX/FMA
 builtins), not a v0.8.x code change.
+
+## The FFN-density axis: Mixture of Experts (1.3.0, M13)
+
+`--experts N --expert-topk K` swaps the dense GELU MLP for N experts + a `C→N`
+router gate; `--experts 1` is the byte-identical dense baseline. Default config,
+8 experts top-2 (`fwd+bwd step moe8` / `moe8 params` in the bench):
+
+| config | fwd+bwd step (ns) | params | gen cached (ns/tok) |
+|--------|-------------------|--------|---------------------|
+| dense (1 expert) | ~3 600 000 | 39 488 | ~163 000 |
+| **MoE 8 / top-2** | **~6 970 000** | **215 648** | ~275 000 |
+
+Per-token compute scales with `topk` (top-2 = two active expert MLPs + the router
+gate, ~1.95× the dense step), while the **parameter count scales with N** (8
+experts = 5.5× the dense params) — that's the lever: capacity at near-constant
+active compute. The density sweep (total vs per-token-active params, routing
+entropy) is [X009](development/experiments.md).
+
+## The sequence-mixer family: linear, SSM, and the per-layer hybrid (1.4.0–1.4.4)
+
+`--attn-kind {mha, mla, lin, ssm}` is four mixers behind one switch; `--attn-every
+K` interleaves them per layer (the hybrid). All numbers below are **one canonical
+run** at the default config (V=25, C=32, T=16, nh=4, NL=3), x86_64, stable to a
+few percent (`./build/bench`):
+
+| mixer | fwd+bwd step (ns) | gen cached (ns/tok) | decode cache (B) | scaling | params |
+|-------|-------------------|---------------------|------------------|---------|--------|
+| **MHA** (default)      | 3 572 260 | 163 030 | 24 576 | ∝ T      | 39 488 |
+| **MLA** (d_c=16)       | ~3 600 000 | ~206 000 | 6 144  | ∝ T      | 37 952 |
+| **linear** (RetNet)    | 3 781 400 | 161 310 | 6 144  | **const**| 39 488 |
+| **SSM** (N=16)         | 5 626 938 | 260 161 | 12 288 | **const**| 38 048 |
+| mha/lin hybrid (1/3)   | 3 740 414 | 164 000 | 12 288 | mixed    | 39 488 |
+| mha/ssm hybrid (1/3)   | 4 900 562 | 228 912 | 16 384 | mixed    | 39 488 |
+
+Reading the step column: **linear ≈ MHA** (the retention recurrence is the same
+order of work as the attention it replaces, +~6%); **SSM is ~1.57× MHA** — the
+selective scan is O(T·C·N) plus the input-dependent Δ/B/C projections and the
+`exp(Δ·A)` discretization. Cached decode mirrors training: linear matches MHA (the
+O(hd²) state update beats the O(T·hd) cache scan exactly enough), SSM is ~1.6×
+(the per-step C×N scan). The **decode cache** is where the mixers diverge: linear
+and SSM hold a state that is **constant in T** (the headline vs MHA/MLA's T-growing
+K/V — 4–8× under MHA at the preset's longer context). Full bits/byte comparison:
+[X010](development/experiments.md) (linear), [X011](development/experiments.md) (SSM).
+
+### The per-layer hybrid + the padded layout (1.4.3 rung c / 1.4.4 rung d)
+
+The hybrid's training step is the **per-layer MIX** of its blocks' steps, with no
+overhead from the rung-d padding (the padded K/V region is zeroed, untrained, and
+never read — each layer's dispatch touches only its own kind's weights). The
+mha/ssm 1/3 hybrid (1 MHA block + 2 SSM blocks of 3) bears this out:
+
+> measured step **4 900 562 ns** ≈ (1·3 572 260 + 2·5 626 938) / 3 = **4 942 045 ns**
+
+— so the padding is a **memory-only** cost (params + Adam moments), not compute.
+That cost is the SSM/MLA layers' K/V region padded up to MHA's: the mha/ssm hybrid
+is **39 488 params vs pure SSM's 38 048 (+1 440, ~4%)**; the mha/lin hybrid is
+**free** (39 488 — linear shares MHA's exact layout, no pad). ADR 0011/0012.
+
+The decode cache is a **continuous knob** in the attention fraction — each block
+contributes its own kind's cache (MHA 8 192 B at T=16, SSM 4 096 B, linear 2 048 B
+per layer), so adding an attention layer trades constant state for T-growing K/V:
+
+| mha ⊕ ssm hybrid | attention fraction | decode cache (B) |
+|------------------|--------------------|------------------|
+| pure SSM         | 0/3 (0%)           | 12 288 (all const) |
+| 1 attention layer| 1/3 (33%)          | 16 384 |
+| 2 attention layers| 2/3 (67%)         | 20 480 |
+| pure MHA         | 3/3 (100%)         | 24 576 (all ∝ T) |
+
+This is the survey's lever made measurable: dial how much of the decode cache is
+T-growing attention vs constant recurrent state, at no parameter cost beyond the
+padding. Bits/byte across the same sweep: [X012](development/experiments.md)
+(mha/lin), [X013](development/experiments.md) (mha/ssm) — within noise at reference
+scale; the win is the cache/recall trade at long context, which the reference can't
+show. Perf consolidation: [X014](development/experiments.md).
+
+### The default training step is unchanged across the 1.x arc
+
+Every mixer/MoE/hybrid above is **opt-in**; a no-flag run is the same MHA
+transformer as 0.9.0. The bench history confirms it — `fwd+bwd step` /
+`tokens/sec` at the default config are flat from 0.4.0 (the SIMD cut) through
+1.4.6 (~3.6 ms, ~4 450 tok/s, b=16; [`bench-history.csv`](../bench-history.csv)),
+i.e. the entire M12–M14 architecture arc added five opt-in axes with **zero
+regression** to the default path.

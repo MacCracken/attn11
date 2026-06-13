@@ -308,6 +308,7 @@ fn main(): i64 {
     e = now_ns();
     _report("gen kv-cached hyb", e - s, NGEN);
     puts("hyb(1/3 mha) cache bytes (mixed): "); fmt_int(kv_cache_bytes()); _putc(10);
+    puts("hyb(mha/lin) params (vs dense 39488, no pad — shared layout): "); fmt_int(g_NP); _putc(10);
 
     # ---- per-layer HYBRID, rung d (M14): a mha ⊕ SSM hybrid (full attention at
     # layer 0, selective-SSM elsewhere; base ssm, N=16) at the default config. The
@@ -330,6 +331,7 @@ fn main(): i64 {
     e = now_ns();
     _report("gen kv-cached hyb-ssm", e - s, NGEN);
     puts("hyb-ssm(1/3 mha) cache bytes (mixed): "); fmt_int(kv_cache_bytes()); _putc(10);
+    puts("hyb-ssm params (vs pure ssm 38048 — padding to MHA's region): "); fmt_int(g_NP); _putc(10);
 
     # ---- isolated tied LM head at BPE-scale vocab (V=768): the M9 lever-1
     # target. head_fwd_row is O(V*C) per row and runs in every training forward

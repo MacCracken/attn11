@@ -5,7 +5,20 @@
 
 ## Version
 
-**1.4.5** — *Hardening pass* (P(-1), **closes the 1.4.x arc**). A security/correctness
+**1.4.6** — *Benchmarking pass*. A dedicated perf release: one canonical
+`./build/bench` run across the whole mixer family on the current binary, with the
+time series (`bench-history.csv`, stale at 0.9.0) and the perf doc
+(`docs/benchmarks.md`, no MoE/linear/SSM/hybrid sections) brought current, and the
+rung-d padded-layout cost pinned. Headline finding (X014): the **padding is
+memory-only** — the mha/ssm 1/3 hybrid step (4.90 ms) equals the per-layer mix
+(1·MHA + 2·SSM)/3 = 4.94 ms, so the zeroed pad costs params + Adam moments, not
+FLOPs. linear ≈ MHA in step/decode (constant-T cache); SSM ~1.58× the step (the
+O(T·C·N) scan); MoE ~1.95× at top-2 with 5.5× params. The default-config training
+step is **flat 0.4.0 → 1.4.6** (~3.6 ms, ~4 450 tok/s) — the M12–M14 arc added five
+opt-in axes with zero regression to the no-flag path. No behavior change
+(measurement + docs + two bench param-prints). Verified: **907** checks x86_64 AND
+aarch64/qemu, agnos, fuzz, lint, smoke.
+(1.4.5 — *Hardening pass* (P(-1), **closes the 1.4.x arc**). A security/correctness
 audit of the 1.4.x surface (the per-layer hybrid dispatch, the rung-d padded
 uniform-stride layout, checkpoint v6, the `--attn-every` CLI) via an adversarial
 multi-agent review — five read-only dimensions, each finding adversarially verified
@@ -21,7 +34,7 @@ dimensions came back clean; audit at `docs/audit/2026-06-13-1.4.x-hardening-audi
 and the checkpoint format comment now documents v6 + v1–v5 back-compat. NO behavior
 change to training, the format, or any valid run. Verified: **907** checks x86_64
 AND aarch64/qemu, agnos, fuzz, lint, smoke.
-(1.4.4 — *Any-mixer hybrids* (M14 rung d, E4, **completes M14**; ADR 0012).
+1.4.4 — *Any-mixer hybrids* (M14 rung d, E4, **completes M14**; ADR 0012).
 Lifts 1.4.3's layout restriction so a hybrid interleaves ANY of the four mixers
 `{mha, mla, lin, ssm}` — including full attention ⊕ the selective SSM (the survey's
 strongest pairing, attn11's best single mixer). The trick: each block's K/V region
@@ -243,6 +256,12 @@ deterministic resume. 0.2.0: stacked layers, grad clipping, LR schedule.)
   vs dense 39 488; cached gen ~273 µs/token. Per-token compute scales with `topk`,
   parameter count with `N` (X009 density sweep).
 - BPE merge training (`--bpe K`): one-shot ~110 ms for 256 KB at K=128.
+- **Canonical mixer/hybrid snapshot (1.4.6, X014):** one bench run cross-compares
+  every mixer (step / cached-decode / cache bytes / params) — linear ≈ MHA, SSM
+  ~1.58× the step, MoE ~1.95× at top-2; the **padded hybrid is memory-only** (its
+  step is the per-layer mix, no pad compute); the default step is flat 0.4.0 →
+  1.4.6. The full tables (incl. the attention-fraction cache curve) live in
+  `docs/benchmarks.md`; the per-release bullets above are kept as the timeline.
 
 See [`benchmarks.md`](../benchmarks.md) + [`../../bench-history.csv`](../../bench-history.csv).
 
@@ -606,15 +625,15 @@ the FFN-density axis `--experts N --expert-topk K`, **two non-softmax mixers**
 (gated linear attention + the selective SSM), and the **per-layer hybrid**
 `--attn-every K` (any mix of the four). **M12, M13, and M14 are all complete.**
 
-**Next — 1.4.6 benchmarking, then M15+.** 1.4.5 (the P(-1) hardening pass) closed
-the 1.4.x feature arc with a security/correctness audit (one finding — the CLI
-stack overflow — fixed; the rest clean; `docs/audit/2026-06-13-1.4.x-hardening-audit.md`).
-**1.4.6** is a dedicated benchmarking release: refresh the full bench across all
-mixers + hybrid ratios, update `bench-history.csv` + `docs/benchmarks.md`, and
-profile the padded hybrid layout. Then E5–E6 (diffusion objective / ternary) as
-M15–M16 and **M17** reinforcement learning (E9). A vidya-scale bake-off across
-mixers AND hybrid ratios is the standing X-entry (X012/X013 ran the ratio sweeps at
-reference scale).
+**Next — M15+.** The 1.4.x arc is fully closed: M12–M14 (MLA/RoPE, MoE, the
+mixer family + hybrid), 1.4.5 the P(-1) hardening pass (audit; one CLI finding
+fixed), and 1.4.6 the benchmarking pass (the canonical mixer/hybrid perf picture in
+`docs/benchmarks.md` + `bench-history.csv`; X014). Next is E5–E6 (diffusion
+objective / ternary) as M15–M16 and **M17** reinforcement learning (E9), per
+[`roadmap.md`](roadmap.md). M15 (char-diffusion) is the natural head of the queue: a
+masked-denoising training objective on the existing trunk. A vidya-scale bake-off
+across mixers AND hybrid ratios is the standing X-entry (X010–X014 ran the
+reference-scale comparisons; the scaled run is the follow-on).
 
 ### Handoff — how to pick this up
 
