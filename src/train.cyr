@@ -30,6 +30,12 @@ var g_vocab = 0;     # id -> BASE byte value (<= 256 entries; BPE ids >= base
 var g_char2id = 0;   # byte value -> BASE id (256 entries, -1 if absent)
 var g_data = 0;      # encoded corpus (ids), length g_datalen
 var g_datalen = 0;
+var g_data_w = 1;    # bytes per token in the PACKED g_data store (1.5.3): 1 = u8
+                     # (byte-level, vocab <= 256), 2 = u16 (BPE, vocab <= 768). The
+                     # corpus is the one buffer that scales with input size, so only
+                     # it is packed; A_tokens/A_targets/G_win/g_enc_buf stay i64. Set
+                     # by the caller BEFORE corpus_set (main: 1 byte-level / 2 BPE or
+                     # --load); corpus_set reads it, bpe_learn requires 2.
 var g_corpus_vlen = 0;  # BYTE vocab size of the loaded corpus (the BPE base;
                         # NOT g_V, which is the model's)
 
@@ -45,7 +51,31 @@ var g_paircnt = 0;      # BPE_VMAX^2 i64: pair counts (bpe_learn only)
 var g_text = 0;         # raw corpus bytes, retained by corpus_set
 var g_textlen = 0;
 
-fn MAX_CORPUS_BYTES(): i64 { return 4194304; }   # 4 MB cap on loaded corpora
+fn MAX_CORPUS_BYTES(): i64 { return 67108864; }  # 64 MB cap on loaded corpora
+                                                 # (1.5.3: u16 g_data = 128 MB < the
+                                                 # 256 MB single-alloc cap, margin)
+
+# ---- packed token-store accessors (1.5.3) ----------------------------------
+# Width-generic token load/store into a byte buffer: w = 1 (u8), 2 (u16), or 8
+# (i64, the legacy full-width). load zero-extends (token ids are non-negative);
+# store writes only the low w bytes (ids <= 768 fit u16, never the high bits).
+# Used so a packed g_data and the i64 g_enc_buf share one tokenizer code path.
+fn _tw_ld(buf, i, w): i64 {
+    if (w == 1) { return load8(buf + i); }
+    if (w == 2) { return load16(buf + i * 2); }
+    return load64(buf + i * 8);
+}
+fn _tw_st(buf, i, w, v): i64 {
+    if (w == 1) { store8(buf + i, v); }
+    elif (w == 2) { store16(buf + i * 2, v); }
+    else { store64(buf + i * 8, v); }
+    return 0;
+}
+# g_data at the active token width. Token-COUNT indexing (i is a token index, not
+# a byte offset) — identical semantics to the old load64(g_data + i*8), so every
+# call site's index math is unchanged and the loss curve stays byte-identical.
+fn gd_ld(i): i64 { return _tw_ld(g_data, i, g_data_w); }
+fn gd_st(i, v): i64 { return _tw_st(g_data, i, g_data_w, v); }
 
 # Byte-level tokenize+encode of an arbitrary `len`-byte buffer. Builds the
 # adaptive vocab (only the byte values that actually occur) and the encoded
@@ -71,10 +101,13 @@ fn corpus_set(text, len): i64 {
         }
         i = i + 1;
     }
-    g_data = t_alloc(len);
+    # packed token store (1.5.3): g_data_w bytes/token (set by the caller before
+    # this call). The fill covers all of [0,len), so the raw alloc needs no zeroing.
+    g_data = alloc(len * g_data_w);
+    if (g_data == 0) { return 0 - 5; }
     i = 0;
     while (i < len) {
-        store64(g_data + i * 8, load64(g_char2id + load8(text + i) * 8));
+        gd_st(i, load64(g_char2id + load8(text + i) * 8));
         i = i + 1;
     }
     g_corpus_vlen = V;
@@ -182,6 +215,18 @@ fn bpe_build_spans(): i64 {
 fn bpe_learn(K): i64 {
     if ((K < 1) || (K > BPE_MAX_MERGES())) { return 0 - 1; }
     if ((g_data == 0) || (g_datalen < 2)) { return 0 - 2; }
+    # BPE mints ids up to base+K-1 (<= 255+511 = 766), which overflow a u8 store,
+    # so the token store must be u16. main pre-sizes u16 for --bpe (no widen); a
+    # byte-level (u8) corpus — the grad-check path that calls build_corpus then
+    # bpe_learn directly — is widened in place ONCE here (a one-time setup copy;
+    # the old u8 buffer is small and not reclaimed by the bump allocator).
+    if (g_data_w < 2) {
+        var wide = alloc(g_datalen * 2);
+        if (wide == 0) { return 0 - 3; }
+        var wi = 0;
+        while (wi < g_datalen) { store16(wide + wi * 2, load8(g_data + wi)); wi = wi + 1; }
+        g_data = wide; g_data_w = 2;
+    }
     bpe_alloc_once();
     if (g_paircnt == 0) { g_paircnt = t_alloc(BPE_VMAX() * BPE_VMAX()); }
     g_bpe_base = g_corpus_vlen;
@@ -197,7 +242,7 @@ fn bpe_learn(K): i64 {
         while (a < Vcur) { t_zero(g_paircnt + (a * BPE_VMAX()) * 8, Vcur); a = a + 1; }
         i = 0;
         while (i + 1 < n) {
-            var cell = g_paircnt + (load64(g_data + i * 8) * BPE_VMAX() + load64(g_data + (i + 1) * 8)) * 8;
+            var cell = g_paircnt + (gd_ld(i) * BPE_VMAX() + gd_ld(i + 1)) * 8;
             store64(cell, load64(cell) + 1);
             i = i + 1;
         }
@@ -227,10 +272,10 @@ fn bpe_learn(K): i64 {
         while (rd < n) {
             var hit = 0;
             if (rd + 1 < n) {
-                if ((load64(g_data + rd * 8) == ba) && (load64(g_data + (rd + 1) * 8) == bb)) { hit = 1; }
+                if ((gd_ld(rd) == ba) && (gd_ld(rd + 1) == bb)) { hit = 1; }
             }
-            if (hit == 1) { store64(g_data + wr * 8, Vcur); rd = rd + 2; }
-            else { store64(g_data + wr * 8, load64(g_data + rd * 8)); rd = rd + 1; }
+            if (hit == 1) { gd_st(wr, Vcur); rd = rd + 2; }
+            else { gd_st(wr, gd_ld(rd)); rd = rd + 1; }
             wr = wr + 1;
         }
         n = wr;
@@ -245,21 +290,22 @@ fn bpe_learn(K): i64 {
     return B + m;
 }
 
-# Encode len raw bytes into out (caller guarantees >= len i64 slots): bytes ->
-# base ids via g_char2id (unseen byte -> id 0, matching generate()'s fallback),
-# then each learned merge applied in order with the same greedy left-to-right
-# replace as bpe_learn. That is EXACTLY the pass sequence bpe_learn performed
-# on the corpus, so encoding the original corpus bytes reproduces g_data
-# bit-for-bit — the property the checkpoint loader's corpus rebuild relies on
-# (and test_bpe_roundtrip pins). Output count <= len: never grows. Returns the
-# id count.
-fn tok_encode(text, len, out): i64 {
+# Encode len raw bytes into out at output width `ow` bytes/token (caller
+# guarantees >= len*ow bytes; ow = 8 for the i64 g_enc_buf prompt scratch, or
+# g_data_w for the packed corpus rebuild): bytes -> base ids via g_char2id
+# (unseen byte -> id 0, matching generate()'s fallback), then each learned merge
+# applied in order with the same greedy left-to-right replace as bpe_learn. That
+# is EXACTLY the pass sequence bpe_learn performed on the corpus, so encoding the
+# original corpus bytes reproduces g_data bit-for-bit — the property the
+# checkpoint loader's corpus rebuild relies on (and test_bpe_roundtrip pins).
+# Output count <= len: never grows. Returns the id count.
+fn tok_encode(text, len, out, ow): i64 {
     var n = 0;
     var i = 0;
     while (i < len) {
         var id = load64(g_char2id + load8(text + i) * 8);
         if (id < 0) { id = 0; }
-        store64(out + n * 8, id);
+        _tw_st(out, n, ow, id);
         n = n + 1;
         i = i + 1;
     }
@@ -273,10 +319,10 @@ fn tok_encode(text, len, out): i64 {
         while (rd < n) {
             var hit = 0;
             if (rd + 1 < n) {
-                if ((load64(out + rd * 8) == ba) && (load64(out + (rd + 1) * 8) == bb)) { hit = 1; }
+                if ((_tw_ld(out, rd, ow) == ba) && (_tw_ld(out, rd + 1, ow) == bb)) { hit = 1; }
             }
-            if (hit == 1) { store64(out + wr * 8, nid); rd = rd + 2; }
-            else { store64(out + wr * 8, load64(out + rd * 8)); rd = rd + 1; }
+            if (hit == 1) { _tw_st(out, wr, ow, nid); rd = rd + 2; }
+            else { _tw_st(out, wr, ow, _tw_ld(out, rd, ow)); rd = rd + 1; }
             wr = wr + 1;
         }
         n = wr;
@@ -308,8 +354,8 @@ fn sample_window(): i64 {
     else { s = s % span; }
     var t = 0;
     while (t < T) {
-        store64(A_tokens + t * 8, load64(g_data + (s + t) * 8));
-        store64(A_targets + t * 8, load64(g_data + (s + t + 1) * 8));
+        store64(A_tokens + t * 8, gd_ld(s + t));
+        store64(A_targets + t * 8, gd_ld(s + t + 1));
         t = t + 1;
     }
     return 0;
@@ -352,7 +398,7 @@ fn sample_window_diffusion(): i64 {
     else { s = s % span; }
     var t = 0;
     while (t < T) {
-        var tok = load64(g_data + (s + t) * 8);
+        var tok = gd_ld(s + t);
         store64(A_tokens + t * 8, tok);
         store64(A_targets + t * 8, tok);
         t = t + 1;
@@ -465,8 +511,8 @@ fn eval_corpus(): i64 {
     while (s + T + 1 <= g_datalen) {
         var t = 0;
         while (t < T) {
-            store64(A_tokens + t * 8, load64(g_data + (s + t) * 8));
-            var tgt = load64(g_data + (s + t + 1) * 8);
+            store64(A_tokens + t * 8, gd_ld(s + t));
+            var tgt = gd_ld(s + t + 1);
             store64(A_targets + t * 8, tgt);
             if (g_bpe_on == 1) { g_eval_bytes = g_eval_bytes + load64(g_tok_len + tgt * 8); }
             else { g_eval_bytes = g_eval_bytes + 1; }
@@ -511,7 +557,7 @@ fn eval_diffusion(pct): i64 {
     while (s + T <= g_datalen) {
         var t = 0;
         while (t < T) {
-            var tok = load64(g_data + (s + t) * 8);
+            var tok = gd_ld(s + t);
             store64(A_tokens + t * 8, tok);
             store64(A_targets + t * 8, tok);
             # evenly-spread k masks: position p is masked iff floor((p+1)k/T) steps
@@ -701,7 +747,7 @@ fn generate(prompt, plen, ngen, temp): i64 {
     } else {
         var pb = plen;
         if (pb > ENC_MAX()) { pb = ENC_MAX(); }
-        var nids = tok_encode(prompt + plen - pb, pb, g_enc_buf);
+        var nids = tok_encode(prompt + plen - pb, pb, g_enc_buf, 8);
         n = nids;
         if (n > T) { n = T; }
         var t2 = 0;
@@ -767,7 +813,7 @@ fn gen_diffusion(prompt, plen, nsteps, sched, emit): i64 {
         }
     } else {
         var pb = plen; if (pb > ENC_MAX()) { pb = ENC_MAX(); }
-        var nids = tok_encode(prompt + plen - pb, pb, g_enc_buf);
+        var nids = tok_encode(prompt + plen - pb, pb, g_enc_buf, 8);
         p = nids; if (p > T) { p = T; }
         var t2 = 0;
         while (t2 < p) {

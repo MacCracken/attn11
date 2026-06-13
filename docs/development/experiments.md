@@ -768,3 +768,46 @@ diversity.
    diversity's value for generalization — a held-out cross-corpus eval is the honest
    way to score diversity, and lands with the scaled runs.) Regeneration:
    [`docs/examples/c4-english.md`](../examples/c4-english.md).
+
+## X018 — token-packing: the corpus-ceiling unlock (v1.5.3) (2026-06-13)
+
+**Setup**: 1.5.3, the data-ingestion arc's storage step. Not a training experiment —
+a memory/representation measurement + a byte-identity proof. The corpus token stream
+`g_data` moved from one **i64 per token (8 B)** to a **packed** byte store: u8 for
+byte-level (vocab ≤ 256), u16 for BPE (vocab ≤ 768). The model/training math is
+untouched (same ids feed the same forward), so the gate is "byte-identical loss
+curve + a larger corpus loads/trains + grad-checks/fuzz green", not a number.
+
+**Storage** (bytes per token, and the resulting single-allocation corpus ceiling
+against the 256 MB `ALLOC_MAX`):
+
+| tokenizer  | before (i64) | after (packed) | g_data ceiling | vs before |
+|------------|--------------|----------------|----------------|-----------|
+| byte-level | 8 B/token    | **1 B (u8)**   | ~256 MB        | **8×**    |
+| BPE        | 8 B/token    | **2 B (u16)**  | ~128 MB        | **4×**    |
+
+`MAX_CORPUS_BYTES` raised **4 MB → 64 MB**: the u16 `g_data` is then 128 MB (half
+the per-alloc cap), leaving room for `g_text` (64 MB) + the model budget.
+
+**Byte-identity** (the gate): default (byte-level/u8), `--bpe 64` (u16), and
+`--preset` (byte-level, bigger config) training runs are **byte-for-byte identical**
+to the 1.5.2 binary's output (full loss curve + eval + samples). Packing is invisible
+to the math.
+
+**Verified**: 977 grad-checks (was 966; +11 from `test_token_packing`) green on
+x86_64 **and** aarch64/qemu; lint clean; fuzz green (100 random corpora + BPE
+round-trip); `make smoke` green. A 6 MB corpus — over the old 4 MB cap — loads
+(6 291 456 byte tokens / 1 138 445 BPE tokens) and trains (byte-level loss 0.239 at
+step 250); a 65 MB corpus rejects cleanly (code −2, no crash).
+
+**Takeaways**:
+1. **The 8×/4× headroom is real and free** — token ids are ≤ 767, so they fit u8/u16
+   trivially; the i64 store was 6–7 B of waste per token. The byte-level default
+   (the common case) gets the full 8×.
+2. **Diversity/volume is still a *scale* lever** (X017) — this lifts the *ceiling*
+   that would otherwise block a larger curated corpus, but a tiny model saturates on
+   data long before 64 MB. The payoff lands with 1.5.4 (curation at scale) and M16+.
+3. **Streaming is still the RAM-independent path** (1.6.x) — packing buys ~4–8× in
+   the *same* RAM; decoupling corpus size from RAM entirely waits for a model big
+   enough to need it. Regeneration: `./build/attn11 [--bpe K] --steps N --eval`
+   (deterministic; compare to a 1.5.2 binary for the byte-identity check).

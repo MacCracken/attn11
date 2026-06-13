@@ -13,14 +13,15 @@
 
 ## Where we are
 
-Current: **v1.5.2**. The v1.0 surface is frozen and additive-only
+Current: **v1.5.3**. The v1.0 surface is frozen and additive-only
 ([`STABILITY.md`](../STABILITY.md)); the reusable numeric core lives in
 **[rosnet](https://github.com/MacCracken/rosnet)** + **[tyche](https://github.com/MacCracken/tyche)**
 (v1.1.0). The 1.x architecture arc through M14 has shipped (the attention/KV, FFN-
 density, and sequence-mixer axes), **M15** (the char-diffusion *training objective*,
 v1.5.0) is the first objective departure, and the data-ingestion 1.5.x arc is under
-way — v1.5.1 the C4 tooling (X016), **v1.5.2 the quality-curating sampler (X017)**.
-**Next up is 1.5.3 (token-packing), then 1.5.4–1.5.5, then M16.** For *what* shipped,
+way — v1.5.1 the C4 tooling (X016), v1.5.2 the quality-curating sampler (X017),
+**v1.5.3 the token-packing unlock (X018 — u8/u16 `g_data`, the 4 MB → 64 MB cap)**.
+**Next up is 1.5.4 (curation at scale), then 1.5.5 (hardening/audit), then M16.** For *what* shipped,
 see [`CHANGELOG.md`](../../CHANGELOG.md)
 (release narrative), [`experiments.md`](experiments.md) (the X-series), and
 [`state.md`](state.md) (the
@@ -42,12 +43,13 @@ CI mirrors it.
 > the immediate next work). The driver (from v1.5.1 / X016): a tiny attn11 is
 > **data-rich and capacity-poor** — 4 MB already exceeds what a 40 K–250 K-param
 > model absorbs (the C4 run saw only ~8% of one epoch in 600 steps), and `g_data`
-> stores **one i64 per token (8 B/token)** against a **256 MB single-allocation cap**
-> (`ALLOC_MAX`), so the corpus ceiling is ~32 MB. So **"data quality > volume"** (the
-> frontier survey) governs the near term, packing buys cheap headroom, and the
-> RAM-independent path (streaming) waits for a model big enough to need it. Each item
-> is tooling/data + a logged X-entry; the no-flag binary stays byte-identical except
-> 1.5.3 (a transparent storage change) and 1.5.5 (the audit).
+> stored **one i64 per token (8 B/token)** against a **256 MB single-allocation cap**
+> (`ALLOC_MAX`), so the corpus ceiling was ~32 MB (**1.5.3 packed it to u8/u16,
+> lifting that ~4–8× and raising `MAX_CORPUS_BYTES` to 64 MB**). So **"data quality >
+> volume"** (the frontier survey) governs the near term, packing bought cheap
+> headroom, and the RAM-independent path (streaming) waits for a model big enough to
+> need it. Each item is tooling/data + a logged X-entry; the no-flag binary stays
+> byte-identical except 1.5.3 (a transparent storage change) and 1.5.5 (the audit).
 
 ### 1.5.2 — Quality-curating sampler (sharpen quality) — ✅ shipped (X017)
 
@@ -60,17 +62,22 @@ met**: the quality filter cut eval bits/byte **3.43 → 3.23 (−5.9%)** at iso-
 model — **diversity/volume is a scale lever**, not a tiny-model one (it lands with
 the model-scale work, M16+), so curate for *quality* now.
 
-### 1.5.3 — Token-packing unlock
+### 1.5.3 — Token-packing unlock — ✅ shipped (X018)
 
-Store the token stream **packed** — `u8` for byte-level (vocab ≤ 256), `u16` for BPE
-(vocab ≤ 768) — instead of one i64 per token, removing the 8× `g_data` bloat and
-lifting the corpus ceiling ~4–8× (to ~64–128 MB) in the same RAM. Touches `g_data` +
-its accessors (the window sampler, `bpe_learn`'s in-place merge rewrite,
-`corpus_set`, `sample_window`/`sample_window_diffusion`) and a `MAX_CORPUS_BYTES`
-raise to the new ceiling. The model / training math is untouched — the same token
-ids feed the same forward. **Gate**: **byte-identical** training (same loss curve) at
-the current corpus size (packing is transparent); a larger corpus loads + trains; the
-alloc-accounting pin + the corpus-load fuzz stay green on x86_64 AND aarch64.
+Stored the token stream **packed** — `u8` for byte-level (vocab ≤ 256), `u16` for BPE
+(vocab ≤ 768) — instead of one i64 per token, removing the 8×/4× `g_data` bloat and
+raising `MAX_CORPUS_BYTES` **4 MB → 64 MB** (the u16 store is then 128 MB, half the
+256 MB per-alloc cap). A `g_data_w` width global + width-generic accessors
+(`gd_ld`/`gd_st`, `_tw_ld`/`_tw_st`) over the corpus buffer; only `g_data` is packed
+(the T-sized batch buffers stay i64); `bpe_learn` self-widens a u8 corpus to u16;
+`tok_encode` gained an output-width arg (i64 prompt scratch vs the packed corpus
+rebuild). See [`../architecture/006-packed-token-store.md`](../architecture/006-packed-token-store.md).
+**Gate met**: default/u8, BPE-64/u16, and `--preset` runs **byte-identical** to 1.5.2;
+**977** grad-checks green on x86_64 AND aarch64/qemu; lint + fuzz (100 random corpora
++ BPE round-trip) + `make smoke` green; a 6 MB corpus (byte + BPE) loads/trains, a
+65 MB corpus rejects cleanly. Finding (X018): the headroom is real and free (ids ≤
+767 fit u8/u16), but diversity/volume remains a *scale* lever — this lifts the ceiling
+1.5.4 will fill.
 
 ### 1.5.4 — Curation at scale
 
@@ -237,8 +244,8 @@ gets reported, no dropped or cherry-picked rows (the "no silent caps" discipline
 ## Sequencing intent
 
 The remaining order is **value ÷ risk** and re-orderable (the axes are
-orthogonal). Immediately next is the **data-ingestion & curation 1.5.x arc**
-(1.5.2 quality-curating sampler → 1.5.3 token-packing → 1.5.4 curation at scale →
+orthogonal). The **data-ingestion & curation 1.5.x arc** is mid-flight (1.5.2
+quality-curating sampler ✓ → 1.5.3 token-packing ✓ → **1.5.4 curation at scale** →
 1.5.5 hardening/audit) — cheap, high-ROW infra that improves the data the *existing*
 models see and lifts the corpus ceiling, before any new model-scale work. Then the
 *precision* departure — **ternary training (M16, E6)** — into whose **1.6.x group**

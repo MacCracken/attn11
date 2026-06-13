@@ -2140,7 +2140,9 @@ fn test_ckpt_v3_roundtrip(): i64 {
     var nm = g_bpe_nmerges;
     var dl = g_datalen;
     var mer = t_alloc(2 * nm); t_copy(mer, g_merges, 2 * nm);
-    var dat = t_alloc(dl); t_copy(dat, g_data, dl);
+    # snapshot the packed token stream into an i64 buffer via the width accessor
+    var dat = t_alloc(dl); var ci = 0;
+    while (ci < dl) { store64(dat + ci * 8, gd_ld(ci)); ci = ci + 1; }
     model_init(V, 8, 4, 2, 2, 1, 1, f64_from(0), 13);
     var np = g_NP;
     var snap = t_alloc(np); t_copy(snap, g_params, np);
@@ -2163,7 +2165,7 @@ fn test_ckpt_v3_roundtrip(): i64 {
     assert(g_datalen == dl, "corpus id stream rebuilt to merged length");
     mism = 0; i = 0;
     while (i < dl) {
-        if (load64(g_data + i * 8) != load64(dat + i * 8)) { mism = mism + 1; }
+        if (gd_ld(i) != load64(dat + i * 8)) { mism = mism + 1; }
         i = i + 1;
     }
     assert(mism == 0, "corpus id stream rebuilt bit-for-bit");
@@ -2444,7 +2446,7 @@ fn test_bpe_known(): i64 {
     store64(&want + 24, 0); store64(&want + 32, 3);
     var mism = 0; var i = 0;
     while (i < 5) {
-        if (load64(g_data + i * 8) != load64(&want + i * 8)) { mism = mism + 1; }
+        if (gd_ld(i) != load64(&want + i * 8)) { mism = mism + 1; }
         i = i + 1;
     }
     assert(mism == 0, "bpe known: encoded stream [aaab,d,aaab,a,c]");
@@ -2468,7 +2470,7 @@ fn test_bpe_roundtrip(): i64 {
     # (a) decode: expand g_data through the span table, compare to g_text
     var pos = 0; var bad = 0; var i = 0;
     while (i < g_datalen) {
-        var id = load64(g_data + i * 8);
+        var id = gd_ld(i);
         var tl = load64(g_tok_len + id * 8);
         var sp = g_tok_bytes + id * BPE_MAX_TOKLEN();
         var j = 0;
@@ -2481,20 +2483,21 @@ fn test_bpe_roundtrip(): i64 {
         i = i + 1;
     }
     assert((bad == 0) && (pos == g_textlen), "bpe roundtrip: decode reconstructs corpus byte-exactly");
-    # (b) encode: tok_encode(raw bytes) == g_data, bit-for-bit
+    # (b) encode: tok_encode(raw bytes) == g_data, bit-for-bit. Re-encode into an
+    # i64 buffer (width 8) and compare to the packed g_data via the width accessor.
     var out = t_alloc(g_textlen);
-    var n = tok_encode(g_text, g_textlen, out);
+    var n = tok_encode(g_text, g_textlen, out, 8);
     assert(n == g_datalen, "bpe roundtrip: re-encode length matches");
     var mism = 0; i = 0;
     while (i < n) {
-        if (load64(out + i * 8) != load64(g_data + i * 8)) { mism = mism + 1; }
+        if (load64(out + i * 8) != gd_ld(i)) { mism = mism + 1; }
         i = i + 1;
     }
     assert(mism == 0, "bpe roundtrip: re-encode reproduces g_data bit-for-bit");
     # (c) unseen bytes (the corpus has no 'Z'/0xF0) fall back to id 0, in range
     var probe = alloc(8);
     store8(probe, 90); store8(probe + 1, 0xF0); store8(probe + 2, 97);
-    var pn = tok_encode(probe, 3, out);
+    var pn = tok_encode(probe, 3, out, 8);
     var oor = 0; i = 0;
     while (i < pn) {
         var pid = load64(out + i * 8);
@@ -2513,7 +2516,8 @@ fn test_bpe_determinism(): i64 {
     var m1 = g_bpe_nmerges;
     var n1 = g_datalen;
     var mer1 = t_alloc(2 * m1); t_copy(mer1, g_merges, 2 * m1);
-    var dat1 = t_alloc(n1); t_copy(dat1, g_data, n1);
+    var dat1 = t_alloc(n1); var ci = 0;
+    while (ci < n1) { store64(dat1 + ci * 8, gd_ld(ci)); ci = ci + 1; }
     var B2 = build_corpus();
     var V2 = bpe_learn(12);
     assert((V1 == V2) && (m1 == g_bpe_nmerges) && (n1 == g_datalen), "bpe determinism: same V/merges/length");
@@ -2524,7 +2528,7 @@ fn test_bpe_determinism(): i64 {
     }
     i = 0;
     while (i < n1) {
-        if (load64(dat1 + i * 8) != load64(g_data + i * 8)) { mism = mism + 1; }
+        if (load64(dat1 + i * 8) != gd_ld(i)) { mism = mism + 1; }
         i = i + 1;
     }
     assert(mism == 0, "bpe determinism: merges + stream bit-identical across runs");
@@ -2858,6 +2862,73 @@ fn test_simd_contract(): i64 {
     return 0;
 }
 
+# ---- token-store packing (1.5.3) -------------------------------------------
+# Pins the packed g_data store: the width-generic accessors round-trip token ids
+# at u8 (byte-level, vocab <= 256) and u16 (BPE, vocab <= 768); the storage width
+# does NOT change the token-id values (the byte-identical-sampling guarantee);
+# and bpe_learn self-widens a u8 corpus to u16. RNG-NEUTRAL (corpus_set/bpe_learn/
+# gd_* draw nothing), so registered last without disturbing the pinned RNG stream.
+fn test_token_packing(): i64 {
+    # (a) direct accessor: low-byte store + zero-extended load at each width, incl.
+    # the boundary ids (u8 max 255; u16 covers the full BPE range 0..767).
+    var scratch = alloc(8);
+    var save_data = g_data; var save_w = g_data_w;
+    g_data = scratch;
+    g_data_w = 1;
+    gd_st(0, 255); gd_st(1, 0);
+    assert(gd_ld(0) == 255, "pack u8: id 255 round-trips (low byte, zero-extended)");
+    assert(gd_ld(1) == 0, "pack u8: id 0 round-trips");
+    g_data_w = 2;
+    gd_st(0, 767); gd_st(1, 256); gd_st(2, 0);
+    assert(gd_ld(0) == 767, "pack u16: id 767 (max BPE vocab) round-trips");
+    assert(gd_ld(1) == 256, "pack u16: id 256 round-trips");
+    assert(gd_ld(2) == 0, "pack u16: id 0 round-trips");
+    g_data = save_data; g_data_w = save_w;
+
+    # (b) byte-level corpus at u8: the packed fill reads back the char2id base ids.
+    g_data_w = 1;
+    var V = build_corpus();
+    var n = g_datalen;
+    var ref = t_alloc(n);
+    var bad8 = 0; var i = 0;
+    while (i < n) {
+        var want = load64(g_char2id + load8(g_text + i) * 8);
+        store64(ref + i * 8, want);
+        if (gd_ld(i) != want) { bad8 = bad8 + 1; }
+        i = i + 1;
+    }
+    assert(bad8 == 0, "pack u8: byte-level corpus reads back the char2id ids");
+
+    # (c) width-invariance: the SAME corpus at u16 yields IDENTICAL ids + counts.
+    g_data_w = 2;
+    var V2 = build_corpus();
+    assert((V2 == V) && (g_datalen == n), "pack u16: same vocab + token count as u8");
+    var bad16 = 0; i = 0;
+    while (i < n) {
+        if (gd_ld(i) != load64(ref + i * 8)) { bad16 = bad16 + 1; }
+        i = i + 1;
+    }
+    assert(bad16 == 0, "pack u16: byte-level corpus reads back ids IDENTICAL to u8");
+
+    # (d) bpe_learn self-widens a u8 corpus to u16; the merged stream stays in range
+    # (ids reach base+merges-1 > 255, which only fit u16). Full byte-exact decode
+    # round-trip is test_bpe_roundtrip; here we pin the widen + range.
+    g_data_w = 1;
+    build_corpus();
+    var Vb = bpe_learn(16);
+    assert(g_data_w == 2, "pack: bpe_learn widened the u8 store to u16");
+    assert(Vb == g_bpe_base + g_bpe_nmerges, "pack: bpe vocab consistent after widen");
+    var oor = 0; i = 0;
+    while (i < g_datalen) {
+        var id = gd_ld(i);
+        if ((id < 0) || (id >= Vb)) { oor = oor + 1; }
+        i = i + 1;
+    }
+    assert(oor == 0, "pack: widened u16 stream ids all in [0,V)");
+    g_data_w = 1;   # restore the byte-level default
+    return 0;
+}
+
 fn main(): i64 {
     alloc_init();
     rng_seed(123);
@@ -2949,6 +3020,9 @@ fn main(): i64 {
     test_model_diffusion();
     test_diffusion_decode_determinism();
     test_ckpt_diffusion();
+    # RNG-neutral, so dead-last is safe and keeps the diffusion group's stream intact
+    test_group("token packing (1.5.3)");
+    test_token_packing();
     return assert_summary();
 }
 

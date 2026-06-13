@@ -4,6 +4,53 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.5.3] - 2026-06-13
+
+**Token-packing unlock** (data-ingestion & curation 1.5.x arc, step 2; X018). The
+corpus token stream `g_data` was one **i64 per token (8 B)**, so a 4 MB corpus cost
+~32 MB and the in-RAM ceiling was ~32 MB against the 256 MB single-allocation cap.
+1.5.3 stores it **packed** — `u8` for byte-level (vocab ≤ 256), `u16` for BPE
+(vocab ≤ 768) — removing the 8×/4× bloat and lifting the cap to **64 MB** (the u16
+`g_data` is then 128 MB, half the per-alloc cap). The model/training math is
+untouched: the same token ids feed the same forward, so the **default run is
+byte-identical** (verified — default/u8, BPE-64/u16, and `--preset` all match
+1.5.2 byte-for-byte).
+
+### Added
+- **Packed `g_data` token store** — a `g_data_w` width global (1 = u8, 2 = u16) +
+  width-generic accessors `_tw_ld`/`_tw_st`(buf, i, w) and `gd_ld`/`gd_st`(token
+  index) over a byte buffer (`load8`/`store8`, `load16`/`store16` — zero-extending
+  loads, low-byte stores; the same builtins `lib/cffi`/`slice`/`net`/`dynlib` use).
+  Only `g_data` (the one buffer that scales with corpus size) is packed; the
+  T-sized `A_tokens`/`A_targets`/`A_mask`/`G_win`/`g_enc_buf` stay i64. `main` sets
+  the width before the corpus load (byte-level → u8, `--bpe` or `--load` → u16);
+  `bpe_learn` self-widens a u8 corpus to u16 if a caller skipped that (BPE mints ids
+  up to base+K−1 ≤ 766, which need u16). `tok_encode` gained an explicit output-width
+  arg so it serves both the i64 prompt scratch (`g_enc_buf`, width 8) and the packed
+  corpus rebuild (`g_data`, `g_data_w`).
+- **`test_token_packing`** — pins the u8/u16 accessor round-trip (incl. boundary ids
+  255 / 256 / 767), **width-invariance** (the same byte-level corpus yields IDENTICAL
+  token ids at u8 and u16), and the `bpe_learn` self-widen. RNG-neutral, registered
+  last so the diffusion group's pinned RNG stream is undisturbed. **966 → 977** checks.
+- **X018** — the packing measurement: 8 B/token → 1 B (byte) / 2 B (BPE); corpus
+  ceiling ~32 MB → ~128 MB (u16) / ~256 MB (u8) against the per-alloc cap; the
+  `MAX_CORPUS_BYTES` raise to 64 MB; byte-identical default run confirmed.
+
+### Changed
+- **`MAX_CORPUS_BYTES` 4 MB → 64 MB** (`--corpus`/`--stdin` cap). Chosen so even the
+  u16 corpus store (128 MB) sits at half the 256 MB single-allocation cap, with room
+  for `g_text` (64 MB) + the model budget. An over-cap corpus still rejects cleanly
+  (code −2, no crash) — verified at 65 MB.
+- Docs/help updated to the 64 MB cap (`src/main.cyr` usage, `docs/STABILITY.md`,
+  `docs/guides/getting-started.md`, `docs/examples/c4-english.md`).
+
+### Verified
+- **Byte-identical** default/u8, BPE-64/u16, and `--preset` runs vs 1.5.2.
+- **977** grad-checks green on **x86_64 AND aarch64/qemu**; lint clean; fuzz green
+  (100 random corpora + BPE round-trip); `make smoke` (hostile-CLI) green.
+- A 6 MB corpus (byte + BPE) loads and trains (was over the old 4 MB cap); a 65 MB
+  corpus rejects cleanly.
+
 ## [1.5.2] - 2026-06-13
 
 **Quality-curating C4 sampler** — first step of the data-ingestion & curation 1.5.x

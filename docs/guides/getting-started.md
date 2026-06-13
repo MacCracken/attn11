@@ -16,7 +16,7 @@ cyrius test                                # gradient-check suite + smoke tests
 
 ```
 attn11                       train on the embedded corpus, then sample
-attn11 --corpus PATH         train on a corpus file (O_NOFOLLOW, 4 MB cap)
+attn11 --corpus PATH         train on a corpus file (O_NOFOLLOW, 64 MB cap)
 attn11 --stdin               train on a corpus read from stdin
 attn11 --steps N             total training steps (also the LR-schedule horizon)
 attn11 --save PATH           write a crash-atomic checkpoint after training

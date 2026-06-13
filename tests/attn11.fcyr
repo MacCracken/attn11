@@ -192,7 +192,7 @@ fn main(): i64 {
             if (bV < vv) { sys_write(2, "FAIL: bpe V < base\n", 19); sys_exit(5); }
             var pos = 0; var ei = 0; var bad = 0;
             while (ei < g_datalen) {
-                var id = load64(g_data + ei * 8);
+                var id = gd_ld(ei);
                 var tl = load64(g_tok_len + id * 8);
                 var sp = g_tok_bytes + id * BPE_MAX_TOKLEN();
                 var bj2 = 0;

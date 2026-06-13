@@ -24,7 +24,8 @@ machinery.
 
 ```sh
 # 1. Sample ~4 MB of English from C4 (en) into a gitignored data file.
-#    (attn11 caps a corpus at 4 MB; the source — C4 — is 305 GB, we slice from it.)
+#    (attn11 caps a corpus at 64 MB (1.5.3); the source — C4 — is 305 GB. A few MB
+#    already saturates a tiny model, so this example slices a small 4 MB sample.)
 python3 scripts/c4_sample.py --out data/c4-en-sample.txt --max-bytes 4000000
 
 # 2. Train: BPE subword tokenizer (so the model predicts word-pieces, not bytes)

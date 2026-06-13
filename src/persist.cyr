@@ -441,7 +441,7 @@ fn ckpt_load_buf(buf, len): i64 {
     # <= byte count, so g_data (sized at one id per byte) never grows.
     if ((g_data != 0) && (g_text != 0)) {
         if ((tok_kind == 1) || (was_bpe == 1)) {
-            g_datalen = tok_encode(g_text, g_textlen, g_data);
+            g_datalen = tok_encode(g_text, g_textlen, g_data, g_data_w);
         }
     }
     var p = base + Vb + 2 * K;

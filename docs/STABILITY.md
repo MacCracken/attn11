@@ -16,7 +16,7 @@ additive — the post-1.0 rule: a no-flag run stays byte-identical regardless.)
 
 | flag | meaning |
 |------|---------|
-| `--corpus PATH` | train on a corpus file (`O_NOFOLLOW`, 4 MB cap) |
+| `--corpus PATH` | train on a corpus file (`O_NOFOLLOW`, 64 MB cap) |
 | `--stdin` | train on a corpus read from stdin |
 | `--steps N` | total training steps (also the LR-schedule horizon) |
 | `--save PATH` | write a crash-atomic checkpoint after training |

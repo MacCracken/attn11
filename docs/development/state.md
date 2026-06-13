@@ -5,7 +5,24 @@
 
 ## Version
 
-**1.5.2** — *Quality-curating C4 sampler* (X017; the data-ingestion & curation 1.5.x
+**1.5.3** — *Token-packing unlock* (X018; the data-ingestion & curation 1.5.x arc,
+step 2). The corpus token stream `g_data` was one **i64 per token (8 B)**; 1.5.3
+stores it **packed** — `u8` for byte-level (vocab ≤ 256), `u16` for BPE (vocab ≤ 768)
+— removing the 8×/4× bloat and raising `MAX_CORPUS_BYTES` **4 MB → 64 MB** (the u16
+store is then 128 MB, half the 256 MB single-alloc cap). A `g_data_w` width global +
+width-generic accessors (`gd_ld`/`gd_st` over `g_data`, `_tw_ld`/`_tw_st`(buf,i,w)
+built on `load8/16`+`store8/16`); **only `g_data`** is packed (the T-sized
+`A_tokens`/`A_targets`/`A_mask`/`G_win`/`g_enc_buf` stay i64). `main` sets the width
+before the corpus load (byte-level → u8, `--bpe`/`--load` → u16); `bpe_learn`
+self-widens a u8 corpus to u16 (BPE ids reach ≤ 766); `tok_encode` gained an
+output-width arg (i64 prompt scratch vs the packed corpus rebuild). The model /
+training math is untouched — same ids, same forward — so the **default run is
+byte-identical** (verified: default/u8, BPE-64/u16, `--preset` all match 1.5.2
+byte-for-byte). New `test_token_packing` (round-trip at u8/u16 incl. boundary ids
+255/256/767, width-invariance, the self-widen) takes **966 → 977** checks. Invariants
+in [`../architecture/006-packed-token-store.md`](../architecture/006-packed-token-store.md).
+A larger corpus (6 MB byte + BPE) loads/trains; a 65 MB corpus rejects cleanly (−2).
+(1.5.2 — *Quality-curating C4 sampler* (X017; the data-ingestion & curation 1.5.x
 arc, step 1). `scripts/c4_sample.py --curate` adds de-duplication (exact + prefix),
 **multi-shard sampling** (`--shards N`, spread across the crawl), and prose/register
 quality filters — all stdlib + deterministic, with a resilient multi-shard download
@@ -16,7 +33,7 @@ while multi-shard *diversity* raised it (+2.7%) — a 53 K-param model can't exp
 diversity it can't fit, so **curate for quality now; diversity/volume is a scale
 lever** (validates sequencing streaming with M16+). NO core binary change (only
 `CFG_VERSION`); **966** checks unchanged.
-(1.5.1 — *C4 English experiment* (X016). Tooling + example for training on a
+1.5.1 — *C4 English experiment* (X016). Tooling + example for training on a
 real **large external corpus** — a 4 MB slice of **C4** (`c4/en`, 305 GB), streamed
 by `scripts/c4_sample.py` (stdlib `gzip`+`json`, no tensorflow/TFDS/pip — it streams
 one public C4 shard and stops, ~1 MB downloaded) into a **gitignored** `data/` file
@@ -347,7 +364,14 @@ checkpoint vs Linux at fixed CPU — `scripts/agnos-smoke.sh`):
   window fills; **bit-identical** to the uncached reference path; greedy +
   temperature sampling
 - **Corpus from file/stdin** (`--corpus`/`--stdin`): `O_NOFOLLOW`, `fstat`
-  size-cap, byte-level adaptive vocab (raw bytes retained for BPE re-encode)
+  size-cap (**64 MB**, 1.5.3, was 4 MB), byte-level adaptive vocab (raw bytes
+  retained for BPE re-encode)
+- **Packed corpus token store** (1.5.3, `g_data_w`): `g_data` holds one **u8**/token
+  byte-level (vocab ≤ 256) or **u16**/token BPE (vocab ≤ 768) instead of an i64,
+  removing the 8×/4× bloat; only the corpus buffer is packed (the T-sized batch
+  buffers stay i64), the token ids and forward are unchanged (default run
+  byte-identical). `bpe_learn` self-widens u8→u16; `tok_encode` carries an
+  output-width arg. [`../architecture/006-packed-token-store.md`](../architecture/006-packed-token-store.md)
 - **`--eval`** (0.7.1): one deterministic, RNG-neutral pass over the corpus →
   CE/token + **bits-per-byte** (tokenizer-comparable); runs after `--save`,
   so checkpoints are bit-identical with or without it
@@ -567,7 +591,7 @@ constant `nh·hd²` state instead of a T-growing K/V.
 
 ## Tests
 
-- `tests/attn11.tcyr` — **966 checks**: finite-difference gradient checks
+- `tests/attn11.tcyr` — **977 checks**: finite-difference gradient checks
   (every op incl. dropout; attention at head dims 6/8/10 and GQA/MQA at
   `nkv ∈ {1, 2, nh}` incl. `dWk`/`dWv`/`dbv`; the `|dbk| ≈ 0`
   softmax-shift-invariance pin; 2-layer full model at MHA and GQA), the **MLA
@@ -627,7 +651,10 @@ constant `nh·hd²` state instead of a T-growing K/V.
   mask_emb AND tokemb at mixed masked/given positions; `test_diffusion_decode_-
   determinism` — the greedy parallel decode resolves every position + is
   reproducible; `test_ckpt_diffusion` — the v7 round-trip + `-47` rejects + the
-  AR-still-v5 pin), a
+  AR-still-v5 pin), the **token-packing suite** (1.5.3: `test_token_packing` —
+  `gd_ld`/`gd_st` round-trip at u8/u16 incl. boundary ids 255/256/767, the
+  width-invariance pin (a byte-level corpus reads back IDENTICAL ids at u8 and u16),
+  and the `bpe_learn` u8→u16 self-widen; RNG-neutral, registered last), a
   **soak/leak** test and a **NaN guard** test. All pass on x86_64 AND aarch64
   (`cyrius test`; aarch64 via qemu).
 - `tests/attn11.bcyr` — benchmark harness (training timings + tokens/sec,
@@ -703,10 +730,11 @@ M15 (1.5.0) the first *training-objective* departure (char-diffusion; X015 — A
 at this tiny scale, the super-data-learner advantage is a scale phenomenon), then
 v1.5.1 the C4 data-ingestion tooling (X016). The **1.5.x data arc** (per [`roadmap.md`](roadmap.md)):
 **1.5.2** quality-curating sampler **shipped** (X017 — the prose-quality filter cut
-bits/byte 5.9%; multi-shard diversity is a scale lever); next is **1.5.3**
-token-packing unlock (u8/u16 token store vs i64; removes the 8× `g_data` bloat, lifts
-the ~32 MB corpus ceiling 4–8×) → **1.5.4** curation at scale → **1.5.5**
-hardening/audit/security pass (P(-1)) closing the arc. Then **M16** ternary
+bits/byte 5.9%; multi-shard diversity is a scale lever); **1.5.3** token-packing unlock
+**shipped** (X018 — u8/u16 `g_data` vs i64; removed the 8×/4× bloat, raised
+`MAX_CORPUS_BYTES` 4 MB → 64 MB; default run byte-identical); next is **1.5.4**
+curation at scale → **1.5.5** hardening/audit/security pass (P(-1)) closing the arc.
+Then **M16** ternary
 (BitNet-style) training (E6), into whose 1.6.x group **streaming token-shard
 ingestion** folds (RAM-independent large corpora — it pays off once a scaled model
 can absorb the data); **M17** RL (E9) last. Open diffusion fast-follows:

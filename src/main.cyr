@@ -4,7 +4,7 @@
 #
 # Usage:
 #   attn11                          train on the embedded corpus, then sample
-#   attn11 --corpus PATH            train on a corpus file (O_NOFOLLOW, 4 MB cap)
+#   attn11 --corpus PATH            train on a corpus file (O_NOFOLLOW, 64 MB cap)
 #   attn11 --stdin                  train on a corpus read from stdin
 #   attn11 --steps N                set total training steps (schedule horizon)
 #   attn11 --save PATH              write a checkpoint after training
@@ -88,12 +88,12 @@ fn _atoi(s): i64 {
 }
 
 # Kept in sync with the VERSION file (CI's docs job gates the match).
-fn CFG_VERSION(): i64 { return "1.5.2"; }
+fn CFG_VERSION(): i64 { return "1.5.3"; }
 
 fn usage(): i64 {
     puts("attn11 — a from-scratch GPT-style transformer, trained, in Cyrius\n");
     puts("usage: attn11 [flags]   (no flags: train on the embedded corpus, then sample)\n");
-    puts("  --corpus PATH   train on a corpus file (O_NOFOLLOW, 4 MB cap)\n");
+    puts("  --corpus PATH   train on a corpus file (O_NOFOLLOW, 64 MB cap)\n");
     puts("  --stdin         train on a corpus read from stdin\n");
     puts("  --steps N       total training steps (also the LR-schedule horizon)\n");
     puts("  --save PATH     write a crash-atomic checkpoint after training\n");
@@ -350,6 +350,14 @@ fn main(): i64 {
     }
 
     # ---- corpus ----
+    # Token-store width (1.5.3): g_data packs one byte/token for byte-level
+    # (vocab <= 256) and two for BPE (vocab <= 768). Set BEFORE the corpus load
+    # (corpus_set reads g_data_w to size + fill the packed buffer). On --load the
+    # checkpoint may carry a BPE tokenizer — its corpus rebuild re-encodes through
+    # the loaded merges (ids up to 766) — so size wide regardless of --bpe.
+    g_data_w = 1;
+    if (use_bpe == 1) { g_data_w = 2; }
+    if (load_path != 0) { g_data_w = 2; }
     var V = 0;
     if (use_stdin == 1) { V = corpus_load_stdin(); }
     elif (corpus_path != 0) { V = corpus_load_file(corpus_path); }
