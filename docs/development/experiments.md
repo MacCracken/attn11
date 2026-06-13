@@ -534,3 +534,64 @@ steps — the 1/3-attention hybrid runs ~3.73 ms, essentially the linear step
 5. The hybrid is restricted to LAYOUT-COMPATIBLE mixers {mha, gqa, lin}. Admitting
    MLA/SSM into a hybrid needs per-layer (or padded) parameter layouts — the rung-d
    follow-on. A vidya-scale bake-off across ratios is the standing M14 follow-on.
+
+## X013 — the any-mixer hybrid: full attention ⊕ SSM (M14 rung d, v1.4.4) (2026-06-13)
+
+**Setup**: 1.4.4, default config (d_model 32, ctx 16, 4 heads, 3 layers), 1200
+steps on the embedded corpus, `--eval`. Rung d lifts rung c's layout restriction:
+`--attn-kind ssm --attn-every K` is a hybrid of the SSM (attn11's best single
+mixer, X011) with a full-attention block every K-th layer — the survey's strongest
+pairing. The block K/V region is PADDED to the max `_kvw` over the present kinds
+(here MHA's, since `2·C·Ckv` > the SSM's `3·C·N+C`), keeping a uniform per-block
+stride. NL=3 → sweep 0/3 → 1/3 → 2/3 → 3/3 attention. x86_64.
+
+**Correctness** (grad-checks, both arches): the deliverable is the MIXED backward
+through a hybrid whose layers have DIFFERENT parameter layouts. `test_model_hybrid_ssm`
+(an SSM ⊕ MHA stack, full-model 1e-3, maxrel ~1e-4) grad-checks `ssm_bwd` for the
+SSM blocks composing with `attn_bwd` for the MHA block — the MHA `Wk` tiling the
+padded region, the SSM `A/W_B` tiling theirs with a zeroed pad, and `Wo` (after the
+padding) all correct. `test_model_hybrid_mla` (MLA ⊕ MHA). `test_kv_hybrid` adds
+the mha/ssm + mha/mla **bit-identity** decode (each block replays its own kind's
+cache — KV arena / C×N state / latent — within the padded layout). `test_ckpt_hybrid`
+round-trips a padded mha/ssm v6 image. Alloc-accounting + config-cap pins for both.
+**857 → 907** checks.
+
+**Comparison** (attention-fraction sweep, base SSM, N=16):
+
+| attention | config              | bits/byte | params | decode cache |
+|-----------|---------------------|-----------|--------|--------------|
+| 0/3 (0%)  | pure ssm            | **0.218** | 38 048 | 12 288 B     |
+| 1/3 (33%) | ssm --attn-every 3  | 0.224     | 39 488 | 16 384 B     |
+| 2/3 (67%) | ssm --attn-every 2  | 0.219     | 39 488 | 20 480 B     |
+| 3/3 (100%)| pure mha            | 0.279     | 39 488 | 24 576 B     |
+
+Decode cache sums the per-layer caches: each MHA layer's T-growing K/V (8 192 B at
+T=16) + each SSM layer's constant C×N state (4 096 B at N=16). The padding lifts
+the hybrid param count to MHA's 39 488 (vs pure SSM's 38 048 — +1 440, the SSM
+layers' region padded up to MHA's by 480 each × 3 layers).
+
+**Cost** (`./build/bench`): the mha/ssm hybrid (1/3 attention) fwd+bwd step
+~5.0 ms — between pure SSM (~5.6 ms) and the dense step, since the one MHA block is
+cheaper than an SSM block. Cached decode advances each block's own state.
+
+**Takeaways**:
+1. **Any-mixer hybrids train and grad-check.** A model whose layers have *different
+   parameter layouts* (SSM's `3CN+C` vs MHA's `2C²` K/V region) composes correctly
+   — the padded uniform stride (ADR 0012) keeps the addressing uniform while each
+   layer runs its own kind's forward/backward. The mixed SSM/MHA and MLA/MHA
+   backwards land at ~1e-4. This completes M14: the full `{mha, mla, lin, ssm}`
+   mixer set is now interleavable.
+2. **The padding cost is real but small** (+1 440 params here; the SSM layers' K/V
+   region padded up to MHA's). It's the price of a uniform stride without a
+   per-layer-offset refactor — exact for {mha,gqa,lin} hybrids (shared `_kvw`, no
+   pad), a few % for SSM/MLA mixed with MHA at reference scale.
+3. **At reference scale the ratio sweep is within noise** (again): the mha/ssm
+   hybrids (0.219–0.224) sit between pure SSM (0.218, the best) and pure MHA (0.279),
+   closer to SSM. Read honestly — NOT a claim that a hybrid beats pure SSM here; the
+   tiny corpus and short context don't exercise where hybrids win (long-context
+   recall the SSM-only model loses + the cache savings vs pure attention). The
+   deliverable is the *mechanism*: any ratio of any mixers, persisted in v6,
+   grad-checked — ready for a vidya-scale bake-off.
+4. The decode cache is now a continuous knob from pure-SSM's 12 288 B (constant in
+   T) to pure-MHA's 24 576 B (∝ T): each attention layer added trades constant
+   state for T-growing K/V. The hybrid is where that trade is dialed.

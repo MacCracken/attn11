@@ -48,21 +48,26 @@ var g_rope_dim = 0;
 # kinds per layer (the survey's structural lever: a few full-attention layers
 # among many cheap recurrent ones). g_layer_kind == 0 means uniform (g_attn_kind
 # everywhere — byte-identical to today). When set, it points to NL i64 per-layer
-# kinds, read ONLY by _lk(L) in the three dispatch helpers. 1.4.3 restricts the
-# mix to LAYOUT-COMPATIBLE kinds {0 = mha/gqa, 2 = gated-linear} — lin reuses
-# MHA's exact projections (ADR 0009), so _kvw/_blk/the offsets/g_NP are identical
-# and the per-block stride stays uniform (NO per-layer parameter-offset refactor).
+# kinds, read ONLY by _lk(L) in the three dispatch helpers. 1.4.3 (rung c) allowed
+# the layout-compatible mix {0 = mha/gqa, 2 = gated-linear}; 1.4.4 (rung d) admits
+# any mix of {0,1 = mla,2,3 = ssm} by PADDING each block's K/V region to the max
+# _kvw over the present kinds (`_kvw_hyb`) — the per-block stride stays uniform
+# (NO per-layer offset refactor), at the cost of a zeroed pad on smaller kinds.
 var g_layer_kind = 0;
 # layer L's mixer kind: the per-layer array when hybrid, else the global.
 fn _lk(L): i64 { if (g_layer_kind == 0) { return g_attn_kind; } return load64(g_layer_kind + L * 8); }
-# 1 if any block runs gated-linear (kind 2) — gates the g_lin_state decode cache.
-# Uniform: base == 2. Hybrid: scan the per-layer kinds.
-fn _any_lin(): i64 {
-    if (g_layer_kind == 0) { if (g_attn_kind == 2) { return 1; } return 0; }
+# 1 if ANY block runs mixer kind k — uniform: base == k; hybrid: scan the
+# per-layer kinds. Gates the per-kind decode/scratch allocation (LA_c for mla,
+# the ssm caches, g_lin_state for lin): a kind's buffers are held when ANY layer
+# uses it (allocated for all NL; non-matching layers' slots sit unused — the
+# dispatch reads a layer's buffer only when _lk(L) selects that kind).
+fn _any_kind(k): i64 {
+    if (g_layer_kind == 0) { if (g_attn_kind == k) { return 1; } return 0; }
     var L = 0;
-    while (L < g_NL) { if (load64(g_layer_kind + L * 8) == 2) { return 1; } L = L + 1; }
+    while (L < g_NL) { if (load64(g_layer_kind + L * 8) == k) { return 1; } L = L + 1; }
     return 0;
 }
+fn _any_lin(): i64 { return _any_kind(2); }
 
 # ---- MoE descriptor (M13, E8; checkpoint v5) -------------------------------
 # The dense GELU MLP becomes N experts + a top-K router. g_num_experts == 1 is
@@ -112,7 +117,31 @@ fn _mlpw(C, F, ne): i64 {
     if (ne > 1) { return ne * (2 * C * F + F + C) + C * ne; }   # N experts + router gate
     return 2 * C * F + F + C;                                   # dense Wfc + bfc + Wproj + bproj
 }
-fn _kv_weight_size(): i64 { return _kvw(g_C, g_nh, g_nkv, g_attn_kind, g_latent_dim, g_pos_kind, g_rope_dim); }
+# Padded block K/V region for a per-layer HYBRID (M14 rung d, ADR 0011): each
+# block's K/V region is sized to the MAX _kvw over the kinds PRESENT, so the
+# per-block stride stays UNIFORM (no per-layer offset refactor) even when the
+# mixed kinds have different region sizes — a layer of a smaller kind tiles its
+# own offsets at the shared region base (2C+C²) and leaves a zeroed pad at the end
+# (t_alloc zeroes; the pad gets no gradient, so Adam never moves it). {mha,gqa,lin}
+# alone share _kvw (max == that size, no pad — rung c's exact layout). All mla/ssm
+# layers share the global latent_dim (d_c / state N), so the within-region offset
+# helpers stay global-`g_latent_dim`-driven and zero-arg.
+fn _kvw_hyb(kinds, NL, C, nh, nkv, dc, pk, dr): i64 {
+    var mx = 0;
+    var L = 0;
+    while (L < NL) {
+        var w = _kvw(C, nh, nkv, load64(kinds + L * 8), dc, pk, dr);
+        if (w > mx) { mx = w; }
+        L = L + 1;
+    }
+    return mx;
+}
+fn _kv_weight_size(): i64 {
+    if (g_layer_kind != 0) {
+        return _kvw_hyb(g_layer_kind, g_NL, g_C, g_nh, g_nkv, g_latent_dim, g_pos_kind, g_rope_dim);
+    }
+    return _kvw(g_C, g_nh, g_nkv, g_attn_kind, g_latent_dim, g_pos_kind, g_rope_dim);
+}
 # Size (elements) of the MLP WEIGHT region — the SECOND place an architecture
 # axis changes the block layout (M13, E8). Dense: Wfc(C*F) + bfc(F) + Wproj(F*C)
 # + bproj(C). MoE (g_num_experts > 1): N experts each the dense quad, packed
@@ -345,27 +374,41 @@ fn model_config_ok_moe(V, C, T, nh, nkv, NL, attn_kind, d_c, pos_kind, d_rope, n
     if ((topk < 1) || (topk > num_experts)) { return 0; }
     return 1;
 }
-# Per-layer HYBRID validity (M14 rung c, 1.4.3). `kinds` is NL i64 mixer kinds.
-# The uniform-stride invariant: EVERY layer must share the base block layout, i.e.
-# its _kvw must equal the base attn_kind's. For base ∈ {0 (mha), 2 (lin)} with
-# d_c == 0 this admits exactly the layout-compatible mix {mha, gqa, lin} (lin reuses
-# MHA's projections, ADR 0009) and rejects mla/ssm (whose _kvw differs) — so the
-# block stride stays uniform and no per-layer offset refactor is needed. RoPE is
-# softmax/MLA-specific, so a hybrid requires learned-absolute positions.
-# (Expressed as the _kvw-equality invariant, not a hardcoded set, so a future
-# layout-compatible kind needs no change here.) Returns 1 if valid, 0 if not.
-fn _hybrid_kinds_ok(kinds, NL, C, nh, nkv, base_ak, d_c, pos_kind, d_rope): i64 {
-    if (pos_kind != 0) { return 0; }
-    if ((base_ak != 0) && (base_ak != 2)) { return 0; }   # base must be a {0,2}-layout kind
-    var base_kvw = _kvw(C, nh, nkv, base_ak, d_c, pos_kind, d_rope);
+# Per-layer HYBRID validity (M14 rung c+d). `kinds` is NL i64 mixer kinds. Rung d
+# (1.4.4) admits ANY mix of {mha/gqa (0), mla (1), lin (2), ssm (3)}: the block K/V
+# region is PADDED to the max _kvw over the present kinds (`_kvw_hyb`), so the
+# per-block stride stays uniform regardless of which kinds appear — no per-layer
+# offset refactor. The cross-cutting constraints are what remains: RoPE is
+# softmax/MLA-specific so a hybrid is learned-absolute (pos_kind == 0); mla/ssm/lin
+# all need FULL heads (nkv == nh); and the SHARED latent_dim (d_c, used as the MLA
+# d_c / SSM state N by every latent layer) must be in [1, C] iff any mla/ssm layer
+# is present (else 0). Returns 1 if valid, 0 if not.
+fn _hybrid_kinds_ok(kinds, NL, C, nh, nkv, d_c, pos_kind, d_rope): i64 {
+    if (pos_kind != 0) { return 0; }       # learned-abs only (no RoPE in a hybrid)
+    if (nkv != nh) { return 0; }           # mla/ssm/lin layers require full heads
     var L = 0;
+    var needs_latent = 0;
     while (L < NL) {
         var k = load64(kinds + L * 8);
-        if ((k != 0) && (k != 1) && (k != 2) && (k != 3)) { return 0; }       # a known kind
-        if (_kvw(C, nh, nkv, k, d_c, pos_kind, d_rope) != base_kvw) { return 0; }   # same stride
+        if ((k != 0) && (k != 1) && (k != 2) && (k != 3)) { return 0; }   # a known kind
+        if ((k == 1) || (k == 3)) { needs_latent = 1; }                   # mla / ssm use the latent
         L = L + 1;
     }
+    if (needs_latent == 1) { if ((d_c < 1) || (d_c > C)) { return 0; } }
+    else { if (d_c != 0) { return 0; } }
     return 1;
+}
+# Pure kind-presence helpers (the alloc-accounting mirror of model_init's gates):
+# does any layer run kind k? _alloc_has handles both the uniform (kinds == 0, all
+# layers run attn_kind) and hybrid (scan the per-layer array) cases.
+fn _present(kinds, NL, k): i64 {
+    var L = 0;
+    while (L < NL) { if (load64(kinds + L * 8) == k) { return 1; } L = L + 1; }
+    return 0;
+}
+fn _alloc_has(kinds, NL, attn_kind, k): i64 {
+    if (kinds == 0) { if (attn_kind == k) { return 1; } return 0; }
+    return _present(kinds, NL, k);
 }
 
 # Exact bytes model_init will allocate for a config (NP precomputed by the
@@ -383,13 +426,14 @@ fn model_alloc_bytes_arch(V, C, T, nh, nkv, NL, NP, attn_kind, d_c, pos_kind, d_
 # MoE-aware variant (M13). KEEP IN SYNC with model_init_moe — test_alloc_accounting
 # pins the two together (incl. the MoE per-layer router/expert caches + scratch).
 fn model_alloc_bytes_moe(V, C, T, nh, nkv, NL, NP, attn_kind, d_c, pos_kind, d_rope, num_experts, topk): i64 {
-    return model_alloc_bytes_hyb(V, C, T, nh, nkv, NL, NP, attn_kind, d_c, pos_kind, d_rope, num_experts, topk, 0, 0);
+    return model_alloc_bytes_hyb(V, C, T, nh, nkv, NL, NP, attn_kind, d_c, pos_kind, d_rope, num_experts, topk, 0);
 }
-# Hybrid-aware (M14 rung c, 1.4.3): lin_extra = 1 when a gated-linear layer needs
-# the g_lin_state decode cache but the base attn_kind isn't lin (so the attn_kind==2
-# term below wouldn't fire); pl = NL when the per-layer g_layer_kind array is held.
+# Hybrid-aware (M14 rung c/d). `kinds` = 0 for a uniform model (every layer runs
+# attn_kind), else the NL per-layer kind array (also held as g_layer_kind, +NL).
+# Each kind's caches are counted when ANY layer uses it (mirrors model_init's
+# presence gates) — for a hybrid the per-layer buffers are held for all NL layers.
 fn model_alloc_bytes_hyb(V, C, T, nh, nkv, NL, NP, attn_kind, d_c, pos_kind, d_rope,
-                         num_experts, topk, lin_extra, pl): i64 {
+                         num_experts, topk, kinds): i64 {
     var F = 4 * C;
     var Ckv = nkv * (C / nh);
     var asz = attn_arena_size(T, C, nh, nkv);
@@ -402,7 +446,7 @@ fn model_alloc_bytes_hyb(V, C, T, nh, nkv, NL, NP, attn_kind, d_c, pos_kind, d_r
     e = e + 9 * C + 2 * F + 2 + T + V + T;            # single-row scratch + G_win
     # MLA latent buffers (ADR 0007): LA_c pointer array (NL) + per-layer latent c
     # (NL * T*d_c) + the two shared down/up backward temporaries (2 * T*d_c).
-    if (attn_kind == 1) { e = e + NL + NL * T * d_c + 2 * T * d_c; }
+    if (_alloc_has(kinds, NL, attn_kind, 1) == 1) { e = e + NL + NL * T * d_c + 2 * T * d_c; }
     # decoupled-RoPE buffers (pos_kind == 2): LA_qr + LA_kr pointer arrays (2*NL) +
     # per-layer rope query/key (NL * (T*nh*d_rope + T*d_rope)) + the two shared
     # backward temporaries D_qr (T*nh*d_rope) + D_kr (T*d_rope).
@@ -411,14 +455,14 @@ fn model_alloc_bytes_hyb(V, C, T, nh, nkv, NL, NP, attn_kind, d_c, pos_kind, d_r
         e = e + nh * d_rope;   # R_qr single-row scratch
     }
     # gated-linear: the per-layer retention state cache (NL pointers + NL·nh·hd^2).
-    # The arena's 2·hd^2 lin scratch is already in `asz` above. Fires for a uniform
-    # lin model (attn_kind==2) OR a hybrid with lin layers over a non-lin base (lin_extra).
-    if (attn_kind == 2) { e = e + NL + NL * nh * (C / nh) * (C / nh); }
-    elif (lin_extra == 1) { e = e + NL + NL * nh * (C / nh) * (C / nh); }
-    e = e + pl;   # per-layer g_layer_kind array (NL i64), held only by a hybrid
-    # selective SSM (attn_kind==3, d_c = state N): 6 per-layer pointer arrays +
-    # per-layer caches (Δ/B/C/h/y + the C*N decode state) + shared reverse scratch.
-    if (attn_kind == 3) {
+    # The arena's 2·hd^2 lin scratch is already in `asz` above. Counted when any
+    # layer is lin (a uniform lin model OR a hybrid with lin layers).
+    if (_alloc_has(kinds, NL, attn_kind, 2) == 1) { e = e + NL + NL * nh * (C / nh) * (C / nh); }
+    if (kinds != 0) { e = e + NL; }   # per-layer g_layer_kind array (NL i64), held only by a hybrid
+    # selective SSM (d_c = state N): 6 per-layer pointer arrays + per-layer caches
+    # (Δ/B/C/h/y + the C*N decode state) + shared reverse scratch. Counted when any
+    # layer is ssm.
+    if (_alloc_has(kinds, NL, attn_kind, 3) == 1) {
         e = e + 6 * NL;
         e = e + NL * (2 * T * C + 2 * T * d_c + T * C * d_c + C * d_c);
         e = e + 3 * T * C + 2 * T * d_c + C * d_c;
@@ -464,8 +508,9 @@ fn model_init_moe(V, C, T, nh, nkv, NL, attn_bias, dropout, seed,
                            attn_kind, d_c, pos_kind, d_rope, num_experts, topk, 0);
 }
 # hybrid_kinds: 0 = uniform (every block runs attn_kind); else a pointer to NL
-# i64 per-layer mixer kinds (copied into g_layer_kind). The per-layer kinds must
-# share attn_kind's block layout (1.4.3: {0,2}) — validated by model_config_ok.
+# i64 per-layer mixer kinds (copied into g_layer_kind). Rung d (1.4.4) admits any
+# mix of {mha,mla,lin,ssm} — the K/V region pads to the max _kvw — validated by
+# _hybrid_kinds_ok (learned-abs, full heads, a valid shared latent for mla/ssm).
 fn model_init_full(V, C, T, nh, nkv, NL, attn_bias, dropout, seed,
                    attn_kind, d_c, pos_kind, d_rope, num_experts, topk, hybrid_kinds): i64 {
     if (model_config_ok_moe(V, C, T, nh, nkv, NL, attn_kind, d_c, pos_kind, d_rope, num_experts, topk) == 0) {
@@ -487,9 +532,9 @@ fn model_init_full(V, C, T, nh, nkv, NL, attn_bias, dropout, seed,
     # a stale array from a prior hybrid. Set before g_NP/_any_lin reads it.
     g_layer_kind = 0;
     if (hybrid_kinds != 0) {
-        if (_hybrid_kinds_ok(hybrid_kinds, NL, C, nh, nkv, attn_kind, d_c, pos_kind, d_rope) == 0) {
-            puts("attn11: model_init: invalid hybrid (per-layer kinds must share the base ");
-            puts("{mha,lin} block layout; learned-abs positions only)\n");
+        if (_hybrid_kinds_ok(hybrid_kinds, NL, C, nh, nkv, d_c, pos_kind, d_rope) == 0) {
+            puts("attn11: model_init: invalid hybrid (per-layer kinds in {mha,mla,lin,ssm}; ");
+            puts("full heads; learned-abs positions; shared latent in [1,C] iff any mla/ssm)\n");
             sys_exit(1);
         }
         g_layer_kind = t_alloc(NL);
@@ -506,14 +551,10 @@ fn model_init_full(V, C, T, nh, nkv, NL, attn_bias, dropout, seed,
     # shape-valid config can still imply a model larger than the allocator cap.
     # Reject BEFORE any allocation so a hostile --layers/--preset combination
     # aborts cleanly instead of through an oversized/undersized t_alloc.
-    # hybrid extras: a lin layer in a non-lin-base model needs g_lin_state
-    # (lin_extra); a hybrid model needs the NL-entry g_layer_kind array (pl).
-    var lin_extra = 0;
-    if (_any_lin() == 1) { if (attn_kind != 2) { lin_extra = 1; } }
-    var pl = 0;
-    if (g_layer_kind != 0) { pl = NL; }
+    # g_layer_kind (0 = uniform, else the per-layer array) drives the per-kind
+    # cache accounting — each present kind's buffers + the NL kind array.
     var abytes = model_alloc_bytes_hyb(V, C, T, nh, nkv, NL, g_NP, attn_kind, d_c, pos_kind, d_rope,
-                                       num_experts, topk, lin_extra, pl);
+                                       num_experts, topk, g_layer_kind);
     if (abytes > CKPT_MAX_MODEL_BYTES()) {
         puts("attn11: model_init: config exceeds the 128 MB model-allocation cap\n");
         sys_exit(1);
@@ -537,7 +578,11 @@ fn model_init_full(V, C, T, nh, nkv, NL, attn_bias, dropout, seed,
         t_fill(PL(L, _o_ln1g()), C, f64_from(1));
         t_fill(PL(L, _o_ln2g()), C, f64_from(1));
         t_randn(PL(L, _o_Wq()), C * C, std);
-        if (attn_kind == 1) {
+        # per-layer kind (M14 rung c/d): a hybrid inits each block to ITS OWN kind's
+        # K/V weights within the (padded) region; the pad tail stays zero (t_alloc).
+        # Uniform model: _lk(L) == attn_kind for every L, so this is unchanged.
+        var lkk = _lk(L);
+        if (lkk == 1) {
             # MLA: down-projection C->d_c, then two up-projections d_c->C
             t_randn(PL(L, _o_Wdkv()), C * d_c, std);
             t_randn(PL(L, _o_Wuk()), d_c * C, std);
@@ -547,7 +592,7 @@ fn model_init_full(V, C, T, nh, nkv, NL, attn_bias, dropout, seed,
                 t_randn(PL(L, _o_Wqr()), C * nh * d_rope, std);
                 t_randn(PL(L, _o_Wkr()), C * d_rope, std);
             }
-        } elif (attn_kind == 3) {
+        } elif (lkk == 3) {
             # SSM (Wq=W_dt above, Wo=output proj below): B/C projections randn; the
             # diagonal A is a fixed negative ramp -(n+1) (S4D-style — a spread of
             # decay rates exp(Δ·A) across state dims); D is the identity skip (=1).
@@ -602,13 +647,16 @@ fn model_init_full(V, C, T, nh, nkv, NL, attn_bias, dropout, seed,
     LA_m2 = t_alloc(NL); LA_r2 = t_alloc(NL);
     LA_arena = t_alloc(NL);
     LA_dmask_attn = t_alloc(NL); LA_dmask_mlp = t_alloc(NL);
-    if (attn_kind == 1) { LA_c = t_alloc(NL); }
+    # per-kind caches gated on PRESENCE (any layer of that kind), not the base —
+    # so a hybrid holds every present kind's caches (M14 rung d).
+    var has_mla = _any_kind(1); var has_ssm = _any_kind(3);
+    if (has_mla == 1) { LA_c = t_alloc(NL); }
     if (pos_kind == 2) { LA_qr = t_alloc(NL); LA_kr = t_alloc(NL); }
     if (num_experts > 1) {
         LA_mlogits = t_alloc(NL); LA_msel = t_alloc(NL); LA_mgate = t_alloc(NL);
         LA_mefc = t_alloc(NL); LA_megg = t_alloc(NL);
     }
-    if (attn_kind == 3) {
+    if (has_ssm == 1) {
         LA_ssm_dlt = t_alloc(NL); LA_ssm_B = t_alloc(NL); LA_ssm_C = t_alloc(NL);
         LA_ssm_h = t_alloc(NL); LA_ssm_y = t_alloc(NL); g_ssm_state = t_alloc(NL);
     }
@@ -629,7 +677,7 @@ fn model_init_full(V, C, T, nh, nkv, NL, attn_bias, dropout, seed,
         store64(LA_arena + L * 8, t_alloc(asz));
         store64(LA_dmask_attn + L * 8, t_alloc(TC));
         store64(LA_dmask_mlp + L * 8, t_alloc(TC));
-        if (attn_kind == 1) { store64(LA_c + L * 8, t_alloc(T * d_c)); }
+        if (has_mla == 1) { store64(LA_c + L * 8, t_alloc(T * d_c)); }
         if (pos_kind == 2) {
             store64(LA_qr + L * 8, t_alloc(T * nh * d_rope));
             store64(LA_kr + L * 8, t_alloc(T * d_rope));
@@ -641,7 +689,7 @@ fn model_init_full(V, C, T, nh, nkv, NL, attn_bias, dropout, seed,
             store64(LA_mefc + L * 8, t_alloc(T * topk * F));
             store64(LA_megg + L * 8, t_alloc(T * topk * F));
         }
-        if (attn_kind == 3) {
+        if (has_ssm == 1) {
             store64(LA_ssm_dlt + L * 8, t_alloc(TC));
             store64(LA_ssm_B + L * 8, t_alloc(T * d_c));
             store64(LA_ssm_C + L * 8, t_alloc(T * d_c));
@@ -656,14 +704,14 @@ fn model_init_full(V, C, T, nh, nkv, NL, attn_bias, dropout, seed,
     D_logits = t_alloc(TV); D_f = t_alloc(TC); D_resid = t_alloc(TC);
     D_xmid = t_alloc(TC); D_a = t_alloc(TC); D_b = t_alloc(TC);
     D_g = t_alloc(TF); D_fc = t_alloc(TF); D_tmp = t_alloc(TC); D_drop = t_alloc(TC);
-    if (attn_kind == 1) { D_lat1 = t_alloc(T * d_c); D_lat2 = t_alloc(T * d_c); }
+    if (has_mla == 1) { D_lat1 = t_alloc(T * d_c); D_lat2 = t_alloc(T * d_c); }
     if (pos_kind == 2) { D_qr = t_alloc(T * nh * d_rope); D_kr = t_alloc(T * d_rope); }
     if (num_experts > 1) {
         g_moe_sc = t_alloc(2 * F + 2 * C + 3 * num_experts + topk);
         g_moe_dlaux = t_alloc(T * num_experts);
         g_moe_disp = t_alloc(num_experts);
     }
-    if (attn_kind == 3) {                       # shared SSM reverse-scan scratch
+    if (has_ssm == 1) {                         # shared SSM reverse-scan scratch
         g_ssm_dy = t_alloc(TC); g_ssm_dDlt = t_alloc(TC); g_ssm_sc = t_alloc(TC);
         g_ssm_dBm = t_alloc(T * d_c); g_ssm_dCm = t_alloc(T * d_c); g_ssm_dhc = t_alloc(C * d_c);
     }
@@ -701,15 +749,23 @@ fn model_init_full(V, C, T, nh, nkv, NL, attn_bias, dropout, seed,
 # Decoupled-RoPE MLA (M12 incr 5) also caches the shared rope key K^R (d_rope per
 # token per layer), so the cache is d_c + d_rope per token.
 fn kv_cache_bytes(): i64 {
-    # per-layer HYBRID (M14 rung c): each block's cache is its own kind's —
-    # mha layers store full K/V (2·T·Ckv), lin layers the constant nh·hd^2 state.
+    # per-layer HYBRID (M14 rung c/d): each block's cache is its OWN kind's —
+    # mha/gqa store full K/V (2·T·Ckv), lin the constant nh·hd^2 retention state,
+    # ssm the constant C·N state, mla the T·d_c latent (hybrids are learned-abs, so
+    # no decoupled-RoPE K^R term). Sums over the per-layer kinds.
     if (g_layer_kind != 0) {
         var hd2 = g_C / g_nh;
         var lin_b = g_nh * hd2 * hd2;
         var mha_b = 2 * g_T * _Ckv();
+        var ssm_b = g_C * g_latent_dim;
+        var mla_b = g_T * g_latent_dim;
         var tot = 0; var L = 0;
         while (L < g_NL) {
-            if (load64(g_layer_kind + L * 8) == 2) { tot = tot + lin_b; } else { tot = tot + mha_b; }
+            var k = load64(g_layer_kind + L * 8);
+            if (k == 2) { tot = tot + lin_b; }
+            elif (k == 3) { tot = tot + ssm_b; }
+            elif (k == 1) { tot = tot + mla_b; }
+            else { tot = tot + mha_b; }
             L = L + 1;
         }
         return tot * 8;

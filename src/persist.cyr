@@ -72,9 +72,17 @@ fn ckpt_expected_np_arch(V, C, T, nh, NL, bias, nkv, attn_kind, d_c, pos_kind, d
 # config here is sized exactly as model_init lays it out (test_alloc_accounting +
 # the -10 NP gate pin them). topk does not affect the parameter count.
 fn ckpt_expected_np_moe(V, C, T, nh, NL, bias, nkv, attn_kind, d_c, pos_kind, d_rope, num_experts, topk): i64 {
+    return ckpt_expected_np_kvw(V, C, T, nh, NL, bias, nkv,
+                                _kvw(C, nh, nkv, attn_kind, d_c, pos_kind, d_rope), num_experts);
+}
+# np for a given per-block K/V-region size kvw_blk — the form a per-layer HYBRID
+# needs (M14 rung d): its block K/V region is PADDED to the max _kvw over the
+# present kinds (computed by the caller via _kvw_hyb), not a single kind's. The
+# bias region (2C+2Ckv) and the MLP region are layout-uniform across kinds.
+fn ckpt_expected_np_kvw(V, C, T, nh, NL, bias, nkv, kvw_blk, num_experts): i64 {
     var Ckv = nkv * (C / nh);
     var emb = V * C + T * C;
-    var blkbase = 4 * C + 2 * C * C + _kvw(C, nh, nkv, attn_kind, d_c, pos_kind, d_rope) + _mlpw(C, 4 * C, num_experts);
+    var blkbase = 4 * C + 2 * C * C + kvw_blk + _mlpw(C, 4 * C, num_experts);
     var blk = blkbase;
     if (bias == 1) { blk = blkbase + 2 * C + 2 * Ckv; }    # MLA: Ckv == C, so 4C, same as full MHA
     return emb + NL * blk + 2 * C;
@@ -267,36 +275,33 @@ fn ckpt_load_buf(buf, len): i64 {
     }
     if ((num_experts < 1) || (num_experts > 256)) { return 0 - 44; }
     if ((topk < 1) || (topk > num_experts)) { return 0 - 45; }
-    # M14 rung-c per-layer hybrid (v6, ADR 0011). v1..v5 carry no per-layer region
-    # and run uniform (the descriptor's attn_kind everywhere), so they cannot hit
-    # -46. The NL kinds sit at [CKPT_HDR() .. CKPT_HDR()+NL); bound the read first
-    # (NL is already in [1,128]), then enforce the uniform-stride invariant — each
-    # layer's _kvw must equal the base attn_kind's (so np below is exact). lin_extra
-    # flags a lin layer under a non-lin base (needs the g_lin_state decode cache).
+    # M14 per-layer hybrid (v6, ADR 0011; rung c+d). v1..v5 carry no per-layer
+    # region and run uniform (the descriptor's attn_kind everywhere), so they cannot
+    # hit -46. The NL kinds sit at [CKPT_HDR() .. CKPT_HDR()+NL); bound the read
+    # first (NL is already in [1,128]), then validate them (`_hybrid_kinds_ok`:
+    # learned-abs, full heads, valid shared latent). The block K/V region is PADDED
+    # to the max _kvw over the present kinds (rung d) — so the np below uses that
+    # padded size, computed the SAME way model_init lays it out (`_kvw_hyb`). A
+    # uniform image keeps the single-kind _kvw. `kinds` (0 = uniform) drives the
+    # alloc accounting.
     var pl = 0;
-    var lin_extra = 0;
+    var kinds = 0;
+    var kvw_blk = _kvw(C, nh, nkv, attn_kind, d_c, pos_kind, d_rope);
     if (ver == 6) {
         pl = NL;
         if (len < (CKPT_HDR() + pl) * 8) { return 0 - 1; }
-        if (_hybrid_kinds_ok(buf + CKPT_HDR() * 8, NL, C, nh, nkv, attn_kind, d_c, pos_kind, d_rope) == 0) {
-            return 0 - 46;
-        }
-        if (attn_kind != 2) {
-            var lk = 0;
-            while (lk < NL) {
-                if (load64(buf + (CKPT_HDR() + lk) * 8) == 2) { lin_extra = 1; }
-                lk = lk + 1;
-            }
-        }
+        kinds = buf + CKPT_HDR() * 8;
+        if (_hybrid_kinds_ok(kinds, NL, C, nh, nkv, d_c, pos_kind, d_rope) == 0) { return 0 - 46; }
+        kvw_blk = _kvw_hyb(kinds, NL, C, nh, nkv, d_c, pos_kind, d_rope);
     }
-    var expnp = ckpt_expected_np_moe(V, C, T, nh, NL, bias, nkv, attn_kind, d_c, pos_kind, d_rope, num_experts, topk);
+    var expnp = ckpt_expected_np_kvw(V, C, T, nh, NL, bias, nkv, kvw_blk, num_experts);
     if ((np < 1) || (np > CKPT_MAX_NP())) { return 0 - 13; }
     if (np != expnp) { return 0 - 10; }
     # shape-valid is not enough: the nh*T*T attention arenas (independent of
     # np) and the 4 parameter vectors must also fit the allocator. Reject any
     # config whose model_init total would exceed the cap — BEFORE allocating.
     var abytes = model_alloc_bytes_hyb(V, C, T, nh, nkv, NL, np, attn_kind, d_c, pos_kind, d_rope,
-                                       num_experts, topk, lin_extra, pl);
+                                       num_experts, topk, kinds);
     if (abytes > CKPT_MAX_MODEL_BYTES()) { return 0 - 18; }
     var need = (hdr + pl + Vb + 2 * K + 3 * np) * 8;
     if (len != need) { return 0 - 11; }

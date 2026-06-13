@@ -88,7 +88,7 @@ fn _atoi(s): i64 {
 }
 
 # Kept in sync with the VERSION file (CI's docs job gates the match).
-fn CFG_VERSION(): i64 { return "1.4.3"; }
+fn CFG_VERSION(): i64 { return "1.4.4"; }
 
 fn usage(): i64 {
     puts("attn11 — a from-scratch GPT-style transformer, trained, in Cyrius\n");
@@ -264,19 +264,15 @@ fn main(): i64 {
             cfg_expert_topk = 1;
         }
     }
-    # Per-layer mixer HYBRID (M14 rung c): --attn-every K places a full-attention
+    # Per-layer mixer HYBRID (M14 rung c+d): --attn-every K places a full-attention
     # (MHA) block at every K-th layer (L % K == 0, so layer 0 is attention) and the
     # --attn-kind base elsewhere — the survey's "few attention layers among many
-    # cheap ones" lever. Restricted to layout-compatible bases {mha, lin} (lin reuses
-    # MHA's projections, so the block stride stays uniform). Ignored under --load
-    # (the checkpoint's per-layer pattern wins). model_config_ok/_hybrid_kinds_ok
-    # are the backstops. If the pattern collapses to one kind (e.g. K=1 → all MHA),
-    # it falls back to that uniform kind (no v6, no hybrid).
+    # cheap ones" lever. Any base {mha, lin, mla, ssm} (rung d pads the K/V region to
+    # the max kind size, so the stride stays uniform). Ignored under --load (the
+    # checkpoint's per-layer pattern wins). model_config_ok/_hybrid_kinds_ok are the
+    # backstops. If the pattern collapses to one kind (K=1 → all MHA), it falls back
+    # to uniform MHA (resetting the latent, since MHA carries none) — no v6, no hybrid.
     if ((cfg_attn_every > 0) && (load_path == 0)) {
-        if ((cfg_attn_kind != 0) && (cfg_attn_kind != 2)) {
-            puts("attn11: --attn-every needs --attn-kind mha or lin (mla/ssm hybrids are a later rung)\n");
-            return 1;
-        }
         if (cfg_pos_kind != 0) {
             puts("attn11: --attn-every requires learned-abs positions (no RoPE in a hybrid)\n");
             return 1;
@@ -289,7 +285,7 @@ fn main(): i64 {
             if (hk != load64(&lkinds)) { cfg_hybrid = 1; }    # differs from layer 0 → mixed
             hl = hl + 1;
         }
-        if (cfg_hybrid == 0) { cfg_attn_kind = load64(&lkinds); }   # collapsed → uniform kinds[0]
+        if (cfg_hybrid == 0) { cfg_attn_kind = load64(&lkinds); cfg_latent_dim = 0; }   # collapsed → uniform MHA
     }
     # K is the experiment's key variable — a silent default would hide it
     if ((use_bpe == 1) && ((bpe_k < 1) || (bpe_k > BPE_MAX_MERGES()))) {
@@ -347,7 +343,10 @@ fn main(): i64 {
         var nm = 0; var hl2 = 0;
         while (hl2 < g_NL) { if (load64(g_layer_kind + hl2 * 8) == 0) { nm = nm + 1; } hl2 = hl2 + 1; }
         puts(" attn=hybrid("); fmt_int(nm); puts("/"); fmt_int(g_NL); puts(" mha, base=");
-        if (g_attn_kind == 2) { puts("lin)"); } else { puts("mha)"); }
+        if (g_attn_kind == 1) { puts("mla)"); }
+        elif (g_attn_kind == 2) { puts("lin)"); }
+        elif (g_attn_kind == 3) { puts("ssm)"); }
+        else { puts("mha)"); }
     } else {
         if (g_attn_kind == 1) { puts(" attn=mla(d_c="); fmt_int(g_latent_dim); puts(")"); }
         if (g_attn_kind == 2) { puts(" attn=linear"); }

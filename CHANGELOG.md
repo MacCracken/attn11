@@ -4,6 +4,66 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.4.4] - 2026-06-13
+
+**Any-mixer hybrids (M14 rung d, E4) — completes M14.** Lifts 1.4.3's layout
+restriction so a hybrid can interleave ANY of the four mixers `{mha, mla, lin, ssm}`
+— including the survey's strongest pairing, full attention ⊕ the selective SSM
+(attn11's best single mixer). The trick: each block's K/V weight region is **padded
+to the max `_kvw` over the kinds present** (`_kvw_hyb`), so the per-block stride
+stays uniform — only `_kv_weight_size()` plus the per-layer weight-init and cache
+gates change, NOT every within-block offset (no per-layer-offset refactor). A
+layer of a smaller kind tiles its own weights and leaves a zeroed pad. Opt-in and
+additive — a no-flag run is byte-identical; checkpoint v6 is unchanged in shape
+(it already carries the per-layer kinds, 1.4.3), the loader just sizes the padded
+block the same way. `{mha, gqa, lin}` hybrids stay exact (shared `_kvw`, no pad).
+
+### Added
+- **`--attn-every K` now accepts any base** (`--attn-kind {mha, lin, mla, ssm}`):
+  a full-attention block every K-th layer, the base mixer elsewhere. For an
+  mla/ssm base the shared `--latent-dim` applies to those layers; the MHA blocks
+  ignore it. (1.4.3 allowed only {mha, lin} bases.)
+- **`_kvw_hyb`** (model.cyr): the padded per-block K/V-region size = max `_kvw`
+  over the present per-layer kinds. `_kv_weight_size()` returns it for a hybrid
+  (the single kind's `_kvw` for a uniform model — byte-identical). The weight-init
+  loop branches per layer on `_lk(L)`; per-kind caches (`LA_c`, the ssm caches,
+  `g_lin_state`) are held when ANY layer uses that kind (`_any_kind`).
+- **`ckpt_expected_np_kvw`** (persist.cyr): the np computation for a given
+  K/V-region size, so the v6 loader sizes a padded hybrid block exactly as
+  model_init lays it out (`_kvw_hyb`); `kv_cache_bytes` sums the per-layer caches
+  for all four kinds (mha K/V, lin/ssm constant state, mla latent).
+- Tests: `test_model_hybrid_ssm` + `test_model_hybrid_mla` (the MIXED
+  SSM/MLA ⊕ MHA full-model grad-checks through the padded layout, ~1e-4);
+  `test_kv_hybrid` extended with mha/ssm + mha/mla bit-identity decode;
+  `test_ckpt_hybrid` extended with a padded mha/ssm v6 round-trip; alloc-accounting
+  + config-cap pins for mla/ssm hybrids. **857 → 907** checks. X013 (the
+  attention ⊕ SSM ratio sweep) + a mha/ssm bench entry. ADR 0012.
+
+### Changed
+- `_hybrid_kinds_ok` drops the `_kvw`-equality (uniform-stride) requirement —
+  padding removes it — and keeps the cross-cutting constraints: learned-abs
+  positions, full heads (`nkv == nh`), and a valid shared latent iff any mla/ssm
+  layer. `model_alloc_bytes_hyb` takes the per-layer `kinds` pointer (replacing the
+  1.4.3 `lin_extra`/`pl` flags) and counts each present kind's caches. The summary
+  print shows the real hybrid base (mha/mla/lin/ssm). The MHA/MLA/lin/SSM/MoE paths
+  and the no-flag run are unchanged; `{mha,gqa,lin}` hybrids are byte-identical to 1.4.3.
+
+### Performance
+- Attention-fraction sweep, base SSM (default config, 1200 steps; the padding lifts
+  the hybrid param count to MHA's 39 488 vs pure SSM's 38 048):
+
+  | attention | config             | bits/byte | decode cache |
+  |-----------|--------------------|-----------|--------------|
+  | 0/3 (0%)  | pure ssm           | **0.218** | 12 288 B     |
+  | 1/3 (33%) | ssm --attn-every 3 | 0.224     | 16 384 B     |
+  | 2/3 (67%) | ssm --attn-every 2 | 0.219     | 20 480 B     |
+  | 3/3 (100%)| pure mha           | 0.279     | 24 576 B     |
+
+  The decode cache is a continuous knob from pure-SSM's constant `C·N` (12 288 B) to
+  pure-MHA's `∝T` K/V (24 576 B) — each attention layer trades constant state for
+  T-growing K/V. bits/byte within noise across ratios (all under pure-MHA, near pure
+  SSM) — a "trains + grad-checks", not a scaling claim. Hybrid fwd+bwd step ~5.0 ms.
+
 ## [1.4.3] - 2026-06-13
 
 **A per-layer mixer hybrid (M14 rung c, E4) — interleave attention with a cheap

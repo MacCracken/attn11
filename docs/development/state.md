@@ -5,7 +5,24 @@
 
 ## Version
 
-**1.4.3** — *Per-layer mixer hybrid* (M14 rung c, E4, **the interleaving lever**;
+**1.4.4** — *Any-mixer hybrids* (M14 rung d, E4, **completes M14**; ADR 0012).
+Lifts 1.4.3's layout restriction so a hybrid interleaves ANY of the four mixers
+`{mha, mla, lin, ssm}` — including full attention ⊕ the selective SSM (the survey's
+strongest pairing, attn11's best single mixer). The trick: each block's K/V region
+is **padded to the max `_kvw` over the kinds present** (`_kvw_hyb`), so the
+per-block stride stays uniform — only `_kv_weight_size()` + the per-layer init/cache
+gates change, NOT every `_o_*` offset (no per-layer-offset refactor). A smaller
+kind tiles its weights and leaves a zeroed pad. `_hybrid_kinds_ok` keeps the
+cross-cutting constraints (learned-abs, full heads, a valid shared latent iff any
+mla/ssm). Checkpoint **v6 unchanged** (already carries the per-layer kinds, 1.4.3);
+the loader sizes the padded block the same way (`ckpt_expected_np_kvw`). The mixed
+SSM/MLA ⊕ MHA backward grad-checks (`test_model_hybrid_ssm`/`_mla`, ~1e-4);
+mha/ssm + mha/mla cached decode bit-identical; padded mha/ssm v6 round-trip green.
+Attention-fraction sweep (X013, base ssm): bits/byte within noise (0.218 pure-ssm →
+0.279 pure-mha), the decode cache a continuous knob from constant `C·N` to ∝T K/V.
+`{mha,gqa,lin}` hybrids stay exact (no pad). A no-flag run is byte-identical.
+Verified: **907** checks x86_64 AND aarch64/qemu, agnos, fuzz, lint.
+(1.4.3 — *Per-layer mixer hybrid* (M14 rung c, E4, **the interleaving lever**;
 ADR 0011). `--attn-every K` places a full-attention (MHA) block at every K-th layer
 and a gated-linear block elsewhere — the survey's "a few attention layers among
 many cheap recurrent ones" structural shift. The global `attn_kind` becomes a
@@ -25,7 +42,7 @@ Attention-fraction sweep (X012, default config, 1200 steps): bits/byte within no
 across ratios (all beat pure-MHA 0.279), cache scales with the fraction — a
 "trains + grad-checks", not a scaling claim. Verified: **857** checks x86_64 AND
 aarch64/qemu, agnos, fuzz, lint.
-(1.4.2 — *Selective SSM* (M14 rung b, E4, **the third sequence mixer**; ADR
+1.4.2 — *Selective SSM* (M14 rung b, E4, **the third sequence mixer**; ADR
 0010). `--attn-kind ssm` adds a minimal Mamba-lite diagonal SSM: a per-channel
 N-state recurrence `h_t = exp(Δ·A)·h_{t-1} + Δ·B·a`, `y = Σ C·h + D·a`, with
 Δ/B/C all functions of the input (the *selective* scan). The milestone is the
@@ -199,6 +216,12 @@ deterministic resume. 0.2.0: stacked layers, grad clipping, LR schedule.)
   pure MHA). bits/byte within noise across ratios (0.234–0.244, all under MHA's
   0.279). Hybrid fwd+bwd step **~3.7 ms** (≈ the linear step; two of three blocks
   linear). X012.
+- **Any-mixer hybrid** (1.4.4, default config, mha ⊕ ssm, base ssm): bits/byte
+  0.218 (pure ssm) → 0.224 (1/3 mha) → 0.219 (2/3) → 0.279 (pure mha) — within noise,
+  near pure ssm. The decode cache is a continuous knob: 12 288 B (pure ssm, constant
+  `C·N`) → 16 384 (1/3) → 20 480 (2/3) → 24 576 (pure mha, ∝T). Padding lifts the
+  hybrid params to MHA's 39 488 (vs pure ssm's 38 048, +1 440). Hybrid fwd+bwd step
+  **~5.0 ms** (between pure ssm ~5.6 ms and the dense step). X013.
 - **MoE** (default config, 8 experts, top-2): fwd+bwd step **~6.9 ms** vs the
   dense ~3.6 ms (top-2 = two active expert MLPs + the `C→N` router), 215 648 params
   vs dense 39 488; cached gen ~273 µs/token. Per-token compute scales with `topk`,
@@ -303,15 +326,20 @@ checkpoint vs Linux at fixed CPU — `scripts/agnos-smoke.sh`):
   (output proj) + `latent_dim` (= state N), so it rides `attn_kind=3` (checkpoint
   v5, no bump). Constant `C·N` decode cache (`g_ssm_state`); A inits to a negative
   ramp, D to 1. Best bits/byte of the four mixers at reference scale (X011).
-- **Per-layer mixer hybrid** (1.4.3, `--attn-every K`, ADR 0011): a full-attention
-  (MHA) block every K-th layer, gated-linear elsewhere. The global `attn_kind`
-  becomes a per-layer `g_layer_kind` read only by the `_attn_block_*` dispatch
-  helpers (`_lk(L)`); `_hybrid_kinds_ok` enforces the uniform-stride invariant
-  (every layer's `_kvw` == the base's), restricting the mix to layout-compatible
-  {mha, gqa, lin} — parameter-free. `kv_cache_bytes` sums the per-layer caches.
-  **Checkpoint v6** carries the per-layer pattern (`-46` on an invariant-breaking
-  kind); v≤5 synthesize uniform. Mixed-mixer full-model grad-check + cached-decode
-  bit-identity green. Trains + checkpoints + samples (X012).
+- **Per-layer mixer hybrid** (1.4.3 rung c + 1.4.4 rung d, `--attn-every K`, ADR
+  0011/0012): a full-attention (MHA) block every K-th layer, the `--attn-kind` base
+  elsewhere. The global `attn_kind` becomes a per-layer `g_layer_kind` read only by
+  the `_attn_block_*` dispatch helpers (`_lk(L)`). Rung c allowed {mha, gqa, lin}
+  (shared `_kvw`, parameter-free); **rung d admits ANY mix of {mha, mla, lin, ssm}**
+  by PADDING each block's K/V region to the max `_kvw` over the present kinds
+  (`_kvw_hyb`) — uniform stride, no per-layer offset refactor, at the cost of a
+  zeroed pad (and a few % params) on smaller-kind layers. `_hybrid_kinds_ok`: any
+  kinds, learned-abs, full heads, a valid shared latent iff any mla/ssm.
+  `kv_cache_bytes` sums the per-layer caches (mha K/V, lin/ssm constant state, mla
+  latent). **Checkpoint v6** carries the per-layer pattern (`-46` on an invalid
+  kind); the loader sizes the padded block via `ckpt_expected_np_kvw`; v≤5
+  synthesize uniform. Mixed SSM/MLA ⊕ MHA full-model grad-check + cached-decode
+  bit-identity green. Trains + checkpoints + samples (X012, X013).
 - CLI: `--corpus --stdin --load --save --steps --gen-only --preset --heads
   --kv-heads --layers --attn-kind --latent-dim --attn-every --pos-kind --rope-dim
   --experts --expert-topk --bpe --eval` (`--attn-kind` takes `mha`/`mla`/`lin`/`ssm`;
@@ -413,11 +441,14 @@ constant `nh·hd²` state instead of a T-growing K/V.
   constant decode cache, and `kv_cache_bytes` reports it. **Mixer dispatch (1.4.1):**
   the mixer-kind branch lives in ONE place each — `_attn_block_fwd`/`_attn_block_bwd`/
   `_attn_block_fwd_row` — so a new mixer (SSM) touches those three, not four functions.
-  **Per-layer hybrid (1.4.3, ADR 0011):** those three helpers read `_lk(L)` (the
-  per-layer `g_layer_kind`, else the global) — uniform models byte-identical;
-  `model_init_full` carries the per-layer array (`model_init_moe` is the uniform
-  delegator), `_hybrid_kinds_ok` enforces the uniform-stride invariant, and
-  `model_alloc_bytes_hyb` accounts the per-layer array + the lin-state extra
+  **Per-layer hybrid (1.4.3 rung c + 1.4.4 rung d, ADR 0011/0012):** those three
+  helpers read `_lk(L)` (the per-layer `g_layer_kind`, else the global) — uniform
+  models byte-identical; `model_init_full` carries the per-layer array
+  (`model_init_moe` is the uniform delegator). Rung d's `_kvw_hyb` pads each block's
+  K/V region to the max `_kvw` over the present kinds (so the stride stays uniform
+  for any mix), the init loop + caches gate per-layer on `_lk(L)`/`_any_kind(k)`,
+  `_hybrid_kinds_ok` validates the relaxed constraints, and `model_alloc_bytes_hyb`
+  takes the per-layer `kinds` pointer to count each present kind's caches
 - `train.cyr` — byte + **BPE** tokenizer (`bpe_learn`/`tok_encode`/
   `bpe_build_spans`/`tok_emit`), corpus (embedded/file/stdin, raw bytes
   retained), batch sampling, LR schedule, resumable training loop, KV-cached
@@ -441,7 +472,7 @@ constant `nh·hd²` state instead of a T-growing K/V.
 
 ## Tests
 
-- `tests/attn11.tcyr` — **857 checks**: finite-difference gradient checks
+- `tests/attn11.tcyr` — **907 checks**: finite-difference gradient checks
   (every op incl. dropout; attention at head dims 6/8/10 and GQA/MQA at
   `nkv ∈ {1, 2, nh}` incl. `dWk`/`dWv`/`dbv`; the `|dbk| ≈ 0`
   softmax-shift-invariance pin; 2-layer full model at MHA and GQA), the **MLA
@@ -489,10 +520,12 @@ constant `nh·hd²` state instead of a T-growing K/V.
   v5 round-trip + `-44`/`-45`/`-10` rejections; `test_ckpt_v4_compat`; MoE
   alloc-accounting + config-cap gates), the **SSM suite** (1.4.2: `test_ssm_core`
   per-op BPTT ~1e-7, `test_model_ssm`, `test_kv_ssm`, `test_ckpt_ssm`), the
-  **per-layer hybrid suite** (1.4.3: `test_model_hybrid` — the MIXED mha/lin
-  full-model grad-check ~1e-5; `test_kv_hybrid` — cached-decode bit-identity across
-  two interleavings; `test_ckpt_hybrid` — the v6 per-layer round-trip + `-46`
-  invariant-breaking rejects; hybrid config-cap + alloc-accounting pins), a
+  **per-layer hybrid suite** (1.4.3 + 1.4.4: `test_model_hybrid` — the MIXED mha/lin
+  full-model grad-check ~1e-5; `test_model_hybrid_ssm`/`_mla` — the SSM/MLA ⊕ MHA
+  mixed backward through the padded layout ~1e-4; `test_kv_hybrid` — cached-decode
+  bit-identity across mha/lin, mha/ssm, mha/mla interleavings; `test_ckpt_hybrid` —
+  the v6 per-layer round-trip (incl. a padded mha/ssm image) + `-46` rejects; hybrid
+  config-cap + alloc-accounting pins for all kinds), a
   **soak/leak** test and a **NaN guard** test. All pass on x86_64 AND aarch64
   (`cyrius test`; aarch64 via qemu).
 - `tests/attn11.bcyr` — benchmark harness (training timings + tokens/sec,
@@ -544,21 +577,23 @@ See [`roadmap.md`](roadmap.md). **Shipped: v1.0.0 (clean cut) → v1.1.0
 (extraction) → v1.2.0–1.2.4 (M12: MLA core, latent KV-cache decode, coupled +
 decoupled RoPE; then 1.2.4 toolchain realign + docs) → v1.3.0 (M13: Mixture of
 Experts) → v1.4.0 (M14 rung a: gated linear attention) → 1.4.1 (refactor sweep) →
-v1.4.2 (M14 rung b: selective SSM) → v1.4.3 (M14 rung c: per-layer mixer hybrid).**
-The surface is frozen ([`STABILITY.md`](../STABILITY.md)) and additive-only past
-1.0; the numeric core lives in **rosnet** + **tyche**. The 1.x arc now has the
-attention/position axes `--attn-kind {mha, mla, lin, ssm}` × `--pos-kind {learned,
-rope, rope-decoupled}`, the FFN-density axis `--experts N --expert-topk K`, **two
-non-softmax mixers** (gated linear attention + the selective SSM), and the
-**per-layer hybrid** `--attn-every K`. **M12, M13, and M14 rungs a+b+c are complete.**
+v1.4.2 (M14 rung b: selective SSM) → v1.4.3 (M14 rung c: per-layer hybrid) → v1.4.4
+(M14 rung d: any-mixer hybrids — completes M14).** The surface is frozen
+([`STABILITY.md`](../STABILITY.md)) and additive-only past 1.0; the numeric core
+lives in **rosnet** + **tyche**. The 1.x arc now has the attention/position axes
+`--attn-kind {mha, mla, lin, ssm}` × `--pos-kind {learned, rope, rope-decoupled}`,
+the FFN-density axis `--experts N --expert-topk K`, **two non-softmax mixers**
+(gated linear attention + the selective SSM), and the **per-layer hybrid**
+`--attn-every K` (any mix of the four). **M12, M13, and M14 are all complete.**
 
-**Next on the arc — M14 rung (d), then M15+.** Rung (c) shipped the per-layer
-hybrid for layout-compatible kinds {mha, gqa, lin} (v1.4.3, ADR 0011). Rung (d)
-lifts that restriction so MLA/SSM layers can join a hybrid (the best single mixer
-at our scale, X011) — it needs a per-layer (or padded) parameter layout (every
-`_o_*` offset + `g_NP` become per-layer; v6 grows a per-layer `latent_dim`). Then
-E5–E6 (diffusion objective / ternary) as M15–M16 and **M17** reinforcement learning
-(E9). A vidya-scale bake-off across mixers AND hybrid ratios is the standing X-entry.
+**Next — 1.4.5 hardening pass (P(-1)), then M15+.** With four feature releases
+stacked (1.4.0–1.4.4, incl. checkpoint v6, per-layer dispatch, and the padded
+hybrid layout), 1.4.5 is a consolidation/hardening pass: security/correctness audit
+(input handling, the v6 load path, buffer/bounds), a benchmark baseline refresh, a
+deep review of the 1.4.x complexity, and a doc/ADR audit (file in `docs/audit/`).
+Then E5–E6 (diffusion objective / ternary) as M15–M16 and **M17** reinforcement
+learning (E9). A vidya-scale bake-off across mixers AND hybrid ratios is the
+standing X-entry (X012/X013 ran the ratio sweeps at reference scale).
 
 ### Handoff — how to pick this up
 

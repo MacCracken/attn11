@@ -1049,6 +1049,69 @@ fn test_model_hybrid(): i64 {
     return 0;
 }
 
+# M14 rung d: a HYBRID with a DIFFERENT-LAYOUT mixer (SSM) interleaved with MHA.
+# The block K/V region pads to the max _kvw; layer 1's MHA Wk/Wv tile the padded
+# region, layers 0/2's SSM A/W_B/W_C/D tile their (smaller) part with a zeroed pad.
+# The MIXED backward — ssm_bwd for the SSM blocks, attn_bwd for the MHA block —
+# must compose. Grad-checks SSM params at an SSM layer, MHA Wk at the MHA layer,
+# Wo (after the padded region) at an SSM layer, and the tied embedding. Base ssm.
+fn test_model_hybrid_ssm(): i64 {
+    var V = 5; var C = 8; var T = 3; var nh = 2; var NL = 3; var N = 4;
+    var kinds[24]; store64(&kinds + 0, 3); store64(&kinds + 8, 0); store64(&kinds + 16, 3);   # ssm, mha, ssm
+    model_init_full(V, C, T, nh, nh, NL, 1, f64_from(0), 31, 3, N, 0, 0, 1, 1, &kinds);        # base ssm
+    assert(g_layer_kind != 0, "ssm-hybrid model built");
+    assert(_lk(0) == 3, "layer 0 ssm"); assert(_lk(1) == 0, "layer 1 mha"); assert(_lk(2) == 3, "layer 2 ssm");
+    store64(A_tokens + 0, 1); store64(A_tokens + 8, 3); store64(A_tokens + 16, 0);
+    store64(A_targets + 0, 3); store64(A_targets + 8, 0); store64(A_targets + 16, 4);
+    model_forward(); model_zero_grads(); model_backward();
+    var Cc = C * C; var CN = C * N;
+    var aA0 = t_alloc(CN); t_copy(aA0, GL(0, _o_ssmA()), CN);       # SSM layer
+    var aWB0 = t_alloc(CN); t_copy(aWB0, GL(0, _o_ssmWB()), CN);
+    var aWk1 = t_alloc(Cc); t_copy(aWk1, GL(1, _o_Wk()), Cc);       # MHA layer (padded region)
+    var aWo2 = t_alloc(Cc); t_copy(aWo2, GL(2, _o_Wo()), Cc);       # after the padded region
+    var atok = t_alloc(V * C); t_copy(atok, G_tokemb(), V * C);
+    var nA0 = t_alloc(CN); model_ng(PL(0, _o_ssmA()), nA0, CN);
+    var nWB0 = t_alloc(CN); model_ng(PL(0, _o_ssmWB()), nWB0, CN);
+    var nWk1 = t_alloc(Cc); model_ng(PL(1, _o_Wk()), nWk1, Cc);
+    var nWo2 = t_alloc(Cc); model_ng(PL(2, _o_Wo()), nWo2, Cc);
+    var ntok = t_alloc(V * C); model_ng(P_tokemb(), ntok, V * C);
+    check("hybrid-ssm L0(ssm) dA", aA0, nA0, CN, 1000);
+    check("hybrid-ssm L0(ssm) dWB", aWB0, nWB0, CN, 1000);
+    check("hybrid-ssm L1(mha) dWk", aWk1, nWk1, Cc, 1000);
+    check("hybrid-ssm L2(ssm) dWo", aWo2, nWo2, Cc, 1000);
+    check("hybrid-ssm dtokemb", atok, ntok, V * C, 1000);
+    return 0;
+}
+
+# M14 rung d: an MLA ⊕ MHA hybrid (base mla). The block region pads to max(_kvw):
+# MLA's W_DKV/W_UK/W_UV tile the region, the MHA layer's Wk/Wv tile it. Mixed
+# backward (attn_mla_bwd + attn_bwd) composes. Grad-checks MLA Wuk at an MLA layer,
+# MHA Wk at the MHA layer, Wo, and the embedding.
+fn test_model_hybrid_mla(): i64 {
+    var V = 5; var C = 8; var T = 3; var nh = 2; var NL = 3; var dc = 4;
+    var kinds[24]; store64(&kinds + 0, 1); store64(&kinds + 8, 0); store64(&kinds + 16, 1);   # mla, mha, mla
+    model_init_full(V, C, T, nh, nh, NL, 1, f64_from(0), 37, 1, dc, 0, 0, 1, 1, &kinds);       # base mla
+    assert(g_layer_kind != 0, "mla-hybrid model built");
+    assert(_lk(1) == 0, "layer 1 mha");
+    store64(A_tokens + 0, 1); store64(A_tokens + 8, 3); store64(A_tokens + 16, 0);
+    store64(A_targets + 0, 3); store64(A_targets + 8, 0); store64(A_targets + 16, 4);
+    model_forward(); model_zero_grads(); model_backward();
+    var Cc = C * C; var dcc = dc * C;
+    var aWuk0 = t_alloc(dcc); t_copy(aWuk0, GL(0, _o_Wuk()), dcc);   # MLA layer
+    var aWk1 = t_alloc(Cc); t_copy(aWk1, GL(1, _o_Wk()), Cc);        # MHA layer
+    var aWo2 = t_alloc(Cc); t_copy(aWo2, GL(2, _o_Wo()), Cc);
+    var atok = t_alloc(V * C); t_copy(atok, G_tokemb(), V * C);
+    var nWuk0 = t_alloc(dcc); model_ng(PL(0, _o_Wuk()), nWuk0, dcc);
+    var nWk1 = t_alloc(Cc); model_ng(PL(1, _o_Wk()), nWk1, Cc);
+    var nWo2 = t_alloc(Cc); model_ng(PL(2, _o_Wo()), nWo2, Cc);
+    var ntok = t_alloc(V * C); model_ng(P_tokemb(), ntok, V * C);
+    check("hybrid-mla L0(mla) dWuk", aWuk0, nWuk0, dcc, 1000);
+    check("hybrid-mla L1(mha) dWk", aWk1, nWk1, Cc, 1000);
+    check("hybrid-mla L2(mla) dWo", aWo2, nWo2, Cc, 1000);
+    check("hybrid-mla dtokemb", atok, ntok, V * C, 1000);
+    return 0;
+}
+
 # The M9 SIMD LM head (head_fwd_row) has a scalar tail for C % 4 != 0 that NO
 # other test exercises — every config above uses C ∈ {8,16}. C=6 (% 4 = 2)
 # hits it. Compare the vectorized head output to an independent scalar dot
@@ -1380,15 +1443,33 @@ fn test_alloc_accounting(): i64 {
     used0 = alloc_used();
     model_init_full(5, 16, 8, 4, 4, 2, 1, f64_from(0), 4, 2, 0, 0, 0, 1, 1, &hkA);   # base lin
     delta = alloc_used() - used0;
-    predicted = model_alloc_bytes_hyb(5, 16, 8, 4, 4, 2, g_NP, 2, 0, 0, 0, 1, 1, 0, 2);
+    predicted = model_alloc_bytes_hyb(5, 16, 8, 4, 4, 2, g_NP, 2, 0, 0, 0, 1, 1, &hkA);
     assert(delta >= predicted, "hybrid(base lin) alloc accounting (under)");
     assert(delta <= predicted + 8192, "hybrid(base lin) alloc accounting (over)");
     used0 = alloc_used();
     model_init_full(5, 16, 8, 4, 4, 2, 1, f64_from(0), 4, 0, 0, 0, 0, 1, 1, &hkA);   # base mha
     delta = alloc_used() - used0;
-    predicted = model_alloc_bytes_hyb(5, 16, 8, 4, 4, 2, g_NP, 0, 0, 0, 0, 1, 1, 1, 2);
+    predicted = model_alloc_bytes_hyb(5, 16, 8, 4, 4, 2, g_NP, 0, 0, 0, 0, 1, 1, &hkA);
     assert(delta >= predicted, "hybrid(base mha) alloc accounting (under)");
     assert(delta <= predicted + 8192, "hybrid(base mha) alloc accounting (over)");
+    # mla/ssm hybrid alloc pins (M14 rung d): the padded K/V region + the present
+    # kinds' per-layer caches (LA_c for mla, the ssm caches) must be accounted. The
+    # base is the latent-owning kind (so the shared d_c/N validates); the per-layer
+    # array overrides one block to MHA.
+    var hkM[16]; store64(&hkM + 0, 0); store64(&hkM + 8, 1);          # mha,mla
+    used0 = alloc_used();
+    model_init_full(5, 16, 8, 4, 4, 2, 1, f64_from(0), 4, 1, 6, 0, 0, 1, 1, &hkM);   # base mla, latent 6
+    delta = alloc_used() - used0;
+    predicted = model_alloc_bytes_hyb(5, 16, 8, 4, 4, 2, g_NP, 1, 6, 0, 0, 1, 1, &hkM);
+    assert(delta >= predicted, "hybrid(mha/mla) alloc accounting (under)");
+    assert(delta <= predicted + 8192, "hybrid(mha/mla) alloc accounting (over)");
+    var hkS[16]; store64(&hkS + 0, 0); store64(&hkS + 8, 3);          # mha,ssm
+    used0 = alloc_used();
+    model_init_full(5, 16, 8, 4, 4, 2, 1, f64_from(0), 4, 3, 4, 0, 0, 1, 1, &hkS);   # base ssm, state N=4
+    delta = alloc_used() - used0;
+    predicted = model_alloc_bytes_hyb(5, 16, 8, 4, 4, 2, g_NP, 3, 4, 0, 0, 1, 1, &hkS);
+    assert(delta >= predicted, "hybrid(mha/ssm) alloc accounting (under)");
+    assert(delta <= predicted + 8192, "hybrid(mha/ssm) alloc accounting (over)");
     return 0;
 }
 
@@ -1440,22 +1521,25 @@ fn test_config_caps(): i64 {
     assert(model_config_ok_arch(25, 32, 16, 4, 2, 3, 3, 16, 0, 0) == 0, "ssm with nkv != nh rejected");
     assert(model_config_ok_arch(25, 32, 16, 4, 4, 3, 3, 0, 0, 0) == 0, "ssm with N = 0 rejected");
     assert(model_config_ok_arch(25, 32, 16, 4, 4, 3, 3, 16, 1, 0) == 0, "ssm + rope rejected");
-    # per-layer HYBRID (M14 rung c): every layer must share the base {0,2} block
-    # layout (same _kvw), and the base must be a layout-compatible kind (mha/lin)
-    # with learned-abs positions. C=32,nh=nkv=4 -> Ckv=32, _kvw(mha/lin)=2048.
+    # per-layer HYBRID (M14 rung c+d): any mix of {mha,mla,lin,ssm}; the K/V region
+    # pads to the max _kvw. Constraints: full heads (nkv==nh), learned-abs, a valid
+    # shared latent in [1,C] iff any mla/ssm layer (else 0). C=32, nh=nkv=4.
+    # _hybrid_kinds_ok(kinds, NL, C, nh, nkv, d_c, pos_kind, d_rope).
     var hk[24];
     store64(&hk + 0, 0); store64(&hk + 8, 2); store64(&hk + 16, 0);     # mha,lin,mha
-    assert(_hybrid_kinds_ok(&hk, 3, 32, 4, 4, 2, 0, 0, 0) == 1, "hybrid mha/lin over lin base accepted");
-    assert(_hybrid_kinds_ok(&hk, 3, 32, 4, 4, 0, 0, 0, 0) == 1, "hybrid mha/lin over mha base accepted");
-    store64(&hk + 8, 1);                                               # layer 1 -> mla (different _kvw)
-    assert(_hybrid_kinds_ok(&hk, 3, 32, 4, 4, 2, 0, 0, 0) == 0, "hybrid with an mla layer rejected (layout)");
-    store64(&hk + 8, 3);                                               # layer 1 -> ssm (different _kvw)
-    assert(_hybrid_kinds_ok(&hk, 3, 32, 4, 4, 2, 0, 0, 0) == 0, "hybrid with an ssm layer rejected (layout)");
+    assert(_hybrid_kinds_ok(&hk, 3, 32, 4, 4, 0, 0, 0) == 1, "hybrid mha/lin (no latent) accepted");
+    assert(_hybrid_kinds_ok(&hk, 3, 32, 4, 4, 8, 0, 0) == 0, "hybrid {mha,lin} carrying a latent rejected");
+    store64(&hk + 8, 1);                                               # mha,mla,mha
+    assert(_hybrid_kinds_ok(&hk, 3, 32, 4, 4, 16, 0, 0) == 1, "hybrid mha/mla with latent accepted (rung d)");
+    assert(_hybrid_kinds_ok(&hk, 3, 32, 4, 4, 0, 0, 0) == 0, "hybrid mha/mla without a latent rejected");
+    assert(_hybrid_kinds_ok(&hk, 3, 32, 4, 2, 16, 0, 0) == 0, "hybrid mha/mla with partial heads rejected");
+    store64(&hk + 8, 3);                                               # mha,ssm,mha
+    assert(_hybrid_kinds_ok(&hk, 3, 32, 4, 4, 16, 0, 0) == 1, "hybrid mha/ssm with state accepted (rung d)");
+    assert(_hybrid_kinds_ok(&hk, 3, 32, 4, 4, 33, 0, 0) == 0, "hybrid mha/ssm with state > C rejected");
     store64(&hk + 8, 7);                                               # layer 1 -> bogus kind
-    assert(_hybrid_kinds_ok(&hk, 3, 32, 4, 4, 2, 0, 0, 0) == 0, "hybrid with a bogus kind rejected");
+    assert(_hybrid_kinds_ok(&hk, 3, 32, 4, 4, 16, 0, 0) == 0, "hybrid with a bogus per-layer kind rejected");
     store64(&hk + 8, 2);                                               # restore lin
-    assert(_hybrid_kinds_ok(&hk, 3, 32, 4, 4, 1, 0, 0, 0) == 0, "hybrid over an mla base rejected (base layout)");
-    assert(_hybrid_kinds_ok(&hk, 3, 32, 4, 4, 2, 0, 1, 0) == 0, "hybrid + rope rejected (learned-abs only)");
+    assert(_hybrid_kinds_ok(&hk, 3, 32, 4, 4, 0, 1, 0) == 0, "hybrid + rope rejected (learned-abs only)");
     # MoE descriptor (M13): 1 <= num_experts <= 256, 1 <= topk <= num_experts.
     assert(model_config_ok_moe(25, 32, 16, 4, 4, 3, 0, 0, 0, 0, 8, 2) == 1, "valid moe (8 experts, top-2) accepted");
     assert(model_config_ok_moe(25, 32, 16, 4, 4, 3, 0, 0, 0, 0, 1, 1) == 1, "moe experts=1 (dense) accepted");
@@ -1789,12 +1873,38 @@ fn test_ckpt_hybrid(): i64 {
     }
     assert(mism == 0, "hybrid params restored bit-for-bit");
     var bad = alloc(sz);
-    t_copy(bad, ck, sz / 8); store64(bad + 22 * 8, 1);     # layer 0 -> mla (different _kvw)
-    assert(ckpt_load_buf(bad, sz) == (0 - 46), "hybrid layer with incompatible layout rejected (-46)");
-    t_copy(bad, ck, sz / 8); store64(bad + 23 * 8, 3);     # layer 1 -> ssm (different _kvw)
-    assert(ckpt_load_buf(bad, sz) == (0 - 46), "hybrid layer ssm-kind rejected (-46)");
+    # base lin carries d_c == 0, so injecting a latent-kind layer (mla/ssm) without a
+    # shared latent breaks the invariant (-46); a bogus kind likewise.
+    t_copy(bad, ck, sz / 8); store64(bad + 22 * 8, 1);     # layer 0 -> mla, but d_c == 0
+    assert(ckpt_load_buf(bad, sz) == (0 - 46), "hybrid mla-layer without a latent rejected (-46)");
+    t_copy(bad, ck, sz / 8); store64(bad + 23 * 8, 3);     # layer 1 -> ssm, but d_c == 0
+    assert(ckpt_load_buf(bad, sz) == (0 - 46), "hybrid ssm-layer without a latent rejected (-46)");
     t_copy(bad, ck, sz / 8); store64(bad + 23 * 8, 9);     # layer 1 -> bogus kind
     assert(ckpt_load_buf(bad, sz) == (0 - 46), "hybrid bogus per-layer kind rejected (-46)");
+
+    # rung d: a DIFFERENT-LAYOUT hybrid (mha ⊕ ssm, base ssm) round-trips through v6
+    # — the per-layer kinds + the padded np must reconstruct exactly. NL=3, N=4.
+    var ksm[24]; store64(&ksm + 0, 3); store64(&ksm + 8, 0); store64(&ksm + 16, 3);   # ssm,mha,ssm
+    model_init_full(V, 8, 4, 2, 2, 3, 1, f64_from(0), 41, 3, 4, 0, 0, 1, 1, &ksm);    # base ssm, N=4
+    assert(g_layer_kind != 0, "ssm-hybrid built");
+    var np2 = g_NP;
+    var snap2 = t_alloc(np2); t_copy(snap2, g_params, np2);
+    var sz2 = ckpt_size();
+    var ck2 = alloc(sz2); ckpt_serialize(ck2);
+    assert(load64(ck2 + 1 * 8) == 6, "ssm-hybrid serializes as v6");
+    assert(load64(ck2 + 16 * 8) == 3, "base attn_kind=ssm recorded");
+    assert(load64(ck2 + 22 * 8) == 3, "layer 0 kind=ssm recorded");
+    assert(load64(ck2 + 23 * 8) == 0, "layer 1 kind=mha recorded");
+    model_init(V, 8, 4, 2, 2, 3, 1, f64_from(0), 73);                  # scramble to uniform mha
+    assert(ckpt_load_buf(ck2, sz2) == 0, "ssm-hybrid checkpoint loads");
+    assert(_lk(0) == 3, "ssm-hybrid layer 0 restored ssm");
+    assert(_lk(1) == 0, "ssm-hybrid layer 1 restored mha");
+    var mism2 = 0; var i2 = 0;
+    while (i2 < np2) {
+        if (load64(g_params + i2 * 8) != load64(snap2 + i2 * 8)) { mism2 = mism2 + 1; }
+        i2 = i2 + 1;
+    }
+    assert(mism2 == 0, "ssm-hybrid params restored bit-for-bit (padded layout)");
     return 0;
 }
 
@@ -2255,14 +2365,19 @@ fn _gen_bits(C, T, nh, nkv, NL, ak, dc, pk, dr, ne, tk, pstep, NG): i64 {
     model_init_moe(V, C, T, nh, nkv, NL, 1, f64_from(0), 21, ak, dc, pk, dr, ne, tk);
     return _gen_verify(pstep, NG);
 }
-# M14 rung-c hybrid bit-identity driver: same two-way contract as _gen_bits but
-# the model is a per-layer mha/lin hybrid (model_init_full, base lin). Each block's
-# decode path (MHA K/V cache vs lin retention state) must match its uncached
-# reference, AND the mixed stack must compose bit-for-bit through context-shifts.
-fn _gen_bits_hyb(C, T, nh, NL, kinds, pstep, NG): i64 {
+# M14 rung c/d hybrid bit-identity driver: same two-way contract as _gen_bits but
+# the model is a per-layer hybrid (model_init_full). Each block's decode path (MHA
+# K/V cache, lin retention state, ssm C×N state, or mla latent) must match its
+# uncached reference, AND the mixed stack must compose bit-for-bit through
+# context-shifts. `base`/`latent` set the descriptor (the latent-owning kind for
+# mla/ssm hybrids); `kinds` is the NL per-layer array.
+fn _gen_bits_hybk(C, T, nh, NL, base, latent, kinds, pstep, NG): i64 {
     var V = build_corpus();
-    model_init_full(V, C, T, nh, nh, NL, 1, f64_from(0), 21, 2, 0, 0, 0, 1, 1, kinds);   # base lin
+    model_init_full(V, C, T, nh, nh, NL, 1, f64_from(0), 21, base, latent, 0, 0, 1, 1, kinds);
     return _gen_verify(pstep, NG);
+}
+fn _gen_bits_hyb(C, T, nh, NL, kinds, pstep, NG): i64 {
+    return _gen_bits_hybk(C, T, nh, NL, 2, 0, kinds, pstep, NG);   # base lin (rung c)
 }
 # The shared post-init verification (extracted 1.4.3 so the uniform and hybrid
 # drivers share ONE body): train briefly, then (1) prefill logits bit-identical
@@ -2422,6 +2537,17 @@ fn test_kv_hybrid(): i64 {
     store64(&k4b + 0, 0); store64(&k4b + 8, 2); store64(&k4b + 16, 2); store64(&k4b + 24, 0);
     _gen_bits_hyb(8, 5, 2, 4, &k4b, 1, 15);     # C=8
     _gen_bits_hyb(12, 2, 2, 4, &k4b, 1, 6);     # degenerate 2-token window
+    # rung d: different-layout mixers in the hybrid — mha ⊕ ssm and mha ⊕ mla. Each
+    # block decodes through ITS kind's cache (KV arena / C×N ssm state / mla latent)
+    # within the padded layout, bit-identical to the uncached reference.
+    var ks[32];    # NL=4: ssm,mha,ssm,mha  (base ssm, N=4)
+    store64(&ks + 0, 3); store64(&ks + 8, 0); store64(&ks + 16, 3); store64(&ks + 24, 0);
+    _gen_bits_hybk(16, 8, 2, 4, 3, 4, &ks, 1, 24);    # mha/ssm, hd=8
+    _gen_bits_hybk(12, 7, 2, 4, 3, 2, &ks, 1, 21);    # odd T; small state N=2
+    var km[32];    # NL=4: mla,mha,mla,mha  (base mla, d_c=8)
+    store64(&km + 0, 1); store64(&km + 8, 0); store64(&km + 16, 1); store64(&km + 24, 0);
+    _gen_bits_hybk(16, 8, 2, 4, 1, 8, &km, 1, 24);    # mha/mla, d_c=8
+    _gen_bits_hybk(12, 2, 2, 4, 1, 6, &km, 1, 6);     # degenerate 2-token window
     return 0;
 }
 
@@ -2578,6 +2704,8 @@ fn main(): i64 {
     test_model_lin();
     test_model_ssm();
     test_model_hybrid();
+    test_model_hybrid_ssm();
+    test_model_hybrid_mla();
     test_head_tail();
     test_group("persistence");
     test_resume_determinism();
