@@ -4,6 +4,29 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.5.2] - 2026-06-13
+
+**Quality-curating C4 sampler** — first step of the data-ingestion & curation 1.5.x
+arc (per `docs/development/roadmap.md`): a tiny model is data-rich and capacity-poor,
+so "data quality > volume". Tooling + data + an A/B experiment; no core binary change.
+
+### Added
+- **`scripts/c4_sample.py --curate`** — de-duplication (exact full-text + a 120-char
+  normalized prefix), **multi-shard sampling** (`--shards N` spreads sampling across
+  the crawl for diversity, not one consecutive block), and prose/register quality
+  filters (letter & digit ratios, terminal punctuation, average word length,
+  repetition, long-token spam). All stdlib + deterministic (stable hashing, no RNG);
+  the multi-shard download is resilient (per-shard retries, skip-on-failure, a
+  remaining-bytes budget that rebalances across a dropped shard). Defaults (no
+  `--curate`, one shard) reproduce the 1.5.1 raw slice **byte-for-byte** (verified),
+  so it stays a clean A/B baseline.
+- **X017** — the raw-vs-curated A/B at iso-compute (default config + BPE 256). The
+  quality filter alone (same shard) cut eval **bits/byte 3.43 → 3.23 (−5.9%)**;
+  multi-shard diversity *raised* it (+2.7%) — a tiny model can't exploit diversity it
+  can't fit, so **curate for quality now, diversity is a scale lever** (validates
+  sequencing streaming + larger corpora with M16+). Recipe in
+  `docs/examples/c4-english.md`.
+
 ## [1.5.1] - 2026-06-13
 
 **C4 English experiment** — tooling + example for training attn11 on a real

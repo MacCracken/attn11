@@ -731,3 +731,40 @@ pateat"*.
    …*"). Same data, better model ⇒ better English: the lever is model scale (M16+)
    and budget, not corpus volume. Regeneration: see
    [`docs/examples/c4-english.md`](../examples/c4-english.md).
+
+## X017 — curation: quality helps, diversity is a scale lever (v1.5.2) (2026-06-13)
+
+**Setup**: 1.5.2, the first data-curation A/B (`scripts/c4_sample.py --curate`).
+Iso-compute: default config (C=32, ctx 16, 3 layers) + BPE 256, **600 steps**, seed
+1337, x86_64 — the *only* difference is the 4 MB corpus. Three corpora from C4-en:
+**raw** (one shard, consecutive — the 1.5.1 baseline), **curated-s0** (the *same*
+shard, quality-filtered — isolates the filter from diversity), and **curated-8sh**
+(8 shards spread across the crawl + quality-filtered — the recommended diverse
+output). C4 is already deduplicated at creation, so `dup=0`; the levers here are the
+quality filter (~5–6% of docs dropped as tables/listings/url-hash spam) and shard
+diversity.
+
+| corpus | what differs vs raw | eval bits/byte | Δ |
+|--------|---------------------|----------------|---|
+| raw (1 shard) | — | 3.433 | — |
+| **curated-s0** (1 shard, quality-filtered) | **quality only** | **3.232** | **−0.20 (−5.9%)** |
+| curated-8sh (8 shards, quality + diversity) | + multi-shard diversity | 3.527 | +0.09 (+2.7%) |
+
+**Takeaways**:
+1. **The quality filter cleanly helps** — same shard, filter on vs off, **−0.20
+   bits/byte (−5.9%)** at iso-compute. Dropping tables / listings / url-hash spam /
+   low-prose docs leaves a more *learnable* corpus, so the fixed-capacity model
+   captures more of it. This is the 1.5.2 gate, met.
+2. **Multi-shard diversity *hurts* the tiny model** (+0.09 bits/byte): 8 spread
+   shards raise the corpus's intrinsic entropy (more varied registers/topics), and a
+   53 K-param model can't exploit the diversity it can't fit — bits/byte on its own
+   corpus penalizes variety. **Diversity/volume is a *scale* lever**, not a tiny-model
+   one — which is exactly why the roadmap sequences streaming + larger corpora with
+   the model-scale work (M16+), not before it.
+3. **So curate for QUALITY now, DIVERSITY later.** For the current reference models,
+   the recommended sampler is the quality filter on a focused corpus; the
+   `--shards N` diversity tooling is built and waiting for the capacity to use it.
+   (Caveat: bits/byte-on-own-corpus rewards a less-varied corpus, so it understates
+   diversity's value for generalization — a held-out cross-corpus eval is the honest
+   way to score diversity, and lands with the scaled runs.) Regeneration:
+   [`docs/examples/c4-english.md`](../examples/c4-english.md).

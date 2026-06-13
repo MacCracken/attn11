@@ -13,14 +13,15 @@
 
 ## Where we are
 
-Current: **v1.5.1**. The v1.0 surface is frozen and additive-only
+Current: **v1.5.2**. The v1.0 surface is frozen and additive-only
 ([`STABILITY.md`](../STABILITY.md)); the reusable numeric core lives in
 **[rosnet](https://github.com/MacCracken/rosnet)** + **[tyche](https://github.com/MacCracken/tyche)**
 (v1.1.0). The 1.x architecture arc through M14 has shipped (the attention/KV, FFN-
 density, and sequence-mixer axes), **M15** (the char-diffusion *training objective*,
-v1.5.0) is the first objective departure, and v1.5.1 added the C4 data-ingestion
-tooling (X016). **Next up is the data-ingestion & curation 1.5.x arc (1.5.2–1.5.5,
-below), then M16.** For *what* shipped, see [`CHANGELOG.md`](../../CHANGELOG.md)
+v1.5.0) is the first objective departure, and the data-ingestion 1.5.x arc is under
+way — v1.5.1 the C4 tooling (X016), **v1.5.2 the quality-curating sampler (X017)**.
+**Next up is 1.5.3 (token-packing), then 1.5.4–1.5.5, then M16.** For *what* shipped,
+see [`CHANGELOG.md`](../../CHANGELOG.md)
 (release narrative), [`experiments.md`](experiments.md) (the X-series), and
 [`state.md`](state.md) (the
 live snapshot — current flags, counts, perf). This file is the plan ahead only.
@@ -48,14 +49,16 @@ CI mirrors it.
 > is tooling/data + a logged X-entry; the no-flag binary stays byte-identical except
 > 1.5.3 (a transparent storage change) and 1.5.5 (the audit).
 
-### 1.5.2 — Quality-curating sampler (sharpen quality)
+### 1.5.2 — Quality-curating sampler (sharpen quality) — ✅ shipped (X017)
 
-Upgrade `scripts/c4_sample.py` (and/or a curation layer) from "the first N raw C4
-docs" to a **curated** 4 MB: exact/near-duplicate filtering, **multi-shard sampling**
-for diversity (across shards, not one consecutive run), and length / boilerplate /
-register filters. Tooling + data only — the binary is unchanged. **Gate**: a
-measurable bits/byte improvement at iso-compute vs the raw 4 MB slice, deterministic
-+ documented, logged as an X-series entry.
+Upgraded `scripts/c4_sample.py` to a curating sampler: exact + prefix
+de-duplication, **multi-shard sampling** (`--shards N`), and prose/register filters
+(letter/digit ratio, terminal punctuation, avg word length, repetition, long-token
+spam). Tooling + data only; defaults reproduce the raw slice byte-for-byte. **Gate
+met**: the quality filter cut eval bits/byte **3.43 → 3.23 (−5.9%)** at iso-compute
+(same shard). Finding (X017): multi-shard *diversity* raised bits/byte for a tiny
+model — **diversity/volume is a scale lever**, not a tiny-model one (it lands with
+the model-scale work, M16+), so curate for *quality* now.
 
 ### 1.5.3 — Token-packing unlock
 

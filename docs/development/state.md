@@ -5,7 +5,18 @@
 
 ## Version
 
-**1.5.1** — *C4 English experiment* (X016). Tooling + example for training on a
+**1.5.2** — *Quality-curating C4 sampler* (X017; the data-ingestion & curation 1.5.x
+arc, step 1). `scripts/c4_sample.py --curate` adds de-duplication (exact + prefix),
+**multi-shard sampling** (`--shards N`, spread across the crawl), and prose/register
+quality filters — all stdlib + deterministic, with a resilient multi-shard download
+(per-shard retries / skip / rebalancing budget); defaults reproduce the 1.5.1 raw
+slice byte-for-byte. A/B at iso-compute (default + BPE 256, 600 steps): the
+**quality filter alone cut eval bits/byte 3.43 → 3.23 (−5.9%)** on the same shard,
+while multi-shard *diversity* raised it (+2.7%) — a 53 K-param model can't exploit
+diversity it can't fit, so **curate for quality now; diversity/volume is a scale
+lever** (validates sequencing streaming with M16+). NO core binary change (only
+`CFG_VERSION`); **966** checks unchanged.
+(1.5.1 — *C4 English experiment* (X016). Tooling + example for training on a
 real **large external corpus** — a 4 MB slice of **C4** (`c4/en`, 305 GB), streamed
 by `scripts/c4_sample.py` (stdlib `gzip`+`json`, no tensorflow/TFDS/pip — it streams
 one public C4 shard and stops, ~1 MB downloaded) into a **gitignored** `data/` file
@@ -14,7 +25,7 @@ for `--corpus`. NO core binary change (only `CFG_VERSION`); the example
 default+BPE model to **3.43 bits/byte** and samples recognizable broken English
 (real words + structure between subword wobble) — fluency is a model-capacity story
 (M16+), not a pipeline one. **966** checks unchanged.
-(1.5.0 — *Char-diffusion objective* (M15, E5; ADR 0013, X015). The first
+1.5.0 — *Char-diffusion objective* (M15, E5; ADR 0013, X015). The first
 *training-objective* departure from the AR trunk: `--objective diffusion` trains a
 masked absorbing-state diffusion model (D3PM/MDLM) — drop the causal mask, corrupt a
 window by replacing positions with a **learned `[MASK]` embedding** (mask_emb, +C
@@ -690,11 +701,11 @@ the FFN-density axis `--experts N --expert-topk K`, **two non-softmax mixers**
 architecture arc (MLA/RoPE, MoE, the mixer family + hybrid) closed at 1.4.6, then
 M15 (1.5.0) the first *training-objective* departure (char-diffusion; X015 — AR wins
 at this tiny scale, the super-data-learner advantage is a scale phenomenon), then
-v1.5.1 the C4 data-ingestion tooling (X016). The immediate next work is the **1.5.x
-data arc** (per [`roadmap.md`](roadmap.md)): **1.5.2** quality-curating sampler
-(dedup / multi-shard / register filters — "data quality > volume") → **1.5.3**
-token-packing unlock (u8/u16 token store vs i64; removes the 8× `g_data` bloat,
-lifts the ~32 MB corpus ceiling 4–8×) → **1.5.4** curation at scale → **1.5.5**
+v1.5.1 the C4 data-ingestion tooling (X016). The **1.5.x data arc** (per [`roadmap.md`](roadmap.md)):
+**1.5.2** quality-curating sampler **shipped** (X017 — the prose-quality filter cut
+bits/byte 5.9%; multi-shard diversity is a scale lever); next is **1.5.3**
+token-packing unlock (u8/u16 token store vs i64; removes the 8× `g_data` bloat, lifts
+the ~32 MB corpus ceiling 4–8×) → **1.5.4** curation at scale → **1.5.5**
 hardening/audit/security pass (P(-1)) closing the arc. Then **M16** ternary
 (BitNet-style) training (E6), into whose 1.6.x group **streaming token-shard
 ingestion** folds (RAM-independent large corpora — it pays off once a scaled model

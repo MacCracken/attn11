@@ -44,6 +44,35 @@ corpus never enters the source tree. The run is deterministic (seed 1337, no
 external RNG beyond the C4 download): retraining on the same sample reproduces
 bit-for-bit.
 
+## Curating the sample (1.5.2)
+
+A tiny model is data-rich and capacity-poor, so **data quality > volume**:
+`--curate` adds (all stdlib, deterministic) de-duplication (exact + a normalized
+prefix), **multi-shard sampling** (`--shards N` spreads across the crawl for
+diversity, not one consecutive block), and prose/register filters (letter & digit
+ratios, terminal punctuation, average word length, repetition, long-token spam —
+dropping tables, listings, and url/hash spam). Defaults (no `--curate`, one shard)
+reproduce the raw slice byte-for-byte, so it stays a clean A/B baseline.
+
+```sh
+# curated 4 MB — quality filter on a focused (few-shard) corpus: the win for a TINY
+# model (X017: same shard, filter on vs off, eval bits/byte 3.43 -> 3.23, -5.9%).
+python3 scripts/c4_sample.py --curate --shards 1 --out data/c4-en-curated.txt --max-bytes 4000000
+./build/attn11 --corpus data/c4-en-curated.txt --bpe 256 --steps 2000 --save data/c4.ckpt --eval
+
+# diversity (more shards) is a SCALE lever, not a tiny-model one — it raised
+# bits/byte here (+2.7%): a 53 K-param model can't exploit registers it can't fit.
+# Reach for --shards N once the model is big enough to absorb the variety (M16+).
+python3 scripts/c4_sample.py --curate --shards 8 --out data/c4-en-diverse.txt --max-bytes 4000000
+```
+
+**X017's lesson: curate for quality now, diversity later.** C4 is already
+deduplicated at creation (so the dedup is a no-op here — it earns its keep on noisier
+sources); the measured win is the **prose-quality filter** (dropping tables /
+listings / url-hash spam). Multi-shard *diversity* hurts the tiny model's bits/byte
+because it can't absorb the extra variety — diversity/volume pays off with model
+scale, which is why the roadmap sequences streaming + larger corpora with M16+.
+
 ## What to expect
 
 attn11's reference models are *tiny* (tens of thousands to a few hundred thousand
