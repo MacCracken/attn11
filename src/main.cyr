@@ -17,6 +17,9 @@
 #   attn11 --kv-heads N             override K/V heads (must divide heads;
 #                                   < heads = GQA, 1 = MQA; default = heads)
 #   attn11 --layers N               override transformer blocks
+#   attn11 --experts N              MoE: N experts per block (1 = dense baseline;
+#                                   the dense MLP becomes a top-K-routed mixture)
+#   attn11 --expert-topk K          active experts per token (default 2; 1..N)
 #   attn11 --bpe K                  learn K BPE merges over the corpus before
 #                                   training (1..512; byte-level is the default;
 #                                   ignored under --load — the checkpoint
@@ -79,7 +82,7 @@ fn _atoi(s): i64 {
 }
 
 # Kept in sync with the VERSION file (CI's docs job gates the match).
-fn CFG_VERSION(): i64 { return "1.2.4"; }
+fn CFG_VERSION(): i64 { return "1.3.0"; }
 
 fn usage(): i64 {
     puts("attn11 — a from-scratch GPT-style transformer, trained, in Cyrius\n");
@@ -98,6 +101,8 @@ fn usage(): i64 {
     puts("  --latent-dim N  MLA latent width d_c (1..d_model; default d_model/2)\n");
     puts("  --pos-kind K    positions: learned (default), rope (coupled, mha/gqa), or rope-decoupled (mla)\n");
     puts("  --rope-dim N    decoupled-RoPE channel width d_rope (even, 2..d_model; default ~hd/2)\n");
+    puts("  --experts N     MoE: N experts per block (1=dense; >1 enables top-K routing, 1..256)\n");
+    puts("  --expert-topk K active experts per token (default 2; 1..N)\n");
     puts("  --bpe K         learn K BPE merges first (1..512; byte-level is the default)\n");
     puts("  --eval          print CE/token + bits-per-byte after training/save\n");
     puts("  --help, -h      show this help and exit\n");
@@ -127,6 +132,8 @@ fn main(): i64 {
     var cfg_attn_kind = 0; var cfg_latent_dim = 0;   # mla off; d_c resolved post-parse
     var cfg_pos_kind = 0;                            # 0 = learned-abs, 1 = coupled RoPE, 2 = decoupled
     var cfg_rope_dim = 0;                            # d_rope; resolved post-parse for rope-decoupled
+    var cfg_num_experts = 1;                         # 1 = dense (default); --experts N enables MoE
+    var cfg_expert_topk = 0;                         # 0 = "default" -> min(2, N), resolved post-parse
     var use_bpe = 0; var bpe_k = 0; var do_eval = 0;
     var i = 1;
     while (i < argc()) {
@@ -158,6 +165,8 @@ fn main(): i64 {
             else { puts("attn11: --pos-kind must be learned, rope, or rope-decoupled\n"); return 1; }
         }
         elif (streq(a, "--rope-dim") == 1) { i = i + 1; cfg_rope_dim = _atoi(_av(i, a)); }
+        elif (streq(a, "--experts") == 1) { i = i + 1; cfg_num_experts = _atoi(_av(i, a)); }
+        elif (streq(a, "--expert-topk") == 1) { i = i + 1; cfg_expert_topk = _atoi(_av(i, a)); }
         elif (streq(a, "--bpe") == 1) { use_bpe = 1; i = i + 1; bpe_k = _atoi(_av(i, a)); }
         elif (streq(a, "--eval") == 1) { do_eval = 1; }
         else { puts("attn11: unknown argument "); puts(a); _putc(10); usage(); return 1; }
@@ -213,6 +222,26 @@ fn main(): i64 {
         puts("attn11: --rope-dim requires --pos-kind rope-decoupled\n");
         return 1;
     }
+    # MoE (M13): --experts N (1 = dense; >1 routes the MLP through N experts) and
+    # --expert-topk K (default 2, capped at N). Ignored under --load (the
+    # checkpoint's descriptor wins); model_config_ok_moe is the backstop (caps N
+    # at 256, requires 1 <= K <= N). Resolved post-parse so --preset's C is final.
+    if (load_path == 0) {
+        if (cfg_num_experts < 1) { puts("attn11: --experts must be >= 1 (1 = dense)\n"); return 1; }
+        if (cfg_num_experts > 1) {
+            if (cfg_expert_topk == 0) {
+                cfg_expert_topk = 2;
+                if (cfg_expert_topk > cfg_num_experts) { cfg_expert_topk = cfg_num_experts; }
+            }
+            if ((cfg_expert_topk < 1) || (cfg_expert_topk > cfg_num_experts)) {
+                puts("attn11: --expert-topk must be 1..--experts\n");
+                return 1;
+            }
+        } else {
+            if (cfg_expert_topk > 1) { puts("attn11: --expert-topk needs --experts > 1\n"); return 1; }
+            cfg_expert_topk = 1;
+        }
+    }
     # K is the experiment's key variable — a silent default would hide it
     if ((use_bpe == 1) && ((bpe_k < 1) || (bpe_k > BPE_MAX_MERGES()))) {
         puts("attn11: --bpe needs a merge count in 1..512\n");
@@ -246,9 +275,10 @@ fn main(): i64 {
         if (rc < 0) { puts("attn11: checkpoint load failed (code "); fmt_int(rc); puts(")\n"); return 1; }
         puts("attn11: resumed from checkpoint at step "); fmt_int(g_step); _putc(10);
     } else {
-        model_init_arch(V, cfg_c, cfg_t, cfg_nh, cfg_nkv, cfg_nl,
-                        CFG_ATTN_BIAS(), CFG_DROPOUT(), CFG_SEED(),
-                        cfg_attn_kind, cfg_latent_dim, cfg_pos_kind, cfg_rope_dim);
+        model_init_moe(V, cfg_c, cfg_t, cfg_nh, cfg_nkv, cfg_nl,
+                       CFG_ATTN_BIAS(), CFG_DROPOUT(), CFG_SEED(),
+                       cfg_attn_kind, cfg_latent_dim, cfg_pos_kind, cfg_rope_dim,
+                       cfg_num_experts, cfg_expert_topk);
     }
 
     puts("attn11 — transformer training in Cyrius\n");
@@ -261,6 +291,9 @@ fn main(): i64 {
     if (g_attn_kind == 1) { puts(" attn=mla(d_c="); fmt_int(g_latent_dim); puts(")"); }
     if (g_pos_kind == 1) { puts(" pos=rope"); }
     if (g_pos_kind == 2) { puts(" pos=rope-decoupled(d_rope="); fmt_int(g_rope_dim); puts(")"); }
+    if (g_num_experts > 1) {
+        puts(" moe(experts="); fmt_int(g_num_experts); puts(",topk="); fmt_int(g_expert_topk); puts(")");
+    }
     puts(" params="); fmt_int(g_NP); _putc(10);
     puts("  tokenizer=");
     if (g_bpe_on == 1) { puts("bpe(merges="); fmt_int(g_bpe_nmerges); puts(")"); }
@@ -299,6 +332,17 @@ fn main(): i64 {
             puts("  ce/token "); f_print(f64_div(g_eval_nats, f64_from(g_eval_tokens)), 5);
             puts("  bits/byte "); f_print(eval_bpb(), 5);
             _putc(10);
+            # MoE: the density-sweep metrics — total vs per-token-active params
+            # and the routing entropy (1 = balanced expert load, 0 = collapse).
+            if (g_num_experts > 1) {
+                var inactive = g_NL * (g_num_experts - g_expert_topk) * (2 * g_C * g_F + g_F + g_C);
+                puts("moe: experts "); fmt_int(g_num_experts);
+                puts("  topk "); fmt_int(g_expert_topk);
+                puts("  params total "); fmt_int(g_NP);
+                puts("  active/token "); fmt_int(g_NP - inactive);
+                puts("  route-entropy "); f_print(moe_entropy(), 4);
+                _putc(10);
+            }
         }
     }
 

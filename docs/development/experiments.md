@@ -336,3 +336,53 @@ optimization, future work) and the cache stays far under full K/V while carrying
 3. A perplexity comparison (decoupled vs coupled vs learned MLA on the vidya
    corpus) pairs with the X003/X006 setups; left as a follow-on since the
    correctness + footprint gates (the shippable deliverables) are met.
+
+## X009 — Mixture of Experts: the density sweep (M13, v1.3.0) (2026-06-12)
+
+**Setup**: 1.3.0, default config (d_model 32, ctx 16, 4 heads, 3 layers), the
+dense GELU MLP replaced by N experts + a top-2 router (`--experts N
+--expert-topk 2`), Switch load-balance aux α = 0.01. Each N trained for a fixed
+1200-step budget on the embedded reference corpus, then evaluated; bits/byte is
+**pure cross-entropy** (the aux term is excluded from the eval metric).
+Reproducible: `scripts/moe-sweep.sh`. x86_64.
+
+**Correctness** (grad-checks, both arches): the router is the milestone. The
+combine backward (`test_moe_op`, 1e-4) grad-checks the renormalized top-K softmax
++ per-expert MLP, incl. top-1 (renorm gate ≡ 1 → zero combine gradient) and K=N;
+the load-balance aux (`test_moe_aux`, 1e-5) grad-checks `∂L_aux/∂logits` with the
+dispatch counts held constant (straight-through). Full-model wiring green (1e-3);
+cached-vs-uncached **bit-identity** across context-shifts (`test_kv_moe`); v5
+round-trips + hostile rejections. **572 → 673** checks.
+
+**Density sweep** (`scripts/moe-sweep.sh 1200`):
+
+| N (experts) | total params | active/token | bits/byte | route-entropy |
+|-------------|--------------|--------------|-----------|---------------|
+| 1 (dense)   | 39 488       | 39 488       | 0.279     | —             |
+| 4           | 115 040      | 64 928       | 0.291     | 0.9994        |
+| 8           | 215 648      | 65 312       | 0.221     | 0.9992        |
+| 16          | 416 864      | 66 080       | 0.215     | 0.9990        |
+| 32          | 819 296      | 67 616       | 0.233     | 0.9958        |
+| 64          | 1 624 160    | 70 688       | 0.261     | 0.9932        |
+
+**Cost** (`./build/bench`, default config): the dense fwd+bwd step is ~3.6 ms; the
+8-expert top-2 step is ~6.9 ms (top-2 = two active expert MLPs + the `C→N` router).
+Cached generation ~273 µs/token. So per-token compute scales with **topk**, not N.
+
+**Takeaways**:
+1. **Total params decouple from active compute.** Total scales ~linearly with N
+   (41× from N=1 to N=64) while per-token-active params stay ~65–71 K (top-2; the
+   only growth is the tiny `C·N` gate). This is the whole point of sparse routing,
+   and the grad-checked reference shows it learns.
+2. **The aux loss prevents collapse.** Routing entropy stays 0.993–0.999 across the
+   whole sweep — the experts carry near-uniform load even at N=64; without the aux
+   term a top-K router collapses onto a few experts. The load-balance backward
+   earns its grad-check in practice.
+3. **Quality peaks at N=8–16, then over-parameterizes** (bits/byte 0.215 at N=16,
+   rising to 0.261 at N=64). At attn11's reference scale (tiny corpus, fixed step
+   budget) each of 64 experts sees too few tokens to train — exactly the honest
+   caveat the roadmap called: the deliverable is the grad-checked reference + the
+   density/utilization curve, not a quality win at this scale. N=256 exceeds the
+   128 MB alloc cap at this config (rejected cleanly), bounding the sweep.
+4. A vidya-corpus bake-off (MoE density vs dense vs the M12 attention variants, at
+   matched compute) is the natural follow-on, pairing with X003/X006/X008.

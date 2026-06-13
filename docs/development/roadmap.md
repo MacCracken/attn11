@@ -13,14 +13,15 @@
 
 ## Where we are
 
-Current: **v1.2.4**. The v1.0 surface is frozen and additive-only
+Current: **v1.3.0**. The v1.0 surface is frozen and additive-only
 ([`STABILITY.md`](../STABILITY.md)); the reusable numeric core lives in
 **[rosnet](https://github.com/MacCracken/rosnet)** + **[tyche](https://github.com/MacCracken/tyche)**
-(v1.1.0); the **1.x architecture arc** is underway — **M12 is complete**: MLA core
-(v1.2.0), its latent KV-cache decode (v1.2.1), coupled RoPE (v1.2.2), and decoupled
-RoPE (v1.2.3) have shipped, so the full `--attn-kind {mha, mla}` × `--pos-kind
-{learned, rope, rope-decoupled}` switch is live. See
-[`CHANGELOG.md`](../../CHANGELOG.md) for the full shipped narrative back to v0.1.0
+(v1.1.0); the **1.x architecture arc** is underway — **M12 and M13 are complete**:
+the attention/position axes (MLA core v1.2.0, latent KV-cache decode v1.2.1,
+coupled RoPE v1.2.2, decoupled RoPE v1.2.3 — the full `--attn-kind {mha, mla}` ×
+`--pos-kind {learned, rope, rope-decoupled}` switch) and the **FFN-density axis**
+(Mixture of Experts v1.3.0 — `--experts N --expert-topk K`, checkpoint v5, ADR
+0008). See [`CHANGELOG.md`](../../CHANGELOG.md) for the full shipped narrative back to v0.1.0
 and the M0–M11 / v1.0-cut history.
 
 ## Versioning
@@ -43,38 +44,13 @@ milestone below graduates one frontier experiment (the **E-series**, logged in
 [`experiments.md`](experiments.md)), is independently shippable, and lands ONE
 change at a time behind its own grad-check / bit-identity gate.
 
-> **M12 is complete** (MLA core + latent KV-cache decode + coupled + decoupled
-> RoPE, v1.2.0–v1.2.3). The full `--attn-kind` × `--pos-kind` switch is live; see
-> the CHANGELOG and X005–X008 for the shipped narrative. The arc continues below.
-
-### M13 — Mixture of Experts (v1.3.0) — E8
-
-**Sparse FFN.** The dense GELU MLP in each block becomes **N experts** with a
-top-`K` router, decoupling parameter count from per-token FLOPs. The deliverable
-is the **expert-density sweep** so density is a chooseable knob, not a hardcode.
-
-- New `--experts N` for **N ∈ {1 (dense baseline), 8, 16, 32, 64, 128, 256}**,
-  `--expert-topk K` (active experts/token, default top-2), each expert reusing
-  the `F = 4·C` width. A linear gate `C → N` + softmax selects the top-K; expert
-  outputs are gate-weighted so the router is differentiable through the combine
-  weights.
-- **The hard grad-check (why this earns a milestone):** the router. Top-K
-  selection is discrete — differentiate the soft gate weights (straight-through
-  for the hard pick), and the **load-balancing auxiliary loss** (Switch-style,
-  to stop expert collapse) gets its own finite-difference check. A router
-  backward without a passing grad check is incomplete.
-- Deterministic routing: the argmax / top-K tie-break is a **frozen** rule
-  (bit-reproducible cross-arch, same discipline as the BPE merge tie-break,
-  ADR 0006).
-- Checkpoint **v5** (router gate + per-expert weights + `experts`/`topk`); prior
-  versions load.
-- **Gates**: router + aux-loss backward grad-checked; the **density-sweep
-  experiment** (X-series) reports, for each N, bits/byte on vidya, active vs
-  total params, and **expert utilization** (routing-entropy / load-balance) — so
-  "choose the expert density" is backed by numbers. Honest caveat: at attn11's
-  reference scale (C = 32–64, tiny corpus) N = 256 is wildly over-parameterized;
-  the value is the **grad-checked reference** that sparse routing learns + the
-  sweep's density/quality/utilization curve, not a quality win at this scale.
+> **M12 and M13 are complete.** M12 (MLA core + latent KV-cache decode + coupled +
+> decoupled RoPE, v1.2.0–v1.2.3) shipped the full `--attn-kind` × `--pos-kind`
+> switch; M13 (Mixture of Experts, v1.3.0) shipped the FFN-density axis
+> `--experts N --expert-topk K` — a frozen top-K router with a Mixtral-style
+> renormalized combine + a Switch load-balance aux loss (both grad-checked, ADR
+> 0008), checkpoint v5, and the X009 density sweep. See the CHANGELOG and
+> X005–X009 for the shipped narrative. The arc continues below.
 
 ### M14 — A second sequence-mixer family (v1.4.0) — E4
 

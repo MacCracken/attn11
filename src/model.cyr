@@ -44,6 +44,19 @@ var g_pos_kind = 0;
 var g_latent_dim = 0;
 var g_rope_dim = 0;
 
+# ---- MoE descriptor (M13, E8; checkpoint v5) -------------------------------
+# The dense GELU MLP becomes N experts + a top-K router. g_num_experts == 1 is
+# the dense baseline — byte-identical to today, NO router/gate. g_expert_topk =
+# active experts per token. g_aux_alpha = Switch load-balance coefficient (f64
+# bit pattern; 0 unless MoE). g_aux_loss carries the last forward's summed aux
+# loss (added to the CE loss; also surfaced for logging).
+var g_num_experts = 1;
+var g_expert_topk = 1;
+var g_aux_alpha = 0;
+var g_aux_loss = 0;
+var g_moe_disp = 0;   # MoE: per-expert dispatch histogram (N counts) for the
+                      # utilization metric (routing entropy); accumulated by eval.
+
 # ---- packed parameter vectors ----------------------------------------------
 var g_params = 0;
 var g_grads = 0;
@@ -70,11 +83,22 @@ fn _kv_weight_size(): i64 {
     }
     return 2 * g_C * _Ckv();
 }
+# Size (elements) of the MLP WEIGHT region — the SECOND place an architecture
+# axis changes the block layout (M13, E8). Dense: Wfc(C*F) + bfc(F) + Wproj(F*C)
+# + bproj(C). MoE (g_num_experts > 1): N experts each the dense quad, packed
+# array-of-structs, + the router gate Wg(C*N). Expert 0 starts exactly where the
+# dense Wfc does, so the dense _o_Wfc/_o_bfc/_o_Wproj/_o_bproj offsets stay valid
+# (they describe expert 0); _o_expert(e)/_o_Wgate index the rest.
+fn _moe_estride_blk(): i64 { return _moe_estride(g_C, g_F); }   # per-expert: C*F+F+F*C+C
+fn _mlp_weight_size(): i64 {
+    if (g_num_experts > 1) { return g_num_experts * _moe_estride_blk() + g_C * g_num_experts; }
+    return 2 * g_C * g_F + g_F + g_C;
+}
 # one block, in elements: ln1(2C) + Wq(C^2) + [K/V weight region] + Wo(C^2) +
-# ln2(2C) + Wfc(CF) + bfc(F) + Wproj(FC) + bproj(C); plus 2C+2Ckv for attention
-# biases (bq,bk,bv,bo) when enabled, appended after bproj so the weight offsets
-# below are unaffected. For MLA, Ckv == C so the bias region is 4C, same as full MHA.
-fn _blk_base_size(): i64 { return 5 * g_C + 2 * g_C * g_C + _kv_weight_size() + 2 * g_C * g_F + g_F; }
+# ln2(2C) + [MLP weight region]; plus 2C+2Ckv for attention biases (bq,bk,bv,bo)
+# when enabled, appended after the MLP region so the weight offsets below are
+# unaffected. For MLA, Ckv == C so the bias region is 4C, same as full MHA.
+fn _blk_base_size(): i64 { return 4 * g_C + 2 * g_C * g_C + _kv_weight_size() + _mlp_weight_size(); }
 fn _blk(): i64 {
     if (g_attn_bias == 1) { return _blk_base_size() + 2 * g_C + 2 * _Ckv(); }
     return _blk_base_size();
@@ -102,6 +126,12 @@ fn _o_Wfc(): i64 { return _o_ln2g() + 2 * g_C; }
 fn _o_bfc(): i64 { return _o_Wfc() + g_C * g_F; }
 fn _o_Wproj(): i64 { return _o_bfc() + g_F; }
 fn _o_bproj(): i64 { return _o_Wproj() + g_F * g_C; }
+# MoE MLP offsets (g_num_experts > 1). The MLP region starts where the dense Wfc
+# does; expert e is a dense quad at stride _moe_estride_blk(); the gate follows
+# all N experts. (_o_expert(0) == _o_Wfc(), so the dense path is unchanged.)
+fn _o_mlp(): i64 { return _o_ln2g() + 2 * g_C; }                          # == _o_Wfc()
+fn _o_expert(e): i64 { return _o_mlp() + e * _moe_estride_blk(); }        # expert e: Wfc|bfc|Wproj|bproj
+fn _o_Wgate(): i64 { return _o_mlp() + g_num_experts * _moe_estride_blk(); }   # router gate: C x N
 # attention biases, appended after the base block (only present when enabled)
 fn _o_bq(): i64 { return _blk_base_size(); }
 fn _o_bk(): i64 { return _blk_base_size() + g_C; }
@@ -155,6 +185,11 @@ var LA_dmask_mlp = 0;   # NL pointers, each T*C  (residual dropout mask, mlp bra
 var LA_c = 0;     # MLA only: NL pointers, each T*d_c (the cached latent c_KV)
 var LA_qr = 0;    # decoupled RoPE only: NL pointers, each T*nh*d_rope (rotated rope query)
 var LA_kr = 0;    # decoupled RoPE only: NL pointers, each T*d_rope (rotated shared rope key; cached)
+# MoE only (g_num_experts > 1): per-layer router/expert caches written by moe_fwd
+# for moe_bwd / moe_aux. logits(T*N), sel(T*K i64), gate(T*K), efc/egg(T*K*F).
+var LA_mlogits = 0; var LA_msel = 0; var LA_mgate = 0; var LA_mefc = 0; var LA_megg = 0;
+var g_moe_sc = 0;    # shared MoE scratch, >= 2*F + 2*C + 3*N + K (fwd/bwd + aux)
+var g_moe_dlaux = 0; # shared aux-backward router-gradient scratch, T*N
 
 fn La(arr, L): i64 { return load64(arr + L * 8); }
 
@@ -205,6 +240,11 @@ fn model_config_ok(V, C, T, nh, nkv, NL): i64 {
 # attn_kind/d_c/pos_kind/d_rope-aware variant (ADR 0007). model_config_ok delegates
 # with the MHA / learned-abs default so existing callers stay unchanged.
 fn model_config_ok_arch(V, C, T, nh, nkv, NL, attn_kind, d_c, pos_kind, d_rope): i64 {
+    return model_config_ok_moe(V, C, T, nh, nkv, NL, attn_kind, d_c, pos_kind, d_rope, 1, 1);   # dense MLP
+}
+# MoE-aware variant (M13, E8; checkpoint v5). model_config_ok_arch delegates with
+# the dense default (1 expert, top-1) so existing callers stay unchanged.
+fn model_config_ok_moe(V, C, T, nh, nkv, NL, attn_kind, d_c, pos_kind, d_rope, num_experts, topk): i64 {
     if ((V < 1) || (C < 1) || (T < 1) || (NL < 1)) { return 0; }
     # Magnitude caps mirror the checkpoint loader's (-4/-5/-7/-8). The fresh
     # path takes CLI-supplied dims (`--layers`, and `--preset`-set C/T) — an
@@ -244,6 +284,11 @@ fn model_config_ok_arch(V, C, T, nh, nkv, NL, attn_kind, d_c, pos_kind, d_rope):
     }
     # rope_dim is 0 unless decoupled (mirrors d_c == 0 unless MLA)
     if ((pos_kind != 2) && (d_rope != 0)) { return 0; }
+    # MoE (M13): num_experts >= 1 (1 = dense). Cap N at 256 (the roadmap's sweep
+    # ceiling); the 128 MB alloc pre-flight in model_init bounds the rest (large
+    # N at non-trivial C/NL is rejected there, not here). 1 <= topk <= num_experts.
+    if ((num_experts < 1) || (num_experts > 256)) { return 0; }
+    if ((topk < 1) || (topk > num_experts)) { return 0; }
     return 1;
 }
 
@@ -257,6 +302,11 @@ fn model_alloc_bytes(V, C, T, nh, nkv, NL, NP): i64 {
 # attn_kind/d_c/pos_kind/d_rope-aware variant (ADR 0007). model_alloc_bytes
 # delegates with the MHA default so existing callers/tests are unchanged.
 fn model_alloc_bytes_arch(V, C, T, nh, nkv, NL, NP, attn_kind, d_c, pos_kind, d_rope): i64 {
+    return model_alloc_bytes_moe(V, C, T, nh, nkv, NL, NP, attn_kind, d_c, pos_kind, d_rope, 1, 1);
+}
+# MoE-aware variant (M13). KEEP IN SYNC with model_init_moe — test_alloc_accounting
+# pins the two together (incl. the MoE per-layer router/expert caches + scratch).
+fn model_alloc_bytes_moe(V, C, T, nh, nkv, NL, NP, attn_kind, d_c, pos_kind, d_rope, num_experts, topk): i64 {
     var F = 4 * C;
     var Ckv = nkv * (C / nh);
     var asz = attn_arena_size(T, C, nh, nkv);
@@ -277,6 +327,17 @@ fn model_alloc_bytes_arch(V, C, T, nh, nkv, NL, NP, attn_kind, d_c, pos_kind, d_
         e = e + 2 * NL + NL * (T * nh * d_rope + T * d_rope) + T * nh * d_rope + T * d_rope;
         e = e + nh * d_rope;   # R_qr single-row scratch
     }
+    # MoE buffers (M13, num_experts > 1): 5 per-layer pointer arrays (LA_mlogits/
+    # msel/mgate/mefc/megg) + per-layer router/expert caches logits(T*N) +
+    # sel/gate(2*T*K) + efc/egg(2*T*K*F) + shared scratch g_moe_sc(2F+2C+3N+K) +
+    # the aux router-gradient scratch g_moe_dlaux(T*N).
+    if (num_experts > 1) {
+        e = e + 5 * NL;
+        e = e + NL * (T * num_experts + 2 * T * topk + 2 * T * topk * F);
+        e = e + 2 * F + 2 * C + 3 * num_experts + topk;
+        e = e + T * num_experts;
+        e = e + num_experts;                       # g_moe_disp utilization histogram
+    }
     return e * 8;
 }
 
@@ -295,17 +356,28 @@ fn model_init(V, C, T, nh, nkv, NL, attn_bias, dropout, seed): i64 {
     return model_init_arch(V, C, T, nh, nkv, NL, attn_bias, dropout, seed, 0, 0, 0, 0);
 }
 fn model_init_arch(V, C, T, nh, nkv, NL, attn_bias, dropout, seed, attn_kind, d_c, pos_kind, d_rope): i64 {
-    if (model_config_ok_arch(V, C, T, nh, nkv, NL, attn_kind, d_c, pos_kind, d_rope) == 0) {
+    return model_init_moe(V, C, T, nh, nkv, NL, attn_bias, dropout, seed, attn_kind, d_c, pos_kind, d_rope, 1, 1);
+}
+# MoE-aware constructor (M13, E8). model_init_arch delegates with the dense
+# default (1 expert) so a no-flag run and every existing caller stay byte-identical.
+fn model_init_moe(V, C, T, nh, nkv, NL, attn_bias, dropout, seed,
+                  attn_kind, d_c, pos_kind, d_rope, num_experts, topk): i64 {
+    if (model_config_ok_moe(V, C, T, nh, nkv, NL, attn_kind, d_c, pos_kind, d_rope, num_experts, topk) == 0) {
         puts("attn11: model_init: invalid config (need nh | C, nkv | nh, nkv <= nh; ");
-        puts("mla: nkv == nh, 1 <= d_c <= C; rope: mha + even hd; rope-decoupled: mla + even d_rope)\n");
+        puts("mla: nkv == nh, 1 <= d_c <= C; rope: mha + even hd; rope-decoupled: mla + even d_rope; ");
+        puts("moe: 1 <= num_experts <= 256, 1 <= topk <= num_experts)\n");
         sys_exit(1);
     }
     g_V = V; g_C = C; g_T = T; g_nh = nh; g_nkv = nkv; g_NL = NL; g_F = 4 * C;
     g_attn_bias = attn_bias; g_dropout = dropout; g_training = 1; g_step = 0;
     # architecture descriptor (ADR 0007). g_attn_kind/g_latent_dim/g_pos_kind/
-    # g_rope_dim must be set BEFORE g_NP, since _blk()->_kv_weight_size() reads
-    # them (decoupled RoPE adds W_QR/W_KR to the block when pos_kind == 2).
+    # g_rope_dim AND g_num_experts must be set BEFORE g_NP, since
+    # _blk()->_kv_weight_size()/_mlp_weight_size() read them (MLA adds W_DKV/up,
+    # decoupled RoPE adds W_QR/W_KR, MoE swaps the MLP region for N experts + gate).
     g_attn_kind = attn_kind; g_pos_kind = pos_kind; g_latent_dim = d_c; g_rope_dim = d_rope;
+    g_num_experts = num_experts; g_expert_topk = topk;
+    g_aux_alpha = f64_from(0);
+    if (num_experts > 1) { g_aux_alpha = f64_div(f64_from(1), f64_from(100)); }   # Switch α = 0.01
     var F = g_F;
     g_NP = _emb_end() + NL * _blk() + 2 * C;
 
@@ -314,7 +386,8 @@ fn model_init_arch(V, C, T, nh, nkv, NL, attn_bias, dropout, seed, attn_kind, d_
     # shape-valid config can still imply a model larger than the allocator cap.
     # Reject BEFORE any allocation so a hostile --layers/--preset combination
     # aborts cleanly instead of through an oversized/undersized t_alloc.
-    if (model_alloc_bytes_arch(V, C, T, nh, nkv, NL, g_NP, attn_kind, d_c, pos_kind, d_rope) > CKPT_MAX_MODEL_BYTES()) {
+    var abytes = model_alloc_bytes_moe(V, C, T, nh, nkv, NL, g_NP, attn_kind, d_c, pos_kind, d_rope, num_experts, topk);
+    if (abytes > CKPT_MAX_MODEL_BYTES()) {
         puts("attn11: model_init: config exceeds the 128 MB model-allocation cap\n");
         sys_exit(1);
     }
@@ -352,8 +425,20 @@ fn model_init_arch(V, C, T, nh, nkv, NL, attn_bias, dropout, seed, attn_kind, d_
             t_randn(PL(L, _o_Wv()), C * Ckv, std);
         }
         t_randn(PL(L, _o_Wo()), C * C, rstd);     # residual projection
-        t_randn(PL(L, _o_Wfc()), C * F, std);
-        t_randn(PL(L, _o_Wproj()), F * C, rstd);  # residual projection
+        if (num_experts > 1) {
+            # N experts, each a dense quad; Wproj is the residual projection (rstd).
+            # The router gate gets the standard 0.02 init. Biases (bfc/bproj) zero.
+            var ei = 0;
+            while (ei < num_experts) {
+                t_randn(PL(L, _o_expert(ei)), C * F, std);                 # Wfc_e
+                t_randn(PL(L, _o_expert(ei) + C * F + F), F * C, rstd);    # Wproj_e
+                ei = ei + 1;
+            }
+            t_randn(PL(L, _o_Wgate()), C * num_experts, std);             # router gate
+        } else {
+            t_randn(PL(L, _o_Wfc()), C * F, std);
+            t_randn(PL(L, _o_Wproj()), F * C, rstd);  # residual projection
+        }
         # biases (bfc, bproj, attn biases) and ln betas already zero
         L = L + 1;
     }
@@ -376,6 +461,10 @@ fn model_init_arch(V, C, T, nh, nkv, NL, attn_bias, dropout, seed, attn_kind, d_
     LA_dmask_attn = t_alloc(NL); LA_dmask_mlp = t_alloc(NL);
     if (attn_kind == 1) { LA_c = t_alloc(NL); }
     if (pos_kind == 2) { LA_qr = t_alloc(NL); LA_kr = t_alloc(NL); }
+    if (num_experts > 1) {
+        LA_mlogits = t_alloc(NL); LA_msel = t_alloc(NL); LA_mgate = t_alloc(NL);
+        LA_mefc = t_alloc(NL); LA_megg = t_alloc(NL);
+    }
     var i = 0;
     while (i < NL + 1) { store64(LA_resid + i * 8, t_alloc(TC)); i = i + 1; }
     var TF = T * F; var asz = attn_arena_size(T, C, nh, nkv);
@@ -398,6 +487,13 @@ fn model_init_arch(V, C, T, nh, nkv, NL, attn_bias, dropout, seed, attn_kind, d_
             store64(LA_qr + L * 8, t_alloc(T * nh * d_rope));
             store64(LA_kr + L * 8, t_alloc(T * d_rope));
         }
+        if (num_experts > 1) {
+            store64(LA_mlogits + L * 8, t_alloc(T * num_experts));
+            store64(LA_msel + L * 8, t_alloc(T * topk));
+            store64(LA_mgate + L * 8, t_alloc(T * topk));
+            store64(LA_mefc + L * 8, t_alloc(T * topk * F));
+            store64(LA_megg + L * 8, t_alloc(T * topk * F));
+        }
         L = L + 1;
     }
 
@@ -407,6 +503,11 @@ fn model_init_arch(V, C, T, nh, nkv, NL, attn_bias, dropout, seed, attn_kind, d_
     D_g = t_alloc(TF); D_fc = t_alloc(TF); D_tmp = t_alloc(TC); D_drop = t_alloc(TC);
     if (attn_kind == 1) { D_lat1 = t_alloc(T * d_c); D_lat2 = t_alloc(T * d_c); }
     if (pos_kind == 2) { D_qr = t_alloc(T * nh * d_rope); D_kr = t_alloc(T * d_rope); }
+    if (num_experts > 1) {
+        g_moe_sc = t_alloc(2 * F + 2 * C + 3 * num_experts + topk);
+        g_moe_dlaux = t_alloc(T * num_experts);
+        g_moe_disp = t_alloc(num_experts);
+    }
 
     # KV caches + single-row scratch (generation)
     var TKv = T * Ckv;
@@ -438,6 +539,53 @@ fn kv_cache_bytes(): i64 {
         return g_NL * g_T * g_latent_dim * 8;
     }
     return 2 * g_NL * g_T * _Ckv() * 8;
+}
+
+# ---- MoE expert-utilization metric (M13, E8) -------------------------------
+# Routing entropy over a measured set of forwards: reset the per-expert dispatch
+# histogram, run forwards (each accumulates the layer routers' top-K picks via
+# moe_disp_accum), then read moe_entropy. Normalized to [0,1]: 1 = perfectly
+# balanced expert load (the aux loss's goal), 0 = full collapse to one expert.
+fn moe_disp_reset(): i64 {
+    if (g_num_experts <= 1) { return 0; }
+    var i = 0;
+    while (i < g_num_experts) { store64(g_moe_disp + i * 8, 0); i = i + 1; }
+    return 0;
+}
+fn moe_disp_accum(): i64 {
+    if (g_num_experts <= 1) { return 0; }
+    var L = 0;
+    while (L < g_NL) {
+        var sel = La(LA_msel, L);
+        var n = g_T * g_expert_topk;
+        var j = 0;
+        while (j < n) {
+            var e = load64(sel + j * 8);
+            store64(g_moe_disp + e * 8, load64(g_moe_disp + e * 8) + 1);
+            j = j + 1;
+        }
+        L = L + 1;
+    }
+    return 0;
+}
+fn moe_entropy(): i64 {
+    if (g_num_experts <= 1) { return f64_from(0); }
+    var tot = 0;
+    var i = 0;
+    while (i < g_num_experts) { tot = tot + load64(g_moe_disp + i * 8); i = i + 1; }
+    if (tot == 0) { return f64_from(0); }
+    var invtot = f64_div(f64_from(1), f64_from(tot));
+    var H = f64_from(0);
+    i = 0;
+    while (i < g_num_experts) {
+        var c = load64(g_moe_disp + i * 8);
+        if (c > 0) {
+            var p = f64_mul(f64_from(c), invtot);
+            H = f64_sub(H, f64_mul(p, f64_ln(p)));
+        }
+        i = i + 1;
+    }
+    return f64_div(H, f64_ln(f64_from(g_num_experts)));   # normalize by ln(N)
 }
 
 # ---- tied LM head ----------------------------------------------------------
@@ -581,6 +729,7 @@ fn embed_bwd(dx0): i64 {
 fn model_forward(): i64 {
     var T = g_T; var C = g_C; var F = g_F; var V = g_V; var nh = g_nh;
     var TC = T * C;
+    g_aux_loss = f64_from(0);   # accumulated across the MoE blocks below (0 if dense)
     embed_fwd();
     var L = 0;
     while (L < g_NL) {
@@ -611,10 +760,21 @@ fn model_forward(): i64 {
         while (i < TC) { store64(xmid + i * 8, f64_add(load64(xin + i * 8), load64(A_attn + i * 8))); i = i + 1; }
         var b = La(LA_b, L);
         ln_fwd(xmid, PL(L, _o_ln2g()), PL(L, _o_ln2b()), b, La(LA_m2, L), La(LA_r2, L), T, C);
-        var fc = La(LA_fc, L); var gg = La(LA_g, L);
-        linear_fwd(b, PL(L, _o_Wfc()), PL(L, _o_bfc()), fc, T, C, F);
-        gelu_fwd(fc, gg, T * F);
-        linear_fwd(gg, PL(L, _o_Wproj()), PL(L, _o_bproj()), A_mlp, T, F, C);
+        if (g_num_experts > 1) {
+            # MoE: route b through the top-K experts into A_mlp, accumulate the
+            # block's load-balance aux loss (router is position-independent, so
+            # the cached decode path runs the same kernel — see model_fwd_row).
+            moe_fwd(b, PL(L, _o_Wgate()), PL(L, _o_expert(0)), A_mlp,
+                    La(LA_mlogits, L), La(LA_msel, L), La(LA_mgate, L), La(LA_mefc, L), La(LA_megg, L),
+                    g_moe_sc, T, C, F, g_num_experts, g_expert_topk);
+            g_aux_loss = f64_add(g_aux_loss,
+                moe_aux_fwd(La(LA_mlogits, L), La(LA_msel, L), g_aux_alpha, g_moe_sc, T, g_num_experts, g_expert_topk));
+        } else {
+            var fc = La(LA_fc, L); var gg = La(LA_g, L);
+            linear_fwd(b, PL(L, _o_Wfc()), PL(L, _o_bfc()), fc, T, C, F);
+            gelu_fwd(fc, gg, T * F);
+            linear_fwd(gg, PL(L, _o_Wproj()), PL(L, _o_bproj()), A_mlp, T, F, C);
+        }
         # residual dropout on the MLP branch
         dropout_gen_mask(La(LA_dmask_mlp, L), TC, g_dropout, g_training);
         dropout_apply(A_mlp, La(LA_dmask_mlp, L), A_mlp, TC);
@@ -625,7 +785,9 @@ fn model_forward(): i64 {
     }
     ln_fwd(La(LA_resid, g_NL), P_lnfg(), P_lnfb(), A_f, A_meanf, A_rstdf, T, C);
     head_fwd();
-    return softmax_xent_fwd(A_logits, A_targets, A_probs, T, V);
+    # total training objective = cross-entropy + Σ_blocks load-balance aux loss
+    # (g_aux_loss is exactly 0 in the dense path, so a no-flag run is unchanged).
+    return f64_add(softmax_xent_fwd(A_logits, A_targets, A_probs, T, V), g_aux_loss);
 }
 
 # ---- cached single-row forward (inference, E1) ------------------------------
@@ -684,9 +846,19 @@ fn model_fwd_row(tok, pos): i64 {
             c = c + 1;
         }
         ln_fwd(R_xmid, PL(L, _o_ln2g()), PL(L, _o_ln2b()), R_b, R_mean, R_rstd, 1, C);
-        linear_fwd(R_b, PL(L, _o_Wfc()), PL(L, _o_bfc()), R_fc, 1, C, F);
-        gelu_fwd(R_fc, R_g, F);
-        linear_fwd(R_g, PL(L, _o_Wproj()), PL(L, _o_bproj()), R_mlp, 1, F, C);
+        if (g_num_experts > 1) {
+            # MoE is position-independent: the cached single row runs the SAME
+            # moe_fwd kernel on one row as training runs on T — so a token's MLP
+            # output is bit-identical to the batch path (test_kv_moe). The LA_m*
+            # caches are reused as eval scratch (no backward in decode).
+            moe_fwd(R_b, PL(L, _o_Wgate()), PL(L, _o_expert(0)), R_mlp,
+                    La(LA_mlogits, L), La(LA_msel, L), La(LA_mgate, L), La(LA_mefc, L), La(LA_megg, L),
+                    g_moe_sc, 1, C, F, g_num_experts, g_expert_topk);
+        } else {
+            linear_fwd(R_b, PL(L, _o_Wfc()), PL(L, _o_bfc()), R_fc, 1, C, F);
+            gelu_fwd(R_fc, R_g, F);
+            linear_fwd(R_g, PL(L, _o_Wproj()), PL(L, _o_bproj()), R_mlp, 1, F, C);
+        }
         c = 0;
         while (c < C) {
             store64(R_x + c * 8, f64_add(load64(R_xmid + c * 8), load64(R_mlp + c * 8)));
@@ -734,10 +906,16 @@ fn model_eval_window(n): i64 {
         while (i < nC) { store64(xmid + i * 8, f64_add(load64(xin + i * 8), load64(A_attn + i * 8))); i = i + 1; }
         var b = La(LA_b, L);
         ln_fwd(xmid, PL(L, _o_ln2g()), PL(L, _o_ln2b()), b, La(LA_m2, L), La(LA_r2, L), n, C);
-        var fc = La(LA_fc, L); var gg = La(LA_g, L);
-        linear_fwd(b, PL(L, _o_Wfc()), PL(L, _o_bfc()), fc, n, C, F);
-        gelu_fwd(fc, gg, n * F);
-        linear_fwd(gg, PL(L, _o_Wproj()), PL(L, _o_bproj()), A_mlp, n, F, C);
+        if (g_num_experts > 1) {
+            moe_fwd(b, PL(L, _o_Wgate()), PL(L, _o_expert(0)), A_mlp,
+                    La(LA_mlogits, L), La(LA_msel, L), La(LA_mgate, L), La(LA_mefc, L), La(LA_megg, L),
+                    g_moe_sc, n, C, F, g_num_experts, g_expert_topk);
+        } else {
+            var fc = La(LA_fc, L); var gg = La(LA_g, L);
+            linear_fwd(b, PL(L, _o_Wfc()), PL(L, _o_bfc()), fc, n, C, F);
+            gelu_fwd(fc, gg, n * F);
+            linear_fwd(gg, PL(L, _o_Wproj()), PL(L, _o_bproj()), A_mlp, n, F, C);
+        }
         var xout = La(LA_resid, L + 1);
         i = 0;
         while (i < nC) { store64(xout + i * 8, f64_add(load64(xmid + i * 8), load64(A_mlp + i * 8))); i = i + 1; }
@@ -763,9 +941,22 @@ fn model_backward(): i64 {
         # D_resid currently holds d_xout for layer L.
         # MLP: d(mlp branch output) = D_resid; back through its dropout first.
         dropout_bwd(La(LA_dmask_mlp, L), D_resid, D_drop, TC);
-        linear_bwd(La(LA_g, L), PL(L, _o_Wproj()), D_drop, D_g, GL(L, _o_Wproj()), GL(L, _o_bproj()), T, F, C);
-        gelu_bwd(La(LA_fc, L), D_g, D_fc, T * F);
-        linear_bwd(La(LA_b, L), PL(L, _o_Wfc()), D_fc, D_b, GL(L, _o_Wfc()), GL(L, _o_bfc()), T, C, F);
+        if (g_num_experts > 1) {
+            # MoE: combine backward (-> D_b = d ln2-out, accumulate expert + gate
+            # grads), then the load-balance aux backward, which ADDS its router
+            # gradient through the gate into D_b (the aux is off the dropout path —
+            # it is a loss term on the router logits, not on the combine output).
+            moe_bwd(La(LA_b, L), PL(L, _o_Wgate()), PL(L, _o_expert(0)), D_drop, D_b,
+                    GL(L, _o_Wgate()), GL(L, _o_expert(0)),
+                    La(LA_msel, L), La(LA_mgate, L), La(LA_mefc, L), La(LA_megg, L),
+                    g_moe_sc, T, C, F, g_num_experts, g_expert_topk);
+            moe_aux_bwd(La(LA_mlogits, L), La(LA_msel, L), g_aux_alpha, La(LA_b, L), PL(L, _o_Wgate()),
+                        D_b, GL(L, _o_Wgate()), g_moe_dlaux, g_moe_sc, T, C, g_num_experts, g_expert_topk);
+        } else {
+            linear_bwd(La(LA_g, L), PL(L, _o_Wproj()), D_drop, D_g, GL(L, _o_Wproj()), GL(L, _o_bproj()), T, F, C);
+            gelu_bwd(La(LA_fc, L), D_g, D_fc, T * F);
+            linear_bwd(La(LA_b, L), PL(L, _o_Wfc()), D_fc, D_b, GL(L, _o_Wfc()), GL(L, _o_bfc()), T, C, F);
+        }
         ln_bwd(xmid, PL(L, _o_ln2g()), D_b, La(LA_m2, L), La(LA_r2, L), D_tmp,
                GL(L, _o_ln2g()), GL(L, _o_ln2b()), T, C);
         # d_xmid = D_resid (residual) + D_tmp (ln2 path)

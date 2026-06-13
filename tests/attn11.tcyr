@@ -561,6 +561,94 @@ fn test_dropout(): i64 {
     return 0;
 }
 
+# ---------------------------------------------------------------------------
+# Mixture of Experts op grad-check (M13.0). Isolates moe_fwd/moe_bwd: the router
+# gate (C->N), the frozen top-K pick, the K-way renormalized softmax combine,
+# and the per-expert MLP backward scaled by the gate weight. Inputs are chosen
+# with a comfortable top-K margin so the central-difference perturbation never
+# flips the discrete selection (the combine is smooth only with the pick fixed).
+fn moe_loss(x, Wg, We, y, logits, sel, gate, efc, egg, sc, dout, T, C, F, N, K): i64 {
+    moe_fwd(x, Wg, We, y, logits, sel, gate, efc, egg, sc, T, C, F, N, K);
+    return dotsum(dout, y, T * C);
+}
+fn moe_ng(p, np, n, x, Wg, We, y, logits, sel, gate, efc, egg, sc, dout, T, C, F, N, K): i64 {
+    var eps = _eps(); var te = f64_mul(f64_from(2), eps); var i = 0;
+    while (i < n) {
+        var o = load64(p + i * 8);
+        store64(p + i * 8, f64_add(o, eps)); var lp = moe_loss(x, Wg, We, y, logits, sel, gate, efc, egg, sc, dout, T, C, F, N, K);
+        store64(p + i * 8, f64_sub(o, eps)); var lm = moe_loss(x, Wg, We, y, logits, sel, gate, efc, egg, sc, dout, T, C, F, N, K);
+        store64(p + i * 8, o); store64(np + i * 8, f64_div(f64_sub(lp, lm), te)); i = i + 1;
+    }
+    return 0;
+}
+fn _moe_check(T, C, F, N, K): i64 {
+    var TC = T * C; var CN = C * N; var TN = T * N; var TK = T * K; var TKF = T * K * F;
+    var estride = _moe_estride(C, F); var WE = N * estride;
+    var x = t_alloc(TC); var Wg = t_alloc(CN); var We = t_alloc(WE);
+    var y = t_alloc(TC); var dout = t_alloc(TC);
+    var logits = t_alloc(TN); var sel = t_alloc(TK); var gate = t_alloc(TK);
+    var efc = t_alloc(TKF); var egg = t_alloc(TKF);
+    var sc = t_alloc(2 * F + 2 * C + K + N);
+    var std = f64_div(f64_from(1), f64_from(2));
+    t_randn(x, TC, f64_from(1)); t_randn(Wg, CN, std); t_randn(We, WE, std); t_randn(dout, TC, f64_from(1));
+    var dx = t_alloc(TC); var dWg = t_alloc(CN); var dWe = t_alloc(WE);
+    moe_fwd(x, Wg, We, y, logits, sel, gate, efc, egg, sc, T, C, F, N, K);
+    moe_bwd(x, Wg, We, dout, dx, dWg, dWe, sel, gate, efc, egg, sc, T, C, F, N, K);
+    var nx = t_alloc(TC); moe_ng(x, nx, TC, x, Wg, We, y, logits, sel, gate, efc, egg, sc, dout, T, C, F, N, K);
+    var nWg = t_alloc(CN); moe_ng(Wg, nWg, CN, x, Wg, We, y, logits, sel, gate, efc, egg, sc, dout, T, C, F, N, K);
+    var nWe = t_alloc(WE); moe_ng(We, nWe, WE, x, Wg, We, y, logits, sel, gate, efc, egg, sc, dout, T, C, F, N, K);
+    # 1e-4: the combine composes the router softmax with each expert's two
+    # matmuls + GELU, so the central-difference reference is noisier than a lone
+    # linear (1e-5); a real backward bug is orders of magnitude larger.
+    var atol = 10000;
+    check("moe dx", dx, nx, TC, atol);
+    check("moe dWg", dWg, nWg, CN, atol);
+    check("moe dWe", dWe, nWe, WE, atol);
+    return 0;
+}
+fn test_moe_op(): i64 {
+    _moe_check(3, 8, 32, 4, 2);    # C=8 F=4C N=4 experts, top-2 (typical)
+    _moe_check(4, 6, 24, 8, 2);    # N=8 experts, top-2
+    _moe_check(3, 8, 32, 4, 1);    # top-1: renorm gate ≡ 1, combine gives zero router grad
+    _moe_check(2, 4, 16, 3, 3);    # K = N: every expert selected (full softmax combine)
+    return 0;
+}
+
+# Load-balance aux loss grad-check (M13.1): verify ∂L_aux/∂logits (moe_aux_dr)
+# against finite differences of L_aux (moe_aux_fwd). The dispatch counts f_i are
+# held fixed (sel is a constant input, not recomputed), so FD only moves the
+# smooth P_i term — exactly the straight-through treatment the analytic encodes.
+fn _moe_aux_check(T, N, K): i64 {
+    var TN = T * N;
+    var logits = t_alloc(TN); var sel = t_alloc(T * K); var sc = t_alloc(3 * N);
+    t_randn(logits, TN, f64_from(1));
+    # fixed distinct routing per row (K < N): experts (t, t+1, ..., t+K-1) mod N
+    var t = 0;
+    while (t < T) { var k = 0; while (k < K) { store64(sel + (t * K + k) * 8, (t + k) % N); k = k + 1; } t = t + 1; }
+    var alpha = _lrc(1, 100);                 # α = 0.01 (the Switch default)
+    var dlogits = t_alloc(TN);                # zeroed; moe_aux_dr accumulates into it
+    moe_aux_dr(logits, sel, alpha, dlogits, sc, T, N, K);
+    var eps = _eps(); var te = f64_mul(f64_from(2), eps);
+    var nd = t_alloc(TN); var i = 0;
+    while (i < TN) {
+        var o = load64(logits + i * 8);
+        store64(logits + i * 8, f64_add(o, eps)); var lp = moe_aux_fwd(logits, sel, alpha, sc, T, N, K);
+        store64(logits + i * 8, f64_sub(o, eps)); var lm = moe_aux_fwd(logits, sel, alpha, sc, T, N, K);
+        store64(logits + i * 8, o); store64(nd + i * 8, f64_div(f64_sub(lp, lm), te)); i = i + 1;
+    }
+    check("moe aux dlogits", dlogits, nd, TN, 100000);   # 1e-5: a lone softmax
+    return 0;
+}
+# Configs with NON-uniform dispatch (N ∤ T·K): a balanced f_i makes f_j − Σf_i·p_i
+# collapse to 0 (L_aux constant in logits), which is correct but a degenerate,
+# FD-noise-dominated grad-check — these keep the aux gradient well-conditioned.
+fn test_moe_aux(): i64 {
+    _moe_aux_check(3, 4, 2);   # f = [1,2,2,1]/3 — skewed
+    _moe_aux_check(3, 8, 2);   # most experts unrouted
+    _moe_aux_check(5, 6, 3);
+    return 0;
+}
+
 fn model_ng(p, np, n): i64 {
     var eps = _eps(); var te = f64_mul(f64_from(2), eps); var i = 0;
     while (i < n) {
@@ -698,6 +786,46 @@ fn test_model_mla_dec(): i64 {
     check("mla-dec model L1 dWuk", aWuk1, nWuk1, dC, 1000);
     check("mla-dec model L0 dWo", aWo0, nWo0, Cc, 1000);
     check("mla-dec model L1 dWq", aWq1, nWq1, Cc, 1000);
+    return 0;
+}
+
+# Full-model grad-check with MoE (M13.2): the dense MLP is replaced by N experts
+# + a top-K router, and the total loss is CE + Σ_blocks load-balance aux. This
+# composition check verifies the wiring of three things at once: (a) the expert
+# weight grads (dWe — no aux term, pure combine/CE path), (b) the gate grad
+# (dWgate — combine AND aux contribute), (c) upstream grads (dWq, dtokemb — the
+# aux gradient flows back through the router into them). The tight per-op proofs
+# are test_moe_op (combine, 1e-4) and test_moe_aux (aux, 1e-5); this is 1e-3, like
+# the other full-model checks (softmax-chain + composition FD noise). The init
+# router logits are tiny and near-uniform, but perturbing ONE weight by eps moves
+# them ~1e4× less than the top-K margin, so the discrete selection stays fixed.
+fn test_model_moe(): i64 {
+    var V = 5; var C = 8; var T = 3; var nh = 2; var NL = 2; var NE = 4; var TK = 2;
+    var F = 4 * C;
+    model_init_moe(V, C, T, nh, nh, NL, 1, f64_from(0), 17, 0, 0, 0, 0, NE, TK);   # MHA + 4 experts, top-2
+    assert(g_num_experts == NE, "moe model built");
+    assert(g_expert_topk == TK, "moe topk installed");
+    store64(A_tokens + 0, 1); store64(A_tokens + 8, 3); store64(A_tokens + 16, 0);
+    store64(A_targets + 0, 3); store64(A_targets + 8, 0); store64(A_targets + 16, 4);
+    model_forward(); model_zero_grads(); model_backward();
+    var Cc = C * C; var CF = C * F; var FC = F * C; var CN = C * NE;
+    # expert 0's Wfc (no aux term), expert 1's Wproj, the router gate, an upstream
+    # attn weight, and the tied embedding — covers combine, aux, and upstream flow.
+    var aWfc0 = t_alloc(CF); t_copy(aWfc0, GL(0, _o_expert(0)), CF);
+    var aWproj1 = t_alloc(FC); t_copy(aWproj1, GL(1, _o_expert(1) + C * F + F), FC);
+    var aWg0 = t_alloc(CN); t_copy(aWg0, GL(0, _o_Wgate()), CN);
+    var aWq1 = t_alloc(Cc); t_copy(aWq1, GL(1, _o_Wq()), Cc);
+    var atok = t_alloc(V * C); t_copy(atok, G_tokemb(), V * C);
+    var nWfc0 = t_alloc(CF); model_ng(PL(0, _o_expert(0)), nWfc0, CF);
+    var nWproj1 = t_alloc(FC); model_ng(PL(1, _o_expert(1) + C * F + F), nWproj1, FC);
+    var nWg0 = t_alloc(CN); model_ng(PL(0, _o_Wgate()), nWg0, CN);
+    var nWq1 = t_alloc(Cc); model_ng(PL(1, _o_Wq()), nWq1, Cc);
+    var ntok = t_alloc(V * C); model_ng(P_tokemb(), ntok, V * C);
+    check("moe model L0 dWfc(e0)", aWfc0, nWfc0, CF, 1000);
+    check("moe model L1 dWproj(e1)", aWproj1, nWproj1, FC, 1000);
+    check("moe model L0 dWgate", aWg0, nWg0, CN, 1000);
+    check("moe model L1 dWq", aWq1, nWq1, Cc, 1000);
+    check("moe model dtokemb", atok, ntok, V * C, 1000);
     return 0;
 }
 
@@ -936,6 +1064,37 @@ fn test_param_layout_mla_dec(): i64 {
     return 0;
 }
 
+# Layout pin for the MoE block (M13.2): the dense Wfc/bfc/Wproj/bproj become N
+# experts (each that quad, array-of-structs) + the router gate Wg(C*N). FD is
+# blind to offset aliasing, so pin the tiling directly — and that expert 0
+# aliases the dense Wfc offset (so the dense path is byte-identical).
+fn test_param_layout_moe(): i64 {
+    model_init_moe(5, 16, 4, 4, 4, 2, 1, f64_from(0), 3, 0, 0, 0, 0, 4, 2);   # MHA C=16, 4 experts
+    var C = g_C; var F = g_F; var NE = g_num_experts; var Ckv = _Ckv();
+    var es = _moe_estride_blk();
+    assert(NE == 4, "moe experts installed");
+    assert(_o_expert(0) == _o_Wfc(), "expert 0 aliases the dense Wfc offset");
+    var p = 0;
+    p = _lay(_o_ln1g(), C, p);
+    p = _lay(_o_ln1b(), C, p);
+    p = _lay(_o_Wq(), C * C, p);
+    p = _lay(_o_Wk(), C * Ckv, p);
+    p = _lay(_o_Wv(), C * Ckv, p);
+    p = _lay(_o_Wo(), C * C, p);
+    p = _lay(_o_ln2g(), C, p);
+    p = _lay(_o_ln2b(), C, p);
+    var ei = 0;
+    while (ei < NE) { p = _lay(_o_expert(ei), es, p); ei = ei + 1; }   # each expert: Wfc|bfc|Wproj|bproj
+    p = _lay(_o_Wgate(), C * NE, p);
+    assert(p == _blk_base_size(), "moe layout: experts + gate tile _blk_base_size exactly");
+    p = _lay(_o_bq(), C, p);
+    p = _lay(_o_bk(), Ckv, p);
+    p = _lay(_o_bv(), Ckv, p);
+    p = _lay(_o_bo(), C, p);
+    assert(p == _blk(), "moe layout: biases tile _blk exactly");
+    return 0;
+}
+
 # model_alloc_bytes (the checkpoint loader's pre-allocation bound) must
 # mirror model_init's actual allocations — pin the two together. Exact when
 # every t_alloc size is 16-byte aligned; allow small per-alloc slack.
@@ -969,6 +1128,14 @@ fn test_alloc_accounting(): i64 {
     predicted = model_alloc_bytes_arch(5, 16, 8, 4, 4, 2, g_NP, 1, 6, 2, 4);
     assert(delta >= predicted, "mla-dec alloc accounting (under)");
     assert(delta <= predicted + 8192, "mla-dec alloc accounting (over)");
+    # MoE pin (M13.2): the per-layer router/expert caches (LA_mlogits/msel/mgate/
+    # mefc/megg) + the shared scratch (g_moe_sc/g_moe_dlaux) must be accounted too.
+    used0 = alloc_used();
+    model_init_moe(5, 16, 8, 4, 4, 2, 1, f64_from(0), 4, 0, 0, 0, 0, 8, 2);
+    delta = alloc_used() - used0;
+    predicted = model_alloc_bytes_moe(5, 16, 8, 4, 4, 2, g_NP, 0, 0, 0, 0, 8, 2);
+    assert(delta >= predicted, "moe alloc accounting (under)");
+    assert(delta <= predicted + 8192, "moe alloc accounting (over)");
     return 0;
 }
 
@@ -1010,6 +1177,14 @@ fn test_config_caps(): i64 {
     assert(model_config_ok_arch(25, 32, 16, 4, 4, 3, 1, 16, 2, 0) == 0, "decoupled d_rope < 2 rejected");
     assert(model_config_ok_arch(25, 32, 16, 4, 4, 3, 1, 16, 2, 34) == 0, "decoupled d_rope > C rejected");
     assert(model_config_ok_arch(25, 32, 16, 4, 4, 3, 1, 16, 1, 4) == 0, "non-decoupled with rope_dim != 0 rejected");
+    # MoE descriptor (M13): 1 <= num_experts <= 256, 1 <= topk <= num_experts.
+    assert(model_config_ok_moe(25, 32, 16, 4, 4, 3, 0, 0, 0, 0, 8, 2) == 1, "valid moe (8 experts, top-2) accepted");
+    assert(model_config_ok_moe(25, 32, 16, 4, 4, 3, 0, 0, 0, 0, 1, 1) == 1, "moe experts=1 (dense) accepted");
+    assert(model_config_ok_moe(25, 32, 16, 4, 4, 3, 0, 0, 0, 0, 256, 2) == 1, "moe experts at cap (256) accepted");
+    assert(model_config_ok_moe(25, 32, 16, 4, 4, 3, 0, 0, 0, 0, 257, 2) == 0, "moe experts over cap (257) rejected");
+    assert(model_config_ok_moe(25, 32, 16, 4, 4, 3, 0, 0, 0, 0, 0, 1) == 0, "moe experts = 0 rejected");
+    assert(model_config_ok_moe(25, 32, 16, 4, 4, 3, 0, 0, 0, 0, 8, 9) == 0, "moe topk > experts rejected");
+    assert(model_config_ok_moe(25, 32, 16, 4, 4, 3, 0, 0, 0, 0, 8, 0) == 0, "moe topk = 0 rejected");
     return 0;
 }
 
@@ -1186,6 +1361,51 @@ fn _ckpt_compat_check(ver, hdr_fields): i64 {
 fn test_ckpt_v1_compat(): i64 { return _ckpt_compat_check(1, 12); }
 fn test_ckpt_v2_compat(): i64 { return _ckpt_compat_check(2, 13); }
 fn test_ckpt_v3_compat(): i64 { return _ckpt_compat_check(3, CKPT_HDR_V3()); }
+fn test_ckpt_v4_compat(): i64 { return _ckpt_compat_check(4, CKPT_HDR_V4()); }   # pre-MoE: synthesizes dense
+
+# Checkpoint v5 round-trip + hostile rejections for the MoE descriptor (M13.4):
+# a MoE model's router gate + per-expert weights serialize, round-trip bit-for-bit
+# (params + the experts/topk fields), and the v5 loader rejects an out-of-range
+# num_experts (-44) / topk (-45) and an NP that disagrees with the descriptor (-10).
+fn test_ckpt_moe(): i64 {
+    var V = build_corpus();
+    model_init_moe(V, 8, 4, 2, 2, 1, 1, f64_from(0), 9, 0, 0, 0, 0, 8, 2);   # MHA + 8 experts, top-2
+    assert(g_num_experts == 8, "moe model built");
+    assert(g_expert_topk == 2, "topk installed");
+    var np = g_NP;
+    var snap = t_alloc(np); t_copy(snap, g_params, np);
+    var sz = ckpt_size();
+    var ck = alloc(sz); ckpt_serialize(ck);
+    assert(load64(ck + 1 * 8) == 5, "moe checkpoint is v5");
+    assert(load64(ck + 20 * 8) == 8, "num_experts recorded");
+    assert(load64(ck + 21 * 8) == 2, "expert_topk recorded");
+    # scramble to a dense model, then reload the MoE checkpoint
+    model_init(V, 8, 4, 2, 2, 1, 1, f64_from(0), 31);
+    assert(g_num_experts == 1, "reset to dense");
+    assert(ckpt_load_buf(ck, sz) == 0, "moe checkpoint loads");
+    assert(g_num_experts == 8, "num_experts restored");
+    assert(g_expert_topk == 2, "expert_topk restored");
+    var mism = 0; var i = 0;
+    while (i < np) {
+        if (load64(g_params + i * 8) != load64(snap + i * 8)) { mism = mism + 1; }
+        i = i + 1;
+    }
+    assert(mism == 0, "moe params restored bit-for-bit");
+    # hostile descriptor rejections (bound-before-alloc, codes -44/-45/-10)
+    var bad = alloc(sz);
+    t_copy(bad, ck, sz / 8); store64(bad + 20 * 8, 0);
+    assert(ckpt_load_buf(bad, sz) == (0 - 44), "num_experts = 0 rejected (-44)");
+    t_copy(bad, ck, sz / 8); store64(bad + 20 * 8, 257);
+    assert(ckpt_load_buf(bad, sz) == (0 - 44), "num_experts over cap (257) rejected (-44)");
+    t_copy(bad, ck, sz / 8); store64(bad + 21 * 8, 9);
+    assert(ckpt_load_buf(bad, sz) == (0 - 45), "topk > num_experts rejected (-45)");
+    t_copy(bad, ck, sz / 8); store64(bad + 21 * 8, 0);
+    assert(ckpt_load_buf(bad, sz) == (0 - 45), "topk = 0 rejected (-45)");
+    # a num_experts that passes its bound but disagrees with NP fails the np gate
+    t_copy(bad, ck, sz / 8); store64(bad + 20 * 8, 4);
+    assert(ckpt_load_buf(bad, sz) == (0 - 10), "num_experts inconsistent with NP rejected (-10)");
+    return 0;
+}
 
 # With a corpus already loaded, a checkpoint whose vocab differs must be
 # rejected (-15) rather than silently mis-indexing g_data.
@@ -1351,12 +1571,14 @@ fn test_ckpt_v4_descriptor(): i64 {
     model_init(V, 8, 4, 2, 2, 1, 0, f64_from(0), 23);
     var sz = ckpt_size();
     var ck = alloc(sz); ckpt_serialize(ck);
-    # the serializer emits v4 with the default descriptor
-    assert(load64(ck + 1 * 8) == 4, "serializer writes version 4");
+    # the serializer emits v5 with the default descriptor + dense MLP
+    assert(load64(ck + 1 * 8) == 5, "serializer writes version 5");
     assert(load64(ck + 16 * 8) == 0, "attn_kind defaults to mha (0)");
     assert(load64(ck + 17 * 8) == 0, "pos_kind defaults to learned-abs (0)");
     assert(load64(ck + 18 * 8) == 0, "latent_dim defaults to 0");
     assert(load64(ck + 19 * 8) == 0, "rope_dim defaults to 0");
+    assert(load64(ck + 20 * 8) == 1, "num_experts defaults to 1 (dense)");
+    assert(load64(ck + 21 * 8) == 1, "expert_topk defaults to 1");
     # round-trip restores the descriptor into the globals
     model_init(V, 8, 4, 2, 2, 1, 0, f64_from(0), 47);   # scramble
     assert(ckpt_load_buf(ck, sz) == 0, "v4 default-descriptor checkpoint loads");
@@ -1786,6 +2008,80 @@ fn test_kv_mla(): i64 {
     return 0;
 }
 
+# M13.3 gate: MoE cached decode must be BIT-IDENTICAL to the uncached reference.
+# The MoE MLP is position-independent (the router + experts depend only on the
+# row, no cross-row term in the forward combine — only the aux loss is cross-row,
+# and decode computes no loss), so the cached single-row moe_fwd must reproduce
+# the batch row exactly. Same two-way verification as the MHA/MLA paths.
+fn _gen_bits_moe(C, T, nh, NL, NE, TK, pstep, NG): i64 {
+    var V = build_corpus();
+    model_init_moe(V, C, T, nh, nh, NL, 1, f64_from(0), 21, 0, 0, 0, 0, NE, TK);   # MHA + MoE
+    train(8, 8, 2, _lrc(3, 1000), _lrc(3, 10000), 2, f64_from(1), 1000000000);
+    g_training = 0;
+    var ids = t_alloc(T);
+    var i = 0;
+    while (i < T) { store64(ids + i * 8, (i * 3 + 1) % V); i = i + 1; }
+    # (1) prefill logits bits at prefix lengths 1, 1+pstep, ... and T
+    var mism = 0;
+    var m = 1;
+    while (m <= T) {
+        gen_prime(ids, m, 1);
+        var cs = t_alloc(V); t_copy(cs, R_logits, V);
+        gen_prime(ids, m, 0);
+        var urow = A_logits + (m - 1) * g_V * 8;
+        var v = 0;
+        while (v < V) {
+            if (load64(cs + v * 8) != load64(urow + v * 8)) { mism = mism + 1; }
+            v = v + 1;
+        }
+        if ((m < T) && (m + pstep > T)) { m = T; }
+        else { m = m + pstep; }
+    }
+    assert(mism == 0, "moe prefill logits bit-identical at every prefix");
+    # (2) decode across slide boundaries, greedy then temp 0.8
+    var outA = t_alloc(NG); var outB = t_alloc(NG);
+    var fin = t_alloc(V);
+    var tt = 0;
+    while (tt < 2) {
+        var temp = f64_from(0);
+        if (tt == 1) { temp = _lrc(8, 10); }
+        _rng_state = 424242 + tt;
+        gen_prime(ids, T, 1);
+        gen_decode(NG, temp, 1, outA, 0);
+        t_copy(fin, R_logits, V);
+        _rng_state = 424242 + tt;
+        gen_prime(ids, T, 0);
+        gen_decode(NG, temp, 0, outB, 0);
+        var dm = 0;
+        i = 0;
+        while (i < NG) {
+            if (load64(outA + i * 8) != load64(outB + i * 8)) { dm = dm + 1; }
+            i = i + 1;
+        }
+        assert(dm == 0, "moe decode ids identical (cached vs uncached)");
+        var urow2 = A_logits + (G_n - 1) * g_V * 8;
+        var lm = 0;
+        var v2 = 0;
+        while (v2 < V) {
+            if (load64(fin + v2 * 8) != load64(urow2 + v2 * 8)) { lm = lm + 1; }
+            v2 = v2 + 1;
+        }
+        assert(lm == 0, "moe final logits bit-identical after slides");
+        tt = tt + 1;
+    }
+    return 0;
+}
+# MHA + MoE configs across the SIMD/tail head dims, top-1 / top-2 / top-K=N,
+# odd T (odd GEN_SHIFT), and a degenerate 2-token window. NL=2, 3T decode tokens.
+fn test_kv_moe(): i64 {
+    _gen_bits_moe(16, 8, 2, 2, 4, 2, 1, 24);    # hd=8, 4 experts top-2
+    _gen_bits_moe(12, 7, 2, 2, 8, 2, 1, 21);    # hd=6 scalar tail; odd T; 8 experts
+    _gen_bits_moe(20, 5, 2, 2, 4, 1, 1, 15);    # hd=10 tail; top-1 (single-expert combine)
+    _gen_bits_moe(16, 6, 4, 2, 3, 3, 1, 18);    # hd=4; K = N (every expert active)
+    _gen_bits_moe(12, 2, 2, 2, 4, 2, 1, 6);     # degenerate 2-token window (shift 1)
+    return 0;
+}
+
 # M12.2/increment-4 gate: coupled RoPE (pos_kind=1) cached decode must be
 # BIT-IDENTICAL to the uncached reference. Same two-way verification as the MHA
 # suite, on the rope path: the cached row rotates q_row + the appended K row by
@@ -2032,6 +2328,8 @@ fn main(): i64 {
     test_gelu();
     test_softmax_xent();
     test_dropout();
+    test_moe_op();
+    test_moe_aux();
     test_simd_contract();
     test_group("attention grad-check");
     test_attention();
@@ -2045,6 +2343,7 @@ fn main(): i64 {
     test_model_mla();
     test_model_rope();
     test_model_mla_dec();
+    test_model_moe();
     test_head_tail();
     test_group("persistence");
     test_resume_determinism();
@@ -2054,6 +2353,7 @@ fn main(): i64 {
     test_param_layout();
     test_param_layout_mla();
     test_param_layout_mla_dec();
+    test_param_layout_moe();
     test_alloc_accounting();
     test_config_caps();
     test_ckpt_reject();
@@ -2064,7 +2364,9 @@ fn main(): i64 {
     test_ckpt_v1_compat();
     test_ckpt_v2_compat();
     test_ckpt_v3_compat();
+    test_ckpt_v4_compat();
     test_ckpt_v4_descriptor();
+    test_ckpt_moe();
     test_ckpt_vocab_mismatch();
     test_group("bpe tokenizer");
     test_bpe_known();
@@ -2080,6 +2382,7 @@ fn main(): i64 {
     test_kv_preset();
     test_kv_vocab300();
     test_kv_mla();
+    test_kv_moe();
     test_kv_rope();
     test_kv_dec();
     test_group("robustness");

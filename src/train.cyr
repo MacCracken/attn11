@@ -413,6 +413,7 @@ fn eval_corpus(): i64 {
     if ((g_data == 0) || (g_datalen < g_T + 1)) { return 0 - 1; }
     var was_training = g_training;
     g_training = 0;
+    moe_disp_reset();                  # MoE: measure routing entropy over this pass
     var T = g_T;
     var s = 0;
     while (s + T + 1 <= g_datalen) {
@@ -426,7 +427,12 @@ fn eval_corpus(): i64 {
             t = t + 1;
         }
         var loss = model_forward();
-        g_eval_nats = f64_add(g_eval_nats, f64_mul(loss, f64_from(T)));
+        # CROSS-ENTROPY only: model_forward returns CE + Σ aux (the training
+        # objective), but bits/byte must be the pure CE so it stays comparable
+        # across dense/MoE and across N. g_aux_loss is exactly 0 in the dense
+        # path, so this stays byte-neutral there.
+        g_eval_nats = f64_add(g_eval_nats, f64_mul(f64_sub(loss, g_aux_loss), f64_from(T)));
+        moe_disp_accum();              # tally this window's expert dispatches (no-op if dense)
         g_eval_tokens = g_eval_tokens + T;
         s = s + T;
     }

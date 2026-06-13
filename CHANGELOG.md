@@ -4,6 +4,82 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-06-12
+
+**Mixture of Experts (M13, E8) — the first FFN-density axis on the 1.x arc.** The
+dense GELU MLP in each block becomes **N experts + a top-K router**
+(`--experts N --expert-topk K`), decoupling parameter count from per-token FLOPs.
+The earned milestone is the **router backward**: a discrete top-K pick (frozen,
+lower-index tie-break — bit-reproducible cross-arch) feeds a renormalized softmax
+combine (Mixtral-style; the normalizer cancels), and a Switch-style load-balance
+auxiliary loss keeps the experts from collapsing — **both hand-derived and
+finite-difference grad-checked**. Opt-in and additive: `--experts 1` is the dense
+baseline, so a no-flag run is **byte-identical**. Checkpoint **v5** records the
+descriptor; v1–v4 still load.
+
+### Added
+- **`--experts N` / `--expert-topk K`** (N in 1..256; 1 = dense; K active
+  experts/token, default 2). Per block: a bias-free router gate `C → N`, N experts
+  each the dense `(C→F, GELU, F→C)` quad, packed array-of-structs (expert 0 aliases
+  the dense MLP offsets, so the dense layout is unchanged). Output is the
+  gate-weighted sum over the top-K experts.
+- **Router combine op** (`moe_fwd`/`moe_bwd`, `ops.cyr`): router logits → top-K
+  (frozen tie-break) → softmax over the selected logits → expert MLPs, gate-weighted.
+  The backward sends gradient ONLY to the selected logits (straight-through for the
+  discrete pick), composes each selected expert's MLP backward scaled by its gate,
+  and accumulates tokens that share an expert. Per-op grad-checked (`test_moe_op`,
+  1e-4) incl. top-1 (renorm gate ≡ 1 → zero combine gradient) and K=N edges.
+- **Load-balance aux loss** (`moe_aux_fwd`/`moe_aux_dr`/`moe_aux_bwd`, Switch,
+  arXiv:2101.03961): `L_aux = α·N·Σ fᵢ·Pᵢ` (α = 0.01), with the dispatch fraction
+  `fᵢ` held constant (straight-through) and the mean router prob `Pᵢ`
+  differentiated. Grad-checked against finite differences (`test_moe_aux`, 1e-5);
+  added to the CE training loss, off the eval/bits-per-byte path.
+- **Checkpoint v5** (`persist.cyr`): header slots `[20] num_experts`,
+  `[21] expert_topk`; `ckpt_expected_np_moe` mirrors the expert+gate layout; new
+  hostile-rejection codes `-44` (num_experts out of `1..256`) / `-45`
+  (topk out of `1..N`), both bound **before** allocation. v1–v4 load (synthesize
+  the dense MLP). Round-trip + rejection tests (`test_ckpt_moe`, `test_ckpt_v4_compat`).
+- **Expert-utilization metric**: per-expert dispatch histogram + `moe_entropy`
+  (normalized routing entropy, 1 = balanced, 0 = collapse), accumulated over the
+  `--eval` pass and printed alongside total / per-token-active params.
+- **Density-sweep experiment** (X009, `scripts/moe-sweep.sh`) + a MoE bench entry
+  (train step + cached-gen + param count, `attn11.bcyr`).
+
+### Changed
+- **Toolchain pin `6.2.1 → 6.2.2`** (`cyrius.cyml`), with `cyrius update`
+  resyncing `./lib/` (byte-identical snapshot — a clean patch realign; the pin and
+  snapshot move together). Re-verified green on the realigned compiler.
+- `model_init_moe` / `model_config_ok_moe` / `model_alloc_bytes_moe` /
+  `ckpt_expected_np_moe` extend the `_arch` forms with `(num_experts, topk)`; the
+  `_arch` forms delegate with the dense default, so every existing caller is
+  unchanged. `eval_corpus` now reports **pure cross-entropy** bits/byte (subtracts
+  the aux term; byte-neutral for the dense path).
+
+### Performance
+- MoE train step (default config, 8 experts, top-2): **~6.9 ms** vs the dense
+  **~3.6 ms** (top-2 = two active expert MLPs + the router); 215 648 params vs the
+  dense 39 488. Cached generation ~273 µs/token.
+- Density sweep (default config, 1200 steps, embedded corpus, top-2): total params
+  scale ~linearly with N (39 K → 1.62 M at N=64) while **per-token-active params stay
+  ~65–71 K**; **routing entropy 0.993–0.999** (the aux loss keeps load balanced even
+  at N=64); bits/byte best at N=8–16, rising past N=16 (over-parameterization at
+  reference scale — the expected honest caveat). See X009.
+
+### Tests
+- **572 → 673** checks (x86_64 AND aarch64/qemu): `test_moe_op`, `test_moe_aux`,
+  `test_model_moe` (full-model, 1e-3), `test_param_layout_moe`, `test_kv_moe`
+  (cached-vs-uncached bit-identity, top-1/top-2/K=N + odd-T + 2-token window),
+  `test_ckpt_moe` (v5 round-trip + `-44`/`-45`/`-10` rejections), `test_ckpt_v4_compat`,
+  plus MoE alloc-accounting and config-cap pins. Fuzz extended (v5 base image; the
+  `num_experts` field in the wild-field + boundary-combination modes).
+
+### Notes
+- The router/aux backward is the only new hand-derived math; everything else
+  composes grad-checked pieces (`linear`, `gelu`, `softmax`). A vidya-corpus
+  perplexity bake-off (MoE density vs dense vs the M12 variants) is the natural
+  follow-on X-entry. New decision: **ADR 0008** (router combine + aux + frozen
+  tie-break + the `experts==1`-is-dense invariant).
+
 ## [1.2.4] - 2026-06-12
 
 **Toolchain realignment + docs.** A maintenance release — no feature change, the

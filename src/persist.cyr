@@ -1,13 +1,14 @@
 # attn11 — model checkpoints (save / load with validated, deterministic resume).
 #
-# Format v4 (all i64, native little-endian via store64/load64):
+# Format v5 (all i64, native little-endian via store64/load64):
 #   [0]  magic     [1] version    [2] V      [3] C       [4] T
 #   [5]  nh        [6] NL         [7] bias   [8] dropout(f64) [9] NP
 #   [10] step      [11] rng_state [12] nkv   [13] tok_kind (0=byte, 1=BPE)
 #   [14] base_vocab Vb             [15] n_merges K       (V = Vb + K)
 #   [16] attn_kind [17] pos_kind   [18] latent_dim d_c   [19] rope_dim d_rope
-#   [20 .. 20+Vb)         base vocab (id -> byte value)
-#   [20+Vb .. 20+Vb+2K)   merge pairs (left id, right id), in learned order
+#   [20] num_experts (1 = dense)   [21] expert_topk      (MoE, M13, E8)
+#   [22 .. 22+Vb)         base vocab (id -> byte value)
+#   [22+Vb .. 22+Vb+2K)   merge pairs (left id, right id), in learned order
 #   then NP f64 g_params, NP f64 g_adam_m, NP f64 g_adam_v
 # Saved state is exactly what a bit-for-bit resume needs: weights, optimizer
 # moments, the completed-step counter, the PRNG state, the tokenizer (learned
@@ -16,11 +17,12 @@
 # defaults to the current MHA / learned-absolute transformer; only those defaults
 # are accepted until MLA/RoPE land, so a v4 save here is a byte-identical resume.
 #
-# v1 (pre-GQA, ≤0.6.0, 12-field), v2 (pre-BPE, 0.7.0, 13-field), and v3 (pre-MLA,
-# 1.0/1.1, 16-field) are still accepted: v1 loads as nkv = nh; v1/v2 as
-# tok_kind = byte, no merges; v1/v2/v3 carry no descriptor and synthesize the
-# default (mha / learned-abs). A byte-kind, default-descriptor v4 body is
-# bit-identical to v3's behind the longer header. Saves always write v4.
+# v1 (pre-GQA, ≤0.6.0, 12-field), v2 (pre-BPE, 0.7.0, 13-field), v3 (pre-MLA,
+# 1.0/1.1, 16-field), and v4 (pre-MoE, 1.2.x, 20-field) are still accepted: v1
+# loads as nkv = nh; v1/v2 as tok_kind = byte, no merges; v1/v2/v3 synthesize the
+# default descriptor (mha / learned-abs); v1..v4 synthesize the dense MLP
+# (num_experts = 1, topk = 1). A dense, default-descriptor v5 body is bit-identical
+# to v4's behind the 2-field-longer header. Saves always write v5.
 #
 # Loading is hostile-input-safe: magic/version, config bounds, the tokenizer
 # triple (kind, Vb, K), a recomputed parameter count, the EXACT total size,
@@ -29,8 +31,9 @@
 # negative error code, never a crash or a decode loop.
 
 fn CKPT_MAGIC(): i64 { return 0x4154544E31317631; }   # "ATTN11v1" (file family)
-fn CKPT_VER(): i64 { return 4; }
-fn CKPT_HDR(): i64 { return 20; }                     # v4 header i64 fields
+fn CKPT_VER(): i64 { return 5; }
+fn CKPT_HDR(): i64 { return 22; }                     # v5 header i64 fields
+fn CKPT_HDR_V4(): i64 { return 20; }                  # v4 header i64 fields
 fn CKPT_HDR_V3(): i64 { return 16; }                  # v3 header i64 fields
 fn CKPT_HDR_V2(): i64 { return 13; }                  # v2 header i64 fields
 fn CKPT_HDR_V1(): i64 { return 12; }                  # v1 header i64 fields
@@ -56,6 +59,11 @@ fn ckpt_expected_np(V, C, T, nh, NL, bias, nkv): i64 {
     return ckpt_expected_np_arch(V, C, T, nh, NL, bias, nkv, 0, 0, 0, 0);   # mha
 }
 fn ckpt_expected_np_arch(V, C, T, nh, NL, bias, nkv, attn_kind, d_c, pos_kind, d_rope): i64 {
+    return ckpt_expected_np_moe(V, C, T, nh, NL, bias, nkv, attn_kind, d_c, pos_kind, d_rope, 1, 1);   # dense
+}
+# MoE-aware (M13): the MLP weight region mirrors model.cyr's _mlp_weight_size —
+# dense (Wfc+bfc+Wproj+bproj) or N experts (each that quad) + the router gate(C*N).
+fn ckpt_expected_np_moe(V, C, T, nh, NL, bias, nkv, attn_kind, d_c, pos_kind, d_rope, num_experts, topk): i64 {
     var F = 4 * C;
     var Ckv = nkv * (C / nh);
     var emb = V * C + T * C;
@@ -64,7 +72,9 @@ fn ckpt_expected_np_arch(V, C, T, nh, NL, bias, nkv, attn_kind, d_c, pos_kind, d
         kvw = C * d_c + 2 * d_c * C;                # MLA: W_DKV + W_UK + W_UV
         if (pos_kind == 2) { kvw = kvw + C * nh * d_rope + C * d_rope; }   # + W_QR + W_KR (decoupled)
     }
-    var blkbase = 5 * C + 2 * C * C + kvw + 2 * C * F + F;
+    var mlpw = 2 * C * F + F + C;                    # dense: Wfc + bfc + Wproj + bproj
+    if (num_experts > 1) { mlpw = num_experts * (2 * C * F + F + C) + C * num_experts; }   # N experts + gate
+    var blkbase = 4 * C + 2 * C * C + kvw + mlpw;
     var blk = blkbase;
     if (bias == 1) { blk = blkbase + 2 * C + 2 * Ckv; }    # MLA: Ckv == C, so 4C, same as full MHA
     return emb + NL * blk + 2 * C;
@@ -105,6 +115,9 @@ fn ckpt_serialize(buf): i64 {
     store64(buf + 17 * 8, g_pos_kind);
     store64(buf + 18 * 8, g_latent_dim);
     store64(buf + 19 * 8, g_rope_dim);
+    # M13 MoE descriptor (E8) — defaults to the dense MLP (1 expert, top-1)
+    store64(buf + 20 * 8, g_num_experts);
+    store64(buf + 21 * 8, g_expert_topk);
     var base = CKPT_HDR();
     var i = 0;
     while (i < vb) { store64(buf + (base + i) * 8, load64(g_vocab + i * 8)); i = i + 1; }
@@ -126,11 +139,12 @@ fn ckpt_load_buf(buf, len): i64 {
     if (len < CKPT_HDR_V1() * 8) { return 0 - 1; }
     if (load64(buf + 0 * 8) != CKPT_MAGIC()) { return 0 - 2; }
     var ver = load64(buf + 1 * 8);
-    if ((ver != 1) && (ver != 2) && (ver != 3) && (ver != 4)) { return 0 - 3; }
+    if ((ver != 1) && (ver != 2) && (ver != 3) && (ver != 4) && (ver != 5)) { return 0 - 3; }
     var hdr = CKPT_HDR_V1();
     if (ver == 2) { hdr = CKPT_HDR_V2(); }
     if (ver == 3) { hdr = CKPT_HDR_V3(); }
-    if (ver == 4) { hdr = CKPT_HDR(); }
+    if (ver == 4) { hdr = CKPT_HDR_V4(); }
+    if (ver == 5) { hdr = CKPT_HDR(); }
     if (len < hdr * 8) { return 0 - 1; }
     var V = load64(buf + 2 * 8);
     var C = load64(buf + 3 * 8);
@@ -225,13 +239,26 @@ fn ckpt_load_buf(buf, len): i64 {
     } else {
         if (d_c != 0) { return 0 - 42; }     # mha must not carry a latent dim
     }
-    var expnp = ckpt_expected_np_arch(V, C, T, nh, NL, bias, nkv, attn_kind, d_c, pos_kind, d_rope);
+    # M13 MoE descriptor (v5). v1..v4 carry no MoE fields and synthesize the dense
+    # MLP (num_experts = 1, top-1), so they cannot hit -44/-45. Validated BEFORE
+    # allocation: num_experts in [1, 256] bounds the per-expert weight region so
+    # N*(2CF+...) cannot overflow the np/size/alloc gates (bound-before-alloc);
+    # 1 <= topk <= num_experts.
+    var num_experts = 1;
+    var topk = 1;
+    if (ver >= 5) {
+        num_experts = load64(buf + 20 * 8);
+        topk = load64(buf + 21 * 8);
+    }
+    if ((num_experts < 1) || (num_experts > 256)) { return 0 - 44; }
+    if ((topk < 1) || (topk > num_experts)) { return 0 - 45; }
+    var expnp = ckpt_expected_np_moe(V, C, T, nh, NL, bias, nkv, attn_kind, d_c, pos_kind, d_rope, num_experts, topk);
     if ((np < 1) || (np > CKPT_MAX_NP())) { return 0 - 13; }
     if (np != expnp) { return 0 - 10; }
     # shape-valid is not enough: the nh*T*T attention arenas (independent of
     # np) and the 4 parameter vectors must also fit the allocator. Reject any
     # config whose model_init total would exceed the cap — BEFORE allocating.
-    var abytes = model_alloc_bytes_arch(V, C, T, nh, nkv, NL, np, attn_kind, d_c, pos_kind, d_rope);
+    var abytes = model_alloc_bytes_moe(V, C, T, nh, nkv, NL, np, attn_kind, d_c, pos_kind, d_rope, num_experts, topk);
     if (abytes > CKPT_MAX_MODEL_BYTES()) { return 0 - 18; }
     var need = (hdr + Vb + 2 * K + 3 * np) * 8;
     if (len != need) { return 0 - 11; }
@@ -291,7 +318,7 @@ fn ckpt_load_buf(buf, len): i64 {
     }
     # validated — build the model and restore state
     var was_bpe = g_bpe_on;
-    model_init_arch(V, C, T, nh, nkv, NL, bias, drop, 1, attn_kind, d_c, pos_kind, d_rope);
+    model_init_moe(V, C, T, nh, nkv, NL, bias, drop, 1, attn_kind, d_c, pos_kind, d_rope, num_experts, topk);
     g_vocab = t_alloc(256);
     g_char2id = t_alloc(256);
     i = 0;
@@ -336,6 +363,8 @@ fn ckpt_load_buf(buf, len): i64 {
     g_pos_kind = pos_kind;
     g_latent_dim = d_c;
     g_rope_dim = d_rope;
+    g_num_experts = num_experts;
+    g_expert_topk = topk;
     return 0;
 }
 

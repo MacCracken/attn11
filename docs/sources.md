@@ -80,6 +80,24 @@ rung; the **decoupled** variant for MLA (`--pos-kind rope-decoupled`, 1.2.3,
 per DeepSeek-V2 (arXiv:2405.04434, above) — the score splits into content + a
 shared-key rope term scaled by `1/sqrt(hd + d_rope)`.
 
+### Mixture of Experts (sparse FFN — top-K router + load-balance aux)
+**Shazeer, N., Mirhoseini, A., Maziarz, K., Davis, A., Le, Q., Hinton, G., Dean, J.
+(2017).** "Outrageously Large Neural Networks: The Sparsely-Gated
+Mixture-of-Experts Layer." *ICLR 2017.* arXiv:[1701.06538](https://arxiv.org/abs/1701.06538).
+**Fedus, W., Zoph, B., Shazeer, N. (2021).** "Switch Transformers: Scaling to
+Trillion Parameter Models with Simple and Efficient Sparsity." *JMLR 2022.*
+arXiv:[2101.03961](https://arxiv.org/abs/2101.03961) — the load-balance auxiliary
+loss `α·N·Σ fᵢ·Pᵢ` attn11 uses (`moe_aux_*`).
+**Jiang, A.Q., Sablayrolles, A., Roux, A., et al. (2024).** "Mixtral of Experts."
+arXiv:[2401.04088](https://arxiv.org/abs/2401.04088) — the renormalized top-K
+softmax combine (softmax over the selected logits) attn11 uses for the gate
+weights (`moe_fwd`/`moe_bwd`).
+Used in: `src/ops.cyr` (`moe_fwd`/`moe_bwd` router + combine, `moe_aux_*`),
+`src/model.cyr` (`_mlp_weight_size`, `_o_expert`/`_o_Wgate`, the MLP branch on
+`g_num_experts > 1`). `--experts N --expert-topk K`; the discrete top-K pick is a
+frozen lower-index tie-break (bit-reproducible cross-arch), differentiated
+straight-through; see ADR 0008 for the combine/balance/dense-invariant decisions.
+
 ### KV-cache inference (cache K/V per position, one row per decoded token)
 **Pope, R., Douglas, S., Chowdhery, A., et al. (2022).** "Efficiently Scaling
 Transformer Inference." *MLSys 2023.* arXiv:[2211.05102](https://arxiv.org/abs/2211.05102).

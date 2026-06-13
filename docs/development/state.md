@@ -5,17 +5,27 @@
 
 ## Version
 
-**1.2.4** — *Toolchain realignment + docs* (maintenance; no feature change). The
-cyrius pin moved **6.1.37 → 6.2.1** to match the installed compiler (`cyrius
-update` resynced the `./lib/` snapshot — pin and snapshot move together); re-
-verified green on the realigned toolchain (**572** checks x86_64 AND aarch64/qemu,
-the `--agnos` static-ELF build, fuzz, lint — `make release` exit 0, no
-shadow/drift warnings). Docs tidied for handoff now that **M12 is complete**: the
-roadmap is forward-facing (M13 leads), `state.md` carries a handoff section, and
-flag/version/pin/count references are swept current. `src/*.cyr` behavior is
-identical to 1.2.3; only the pin, `cyrius.lock`, `VERSION`/`CFG_VERSION`, and docs
-move.
-(1.2.3 — *Decoupled RoPE* (M12 increment 5, **closes M12**; ADR 0007):
+**1.3.0** — *Mixture of Experts* (M13, E8, **opens the FFN-density axis**; ADR
+0008). The dense GELU MLP in each block becomes **N experts + a top-K router**:
+`--experts N --expert-topk K` (N in 1..256, default topk 2; `--experts 1` = the
+byte-identical dense baseline). The milestone is the **router backward** —
+a discrete top-K pick (frozen, lower-index tie-break, bit-reproducible cross-arch)
+→ a Mixtral-style renormalized top-K softmax combine (gradient only to the
+selected logits, straight-through) + a Switch-style load-balance aux loss
+(`α·N·Σ fᵢ·Pᵢ`, dispatch counts held constant) — both hand-derived and
+finite-difference grad-checked (`test_moe_op` 1e-4, `test_moe_aux` 1e-5, full
+model 1e-3; cached-vs-uncached **bit-identity** `test_kv_moe`). Checkpoint **v5**
+records `num_experts`/`topk` (v1–v4 load, synthesizing the dense MLP). The
+density sweep (X009, `scripts/moe-sweep.sh`): total params scale ~linearly with N
+(39 K → 1.62 M at N=64) while per-token-active stays ~65–71 K, **routing entropy
+0.993–0.999** (load stays balanced), bits/byte best at N=8–16. The cyrius pin also
+moved **6.2.1 → 6.2.2** (clean patch realign, byte-identical `./lib/` snapshot).
+Verified green: **673** checks x86_64 AND aarch64/qemu, the `--agnos` static-ELF
+build, fuzz, lint — `make release` exit 0.
+(1.2.4 — *Toolchain realignment + docs* (maintenance): pin **6.1.37 → 6.2.1**,
+`./lib/` resynced, **572** checks green on both arches + agnos + fuzz; roadmap
+trimmed forward-facing, handoff section added. `src/*.cyr` identical to 1.2.3.
+1.2.3 — *Decoupled RoPE* (M12 increment 5, **closes M12**; ADR 0007):
 `--pos-kind rope-decoupled --rope-dim d_rope` — the faithful DeepSeek-V2 form for
 MLA (arXiv:2405.04434). Position rides a **separate `d_rope` channel** that
 bypasses the latent; the score = CONTENT (compressed per-head K) + POSITION (rope
@@ -90,10 +100,12 @@ deterministic resume. 0.2.0: stacked layers, grad clipping, LR schedule.)
 
 ## Toolchain
 
-- **Cyrius pin**: `6.2.1` (in `cyrius.cyml [package].cyrius`) — bumped from
-  6.1.37 in 1.2.4 to realign with the installed cycc (`cyrius update` resynced
-  the `lib/` snapshot; 572 checks green on both arches + the agnos build, no
-  shadow/drift warnings). The pin and snapshot must always move together: cycc
+- **Cyrius pin**: `6.2.2` (in `cyrius.cyml [package].cyrius`) — bumped from
+  6.2.1 in 1.3.0 to realign with the installed cycc (`cyrius update` resynced the
+  `lib/` snapshot; it is byte-identical to the 6.2.1 snapshot — a clean patch
+  realign — so only `cyrius.cyml` moved in the working tree; 673 checks green on
+  both arches + the agnos build, no shadow/drift warnings). (1.2.4 had moved the
+  pin 6.1.37 → 6.2.1.) The pin and snapshot must always move together: cycc
   6.1.32 fixed attn11's agnos argv-capture issue (r15-parked init rsp; the old
   `_agnos_init_rsp` global is gone) during M6, and a new-compiler/old-lib
   mismatch reproduces `argc()==0` under the kernel — the run gate caught it, so
@@ -115,6 +127,10 @@ deterministic resume. 0.2.0: stacked layers, grad clipping, LR schedule.)
   amortizes over T/2 = 32 tokens at ctx 64.
 - KV cache bytes (default config): 24 576 at `nkv=4` → 12 288 (`nkv=2`) →
   6 144 (`nkv=1`).
+- **MoE** (default config, 8 experts, top-2): fwd+bwd step **~6.9 ms** vs the
+  dense ~3.6 ms (top-2 = two active expert MLPs + the `C→N` router), 215 648 params
+  vs dense 39 488; cached gen ~273 µs/token. Per-token compute scales with `topk`,
+  parameter count with `N` (X009 density sweep).
 - BPE merge training (`--bpe K`): one-shot ~110 ms for 256 KB at K=128.
 
 See [`benchmarks.md`](../benchmarks.md) + [`../../bench-history.csv`](../../bench-history.csv).
@@ -188,8 +204,20 @@ checkpoint vs Linux at fixed CPU — `scripts/agnos-smoke.sh`):
   7680 B at d_c=16/d_rope=4). New decoupled core (`attn_dec_core_*`,
   `attn_mla_dec_*`); grad-checked per-op + full-model + cached/uncached
   bit-identical; v4 carries `pos_kind=2`/`rope_dim`.
+- **Mixture of Experts** (1.3.0, `--experts N --expert-topk K`, ADR 0008): the
+  dense MLP becomes N experts (each `C→F→C`) + a bias-free router gate `C→N`;
+  `--experts 1` is the byte-identical dense baseline. Forward: router logits →
+  top-K (frozen lower-index tie-break) → renormalized top-K softmax → gate-weighted
+  expert sum. Backward (`moe_fwd`/`moe_bwd`, `moe_aux_*` in `ops.cyr`): gradient to
+  the selected logits only (straight-through pick) + the Switch load-balance aux
+  loss (`α·N·Σ fᵢ·Pᵢ`, α=0.01, added to CE, off the eval path). Per-op +
+  full-model grad-checked; cached decode bit-identical (MoE MLP is
+  position-independent). Checkpoint v5 carries `num_experts`/`topk`. `--eval`
+  reports total / per-token-active params + routing entropy. Trains + checkpoints
+  + samples; the density sweep is X009 (`scripts/moe-sweep.sh`).
 - CLI: `--corpus --stdin --load --save --steps --gen-only --preset --heads
-  --kv-heads --layers --attn-kind --latent-dim --pos-kind --rope-dim --bpe --eval`
+  --kv-heads --layers --attn-kind --latent-dim --pos-kind --rope-dim --experts
+  --expert-topk --bpe --eval`
 
 Default run (`./build/attn11`, 3 layers): loss `~3.2 → ~0.13` over 2000 steps;
 sampled output reproduces real corpus phrases.
@@ -219,6 +247,10 @@ raises V to `base + K` (≤ 768). `--attn-kind mla --latent-dim d_c` (1 ≤ d_c 
 default C/2) swaps the K/V projections for the low-rank latent (37 952 params at
 d_c=16 vs MHA's 39 488). `--pos-kind rope` (1.2.2; MHA/GQA, even head dim) swaps
 learned-abs positions for coupled RoPE — parameter-free, so `params` is unchanged.
+`--experts N --expert-topk K` (1.3.0; N ≤ 256, default topk 2) replaces the dense
+MLP with N experts + a `C→N` gate: total params scale with N (215 648 at N=8 vs
+39 488 dense) while per-token-active compute scales with topk; `--experts 1` is
+the dense default (params unchanged).
 
 ## Source (`src/`, ~1500 LOC)
 
@@ -226,7 +258,10 @@ learned-abs positions for coupled RoPE — parameter-free, so `params` is unchan
   lines); the f64-array helpers + dense matmul moved to **rosnet**, the PRNG to
   **tyche** (1.1.0 extraction)
 - `ops.cyr` — layernorm, GELU (tanh approx), softmax cross-entropy (forward +
-  backward); `linear_fwd`/`linear_bwd` now resolve from **rosnet**
+  backward); `linear_fwd`/`linear_bwd` now resolve from **rosnet**; plus the
+  **MoE** router/combine (1.3.0) `moe_fwd`/`moe_bwd` (top-K pick + renormalized
+  softmax + per-expert MLP, gradient to selected logits only) and the Switch
+  load-balance aux (`moe_aux_fwd`/`moe_aux_dr`/`moe_aux_bwd`)
 - `attn.cyr` — the shared attention core `attn_core_fwd`/`attn_core_bwd` (causal
   scaled-dot-product softmax/PV), wrapped by `attn_fwd`/`attn_bwd` (MHA/GQA
   projections) and `attn_mla_fwd`/`attn_mla_bwd` (MLA low-rank latent down/up
@@ -254,25 +289,33 @@ learned-abs positions for coupled RoPE — parameter-free, so `params` is unchan
   `model_alloc_bytes_arch` carry the descriptor (the `_arch` forms; the old
   names delegate as MHA). `model_config_ok_arch`/`model_init_arch` also carry
   `pos_kind` (1.2.2: gate rope→even-hd + MHA/GQA); `embed_fwd_n`/`embed_bwd`/
-  `model_fwd_row` skip the learned posemb add/grad under RoPE
+  `model_fwd_row` skip the learned posemb add/grad under RoPE. **MoE** (1.3.0):
+  `_mlp_weight_size()` branches the MLP region dense↔experts (ADR 0008, the second
+  config-dependent region after `_kv_weight_size`), `_o_expert(e)`/`_o_Wgate()`
+  index the experts + gate; the `_moe` forms (`model_init_moe`/`model_config_ok_moe`/
+  `model_alloc_bytes_moe`) carry `num_experts`/`topk` (the `_arch` forms delegate as
+  dense); the block MLP fwd/bwd + `model_fwd_row` + `model_eval_window` branch on
+  `g_num_experts > 1`; `moe_entropy`/`moe_disp_*` report routing-entropy utilization
 - `train.cyr` — byte + **BPE** tokenizer (`bpe_learn`/`tok_encode`/
   `bpe_build_spans`/`tok_emit`), corpus (embedded/file/stdin, raw bytes
   retained), batch sampling, LR schedule, resumable training loop, KV-cached
   generation (`gen_prime`/`gen_decode` + context-shift), `eval_corpus`
-  (CE/token + bits-per-byte)
-- `persist.cyr` — validated **v4** checkpoint serialize/load (tokenizer triple +
+  (CE/token + bits-per-byte — pure CE, excludes the MoE aux term; accumulates the
+  routing-entropy dispatch histogram)
+- `persist.cyr` — validated **v5** checkpoint serialize/load (tokenizer triple +
   merge-table DAG/expansion validation + the v4 architecture descriptor, codes
-  `-40..-43`; `ckpt_expected_np_arch` mirrors the MLA/decoupled layout; `pos_kind=1`
+  `-40..-43`, + the v5 **MoE** descriptor `num_experts`/`topk`, codes `-44`/`-45`;
+  `ckpt_expected_np_moe` mirrors the MLA/decoupled/MoE layout; `pos_kind=1`
   (coupled RoPE) accepted on even-hd MHA images, `pos_kind=2`+`rope_dim` (decoupled)
-  accepted on MLA images with even `2≤d_rope≤C` — bounded before alloc; v1/v2/v3
-  accepted)
+  accepted on MLA images with even `2≤d_rope≤C`, `num_experts∈1..256`/`topk∈1..N`
+  — all bounded before alloc; v1/v2/v3/v4 accepted, synthesizing dense MLP)
 - `main.cyr` — CLI arg parsing (incl. `--preset`/`--heads`/`--kv-heads`/
-  `--layers`/`--attn-kind`/`--latent-dim`/`--pos-kind`/`--rope-dim`/`--bpe`/`--eval`,
-  null-guarded `_atoi`) + orchestration
+  `--layers`/`--attn-kind`/`--latent-dim`/`--pos-kind`/`--rope-dim`/`--experts`/
+  `--expert-topk`/`--bpe`/`--eval`, null-guarded `_atoi`) + orchestration
 
 ## Tests
 
-- `tests/attn11.tcyr` — **572 checks**: finite-difference gradient checks
+- `tests/attn11.tcyr` — **673 checks**: finite-difference gradient checks
   (every op incl. dropout; attention at head dims 6/8/10 and GQA/MQA at
   `nkv ∈ {1, 2, nh}` incl. `dWk`/`dWv`/`dbv`; the `|dbk| ≈ 0`
   softmax-shift-invariance pin; 2-layer full model at MHA and GQA), the **MLA
@@ -311,14 +354,21 @@ learned-abs positions for coupled RoPE — parameter-free, so `params` is unchan
   cached-vs-uncached bit-identity across shifts incl. a non-even content head dim;
   `test_param_layout_mla_dec` — the W_QR/W_KR aliasing pin; `test_ckpt_dec` — v4
   `pos_kind=2`/`rope_dim` round-trip + decoupled hostile rejections; alloc-accounting
-  + config-cap decoupled gates), a
+  + config-cap decoupled gates), the **MoE suite** (1.3.0: `test_moe_op` — per-op
+  combine grad-check (dx/dWg/dWe, 1e-4) at 4 configs incl. top-1 and K=N;
+  `test_moe_aux` — the load-balance aux backward vs FD (1e-5, non-uniform dispatch);
+  `test_model_moe` — full-model wiring (dWe/dWgate/dWq/dtokemb, 1e-3); `test_kv_moe`
+  — cached-vs-uncached bit-identity (top-1/top-2/K=N, odd T, 2-token window);
+  `test_param_layout_moe` — the experts+gate tiling/aliasing pin; `test_ckpt_moe` —
+  v5 round-trip + `-44`/`-45`/`-10` rejections; `test_ckpt_v4_compat`; MoE
+  alloc-accounting + config-cap gates), a
   **soak/leak** test and a **NaN guard** test. All pass on x86_64 AND aarch64
   (`cyrius test`; aarch64 via qemu).
 - `tests/attn11.bcyr` — benchmark harness (training timings + tokens/sec,
   generation cached/uncached, KV bytes per nkv, MQA timings, **preset
   train+gen**, **MLA latent-cache gen + the cache-bytes table** (latent vs
-  MHA/MQA full-K/V), **RoPE train-step + cached-gen overhead**, **`bpe_learn`
-  cost**).
+  MHA/MQA full-K/V), **RoPE train-step + cached-gen overhead**, **MoE train-step +
+  cached-gen + param count**, **`bpe_learn` cost**).
 - `tests/attn11.fcyr` — fuzz harness: 500 mutated-checkpoint rounds (v2/v3
   header fields incl. nkv/step, + a **boundary-combination** mode: every size
   field at/over its cap at once) + **500 BPE-image rounds** (merge-slot
@@ -361,21 +411,21 @@ _None yet._
 
 See [`roadmap.md`](roadmap.md). **Shipped: v1.0.0 (clean cut) → v1.1.0
 (extraction) → v1.2.0–1.2.4 (M12: MLA core, latent KV-cache decode, coupled +
-decoupled RoPE; then 1.2.4 toolchain realign + docs).** The surface is frozen
-([`STABILITY.md`](../STABILITY.md)) and additive-only past 1.0; the numeric core
-lives in **rosnet** + **tyche**. The 1.x architecture arc now has the full
-attention/position axes: `--attn-kind {mha, mla}` × `--pos-kind {learned, rope,
-rope-decoupled}` (checkpoint v4). **M12 is complete.**
+decoupled RoPE; then 1.2.4 toolchain realign + docs) → v1.3.0 (M13: Mixture of
+Experts).** The surface is frozen ([`STABILITY.md`](../STABILITY.md)) and
+additive-only past 1.0; the numeric core lives in **rosnet** + **tyche**. The 1.x
+arc now has the full attention/position axes `--attn-kind {mha, mla}` ×
+`--pos-kind {learned, rope, rope-decoupled}` **and** the FFN-density axis
+`--experts N --expert-topk K` (checkpoint v5). **M12 and M13 are complete.**
 
-**Next on the arc — M13 (v1.3.0), Mixture of Experts** (E8; full spec in
-[`roadmap.md`](roadmap.md#m13--mixture-of-experts-v130--e8)): the dense GELU MLP
-becomes N experts + a top-K router, `--experts {1,8,16,32,64,128,256}` /
-`--expert-topk K`, checkpoint **v5** (prior versions load). The earned milestone
-is the **router backward** (discrete top-K → straight-through soft gate +
-Switch-style load-balance aux loss, both grad-checked) with a frozen deterministic
-tie-break, and the density-sweep experiment (bits/byte, active-vs-total params,
-expert utilization). Then E4–E6 (mixers / diffusion / ternary) as M14–M16 and
-**M17** reinforcement learning (E9).
+**Next on the arc — M14 (v1.4.0), a second sequence-mixer family** (E4; full spec
+in [`roadmap.md`](roadmap.md)): linear attention → a minimal selective SSM, then a
+per-layer `kind` config to interleave mixer types and sweep the hybrid ratio. This
+is the first non-attention mixer (a large departure), so each new backward lands
+behind its grad-check, perplexity vs the iso-param transformer logged as an
+X-entry. Then E5–E6 (diffusion objective / ternary) as M15–M16 and **M17**
+reinforcement learning (E9). A vidya-corpus bake-off across the M12/M13 axes is
+the natural next X-entry.
 
 ### Handoff — how to pick this up
 
@@ -404,8 +454,12 @@ expert utilization). Then E4–E6 (mixers / diffusion / ternary) as M14–M16 an
 cross-repo edit on the agnos maintainer's side, not actionable here. (2) The
 **MLA absorption** compute optimization (fold `W_UK` into `W_Q` to attend latents
 directly, avoiding the per-step K/V re-materialization in 1.2.1/1.2.3) is deferred
-— it reorders accumulation, so it would ride its own bit-identity story. (3) A
-perplexity bake-off (decoupled vs coupled vs learned MLA, and MoE density) on the
-vidya corpus is the natural next X-series entry once M13 lands. The pin is now
-**6.2.1** (realigned 1.2.4, `lib/` resynced); the cycc argv-capture issue is
-resolved upstream (6.1.32; `docs/architecture/002` retired).
+— it reorders accumulation, so it would ride its own bit-identity story; the MoE
+combine has an analogous folding option but the same caveat. (3) A perplexity
+bake-off (decoupled vs coupled vs learned MLA, and MoE density) on the vidya
+corpus is the natural next X-series entry now that M13 has landed (X009 ran the
+density sweep on the embedded corpus; the vidya-scale run is the follow-on). (4)
+The MoE aux coefficient α is fixed at 0.01 (no `--aux-alpha` flag); an α sweep is
+a small additive follow-on if it earns one. The pin is now **6.2.2** (realigned
+1.3.0, byte-identical `lib/` snapshot); the cycc argv-capture issue is resolved
+upstream (6.1.32; `docs/architecture/002` retired).

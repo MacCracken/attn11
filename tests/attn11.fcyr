@@ -69,6 +69,7 @@ fn main(): i64 {
             store64(work + 4 * 8, 8192 + (fz_pos() % 3));   # T  (cap 8192)
             store64(work + 6 * 8, 128 + (fz_pos() % 3));    # NL (cap 128)
             store64(work + 9 * 8, 4194304 + (fz_pos() % 3));# np (cap 4M) — stresses size arithmetic + check order
+            store64(work + 20 * 8, 256 + (fz_pos() % 3));   # num_experts (cap 256) — stresses N*(2CF+...) arithmetic
         } else {                              # fully random header
             var k = 0;
             while (k < CKPT_HDR()) { store64(work + k * 8, fz_next()); k = k + 1; }

@@ -244,3 +244,314 @@ fn softmax_xent_bwd(probs, targets, dlogits, M, V): i64 {
     }
     return 0;
 }
+
+# ===========================================================================
+# Mixture of Experts (MoE) FFN — the dense GELU MLP becomes N experts + a
+# top-K router (M13, E8). The dense block runs ONE MLP; MoE runs K of N.
+#
+# Forward, per row x (length C):
+#   router logits   r = x · Wg           (Wg: C x N, bias-free)
+#   pick top-K       = the K largest r   (frozen rule: lower index wins ties,
+#                                          bit-reproducible cross-arch — same
+#                                          discipline as the BPE merge tie-break,
+#                                          ADR 0006)
+#   gate weights    g = softmax(r over the K selected logits)  — this is the
+#                       full softmax(r) renormalized over the selected set (the
+#                       normalizer Z cancels), so g sums to 1 over the top-K.
+#   output          y = Σ_{k∈topK} g_k · E_k(x), E_k(x) = down(GELU(up(x))).
+#
+# Backward sends gradient ONLY to the selected logits (straight-through for the
+# discrete pick): dg_k = <dY, E_k(x)>, then the K-way softmax Jacobian
+#   dr_j = g_j·(dg_j − Σ_k g_k·dg_k)   (scattered to selected logit positions),
+# then the gate's linear backward. Each selected expert runs the standard MLP
+# backward scaled by its gate weight; tokens sharing an expert accumulate into
+# that expert's weight grads. Hand-derived, finite-difference grad-checked
+# (test_moe_op). Sources: Shazeer et al. 2017 (arXiv:1701.06538, sparsely-gated
+# MoE); Fedus et al. 2021 (arXiv:2101.03961, Switch); Jiang et al. 2024
+# (arXiv:2401.04088, Mixtral — the top-K renormalized combine). See docs/sources.md.
+#
+# Expert weights are packed array-of-structs: expert e lives at We + e*estride,
+# holding Wfc(C*F) bfc(F) Wproj(F*C) bproj(C); estride = C*F + F + F*C + C. The
+# router gate Wg is a separate C*N block. Caches written by fwd for bwd:
+#   logits(T,N), sel(T,K i64 expert indices), gate(T,K weights),
+#   efc(T*K*F pre-GELU), egg(T*K*F post-GELU).
+# sc: scratch, length >= 2*F + 2*C + K + N.
+# ===========================================================================
+fn _moe_estride(C, F): i64 { return C * F + F + F * C + C; }
+
+fn moe_fwd(x, Wg, We, y, logits, sel, gate, efc, egg, sc, T, C, F, N, K): i64 {
+    var estride = _moe_estride(C, F);
+    var ej = sc;                          # scratch (C): one expert's output row
+    linear_fwd(x, Wg, 0, logits, T, C, N);   # router logits (T,N), bias-free
+    var r = 0;
+    while (r < T) {
+        var lrow = logits + r * N * 8;
+        # ---- frozen top-K selection (strict >, so lower index wins ties) ----
+        var k = 0;
+        while (k < K) {
+            var bi = 0; var bestset = 0; var best = f64_from(0);
+            var j = 0;
+            while (j < N) {
+                var seen = 0; var kk = 0;
+                while (kk < k) { if (load64(sel + (r * K + kk) * 8) == j) { seen = 1; } kk = kk + 1; }
+                if (seen == 0) {
+                    var lv = load64(lrow + j * 8);
+                    if ((bestset == 0) || (f64_gt(lv, best) == 1)) { best = lv; bi = j; bestset = 1; }
+                }
+                j = j + 1;
+            }
+            store64(sel + (r * K + k) * 8, bi);
+            k = k + 1;
+        }
+        # ---- gate = softmax over the K selected logits (max-shift for stability) ----
+        var mx = load64(lrow + load64(sel + (r * K) * 8) * 8);
+        k = 1;
+        while (k < K) {
+            var lv2 = load64(lrow + load64(sel + (r * K + k) * 8) * 8);
+            if (f64_gt(lv2, mx) == 1) { mx = lv2; }
+            k = k + 1;
+        }
+        var sum = f64_from(0);
+        k = 0;
+        while (k < K) {
+            var ev = f64_exp(f64_sub(load64(lrow + load64(sel + (r * K + k) * 8) * 8), mx));
+            store64(gate + (r * K + k) * 8, ev);
+            sum = f64_add(sum, ev);
+            k = k + 1;
+        }
+        var invs = f64_div(f64_from(1), sum);
+        k = 0;
+        while (k < K) {
+            var gw = gate + (r * K + k) * 8;
+            store64(gw, f64_mul(load64(gw), invs));
+            k = k + 1;
+        }
+        # ---- combine: y[r] = Σ_k g_k · E_{sel_k}(x[r]) ----
+        var yr = y + r * C * 8;
+        var c0 = 0;
+        while (c0 < C) { store64(yr + c0 * 8, f64_from(0)); c0 = c0 + 1; }
+        k = 0;
+        while (k < K) {
+            var e = load64(sel + (r * K + k) * 8);
+            var g = load64(gate + (r * K + k) * 8);
+            var Wfc = We + e * estride * 8;
+            var bfc = Wfc + C * F * 8;
+            var Wproj = bfc + F * 8;
+            var bproj = Wproj + F * C * 8;
+            var fcs = efc + (r * K + k) * F * 8;
+            var ggs = egg + (r * K + k) * F * 8;
+            linear_fwd(x + r * C * 8, Wfc, bfc, fcs, 1, C, F);
+            gelu_fwd(fcs, ggs, F);
+            linear_fwd(ggs, Wproj, bproj, ej, 1, F, C);
+            var c = 0;
+            while (c < C) {
+                store64(yr + c * 8, f64_add(load64(yr + c * 8), f64_mul(g, load64(ej + c * 8))));
+                c = c + 1;
+            }
+            k = k + 1;
+        }
+        r = r + 1;
+    }
+    return 0;
+}
+
+# Backward. dY(T,C) -> dx(T,C) [written fresh]; ACCUMULATE dWe (expert weights,
+# same array-of-structs layout as We) and dWg (gate, C*N). sc layout (lengths):
+#   d_gg(F) | d_fc(F) | dxi(C) | ej(C) | dg(K) | dl(N) ; total 2*F+2*C+K+N.
+fn moe_bwd(x, Wg, We, dY, dx, dWg, dWe, sel, gate, efc, egg, sc, T, C, F, N, K): i64 {
+    var estride = _moe_estride(C, F);
+    var d_gg = sc;
+    var d_fc = sc + F * 8;
+    var dxi  = sc + 2 * F * 8;
+    var ej   = sc + (2 * F + C) * 8;
+    var dg   = sc + (2 * F + 2 * C) * 8;
+    var dl   = sc + (2 * F + 2 * C + K) * 8;
+    var z = 0;
+    while (z < T * C) { store64(dx + z * 8, f64_from(0)); z = z + 1; }
+    var r = 0;
+    while (r < T) {
+        var dYr = dY + r * C * 8;
+        var xr = x + r * C * 8;
+        var dxr = dx + r * C * 8;
+        # ---- Phase A: per selected expert — MLP backward + dg_k = <dY[r], E_k> ----
+        var k = 0;
+        while (k < K) {
+            var e = load64(sel + (r * K + k) * 8);
+            var g = load64(gate + (r * K + k) * 8);
+            var Wfc = We + e * estride * 8;
+            var Wproj = Wfc + (C * F + F) * 8;
+            var bproj = Wproj + F * C * 8;
+            var dWfc = dWe + e * estride * 8;
+            var dbfc = dWfc + C * F * 8;
+            var dWproj = dbfc + F * 8;
+            var dbproj = dWproj + F * C * 8;
+            var fcs = efc + (r * K + k) * F * 8;
+            var ggs = egg + (r * K + k) * F * 8;
+            # recompute E_k(x[r]) into ej (= forward output), for dg_k
+            linear_fwd(ggs, Wproj, bproj, ej, 1, F, C);
+            var dgk = f64_from(0);
+            var c = 0;
+            while (c < C) { dgk = f64_add(dgk, f64_mul(load64(dYr + c * 8), load64(ej + c * 8))); c = c + 1; }
+            store64(dg + k * 8, dgk);
+            # d_ej = g · dY[r]  (reuse ej buffer as the down-proj output gradient)
+            c = 0;
+            while (c < C) { store64(ej + c * 8, f64_mul(g, load64(dYr + c * 8))); c = c + 1; }
+            linear_bwd(ggs, Wproj, ej, d_gg, dWproj, dbproj, 1, F, C);   # down: dy=d_ej -> d_gg
+            gelu_bwd(fcs, d_gg, d_fc, F);
+            linear_bwd(xr, Wfc, d_fc, dxi, dWfc, dbfc, 1, C, F);         # up: dy=d_fc -> dxi
+            c = 0;
+            while (c < C) { store64(dxr + c * 8, f64_add(load64(dxr + c * 8), load64(dxi + c * 8))); c = c + 1; }
+            k = k + 1;
+        }
+        # ---- Phase B: K-way softmax backward -> dl (only selected logits nonzero) ----
+        var sdot = f64_from(0);
+        k = 0;
+        while (k < K) { sdot = f64_add(sdot, f64_mul(load64(gate + (r * K + k) * 8), load64(dg + k * 8))); k = k + 1; }
+        var jj = 0;
+        while (jj < N) { store64(dl + jj * 8, f64_from(0)); jj = jj + 1; }
+        k = 0;
+        while (k < K) {
+            var gk = load64(gate + (r * K + k) * 8);
+            var dlk = f64_mul(gk, f64_sub(load64(dg + k * 8), sdot));
+            store64(dl + load64(sel + (r * K + k) * 8) * 8, dlk);
+            k = k + 1;
+        }
+        # ---- Phase C: gate linear backward for row r -> dxi; dxr += dxi; dWg += ----
+        linear_bwd(xr, Wg, dl, dxi, dWg, 0, 1, C, N);
+        var c2 = 0;
+        while (c2 < C) { store64(dxr + c2 * 8, f64_add(load64(dxr + c2 * 8), load64(dxi + c2 * 8))); c2 = c2 + 1; }
+        r = r + 1;
+    }
+    return 0;
+}
+
+# ---------------------------------------------------------------------------
+# Load-balancing auxiliary loss (Switch, Fedus et al. 2021, arXiv:2101.03961).
+# Over a batch of T tokens routed across N experts:
+#   f_i = (1/T)·#{t : i ∈ topK(t)}     dispatch fraction (the discrete count)
+#   P_i = (1/T)·Σ_t softmax(r(t))_i    mean full-router prob for expert i
+#   L_aux = α·N·Σ_i f_i·P_i            (= α at the uniform optimum; pushes the
+#                                        router toward balanced expert load)
+# f_i is the discrete dispatch count, held CONSTANT in backward (straight-through
+# — it has no usable gradient); only P_i (the smooth softmax) carries gradient:
+#   ∂L_aux/∂r_j(t) = (α·N/T)·p_j(t)·( f_j − Σ_i f_i·p_i(t) ).
+# Hand-derived, finite-difference grad-checked (test_moe_aux). sc: scratch with
+# room for f(N) | P(N) | p(N) — pass length >= 3*N.
+# ---------------------------------------------------------------------------
+fn _moe_aux_counts(sel, f, T, N, K): i64 {
+    var i = 0;
+    while (i < N) { store64(f + i * 8, f64_from(0)); i = i + 1; }
+    var t = 0;
+    while (t < T) {
+        var k = 0;
+        while (k < K) {
+            var e = load64(sel + (t * K + k) * 8);
+            store64(f + e * 8, f64_add(load64(f + e * 8), f64_from(1)));
+            k = k + 1;
+        }
+        t = t + 1;
+    }
+    return 0;
+}
+
+fn moe_aux_fwd(logits, sel, alpha, sc, T, N, K): i64 {
+    var f = sc; var P = sc + N * 8; var p = sc + 2 * N * 8;
+    _moe_aux_counts(sel, f, T, N, K);
+    var i = 0;
+    while (i < N) { store64(P + i * 8, f64_from(0)); i = i + 1; }
+    var t = 0;
+    while (t < T) {
+        var lrow = logits + t * N * 8;
+        var mx = load64(lrow);
+        i = 1;
+        while (i < N) { var lv = load64(lrow + i * 8); if (f64_gt(lv, mx) == 1) { mx = lv; } i = i + 1; }
+        var sum = f64_from(0);
+        i = 0;
+        while (i < N) {
+            var ev = f64_exp(f64_sub(load64(lrow + i * 8), mx));
+            store64(p + i * 8, ev); sum = f64_add(sum, ev); i = i + 1;
+        }
+        var invs = f64_div(f64_from(1), sum);
+        i = 0;
+        while (i < N) {
+            store64(P + i * 8, f64_add(load64(P + i * 8), f64_mul(load64(p + i * 8), invs)));
+            i = i + 1;
+        }
+        t = t + 1;
+    }
+    var invT = f64_div(f64_from(1), f64_from(T));
+    var acc = f64_from(0);
+    i = 0;
+    while (i < N) {
+        var fi = f64_mul(load64(f + i * 8), invT);
+        var Pi = f64_mul(load64(P + i * 8), invT);
+        acc = f64_add(acc, f64_mul(fi, Pi));
+        i = i + 1;
+    }
+    return f64_mul(f64_mul(alpha, f64_from(N)), acc);
+}
+
+# Backward: ADD ∂L_aux/∂logits into dlogits(T,N). sc: f(N) | p(N), length >= 2*N.
+fn moe_aux_dr(logits, sel, alpha, dlogits, sc, T, N, K): i64 {
+    var f = sc; var p = sc + N * 8;
+    var invT = f64_div(f64_from(1), f64_from(T));
+    _moe_aux_counts(sel, f, T, N, K);
+    var i = 0;
+    while (i < N) { store64(f + i * 8, f64_mul(load64(f + i * 8), invT)); i = i + 1; }
+    var scale = f64_mul(f64_mul(alpha, f64_from(N)), invT);   # α·N/T
+    var t = 0;
+    while (t < T) {
+        var lrow = logits + t * N * 8;
+        var drow = dlogits + t * N * 8;
+        var mx = load64(lrow);
+        i = 1;
+        while (i < N) { var lv = load64(lrow + i * 8); if (f64_gt(lv, mx) == 1) { mx = lv; } i = i + 1; }
+        var sum = f64_from(0);
+        i = 0;
+        while (i < N) {
+            var ev = f64_exp(f64_sub(load64(lrow + i * 8), mx));
+            store64(p + i * 8, ev); sum = f64_add(sum, ev); i = i + 1;
+        }
+        var invs = f64_div(f64_from(1), sum);
+        var S = f64_from(0);
+        i = 0;
+        while (i < N) {
+            var pi = f64_mul(load64(p + i * 8), invs);
+            store64(p + i * 8, pi);
+            S = f64_add(S, f64_mul(load64(f + i * 8), pi));
+            i = i + 1;
+        }
+        i = 0;
+        while (i < N) {
+            var dr = f64_mul(scale, f64_mul(load64(p + i * 8), f64_sub(load64(f + i * 8), S)));
+            store64(drow + i * 8, f64_add(load64(drow + i * 8), dr));
+            i = i + 1;
+        }
+        t = t + 1;
+    }
+    return 0;
+}
+
+# Full aux backward through the router gate, for model wiring (M13.2). Computes
+# ∂L_aux/∂logits (moe_aux_dr), then the gate's linear backward: ADDS the result
+# into dx (= d ln2-output) and ACCUMULATES dWg. Both moe_aux_dr and linear_bwd
+# are independently grad-checked; the full-model grad-check (test_model_moe)
+# validates this composition. dlaux: T*N scratch. sc: f(N)|p(N)|dxi(C), >= 2N+C.
+fn moe_aux_bwd(logits, sel, alpha, x, Wg, dx, dWg, dlaux, sc, T, C, N, K): i64 {
+    var z = 0;
+    while (z < T * N) { store64(dlaux + z * 8, f64_from(0)); z = z + 1; }
+    moe_aux_dr(logits, sel, alpha, dlaux, sc, T, N, K);   # dlaux = ∂L_aux/∂logits
+    var dxi = sc + 2 * N * 8;                              # moe_aux_dr uses sc[0,2N)
+    var r = 0;
+    while (r < T) {
+        linear_bwd(x + r * C * 8, Wg, dlaux + r * N * 8, dxi, dWg, 0, 1, C, N);
+        var c = 0;
+        while (c < C) {
+            var a = dx + (r * C + c) * 8;
+            store64(a, f64_add(load64(a), load64(dxi + c * 8)));
+            c = c + 1;
+        }
+        r = r + 1;
+    }
+    return 0;
+}

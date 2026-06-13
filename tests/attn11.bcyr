@@ -220,6 +220,28 @@ fn main(): i64 {
     fmt_int(3 * 16 * 16 * 8); print(" + ", 3); fmt_int(3 * 16 * 4 * 8); _putc(10);
     print("  vs MHA full K/V (nkv=4):                  ", 43); fmt_int(2 * 3 * 16 * 32 * 8); _putc(10);
 
+    # ---- MoE (M13, E8): training step + cached generation at N=8 experts,
+    # top-2, vs the dense baseline (fwd+bwd step above). Only top-2 experts
+    # compute per token (active FLOPs ~ 2 dense MLPs + the C->N router), but the
+    # parameter count scales with N — the density knob. The router + per-expert
+    # MLP backward are hand-derived + grad-checked (test_moe_op / test_model_moe).
+    model_init_moe(V, 32, 16, 4, 4, 3, 1, f64_from(0), 1337, 0, 0, 0, 0, 8, 2);   # 8 experts, top-2
+    model_forward(); model_zero_grads(); model_backward();   # prime
+    s = now_ns(); i = 0;
+    while (i < N) {
+        model_zero_grads(); sample_window(); model_forward(); model_backward();
+        i = i + 1;
+    }
+    e = now_ns();
+    _report("fwd+bwd step moe8", e - s, N);
+    print("moe8 params (vs dense 39488): ", 30); fmt_int(g_NP); _putc(10);
+    g_training = 0;
+    s = now_ns();
+    gen_prime(pids, 1, 1);
+    gen_decode(NGEN, f64_from(0), 1, 0, 0);
+    e = now_ns();
+    _report("gen kv-cached moe8", e - s, NGEN);
+
     # ---- isolated tied LM head at BPE-scale vocab (V=768): the M9 lever-1
     # target. head_fwd_row is O(V*C) per row and runs in every training forward
     # and every generated token; its share grows with the vocab, so bench it
