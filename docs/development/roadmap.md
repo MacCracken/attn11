@@ -124,6 +124,85 @@ RL-vs-SFT comparison (does the policy move toward the reward) logged as an
 X-series entry. PPO/GRPO (clipped ratio, group baselines) noted as a heavier
 follow-on only if REINFORCE earns it.
 
+### M18 — GPU backend (sequencing TBD) — E-infra
+
+**Moved in from Out-of-scope per the user (2026-06-13).** A GPU *compute* backend
+for the same hand-derived forward/backward — an execution target, not a new
+dependency. The sovereign path: the f64 tensor ops (matmul, attention, LM head,
+Adam) dispatch to the **[mabda](https://github.com/MacCracken/mabda)** GPU
+foundation (already vendored in `lib/mabda.cyr`) with **ai-hwaccel** for device
+detection — **no cuBLAS / cuDNN / autodiff**; the "everything-is-i64, hand-derived,
+grad-checked" invariant is device-independent. The CPU scalar/SIMD path stays the
+reference and the bit-exact oracle: every GPU kernel is gated by matching the CPU
+result to f64 tolerance (the finite-difference discipline, one level up), and the
+no-flag run stays CPU + byte-identical. **Gate**: each GPU op validated against the
+CPU reference within tolerance. Sequencing is TBD relative to M15–M17 (the user
+reads it as "a few updates away"); no version pinned yet. **This milestone unblocks
+benchmark phase B4 (the GPU competitor comparison).**
+
+## Competitor benchmarking (B-series)
+
+> The existing `scripts/bench-history.sh` + `bench-history.csv` track is
+> **self-referential** — attn11's own tokens/sec across its own versions. This
+> series adds the missing axis: **throughput vs external references.** It is a
+> measurement/infra track, not an architecture milestone — it runs continuously
+> and is re-runnable per release, so it carries no single version tag.
+
+**Two headline axes** (per the user 2026-06-13):
+
+1. **Honest raw throughput** — tokens/sec at a *matched model config*, reported
+   straight even where attn11 loses (it will, to OpenMP-multicore llm.c and to any
+   GPU competitor), with a **context column**: thread count, shared-lib deps
+   (`ldd`), total shippable bytes, single-static-ELF (y/n), peak RSS.
+2. **Normalized: throughput-at-zero-dependencies** — the axis where attn11 is
+   alone: tokens/sec carrying *no* BLAS/libc/CUDA, one static ELF (~312 KB). The
+   raw table is shown, but the *story* leads with the dependency-closure framing.
+
+**Competitors** (each pinned to a specific upstream commit/tag for reproducibility):
+
+| competitor | lang | comparable on | deps |
+|------------|------|---------------|------|
+| **llm.c** (`train_gpt2`, CPU) | C | **training** step tok/s | libc + libm + OpenMP (multi-core) |
+| **nanoGPT** | PyTorch | training **and** decode | PyTorch + (CUDA) — GB-scale |
+| **llama2.c** (`run`) | C | **decode/gen** tok/s only (no train) | libc + libm |
+| **micrograd** | Python | training, from-scratch peer / sanity floor | CPython runtime |
+
+**Fairness rules** (the harness asserts these — no cherry-picking):
+
+- *Matched config* — same vocab, `d_model`, `n_layers`, `n_heads`, context `T`,
+  batch. The harness maps attn11's `--preset` to each competitor's config and
+  **requires the printed parameter count to match within tolerance** before a row
+  is accepted.
+- *Same host, pinned* — one CPU (`taskset`), perf governor, warmup + a
+  run-of-record; host CPU + thread count + date stamped into every CSV row.
+- *attn11 single-thread FIRST* — its honest scalar baseline, then the SIMD path;
+  competitors' thread counts (llm.c OpenMP, PyTorch MKL) are recorded in the
+  context column, never hidden.
+- *Two surfaces, separate tables* — (a) **training** step throughput
+  (fwd+bwd+opt), (b) **decode** throughput (attn11's KV-cached gen vs llama2.c /
+  nanoGPT generate).
+- *No vendoring* — competitors are cloned + built at pinned refs into a gitignored
+  `bench/` dir (license + size); the harness records the ref it built.
+
+**Phases:**
+
+- **B0 — harness scaffold.** `scripts/compete-bench.sh`: clone+build each
+  competitor at its pinned ref, run the matched config, emit a CSV row
+  (`competitor, ref, tokens_per_sec, surface, threads, deps_bytes, peak_rss, host, date`).
+  New `competitor-bench.csv` (the self-bench `bench-history.csv` stays as-is).
+- **B1 — CPU training throughput.** attn11 (1-thread → SIMD) vs llm.c-CPU vs
+  nanoGPT-CPU vs micrograd, matched config. First external table → `docs/benchmarks.md`.
+- **B2 — decode throughput.** attn11 KV-cached gen vs llama2.c `run` vs nanoGPT
+  generate.
+- **B3 — the normalized story.** Add the zero-deps / shippable-bytes / single-ELF
+  context columns + write the headline framing into `docs/benchmarks.md`.
+- **B4 — GPU comparison** *(rides M18)*. attn11-GPU vs nanoGPT-GPU vs llama2.c
+  CUDA, same matched config, a `backend` column folded into the same tables.
+
+**Gate**: reproducible (every competitor at a pinned ref; config-match asserted by
+param count; host/threads/date in every row) and *complete* — every config run
+gets reported, no dropped or cherry-picked rows (the "no silent caps" discipline).
+
 ## Sequencing intent
 
 The order is **value ÷ risk** and re-orderable (the axes are orthogonal):
@@ -140,10 +219,13 @@ experiment graduates into a milestone only when it earns one; results land in
 
 ## Out of scope
 
-- GPU / accelerator backends — attn11 is a CPU, scalar-f64 (then SIMD) reference
-  implementation. (The survey's engine/serving layer — vLLM/SGLang, FP4 tensor
-  cores, photonics — is *observed, not chased*; only its algorithmic ideas
-  translate here.)
+- The **serving / engine** layer — vLLM/SGLang, FP4 tensor cores, photonics — is
+  *observed, not chased*; only its algorithmic ideas translate here. (Note: a GPU
+  *compute* backend is **no longer** out of scope — it moved in as **M18** above,
+  per the user 2026-06-13. What stays out is the serving stack, not the device.)
+- A **CUDA / cuBLAS / cuDNN** dependency — when the GPU backend (M18) lands it
+  goes through the sovereign **mabda** + **ai-hwaccel** path, never a vendor
+  BLAS/autodiff stack. The "no BLAS / no autodiff" invariant is device-independent.
 - Distributed / multi-process training.
 - A general autodiff engine — gradients stay hand-derived and grad-checked.
 - Windows / macOS as first-class training targets (cross-build only, if at all).
