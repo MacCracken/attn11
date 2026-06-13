@@ -504,6 +504,8 @@ constant `nh·hd²` state instead of a T-growing K/V.
   `--layers`/`--attn-kind`/`--latent-dim`/`--attn-every`/`--pos-kind`/`--rope-dim`/
   `--experts`/`--expert-topk`/`--bpe`/`--eval`, null-guarded `_atoi`; `--attn-every K`
   builds the per-layer hybrid and dispatches to `model_init_full`) + orchestration
+- `test.cyr` — the `[build].test` entry (`cyrius.cyml`); delegates the unit suite to
+  `tests/attn11.tcyr`
 
 ## Tests
 
@@ -663,10 +665,10 @@ cross-repo edit on the agnos maintainer's side, not actionable here. (2) The
 **MLA absorption** compute optimization (fold `W_UK` into `W_Q` to attend latents
 directly, avoiding the per-step K/V re-materialization in 1.2.1/1.2.3) is deferred
 — it reorders accumulation, so it would ride its own bit-identity story; the MoE
-combine has an analogous folding option but the same caveat. (3) A perplexity
-bake-off (decoupled vs coupled vs learned MLA, and MoE density) on the vidya
-corpus is the natural next X-series entry now that M13 has landed (X009 ran the
-density sweep on the embedded corpus; the vidya-scale run is the follow-on). (4)
+combine has an analogous folding option but the same caveat. (3) A vidya-scale
+perplexity bake-off across the mixers/positions/MoE-density/hybrid-ratio axes
+remains an open X-series follow-on (the reference-scale comparisons ran as
+X009–X014; the scaled run is the follow-on). (4)
 The MoE aux coefficient α is fixed at 0.01 (no `--aux-alpha` flag); an α sweep is
 a small additive follow-on if it earns one. The pin is now **6.2.2** (realigned
 1.3.0, byte-identical `lib/` snapshot); the cycc argv-capture issue is resolved

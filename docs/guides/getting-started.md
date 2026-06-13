@@ -26,17 +26,21 @@ attn11 --preset              ctx 64 / d_model 64 / 8 heads / 4 layers (default: 
 attn11 --heads N             override attention heads (must divide d_model)
 attn11 --kv-heads N          override K/V heads (< heads = GQA, 1 = MQA)
 attn11 --layers N            override transformer blocks
-attn11 --attn-kind K         attention variant: mha (default) or mla (latent KV)
-attn11 --latent-dim N        MLA latent width d_c (1..d_model; default d_model/2)
+attn11 --attn-kind K         mixer: mha (default), mla (latent KV), lin (gated linear), ssm (selective SSM)
+attn11 --latent-dim N        MLA latent width d_c / SSM state size N (1..d_model; MLA default d_model/2, SSM 16)
+attn11 --attn-every K        hybrid: a full-attention (MHA) block every K-th layer, --attn-kind base elsewhere
 attn11 --pos-kind K          positions: learned (default), rope (coupled, mha/gqa) or rope-decoupled (mla)
 attn11 --rope-dim N          decoupled-RoPE channel width d_rope (even, 2..d_model; default ~hd/2)
+attn11 --experts N           MoE: N experts per block (1 = dense; >1 enables top-K routing, 1..256)
+attn11 --expert-topk K       active experts per token (default 2; 1..N)
 attn11 --bpe K               learn K BPE merges first (1..512; default is byte-level)
 attn11 --eval                print CE/token + bits-per-byte after training/save
 ```
 
 Config flags (`--preset`/`--heads`/`--kv-heads`/`--layers`/`--attn-kind`/
-`--latent-dim`/`--pos-kind`/`--rope-dim`/`--bpe`) shape a **fresh** model; under
-`--load` the checkpoint's config and tokenizer win.
+`--latent-dim`/`--attn-every`/`--pos-kind`/`--rope-dim`/`--experts`/`--expert-topk`/
+`--bpe`) shape a **fresh** model; under `--load` the checkpoint's config and
+tokenizer win.
 Magnitude caps (enforced in `model_config_ok`, else a clean abort): d_model
 ≤ 4096, ctx ≤ 8192, `--layers` 1..128, vocab ≤ 768; `--heads` must divide
 d_model and `--kv-heads` must divide `--heads`. See
@@ -61,11 +65,12 @@ Sampling is **KV-cached** (0.7.0): the prompt prefills per-layer K/V caches
 and each generated token costs one cached row instead of a window recompute
 (~6× faster at ctx 16, ~23× at the ctx-64 preset; bit-identical to the
 uncached reference — see ADR 0005). MLA caches a low-rank latent instead of
-full K/V (1.2.1) and coupled RoPE (`--pos-kind rope`, 1.2.2) rotates Q/K by
-position — both also bit-identical cached-vs-uncached. Checkpoints from earlier
-formats (v1 ≤ 0.6.0, v2 = 0.7.0, v3 = 1.0/1.1) still load; saves write **v4**
-(which records the tokenizer and the architecture descriptor — see ADR 0006 and
-ADR 0007).
+full K/V (1.2.1); the `lin` and `ssm` mixers cache a **constant-size** recurrent
+state (not a T-growing K/V); coupled/decoupled RoPE (`--pos-kind`, 1.2.2/1.2.3)
+rotate by position — all bit-identical cached-vs-uncached. Checkpoints from
+earlier formats (v1 ≤ 0.6.0, v2 = 0.7.0, v3 = 1.0/1.1, v4 = 1.2.x, v5 =
+1.3.0–1.4.2) all still load; saves write **v5** for a uniform model and **v6** for
+a per-layer hybrid (the per-layer mixer array) — see ADR 0006/0007/0008/0011/0012.
 
 ## Layout
 

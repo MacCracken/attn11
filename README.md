@@ -14,10 +14,14 @@ No BLAS. No libc. No autodiff framework. The forward pass, the backward pass
 `attn11` trains a small char-level transformer to predict the next character in
 an embedded corpus, then samples from it:
 
-- **Tokenizer** — char-level over a fixed embedded corpus
-- **Embeddings** — token embedding + learned positional embedding
-- **Block** — pre-norm `LayerNorm → causal multi-head self-attention → residual
-  → LayerNorm → MLP (GELU) → residual`
+- **Tokenizer** — char-level by default (embedded or `--corpus`/`--stdin`), or
+  opt-in **BPE** (`--bpe K`)
+- **Embeddings** — token embedding + positions selectable via `--pos-kind`
+  (learned-absolute / coupled RoPE / decoupled RoPE)
+- **Block** — pre-norm `LayerNorm → causal sequence mixer → residual → LayerNorm
+  → FFN → residual`, where the mixer is `--attn-kind {mha, mla (latent-KV), lin
+  (gated-linear), ssm (selective-SSM)}` — or a per-layer **hybrid** (`--attn-every`)
+  — and the FFN is a dense GELU MLP or a top-K **MoE** (`--experts N`)
 - **Head** — final `LayerNorm` + weight-tied LM head → softmax cross-entropy
 - **Training** — hand-written backprop + **Adam**; loss printed as it descends
 - **Generation** — autoregressive sampling from the trained weights
@@ -44,9 +48,10 @@ cyrius test                               # grad checks + smoke tests
 ```
 
 See [`docs/guides/getting-started.md`](docs/guides/getting-started.md) for the
-full CLI (`--corpus`, `--load`/`--save` checkpoints, `--preset`, `--bpe`,
-`--eval`, and the architecture axes `--attn-kind` (MLA), `--pos-kind` (RoPE), …)
-and [`docs/STABILITY.md`](docs/STABILITY.md) for the frozen surface.
+full CLI (`--corpus`, `--load`/`--save` checkpoints, `--preset`, `--bpe`, `--eval`,
+and the architecture axes `--attn-kind {mha,mla,lin,ssm}`, `--pos-kind
+{learned,rope,rope-decoupled}`, `--experts N` (MoE), `--attn-every K` (per-layer
+hybrid)) and [`docs/STABILITY.md`](docs/STABILITY.md) for the frozen surface.
 
 ## Model size
 

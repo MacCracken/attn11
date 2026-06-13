@@ -12,6 +12,11 @@
 5. `cyrius build tests/attn11.fcyr build/fuzz && ./build/fuzz` — fuzz harness.
 6. `cyrius build tests/attn11.bcyr build/bench && ./build/bench` — benchmarks.
 
+Or use the Makefile: **`make check`** (lint + grad-checks — the fast loop) and
+**`make release`** (the full pre-tag gate: lint + x86 grad-checks + aarch64/qemu +
+DCE build + fuzz + **`make smoke`**, the hostile-CLI-args regression). Both must
+exit 0 before a release.
+
 See [`CLAUDE.md`](CLAUDE.md) for the full development loop and
 [`docs/architecture/001-tensors-and-floats.md`](docs/architecture/001-tensors-and-floats.md)
 for the numeric conventions.

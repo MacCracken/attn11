@@ -107,8 +107,8 @@ constant-state recurrence (the cache is an `hd×hd` state, not a growing K/V).
 (2023).** "Retentive Network: A Successor to Transformer for Large Language
 Models." arXiv:[2307.08621](https://arxiv.org/abs/2307.08621) — the per-head decay
 `γ_h` (retention) attn11 uses.
-Used in: `src/attn.cyr` (`lin_core_fwd`/`lin_core_bwd` + `lin_core_fwd_row` the
-constant-state decode, `attn_lin_fwd`/`attn_lin_bwd` wrappers), `src/model.cyr`
+Used in: `src/attn_linear.cyr` (`lin_core_fwd`/`lin_core_bwd` + `lin_core_fwd_row`
+the constant-state decode, `attn_lin_fwd`/`attn_lin_bwd` wrappers), `src/model.cyr`
 (the `attn_kind == 2` branch + `g_lin_state` cache). `--attn-kind lin`: a causal
 `S_t = γ_h·S_{t-1} + k_t⊗v_t`, `out_t = (1/√hd)·S_t^T q_t`, fixed per-head decay
 (parameter-free) over the MHA projections. See ADR 0009.
@@ -133,11 +133,14 @@ Transformer-Mamba Language Model." arXiv:[2403.19887](https://arxiv.org/abs/2403
 or beats pure transformers at far lower KV-cache cost. **De, S., Smith, S.L.,
 Fernando, A., et al. (2024).** "Griffin: Mixing Gated Linear Recurrences with Local
 Attention for Efficient Language Models." arXiv:[2402.19427](https://arxiv.org/abs/2402.19427)
-— a gated-linear-recurrence + attention hybrid (the {linear, attention} mix attn11's
-rung c implements). Used in: `src/model.cyr` (`g_layer_kind` + `_lk(L)` per-layer
-dispatch, `_hybrid_kinds_ok`), `src/main.cyr` (`--attn-every K`). The hybrid is
-restricted to layout-compatible kinds {mha, gqa, lin} (so the per-block stride stays
-uniform); the decode cache scales with the attention fraction. See ADR 0011, X012.
+— a gated-linear-recurrence + attention hybrid (the attention ⊕ recurrence mix
+attn11 implements). Used in: `src/model.cyr` (`g_layer_kind` + `_lk(L)` per-layer
+dispatch, `_hybrid_kinds_ok`, `_kvw_hyb`/`_any_kind`), `src/main.cyr`
+(`--attn-every K`). Rung c (ADR 0011, X012) interleaved the layout-compatible kinds
+{mha, gqa, lin}; rung d (ADR 0012, X013) lifted that — ANY mix of {mha, mla, lin,
+ssm} interleaves via a K/V region PADDED to the max `_kvw` over the present kinds
+(uniform stride; {mha,gqa,lin} hybrids stay exact, no pad). The decode cache scales
+with the attention fraction. See ADR 0011/0012, X012/X013.
 
 ### KV-cache inference (cache K/V per position, one row per decoded token)
 **Pope, R., Douglas, S., Chowdhery, A., et al. (2022).** "Efficiently Scaling

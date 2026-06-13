@@ -13,23 +13,14 @@
 
 ## Where we are
 
-Current: **v1.4.6** (the benchmarking pass closing the 1.4.x arc — the canonical
-mixer/hybrid perf picture in `docs/benchmarks.md` + a current `bench-history.csv`
-row, X014; the padded hybrid layout confirmed memory-only. Preceded by 1.4.5, the
-P(-1) hardening pass — a security/correctness audit; one CLI stack-overflow finding
-fixed). The v1.0 surface is frozen and additive-only
+Current: **v1.4.6**. The v1.0 surface is frozen and additive-only
 ([`STABILITY.md`](../STABILITY.md)); the reusable numeric core lives in
 **[rosnet](https://github.com/MacCracken/rosnet)** + **[tyche](https://github.com/MacCracken/tyche)**
-(v1.1.0); the **1.x architecture arc** is underway — **M12, M13, and M14 are
-complete**: the attention/position axes (MLA core v1.2.0, latent KV-cache decode
-v1.2.1, coupled RoPE v1.2.2, decoupled RoPE v1.2.3), the **FFN-density axis**
-(Mixture of Experts v1.3.0 — `--experts N --expert-topk K`, checkpoint v5, ADR
-0008), **two non-softmax sequence mixers** (gated linear attention v1.4.0 —
-`--attn-kind lin`, ADR 0009; the selective SSM v1.4.2 — `--attn-kind ssm`, ADR
-0010; with 1.4.1 a refactor sweep between them), and the **per-layer mixer hybrid**
-— rung c (v1.4.3, `--attn-every K`, checkpoint v6, ADR 0011) then rung d (v1.4.4,
-any-mixer via a padded stride, ADR 0012). See [`CHANGELOG.md`](../../CHANGELOG.md) for
-the full shipped narrative back to v0.1.0 and the M0–M11 / v1.0-cut history.
+(v1.1.0). The 1.x architecture arc through M14 has shipped (the attention/KV, FFN-
+density, and sequence-mixer axes); **next up is M15** (below). For *what* shipped,
+see [`CHANGELOG.md`](../../CHANGELOG.md) (release narrative),
+[`experiments.md`](experiments.md) (the X-series), and [`state.md`](state.md) (the
+live snapshot — current flags, counts, perf). This file is the plan ahead only.
 
 ## Versioning
 
@@ -38,7 +29,8 @@ the full shipped narrative back to v0.1.0 and the M0–M11 / v1.0-cut history.
 which also rewrites `CFG_VERSION` and stubs the CHANGELOG. The major is `1`, so
 releases are stable, additive-only tags (no v2 fork is planned — the architecture
 arc rides as 1.x minors). The local release gate is `make release` (lint + x86
-grad-checks + aarch64/qemu + DCE build + fuzz); CI mirrors it.
+grad-checks + aarch64/qemu + DCE build + fuzz + the `make smoke` CLI regression);
+CI mirrors it.
 
 ## The 1.x architecture arc
 
@@ -51,48 +43,12 @@ milestone below graduates one frontier experiment (the **E-series**, logged in
 [`experiments.md`](experiments.md)), is independently shippable, and lands ONE
 change at a time behind its own grad-check / bit-identity gate.
 
-> **M12, M13, and M14 are all complete.** M12 (MLA + RoPE, v1.2.0–v1.2.3) shipped
-> the full `--attn-kind` × `--pos-kind` switch; M13 (Mixture of Experts, v1.3.0)
-> shipped the FFN-density axis (ADR 0008, X009); **M14** shipped the second
-> sequence-mixer family across four rungs — gated linear attention (a, v1.4.0, ADR
-> 0009, X010), the selective SSM (b, v1.4.2, ADR 0010, X011), the per-layer hybrid
-> (c, v1.4.3, ADR 0011, X012), and any-mixer hybrids via a padded stride (d, v1.4.4,
-> ADR 0012, X013) — with 1.4.1 a refactor sweep along the way. See the CHANGELOG
-> and X005–X014 for the shipped narrative. The 1.4.x arc closed with two
-> housekeeping cuts: **1.4.5** (P(-1) hardening — adversarial audit of the hybrid/v6
-> surface, one CLI finding fixed) and **1.4.6** (benchmarking — the canonical
-> mixer/hybrid perf picture, X014). **Next: M15+ (below).**
-
-### M14 — A second sequence-mixer family (v1.4.0+) — E4
-
-**Linear attention → selective SSM → hybrid**, the survey's structural shift
-(hybrids with ~10–25% attention layers beat pure transformers). Ladder:
-
-- **(a) gated linear-attention/RetNet-style block** — **DONE (v1.4.0, ADR 0009).**
-  `--attn-kind lin`: constant-`nh·hd²`-state retention, parameter-free, `attn_kind = 2`,
-  per-op grad-check ~1e-9. X010 = the MHA/MLA/linear comparison.
-- **(b) a minimal selective-SSM block** — **DONE (v1.4.2, ADR 0010).** `--attn-kind
-  ssm`: a Mamba-lite diagonal SSM with input-dependent Δ/B/C, `attn_kind = 3`
-  reusing Wq/Wo + `latent_dim` (state N, no checkpoint bump); hand-derived BPTT
-  through the data-dependent scan (~1e-7), constant `C·N` decode cache. X011 adds
-  it to the comparison (best bits/byte at reference scale).
-- **(c) a per-layer `kind` config** — **DONE (v1.4.3, ADR 0011).** `--attn-every K`:
-  the global `g_attn_kind` becomes a per-layer `g_layer_kind` read only by the three
-  `_attn_block_*` dispatch helpers (the 1.4.1 refactor localized it). Restricted to
-  layout-compatible kinds {mha, gqa, lin} so the per-block stride stays uniform — the
-  hybrid is parameter-free, and the decode cache scales with the attention fraction.
-  First checkpoint format bump (**v6** carries the per-layer pattern). X012 = the
-  attention-fraction sweep.
-- **(d) any-mixer hybrids** — **DONE (v1.4.4, ADR 0012).** Lifts (c)'s {mha, gqa,
-  lin} restriction so MLA/SSM layers join a hybrid (full attention ⊕ SSM, the
-  survey's strongest pairing). Each block's K/V region is PADDED to the max `_kvw`
-  over the present kinds (`_kvw_hyb`) — uniform stride, so only `_kv_weight_size()`
-  + the per-layer init/cache gates change, not every `_o_*` offset. v6 unchanged
-  (carries the per-layer kinds). Mixed SSM/MLA ⊕ MHA backward grad-checked (~1e-4);
-  X013 = the attention ⊕ SSM ratio sweep. **M14 complete.**
-
-**Gate**: every new backward grad-checked; perplexity vs the iso-param transformer
-on the vidya corpus, logged as an X-series entry.
+> **Shipped (M12–M14, v1.2.0–v1.4.6):** the attention/KV axis (MLA + the
+> `--pos-kind` RoPE switch), the FFN-density axis (MoE, `--experts`), and the
+> second sequence-mixer family (`--attn-kind {lin,ssm}` + the any-mixer per-layer
+> `--attn-every` hybrid), then 1.4.5 hardening + 1.4.6 benchmarking to close the
+> arc. Detail lives in [`CHANGELOG.md`](../../CHANGELOG.md), ADRs 0007–0012, and
+> [`experiments.md`](experiments.md) (X005–X014). **The plan ahead starts at M15.**
 
 ### M15 — Char-diffusion objective (v1.5.0) — E5
 
@@ -211,11 +167,12 @@ gets reported, no dropped or cherry-picked rows (the "no silent caps" discipline
 
 ## Sequencing intent
 
-The order is **value ÷ risk** and re-orderable (the axes are orthogonal):
-decoupled RoPE finishes the lowest-risk KV-cache arc M12 opened; MoE is the
-requested scale-up knob; the mixer / objective / precision departures (E4–E6)
-are the biggest architectural changes and ride later; RL (E9) is last because it
-is an objective layer over a finished trunk. The E-series is informed by the
+The remaining order is **value ÷ risk** and re-orderable (the axes are
+orthogonal): the *training-objective* and *precision* departures ride next — the
+char-diffusion objective (M15, E5) then ternary training (M16, E6) — with RL (M17,
+E9) last because it is an objective layer over a finished trunk, and the GPU
+*compute* backend (M18, E-infra) sequenced TBD (it unblocks the B4 GPU benchmark).
+The E-series is informed by the
 June-2026 frontier survey (`ai-ml-frontier-2026-expanded.docx`, repo root) —
 data quality > volume, the KV cache as the central inference object, SSM/attention
 hybrids, diffusion LMs, the precision ladder — which attn11 adapts by building

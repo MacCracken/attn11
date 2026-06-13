@@ -126,7 +126,7 @@ cyrius build --agnos src/main.cyr build/attn11_agnos        # AGNOS ring-3 targe
 - [`docs/audit/`](docs/audit/) — Security/correctness audit reports
 - [`docs/benchmarks.md`](docs/benchmarks.md) — Performance history
 - [`docs/development/state.md`](docs/development/state.md) — Live state snapshot
-- [`docs/development/roadmap.md`](docs/development/roadmap.md) — Milestones through v1.0 + the post-1.0 frontier track
+- [`docs/development/roadmap.md`](docs/development/roadmap.md) — forward milestone sequencing (the 1.x architecture arc + the M15+ frontier track)
 - [`docs/development/experiments.md`](docs/development/experiments.md) — Experiments ledger (numbered X-series; append-only, never renumber)
 
 New quirks land in `docs/architecture/` as numbered `NNN-kebab-case.md`; new
