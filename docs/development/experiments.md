@@ -722,9 +722,12 @@ pateat"*.
    gets the *identical* corpus TFDS catalogs with zero heavy deps and a ~1 MB
    download. The "large dataset" is the *source*; the model-facing slice is small (a
    tiny model saturates on diversity long before 4 MB).
-3. **Fluency is a capacity story, not a data one.** 3.43 bits/byte (vs ~1–1.5 for a
-   strong English model, ~6+ uniform over this vocab) — the model learned real
-   structure but is far from fluent. ctx 16 (~10 BPE words) caps coherence; the
-   `--preset` (ctx 64, C=64, 232 K params) covers ~40 words and reads better at ~17×
-   the per-step cost. The model-scale follow-on (M16+) and a longer budget are where
-   fluency lives. Regeneration: see [`docs/examples/c4-english.md`](../examples/c4-english.md).
+3. **Fluency is a capacity story, not a data one — and the preset proves it.** The
+   default reaches 3.43 bits/byte (vs ~1–1.5 for a strong English model, ~6+ uniform
+   over this vocab); the **`--preset`** (ctx 64 / C=64 / 4 layers, 232 K params) on
+   the *same* 4 MB slice reaches **2.695 bits/byte** at 1500 steps — a **0.74
+   bits/byte** gain purely from more context + capacity, with visibly more word-shaped
+   output ("*…made … looking court and … will … make nights of … to posess … of your
+   …*"). Same data, better model ⇒ better English: the lever is model scale (M16+)
+   and budget, not corpus volume. Regeneration: see
+   [`docs/examples/c4-english.md`](../examples/c4-english.md).

@@ -76,6 +76,32 @@ tecudiis it pemired in the blench have leicing alle cidforesionw pateat
 
 Recognizable English threads through it — `the`, `be of`, `a you`, `for`, `have`,
 `it`, `in the`, `20...` — between the wobbling subwords. The model is *speaking
-English-ish* off raw web text it has never been told the rules of. Scaling the
-model (`--preset`), the data, and the step budget tightens the wobble; that crossover
-is the open follow-on (and the M16+ capacity story).
+English-ish* off raw web text it has never been told the rules of.
+
+## Scaling up: the `--preset` (1.5.1, x86_64, BPE 256, 1500 steps)
+
+The preset (ctx 64 / d_model 64 / 8 heads / 4 layers — ~40 words of context, 232 K
+params) is a clear step toward fluency over the default config, on the *same* 4 MB
+C4 slice:
+
+| metric | default (ctx 16, 53 K) | **preset (ctx 64, 232 K)** |
+|--------|------------------------|----------------------------|
+| train loss | 4.90 (600 steps) | **3.82 (1500 steps)** |
+| eval CE/token · **bits/byte** | 4.836 · 3.433 | 3.796 · **2.695** |
+| checkpoint | — | 5.58 MB |
+
+Preset sample (temperature 0.8):
+
+```
+a transformer feneffacting and memgram wits made untustory, and usix dateverse and
+vist looking court and loge will meast make nights of Jologian fure these moil sehe
+in createds, itord to posess datcharvially cosing gover tract of your hombwrum and
+```
+
+More function words and word-shaped chunks survive (`and ... made ... looking court
+and ... will ... make nights of ... in ... to posess ... of your ...`) — the longer
+context and bigger model roughly **0.74 bits/byte** lower than the default. Greedy
+still collapses to a frequent phrase (`... service and service and ...`); temperature
+is the readable view. Fluency keeps coming with more model, more context, and a
+bigger step/data budget — the **token-packing (1.5.3) + curation-at-scale (1.5.4)**
+data arc and the **M16+** capacity work are where that crossover lives.

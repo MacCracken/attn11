@@ -22,7 +22,9 @@ trunk (and the AR default) learning English statistics off web text.
   full TFDS pipeline is skipped, honest expectations (a tiny model produces
   English-*flavored* text, not fluent prose), and measured results.
 - **X016** — the C4-English run: a 53 K-param default+BPE model over a 4 MB C4 slice
-  reaches 3.43 bits/byte and samples recognizable broken English.
+  reaches 3.43 bits/byte and samples recognizable broken English; the `--preset`
+  (232 K params, ctx 64) on the same slice reaches 2.70 bits/byte with visibly more
+  word-shaped output — same data, better model ⇒ better English.
 
 ### Changed
 - **`.gitignore`** — ignore `/data/` (sampled corpora + shards are large and
