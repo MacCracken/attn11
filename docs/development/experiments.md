@@ -686,3 +686,45 @@ directly comparable head-to-head (see takeaway 3), so three clearly-scoped numbe
    correctness issue. A stochastic/temperature decode and larger scale are the
    fast-follows. Regeneration: `./build/attn11 --steps 2000 --eval` (AR) and
    `./build/attn11 --objective diffusion --steps 2000 --eval` (diffusion grid).
+
+## X016 — teaching English from C4: a large external corpus (v1.5.1) (2026-06-13)
+
+**Setup**: 1.5.1, the first run on a real **large external dataset** — a 4 MB slice
+of **C4** (`c4/en`, the 305 GB Colossal Clean Crawled Corpus), streamed with
+`scripts/c4_sample.py` (stdlib `gzip`+`json` over a public C4 shard — no
+tensorflow/TFDS/pip; ~1 MB actually downloaded). Goal: does a tiny attn11 learn
+English off raw web text and "speak" something? Default config (C=32, ctx 16, 3
+layers) + **BPE 256** (subword tokens, so the model predicts word-pieces), 600 steps,
+seed 1337, x86_64. The `data/` corpus is gitignored.
+
+| metric | value |
+|--------|-------|
+| C4 sample | 4,002,896 bytes (1 stream, ~0.3 s) |
+| vocab (byte base + 256 BPE merges) | 438 |
+| params | 52,704 |
+| corpus tokens (BPE) | 1,969,733 |
+| train loss | 5.29 (250) → 4.90 (600) |
+| eval CE/token · bits/byte | 4.836 · **3.433** |
+
+Sample (temp 0.8): *"a transformer arduns famt m, resianit conin the loltinaitjae
+bfre heelsaral be of poluring a you clonwetkes froms whisuly 20gam nurenten ... gent
+ho the geyf eet tecudiis it pemired in the blench have leicing alle cidforesionw
+pateat"*.
+
+**Takeaways**:
+1. **It speaks English-ish.** Real words and structure thread through the temp-0.8
+   sample (`the`, `be of`, `a you`, `for`, `have`, `it`, `in the`) between wobbling
+   subwords — a 53 K-param model producing English-shaped text off web prose it was
+   never given the rules of. Greedy decoding collapses to high-frequency tokens
+   ("and"/"see"/" "); temperature sampling is the readable view.
+2. **Pipeline, not Beam.** The C4 source is 305 GB but attn11 only needs a few MB of
+   bytes; streaming one shard and stopping early ([`scripts/c4_sample.py`](../../scripts/c4_sample.py))
+   gets the *identical* corpus TFDS catalogs with zero heavy deps and a ~1 MB
+   download. The "large dataset" is the *source*; the model-facing slice is small (a
+   tiny model saturates on diversity long before 4 MB).
+3. **Fluency is a capacity story, not a data one.** 3.43 bits/byte (vs ~1–1.5 for a
+   strong English model, ~6+ uniform over this vocab) — the model learned real
+   structure but is far from fluent. ctx 16 (~10 BPE words) caps coherence; the
+   `--preset` (ctx 64, C=64, 232 K params) covers ~40 words and reads better at ~17×
+   the per-step cost. The model-scale follow-on (M16+) and a longer budget are where
+   fluency lives. Regeneration: see [`docs/examples/c4-english.md`](../examples/c4-english.md).

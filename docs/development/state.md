@@ -5,7 +5,16 @@
 
 ## Version
 
-**1.5.0** — *Char-diffusion objective* (M15, E5; ADR 0013, X015). The first
+**1.5.1** — *C4 English experiment* (X016). Tooling + example for training on a
+real **large external corpus** — a 4 MB slice of **C4** (`c4/en`, 305 GB), streamed
+by `scripts/c4_sample.py` (stdlib `gzip`+`json`, no tensorflow/TFDS/pip — it streams
+one public C4 shard and stops, ~1 MB downloaded) into a **gitignored** `data/` file
+for `--corpus`. NO core binary change (only `CFG_VERSION`); the example
+([`docs/examples/c4-english.md`](../examples/c4-english.md)) trains a 53 K-param
+default+BPE model to **3.43 bits/byte** and samples recognizable broken English
+(real words + structure between subword wobble) — fluency is a model-capacity story
+(M16+), not a pipeline one. **966** checks unchanged.
+(1.5.0 — *Char-diffusion objective* (M15, E5; ADR 0013, X015). The first
 *training-objective* departure from the AR trunk: `--objective diffusion` trains a
 masked absorbing-state diffusion model (D3PM/MDLM) — drop the causal mask, corrupt a
 window by replacing positions with a **learned `[MASK]` embedding** (mask_emb, +C
@@ -27,7 +36,7 @@ is a scale phenomenon, absent at 39 K params / 190 bytes; honest negative result
 the gate is the grad-checks + a logged comparison, not a win. A no-flag run is
 byte-identical. Verified: **966** checks x86_64 AND aarch64/qemu, agnos, fuzz, lint,
 smoke.
-(1.4.6 — *Benchmarking pass*. A dedicated perf release: one canonical
+1.4.6 — *Benchmarking pass*. A dedicated perf release: one canonical
 `./build/bench` run across the whole mixer family on the current binary, with the
 time series (`bench-history.csv`, stale at 0.9.0) and the perf doc
 (`docs/benchmarks.md`, no MoE/linear/SSM/hybrid sections) brought current, and the

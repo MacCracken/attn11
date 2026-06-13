@@ -4,6 +4,30 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.5.1] - 2026-06-13
+
+**C4 English experiment** — tooling + example for training attn11 on a real
+large-corpus slice (the C4 `c4/en` dataset). No core binary change; a data-prep
+helper, an example pipeline, and an experiment log. Demonstrates the diffusion-era
+trunk (and the AR default) learning English statistics off web text.
+
+### Added
+- **`scripts/c4_sample.py`** — stream a small English sample out of C4 into a plain
+  UTF-8 corpus file for `--corpus`, with **zero third-party deps** (stdlib `gzip` +
+  `json`). C4's TFDS `c4/en` config is 305 GB and needs an Apache-Beam prep; instead
+  the script streams ONE of C4's public gzipped JSON-lines shards (`allenai/c4`, the
+  raw mirror of the same corpus) and stops at `--max-bytes`, so it downloads only ~a
+  few MB, not the 319 MB shard. Reads a URL (urllib) or a piped shard (`--url -`).
+- **`docs/examples/c4-english.md`** — the stream → train → sample recipe, why the
+  full TFDS pipeline is skipped, honest expectations (a tiny model produces
+  English-*flavored* text, not fluent prose), and measured results.
+- **X016** — the C4-English run: a 53 K-param default+BPE model over a 4 MB C4 slice
+  reaches 3.43 bits/byte and samples recognizable broken English.
+
+### Changed
+- **`.gitignore`** — ignore `/data/` (sampled corpora + shards are large and
+  regenerable; never committed).
+
 ## [1.5.0] - 2026-06-13
 
 **Char-diffusion objective** (M15, E5; ADR 0013) — the first *training-objective*

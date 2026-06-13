@@ -3,6 +3,10 @@
 /dist/
 *.core
 
+# Experiment datasets — corpora sampled from C4/etc. (scripts/c4_sample.py).
+# Large, regenerable, and never part of the source tree (1.5.1).
+/data/
+
 # Release / toolchain artifacts
 cyrius-*.tar.gz
 *.tar.gz
