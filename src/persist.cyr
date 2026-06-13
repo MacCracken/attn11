@@ -31,8 +31,14 @@
 # negative error code, never a crash or a decode loop.
 
 fn CKPT_MAGIC(): i64 { return 0x4154544E31317631; }   # "ATTN11v1" (file family)
-fn CKPT_VER(): i64 { return 5; }
-fn CKPT_HDR(): i64 { return 22; }                     # v5 header i64 fields
+# The version the CURRENT model serializes as: v6 carries the M14 rung-c per-layer
+# mixer array (a hybrid); a uniform model writes v5 — byte-identical to pre-1.4.3,
+# so every existing v5 round-trip and the fuzz harness are unchanged.
+fn CKPT_VER(): i64 { if (g_layer_kind != 0) { return 6; } return 5; }
+fn CKPT_HDR(): i64 { return 22; }                     # v5/v6 fixed header i64 fields
+# per-layer mixer region (v6, ADR 0011): NL i64 kinds appended after the fixed
+# header, before the vocab. 0 (no region) for a uniform model (v5 and earlier).
+fn _ckpt_pl(): i64 { if (g_layer_kind != 0) { return g_NL; } return 0; }
 fn CKPT_HDR_V4(): i64 { return 20; }                  # v4 header i64 fields
 fn CKPT_HDR_V3(): i64 { return 16; }                  # v3 header i64 fields
 fn CKPT_HDR_V2(): i64 { return 13; }                  # v2 header i64 fields
@@ -80,7 +86,7 @@ fn _ckpt_vb(): i64 { if (g_bpe_on == 1) { return g_bpe_base; } return g_V; }
 fn _ckpt_k(): i64 { if (g_bpe_on == 1) { return g_bpe_nmerges; } return 0; }
 
 # Total checkpoint size in bytes for the current model.
-fn ckpt_size(): i64 { return (CKPT_HDR() + _ckpt_vb() + 2 * _ckpt_k() + 3 * g_NP) * 8; }
+fn ckpt_size(): i64 { return (CKPT_HDR() + _ckpt_pl() + _ckpt_vb() + 2 * _ckpt_k() + 3 * g_NP) * 8; }
 
 # Serialize the current model state into buf (caller allocs ckpt_size bytes).
 # The vocab loop runs to Vb, NOT g_V: g_vocab is a 256-entry base table, and
@@ -112,7 +118,12 @@ fn ckpt_serialize(buf): i64 {
     # M13 MoE descriptor (E8) — defaults to the dense MLP (1 expert, top-1)
     store64(buf + 20 * 8, g_num_experts);
     store64(buf + 21 * 8, g_expert_topk);
-    var base = CKPT_HDR();
+    # M14 rung-c per-layer mixer kinds (v6) — only present when a hybrid (g_layer_kind
+    # set); a uniform model writes nothing here and stays a byte-identical v5.
+    var pl = _ckpt_pl();
+    var li = 0;
+    while (li < pl) { store64(buf + (CKPT_HDR() + li) * 8, load64(g_layer_kind + li * 8)); li = li + 1; }
+    var base = CKPT_HDR() + pl;
     var i = 0;
     while (i < vb) { store64(buf + (base + i) * 8, load64(g_vocab + i * 8)); i = i + 1; }
     i = 0;
@@ -133,12 +144,13 @@ fn ckpt_load_buf(buf, len): i64 {
     if (len < CKPT_HDR_V1() * 8) { return 0 - 1; }
     if (load64(buf + 0 * 8) != CKPT_MAGIC()) { return 0 - 2; }
     var ver = load64(buf + 1 * 8);
-    if ((ver != 1) && (ver != 2) && (ver != 3) && (ver != 4) && (ver != 5)) { return 0 - 3; }
+    if ((ver != 1) && (ver != 2) && (ver != 3) && (ver != 4) && (ver != 5) && (ver != 6)) { return 0 - 3; }
     var hdr = CKPT_HDR_V1();
     if (ver == 2) { hdr = CKPT_HDR_V2(); }
     if (ver == 3) { hdr = CKPT_HDR_V3(); }
     if (ver == 4) { hdr = CKPT_HDR_V4(); }
     if (ver == 5) { hdr = CKPT_HDR(); }
+    if (ver == 6) { hdr = CKPT_HDR(); }   # v6: 22 fixed fields + the NL per-layer region (added as pl below)
     if (len < hdr * 8) { return 0 - 1; }
     var V = load64(buf + 2 * 8);
     var C = load64(buf + 3 * 8);
@@ -255,18 +267,41 @@ fn ckpt_load_buf(buf, len): i64 {
     }
     if ((num_experts < 1) || (num_experts > 256)) { return 0 - 44; }
     if ((topk < 1) || (topk > num_experts)) { return 0 - 45; }
+    # M14 rung-c per-layer hybrid (v6, ADR 0011). v1..v5 carry no per-layer region
+    # and run uniform (the descriptor's attn_kind everywhere), so they cannot hit
+    # -46. The NL kinds sit at [CKPT_HDR() .. CKPT_HDR()+NL); bound the read first
+    # (NL is already in [1,128]), then enforce the uniform-stride invariant — each
+    # layer's _kvw must equal the base attn_kind's (so np below is exact). lin_extra
+    # flags a lin layer under a non-lin base (needs the g_lin_state decode cache).
+    var pl = 0;
+    var lin_extra = 0;
+    if (ver == 6) {
+        pl = NL;
+        if (len < (CKPT_HDR() + pl) * 8) { return 0 - 1; }
+        if (_hybrid_kinds_ok(buf + CKPT_HDR() * 8, NL, C, nh, nkv, attn_kind, d_c, pos_kind, d_rope) == 0) {
+            return 0 - 46;
+        }
+        if (attn_kind != 2) {
+            var lk = 0;
+            while (lk < NL) {
+                if (load64(buf + (CKPT_HDR() + lk) * 8) == 2) { lin_extra = 1; }
+                lk = lk + 1;
+            }
+        }
+    }
     var expnp = ckpt_expected_np_moe(V, C, T, nh, NL, bias, nkv, attn_kind, d_c, pos_kind, d_rope, num_experts, topk);
     if ((np < 1) || (np > CKPT_MAX_NP())) { return 0 - 13; }
     if (np != expnp) { return 0 - 10; }
     # shape-valid is not enough: the nh*T*T attention arenas (independent of
     # np) and the 4 parameter vectors must also fit the allocator. Reject any
     # config whose model_init total would exceed the cap — BEFORE allocating.
-    var abytes = model_alloc_bytes_moe(V, C, T, nh, nkv, NL, np, attn_kind, d_c, pos_kind, d_rope, num_experts, topk);
+    var abytes = model_alloc_bytes_hyb(V, C, T, nh, nkv, NL, np, attn_kind, d_c, pos_kind, d_rope,
+                                       num_experts, topk, lin_extra, pl);
     if (abytes > CKPT_MAX_MODEL_BYTES()) { return 0 - 18; }
-    var need = (hdr + Vb + 2 * K + 3 * np) * 8;
+    var need = (hdr + pl + Vb + 2 * K + 3 * np) * 8;
     if (len != need) { return 0 - 11; }
-    # base vocab bytes must be valid 0..255
-    var base = hdr;
+    # base vocab bytes must be valid 0..255 (after the fixed header + per-layer region)
+    var base = hdr + pl;
     var i = 0;
     while (i < Vb) {
         var code = load64(buf + (base + i) * 8);
@@ -319,9 +354,16 @@ fn ckpt_load_buf(buf, len): i64 {
         # corpus_set always retains them, so this is purely defensive
         if ((tok_kind == 1) && (g_text == 0)) { return 0 - 39; }
     }
-    # validated — build the model and restore state
+    # validated — build the model and restore state. v6 rebuilds the per-layer
+    # hybrid from the in-buffer kinds (already _hybrid_kinds_ok-validated above);
+    # uniform models take the plain path. The kinds pointer is the in-buffer region.
     var was_bpe = g_bpe_on;
-    model_init_moe(V, C, T, nh, nkv, NL, bias, drop, 1, attn_kind, d_c, pos_kind, d_rope, num_experts, topk);
+    if (pl > 0) {
+        model_init_full(V, C, T, nh, nkv, NL, bias, drop, 1, attn_kind, d_c, pos_kind, d_rope,
+                        num_experts, topk, buf + CKPT_HDR() * 8);
+    } else {
+        model_init_moe(V, C, T, nh, nkv, NL, bias, drop, 1, attn_kind, d_c, pos_kind, d_rope, num_experts, topk);
+    }
     g_vocab = t_alloc(256);
     g_char2id = t_alloc(256);
     i = 0;

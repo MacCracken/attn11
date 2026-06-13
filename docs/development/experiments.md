@@ -473,3 +473,64 @@ The C×N state cache (12 288 B at N=16) does NOT grow with T — at the preset
 4. The `--attn-kind {mha, mla, lin, ssm}` switch is now four mixers wide. Rung (c)
    — per-layer interleaving + the hybrid-ratio sweep — and a vidya-scale bake-off
    are the follow-ons.
+
+## X012 — the per-layer hybrid: a mixer-ratio sweep (M14 rung c, v1.4.3) (2026-06-13)
+
+**Setup**: 1.4.3, default config (d_model 32, ctx 16, 4 heads, 3 layers), 1200
+steps on the embedded corpus, `--eval`. The new lever is `--attn-every K`: a
+full-attention (MHA) block at every K-th layer, gated-linear (`--attn-kind lin`)
+elsewhere — the survey's "a few attention layers among many cheap recurrent ones"
+structural shift. NL=3 gives a four-point sweep on the attention fraction:
+pure-lin (0/3) → every-3 (1/3) → every-2 (2/3) → pure-mha (3/3). x86_64.
+
+**Correctness** (grad-checks, both arches): the per-layer dispatch is the wiring
+proven here. `test_model_hybrid` (full-model 1e-3) grad-checks a [mha, lin, mha]
+stack — the MIXED backward (`attn_bwd` for the attention blocks, `attn_lin_bwd`
+for the linear block) composing through the residual stream and the tied head
+(maxrel ~1e-5). `test_kv_hybrid` (cached-vs-uncached **bit-identity** across
+context-shifts, two interleavings — each block replays its own kind's decode
+path); `test_ckpt_hybrid` (the new **checkpoint v6** per-layer region round-trips,
+and an image whose per-layer kind breaks the uniform-stride invariant is rejected
+`-46`); `test_config_caps`/`test_alloc_accounting` hybrid pins. **801 → 857** checks.
+
+**Comparison** (attention-fraction sweep; all configs are PARAMETER-identical —
+the hybrid is free in parameters, it only redistributes the decode cache):
+
+| attention | config            | bits/byte | params | decode cache | cache vs MHA |
+|-----------|-------------------|-----------|--------|--------------|--------------|
+| 0/3 (0%)  | pure lin          | 0.239     | 39 488 | 6 144 B      | 0.25×        |
+| 1/3 (33%) | lin --attn-every 3| 0.244     | 39 488 | 12 288 B     | 0.50×        |
+| 2/3 (67%) | lin --attn-every 2| **0.234** | 39 488 | 18 432 B     | 0.75×        |
+| 3/3 (100%)| pure mha          | 0.279     | 39 488 | 24 576 B     | 1.00×        |
+
+Decode cache is the SUM of per-layer caches: each attention layer keeps its
+T-growing K/V (8 192 B at T=16), each linear layer the constant nh·hd² state
+(2 048 B). So the cache scales with the attention fraction — exactly the lever.
+
+**Cost** (`./build/bench`): the hybrid fwd+bwd step is the mix of its blocks'
+steps — the 1/3-attention hybrid runs ~3.73 ms, essentially the linear step
+(~3.80 ms) since two of three blocks are linear, and well under a pure-SSM step
+(~5.65 ms). Cached decode advances each block's own state.
+
+**Takeaways**:
+1. **Per-layer interleaving trains and grad-checks.** A model whose blocks run
+   DIFFERENT sequence mixers composes correctly forward and backward — the mixed
+   stack's hand-derived gradients land at ~1e-5, and the cached decode is
+   bit-identical to the uncached reference for every interleaving.
+2. **The hybrid is parameter-free to switch on** (gated-linear reuses MHA's
+   projections, so {mha, lin} share the block layout — no per-layer offset refactor,
+   the per-block stride stays uniform). What it buys is a knob on the decode cache:
+   the attention fraction sets how much of the cache is T-growing K/V vs constant
+   state. At 1/3 attention the cache is half of pure-MHA's.
+3. **At reference scale the ratio sweep is within noise.** The 2/3-attention hybrid
+   (0.234) edges pure-lin (0.239), the 1/3 (0.244) trails it slightly, and all three
+   beat pure-MHA (0.279) — but on a tiny repetitive corpus the spread is noise.
+   Read honestly: this is "the hybrid is expressible and grad-checked", NOT a claim
+   that any ratio wins; the survey's hybrid advantage is a long-context, scaled
+   phenomenon the reference can't show. The infrastructure to run that sweep — at
+   any ratio, persisted in the checkpoint — is the deliverable.
+4. **Checkpoint v6** carries the per-layer pattern (the first model state that can't
+   ride the scalar descriptor); uniform models still write v5, byte-identical.
+5. The hybrid is restricted to LAYOUT-COMPATIBLE mixers {mha, gqa, lin}. Admitting
+   MLA/SSM into a hybrid needs per-layer (or padded) parameter layouts — the rung-d
+   follow-on. A vidya-scale bake-off across ratios is the standing M14 follow-on.

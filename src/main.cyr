@@ -17,6 +17,10 @@
 #   attn11 --kv-heads N             override K/V heads (must divide heads;
 #                                   < heads = GQA, 1 = MQA; default = heads)
 #   attn11 --layers N               override transformer blocks
+#   attn11 --attn-every K           hybrid mixer (M14 rung c): a full-attention
+#                                   (MHA) block every K-th layer, the --attn-kind
+#                                   base (mha/lin) elsewhere — the survey's
+#                                   "few attention layers among many cheap" lever
 #   attn11 --experts N              MoE: N experts per block (1 = dense baseline;
 #                                   the dense MLP becomes a top-K-routed mixture)
 #   attn11 --expert-topk K          active experts per token (default 2; 1..N)
@@ -84,7 +88,7 @@ fn _atoi(s): i64 {
 }
 
 # Kept in sync with the VERSION file (CI's docs job gates the match).
-fn CFG_VERSION(): i64 { return "1.4.2"; }
+fn CFG_VERSION(): i64 { return "1.4.3"; }
 
 fn usage(): i64 {
     puts("attn11 — a from-scratch GPT-style transformer, trained, in Cyrius\n");
@@ -101,6 +105,7 @@ fn usage(): i64 {
     puts("  --layers N      transformer blocks (1..128)\n");
     puts("  --attn-kind K   mixer: mha (default), mla (latent KV), lin (gated linear), ssm (selective SSM)\n");
     puts("  --latent-dim N  MLA latent width / SSM state size (1..d_model; MLA default d_model/2, SSM 16)\n");
+    puts("  --attn-every K  hybrid: a full-attention (MHA) block every K-th layer, --attn-kind base elsewhere\n");
     puts("  --pos-kind K    positions: learned (default), rope (coupled, mha/gqa), or rope-decoupled (mla)\n");
     puts("  --rope-dim N    decoupled-RoPE channel width d_rope (even, 2..d_model; default ~hd/2)\n");
     puts("  --experts N     MoE: N experts per block (1=dense; >1 enables top-K routing, 1..256)\n");
@@ -136,6 +141,9 @@ fn main(): i64 {
     var cfg_rope_dim = 0;                            # d_rope; resolved post-parse for rope-decoupled
     var cfg_num_experts = 1;                         # 1 = dense (default); --experts N enables MoE
     var cfg_expert_topk = 0;                         # 0 = "default" -> min(2, N), resolved post-parse
+    var cfg_attn_every = 0;                          # M14 rung c: MHA every K-th layer (0 = uniform)
+    var cfg_hybrid = 0;                              # set post-parse if the per-layer kinds are mixed
+    var lkinds[1024];                                # per-layer mixer kinds (128 i64 = max --layers)
     var use_bpe = 0; var bpe_k = 0; var do_eval = 0;
     var i = 1;
     while (i < argc()) {
@@ -169,6 +177,7 @@ fn main(): i64 {
             else { puts("attn11: --pos-kind must be learned, rope, or rope-decoupled\n"); return 1; }
         }
         elif (streq(a, "--rope-dim") == 1) { i = i + 1; cfg_rope_dim = _atoi(_av(i, a)); }
+        elif (streq(a, "--attn-every") == 1) { i = i + 1; cfg_attn_every = _atoi(_av(i, a)); }
         elif (streq(a, "--experts") == 1) { i = i + 1; cfg_num_experts = _atoi(_av(i, a)); }
         elif (streq(a, "--expert-topk") == 1) { i = i + 1; cfg_expert_topk = _atoi(_av(i, a)); }
         elif (streq(a, "--bpe") == 1) { use_bpe = 1; i = i + 1; bpe_k = _atoi(_av(i, a)); }
@@ -255,6 +264,33 @@ fn main(): i64 {
             cfg_expert_topk = 1;
         }
     }
+    # Per-layer mixer HYBRID (M14 rung c): --attn-every K places a full-attention
+    # (MHA) block at every K-th layer (L % K == 0, so layer 0 is attention) and the
+    # --attn-kind base elsewhere — the survey's "few attention layers among many
+    # cheap ones" lever. Restricted to layout-compatible bases {mha, lin} (lin reuses
+    # MHA's projections, so the block stride stays uniform). Ignored under --load
+    # (the checkpoint's per-layer pattern wins). model_config_ok/_hybrid_kinds_ok
+    # are the backstops. If the pattern collapses to one kind (e.g. K=1 → all MHA),
+    # it falls back to that uniform kind (no v6, no hybrid).
+    if ((cfg_attn_every > 0) && (load_path == 0)) {
+        if ((cfg_attn_kind != 0) && (cfg_attn_kind != 2)) {
+            puts("attn11: --attn-every needs --attn-kind mha or lin (mla/ssm hybrids are a later rung)\n");
+            return 1;
+        }
+        if (cfg_pos_kind != 0) {
+            puts("attn11: --attn-every requires learned-abs positions (no RoPE in a hybrid)\n");
+            return 1;
+        }
+        var hl = 0;
+        while (hl < cfg_nl) {
+            var hk = cfg_attn_kind;
+            if ((hl % cfg_attn_every) == 0) { hk = 0; }       # attention block
+            store64(&lkinds + hl * 8, hk);
+            if (hk != load64(&lkinds)) { cfg_hybrid = 1; }    # differs from layer 0 → mixed
+            hl = hl + 1;
+        }
+        if (cfg_hybrid == 0) { cfg_attn_kind = load64(&lkinds); }   # collapsed → uniform kinds[0]
+    }
     # K is the experiment's key variable — a silent default would hide it
     if ((use_bpe == 1) && ((bpe_k < 1) || (bpe_k > BPE_MAX_MERGES()))) {
         puts("attn11: --bpe needs a merge count in 1..512\n");
@@ -287,6 +323,11 @@ fn main(): i64 {
         var rc = ckpt_load_file(load_path);
         if (rc < 0) { puts("attn11: checkpoint load failed (code "); fmt_int(rc); puts(")\n"); return 1; }
         puts("attn11: resumed from checkpoint at step "); fmt_int(g_step); _putc(10);
+    } elif (cfg_hybrid == 1) {
+        model_init_full(V, cfg_c, cfg_t, cfg_nh, cfg_nkv, cfg_nl,
+                        CFG_ATTN_BIAS(), CFG_DROPOUT(), CFG_SEED(),
+                        cfg_attn_kind, cfg_latent_dim, cfg_pos_kind, cfg_rope_dim,
+                        cfg_num_experts, cfg_expert_topk, &lkinds);
     } else {
         model_init_moe(V, cfg_c, cfg_t, cfg_nh, cfg_nkv, cfg_nl,
                        CFG_ATTN_BIAS(), CFG_DROPOUT(), CFG_SEED(),
@@ -301,9 +342,17 @@ fn main(): i64 {
     puts(" heads="); fmt_int(g_nh);
     puts(" kv_heads="); fmt_int(g_nkv);
     puts(" layers="); fmt_int(g_NL);
-    if (g_attn_kind == 1) { puts(" attn=mla(d_c="); fmt_int(g_latent_dim); puts(")"); }
-    if (g_attn_kind == 2) { puts(" attn=linear"); }
-    if (g_attn_kind == 3) { puts(" attn=ssm(N="); fmt_int(g_latent_dim); puts(")"); }
+    if (g_layer_kind != 0) {
+        # per-layer hybrid (M14 rung c): count the MHA (attention) blocks vs the base
+        var nm = 0; var hl2 = 0;
+        while (hl2 < g_NL) { if (load64(g_layer_kind + hl2 * 8) == 0) { nm = nm + 1; } hl2 = hl2 + 1; }
+        puts(" attn=hybrid("); fmt_int(nm); puts("/"); fmt_int(g_NL); puts(" mha, base=");
+        if (g_attn_kind == 2) { puts("lin)"); } else { puts("mha)"); }
+    } else {
+        if (g_attn_kind == 1) { puts(" attn=mla(d_c="); fmt_int(g_latent_dim); puts(")"); }
+        if (g_attn_kind == 2) { puts(" attn=linear"); }
+        if (g_attn_kind == 3) { puts(" attn=ssm(N="); fmt_int(g_latent_dim); puts(")"); }
+    }
     if (g_pos_kind == 1) { puts(" pos=rope"); }
     if (g_pos_kind == 2) { puts(" pos=rope-decoupled(d_rope="); fmt_int(g_rope_dim); puts(")"); }
     if (g_num_experts > 1) {

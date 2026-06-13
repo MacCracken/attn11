@@ -43,6 +43,26 @@ var g_attn_kind = 0;
 var g_pos_kind = 0;
 var g_latent_dim = 0;
 var g_rope_dim = 0;
+# ---- per-layer mixer hybrid (M14 rung c; checkpoint v6, ADR 0011) -----------
+# By default every block runs the global g_attn_kind. A HYBRID interleaves mixer
+# kinds per layer (the survey's structural lever: a few full-attention layers
+# among many cheap recurrent ones). g_layer_kind == 0 means uniform (g_attn_kind
+# everywhere — byte-identical to today). When set, it points to NL i64 per-layer
+# kinds, read ONLY by _lk(L) in the three dispatch helpers. 1.4.3 restricts the
+# mix to LAYOUT-COMPATIBLE kinds {0 = mha/gqa, 2 = gated-linear} — lin reuses
+# MHA's exact projections (ADR 0009), so _kvw/_blk/the offsets/g_NP are identical
+# and the per-block stride stays uniform (NO per-layer parameter-offset refactor).
+var g_layer_kind = 0;
+# layer L's mixer kind: the per-layer array when hybrid, else the global.
+fn _lk(L): i64 { if (g_layer_kind == 0) { return g_attn_kind; } return load64(g_layer_kind + L * 8); }
+# 1 if any block runs gated-linear (kind 2) — gates the g_lin_state decode cache.
+# Uniform: base == 2. Hybrid: scan the per-layer kinds.
+fn _any_lin(): i64 {
+    if (g_layer_kind == 0) { if (g_attn_kind == 2) { return 1; } return 0; }
+    var L = 0;
+    while (L < g_NL) { if (load64(g_layer_kind + L * 8) == 2) { return 1; } L = L + 1; }
+    return 0;
+}
 
 # ---- MoE descriptor (M13, E8; checkpoint v5) -------------------------------
 # The dense GELU MLP becomes N experts + a top-K router. g_num_experts == 1 is
@@ -325,6 +345,28 @@ fn model_config_ok_moe(V, C, T, nh, nkv, NL, attn_kind, d_c, pos_kind, d_rope, n
     if ((topk < 1) || (topk > num_experts)) { return 0; }
     return 1;
 }
+# Per-layer HYBRID validity (M14 rung c, 1.4.3). `kinds` is NL i64 mixer kinds.
+# The uniform-stride invariant: EVERY layer must share the base block layout, i.e.
+# its _kvw must equal the base attn_kind's. For base ∈ {0 (mha), 2 (lin)} with
+# d_c == 0 this admits exactly the layout-compatible mix {mha, gqa, lin} (lin reuses
+# MHA's projections, ADR 0009) and rejects mla/ssm (whose _kvw differs) — so the
+# block stride stays uniform and no per-layer offset refactor is needed. RoPE is
+# softmax/MLA-specific, so a hybrid requires learned-absolute positions.
+# (Expressed as the _kvw-equality invariant, not a hardcoded set, so a future
+# layout-compatible kind needs no change here.) Returns 1 if valid, 0 if not.
+fn _hybrid_kinds_ok(kinds, NL, C, nh, nkv, base_ak, d_c, pos_kind, d_rope): i64 {
+    if (pos_kind != 0) { return 0; }
+    if ((base_ak != 0) && (base_ak != 2)) { return 0; }   # base must be a {0,2}-layout kind
+    var base_kvw = _kvw(C, nh, nkv, base_ak, d_c, pos_kind, d_rope);
+    var L = 0;
+    while (L < NL) {
+        var k = load64(kinds + L * 8);
+        if ((k != 0) && (k != 1) && (k != 2) && (k != 3)) { return 0; }       # a known kind
+        if (_kvw(C, nh, nkv, k, d_c, pos_kind, d_rope) != base_kvw) { return 0; }   # same stride
+        L = L + 1;
+    }
+    return 1;
+}
 
 # Exact bytes model_init will allocate for a config (NP precomputed by the
 # caller). Used by the checkpoint loader to reject configs that would drive
@@ -341,6 +383,13 @@ fn model_alloc_bytes_arch(V, C, T, nh, nkv, NL, NP, attn_kind, d_c, pos_kind, d_
 # MoE-aware variant (M13). KEEP IN SYNC with model_init_moe — test_alloc_accounting
 # pins the two together (incl. the MoE per-layer router/expert caches + scratch).
 fn model_alloc_bytes_moe(V, C, T, nh, nkv, NL, NP, attn_kind, d_c, pos_kind, d_rope, num_experts, topk): i64 {
+    return model_alloc_bytes_hyb(V, C, T, nh, nkv, NL, NP, attn_kind, d_c, pos_kind, d_rope, num_experts, topk, 0, 0);
+}
+# Hybrid-aware (M14 rung c, 1.4.3): lin_extra = 1 when a gated-linear layer needs
+# the g_lin_state decode cache but the base attn_kind isn't lin (so the attn_kind==2
+# term below wouldn't fire); pl = NL when the per-layer g_layer_kind array is held.
+fn model_alloc_bytes_hyb(V, C, T, nh, nkv, NL, NP, attn_kind, d_c, pos_kind, d_rope,
+                         num_experts, topk, lin_extra, pl): i64 {
     var F = 4 * C;
     var Ckv = nkv * (C / nh);
     var asz = attn_arena_size(T, C, nh, nkv);
@@ -361,9 +410,12 @@ fn model_alloc_bytes_moe(V, C, T, nh, nkv, NL, NP, attn_kind, d_c, pos_kind, d_r
         e = e + 2 * NL + NL * (T * nh * d_rope + T * d_rope) + T * nh * d_rope + T * d_rope;
         e = e + nh * d_rope;   # R_qr single-row scratch
     }
-    # gated-linear (attn_kind==2): the per-layer retention state cache (NL pointers
-    # + NL·nh·hd^2). The arena's 2·hd^2 lin scratch is already in `asz` above.
+    # gated-linear: the per-layer retention state cache (NL pointers + NL·nh·hd^2).
+    # The arena's 2·hd^2 lin scratch is already in `asz` above. Fires for a uniform
+    # lin model (attn_kind==2) OR a hybrid with lin layers over a non-lin base (lin_extra).
     if (attn_kind == 2) { e = e + NL + NL * nh * (C / nh) * (C / nh); }
+    elif (lin_extra == 1) { e = e + NL + NL * nh * (C / nh) * (C / nh); }
+    e = e + pl;   # per-layer g_layer_kind array (NL i64), held only by a hybrid
     # selective SSM (attn_kind==3, d_c = state N): 6 per-layer pointer arrays +
     # per-layer caches (Δ/B/C/h/y + the C*N decode state) + shared reverse scratch.
     if (attn_kind == 3) {
@@ -404,8 +456,18 @@ fn model_init_arch(V, C, T, nh, nkv, NL, attn_bias, dropout, seed, attn_kind, d_
 }
 # MoE-aware constructor (M13, E8). model_init_arch delegates with the dense
 # default (1 expert) so a no-flag run and every existing caller stay byte-identical.
+# model_init_moe is the uniform entry (hybrid_kinds = 0); model_init_full carries
+# the M14 rung-c per-layer hybrid array (1.4.3). Existing callers use model_init_moe.
 fn model_init_moe(V, C, T, nh, nkv, NL, attn_bias, dropout, seed,
                   attn_kind, d_c, pos_kind, d_rope, num_experts, topk): i64 {
+    return model_init_full(V, C, T, nh, nkv, NL, attn_bias, dropout, seed,
+                           attn_kind, d_c, pos_kind, d_rope, num_experts, topk, 0);
+}
+# hybrid_kinds: 0 = uniform (every block runs attn_kind); else a pointer to NL
+# i64 per-layer mixer kinds (copied into g_layer_kind). The per-layer kinds must
+# share attn_kind's block layout (1.4.3: {0,2}) — validated by model_config_ok.
+fn model_init_full(V, C, T, nh, nkv, NL, attn_bias, dropout, seed,
+                   attn_kind, d_c, pos_kind, d_rope, num_experts, topk, hybrid_kinds): i64 {
     if (model_config_ok_moe(V, C, T, nh, nkv, NL, attn_kind, d_c, pos_kind, d_rope, num_experts, topk) == 0) {
         puts("attn11: model_init: invalid config (need nh | C, nkv | nh, nkv <= nh; ");
         puts("mla: nkv == nh, 1 <= d_c <= C; rope: mha + even hd; rope-decoupled: mla + even d_rope; ");
@@ -420,6 +482,20 @@ fn model_init_moe(V, C, T, nh, nkv, NL, attn_bias, dropout, seed,
     # decoupled RoPE adds W_QR/W_KR, MoE swaps the MLP region for N experts + gate).
     g_attn_kind = attn_kind; g_pos_kind = pos_kind; g_latent_dim = d_c; g_rope_dim = d_rope;
     g_num_experts = num_experts; g_expert_topk = topk;
+    # per-layer hybrid (M14 rung c): copy the NL kinds into g_layer_kind, or stay
+    # uniform (0). Reset FIRST so a re-init (tests build many models) never carries
+    # a stale array from a prior hybrid. Set before g_NP/_any_lin reads it.
+    g_layer_kind = 0;
+    if (hybrid_kinds != 0) {
+        if (_hybrid_kinds_ok(hybrid_kinds, NL, C, nh, nkv, attn_kind, d_c, pos_kind, d_rope) == 0) {
+            puts("attn11: model_init: invalid hybrid (per-layer kinds must share the base ");
+            puts("{mha,lin} block layout; learned-abs positions only)\n");
+            sys_exit(1);
+        }
+        g_layer_kind = t_alloc(NL);
+        var lk = 0;
+        while (lk < NL) { store64(g_layer_kind + lk * 8, load64(hybrid_kinds + lk * 8)); lk = lk + 1; }
+    }
     g_aux_alpha = f64_from(0);
     if (num_experts > 1) { g_aux_alpha = f64_div(f64_from(1), f64_from(100)); }   # Switch α = 0.01
     var F = g_F;
@@ -430,7 +506,14 @@ fn model_init_moe(V, C, T, nh, nkv, NL, attn_bias, dropout, seed,
     # shape-valid config can still imply a model larger than the allocator cap.
     # Reject BEFORE any allocation so a hostile --layers/--preset combination
     # aborts cleanly instead of through an oversized/undersized t_alloc.
-    var abytes = model_alloc_bytes_moe(V, C, T, nh, nkv, NL, g_NP, attn_kind, d_c, pos_kind, d_rope, num_experts, topk);
+    # hybrid extras: a lin layer in a non-lin-base model needs g_lin_state
+    # (lin_extra); a hybrid model needs the NL-entry g_layer_kind array (pl).
+    var lin_extra = 0;
+    if (_any_lin() == 1) { if (attn_kind != 2) { lin_extra = 1; } }
+    var pl = 0;
+    if (g_layer_kind != 0) { pl = NL; }
+    var abytes = model_alloc_bytes_hyb(V, C, T, nh, nkv, NL, g_NP, attn_kind, d_c, pos_kind, d_rope,
+                                       num_experts, topk, lin_extra, pl);
     if (abytes > CKPT_MAX_MODEL_BYTES()) {
         puts("attn11: model_init: config exceeds the 128 MB model-allocation cap\n");
         sys_exit(1);
@@ -594,8 +677,9 @@ fn model_init_moe(V, C, T, nh, nkv, NL, attn_bias, dropout, seed,
         store64(KV_V + L * 8, t_alloc(TKv));
         L = L + 1;
     }
-    # gated-linear decode state (attn_kind==2): per-layer nh*hd^2 retention state
-    if (attn_kind == 2) {
+    # gated-linear decode state: per-layer nh*hd^2 retention state. Allocated when
+    # ANY block is gated-linear — a uniform lin model OR a hybrid with lin layers.
+    if (_any_lin() == 1) {
         var hdl = C / nh;
         g_lin_state = t_alloc(NL);
         L = 0;
@@ -617,6 +701,19 @@ fn model_init_moe(V, C, T, nh, nkv, NL, attn_bias, dropout, seed,
 # Decoupled-RoPE MLA (M12 incr 5) also caches the shared rope key K^R (d_rope per
 # token per layer), so the cache is d_c + d_rope per token.
 fn kv_cache_bytes(): i64 {
+    # per-layer HYBRID (M14 rung c): each block's cache is its own kind's —
+    # mha layers store full K/V (2·T·Ckv), lin layers the constant nh·hd^2 state.
+    if (g_layer_kind != 0) {
+        var hd2 = g_C / g_nh;
+        var lin_b = g_nh * hd2 * hd2;
+        var mha_b = 2 * g_T * _Ckv();
+        var tot = 0; var L = 0;
+        while (L < g_NL) {
+            if (load64(g_layer_kind + L * 8) == 2) { tot = tot + lin_b; } else { tot = tot + mha_b; }
+            L = L + 1;
+        }
+        return tot * 8;
+    }
     # gated linear attention (M14): the cache is the per-layer retention STATE
     # (nh·hd^2), CONSTANT in T — the headline vs MHA/MLA's T-growing K/V.
     if (g_attn_kind == 2) { var hd = g_C / g_nh; return g_NL * g_nh * hd * hd * 8; }
@@ -815,24 +912,26 @@ fn embed_bwd(dx0): i64 {
 
 # ---- full forward: returns mean loss (f64) ---------------------------------
 # ---- attention-sublayer mixer dispatch (1.4.1) ------------------------------
-# ONE branch point each on the mixer kind (g_attn_kind: 0 = mha/gqa, 1 = mla
-# [× g_pos_kind], 2 = gated-linear): the batch forward (shared by model_forward
-# and model_eval_window), the batch backward, and the cached single-row decode.
-# A new mixer (the M14 selective SSM) adds one case in each of these three, not
-# in four functions; the M14 per-layer hybrid flips g_attn_kind to a per-layer
-# lookup HERE and nowhere else.
+# ONE branch point each on the mixer kind (0 = mha/gqa, 1 = mla [× g_pos_kind],
+# 2 = gated-linear, 3 = selective-SSM): the batch forward (shared by
+# model_forward and model_eval_window), the batch backward, and the cached
+# single-row decode. A new mixer adds one case in each of these three, not in
+# four functions. The M14 rung-c per-layer HYBRID (1.4.3) reads the kind via
+# `_lk(L)` HERE and nowhere else — uniform models (g_layer_kind == 0) get
+# g_attn_kind back unchanged, so this is byte-identical until a hybrid is built.
 fn _attn_block_fwd(L, rows): i64 {
     var a = La(LA_a, L);
-    if (g_attn_kind == 2) {
+    var ak = _lk(L);
+    if (ak == 2) {
         attn_lin_fwd(PL(L, _o_Wq()), P_bq(L), PL(L, _o_Wk()), P_bk(L),
                      PL(L, _o_Wv()), P_bv(L), PL(L, _o_Wo()), P_bo(L),
                      a, A_attn, La(LA_arena, L), rows, g_C, g_nh);
-    } elif (g_attn_kind == 3) {
+    } elif (ak == 3) {
         ssm_fwd(a, PL(L, _o_Wq()), P_bq(L), PL(L, _o_ssmA()), PL(L, _o_ssmWB()), PL(L, _o_ssmWC()),
                 PL(L, _o_ssmD()), PL(L, _o_Wo()), P_bo(L), A_attn,
                 La(LA_ssm_dlt, L), La(LA_ssm_B, L), La(LA_ssm_C, L), La(LA_ssm_h, L), La(LA_ssm_y, L),
                 rows, g_C, g_latent_dim);
-    } elif (g_attn_kind == 1) {
+    } elif (ak == 1) {
         if (g_pos_kind == 2) {
             attn_mla_dec_fwd(PL(L, _o_Wq()), P_bq(L), PL(L, _o_Wdkv()), PL(L, _o_Wuk()), P_bk(L),
                              PL(L, _o_Wuv()), P_bv(L), PL(L, _o_Wqr()), PL(L, _o_Wkr()), PL(L, _o_Wo()), P_bo(L),
@@ -851,20 +950,21 @@ fn _attn_block_fwd(L, rows): i64 {
     return 0;
 }
 fn _attn_block_bwd(L): i64 {
-    if (g_attn_kind == 2) {
+    var ak = _lk(L);
+    if (ak == 2) {
         attn_lin_bwd(PL(L, _o_Wq()), PL(L, _o_Wk()), PL(L, _o_Wv()), PL(L, _o_Wo()),
                      La(LA_a, L), D_drop, D_a,
                      GL(L, _o_Wq()), G_bq(L), GL(L, _o_Wk()), G_bk(L),
                      GL(L, _o_Wv()), G_bv(L), GL(L, _o_Wo()), G_bo(L),
                      La(LA_arena, L), g_T, g_C, g_nh);
-    } elif (g_attn_kind == 3) {
+    } elif (ak == 3) {
         ssm_bwd(La(LA_a, L), PL(L, _o_Wq()), PL(L, _o_ssmA()), PL(L, _o_ssmWB()), PL(L, _o_ssmWC()),
                 PL(L, _o_ssmD()), PL(L, _o_Wo()), D_drop, D_a,
                 GL(L, _o_Wq()), G_bq(L), GL(L, _o_ssmA()), GL(L, _o_ssmWB()), GL(L, _o_ssmWC()),
                 GL(L, _o_ssmD()), GL(L, _o_Wo()), G_bo(L),
                 La(LA_ssm_dlt, L), La(LA_ssm_B, L), La(LA_ssm_C, L), La(LA_ssm_h, L), La(LA_ssm_y, L),
                 g_ssm_dy, g_ssm_dDlt, g_ssm_dBm, g_ssm_dCm, g_ssm_dhc, g_ssm_sc, g_T, g_C, g_latent_dim);
-    } elif (g_attn_kind == 1) {
+    } elif (ak == 1) {
         if (g_pos_kind == 2) {
             attn_mla_dec_bwd(PL(L, _o_Wq()), PL(L, _o_Wdkv()), PL(L, _o_Wuk()), PL(L, _o_Wuv()),
                              PL(L, _o_Wqr()), PL(L, _o_Wkr()), PL(L, _o_Wo()),
@@ -890,15 +990,16 @@ fn _attn_block_bwd(L): i64 {
     return 0;
 }
 fn _attn_block_fwd_row(L, pos): i64 {
-    if (g_attn_kind == 2) {
+    var ak = _lk(L);
+    if (ak == 2) {
         attn_lin_fwd_row(PL(L, _o_Wq()), P_bq(L), PL(L, _o_Wk()), P_bk(L),
                          PL(L, _o_Wv()), P_bv(L), PL(L, _o_Wo()), P_bo(L),
                          R_a, R_attn, La(LA_arena, L), La(g_lin_state, L), pos, g_C, g_nh);
-    } elif (g_attn_kind == 3) {
+    } elif (ak == 3) {
         ssm_fwd_row(R_a, PL(L, _o_Wq()), P_bq(L), PL(L, _o_ssmA()), PL(L, _o_ssmWB()), PL(L, _o_ssmWC()),
                     PL(L, _o_ssmD()), PL(L, _o_Wo()), P_bo(L), R_attn, La(g_ssm_state, L),
                     R_q, R_fc, R_g, R_concat, pos, g_C, g_latent_dim);
-    } elif (g_attn_kind == 1) {
+    } elif (ak == 1) {
         var ar = La(LA_arena, L);
         if (g_pos_kind == 2) {
             attn_mla_dec_fwd_row(PL(L, _o_Wq()), P_bq(L), PL(L, _o_Wdkv()), PL(L, _o_Wuk()), P_bk(L),

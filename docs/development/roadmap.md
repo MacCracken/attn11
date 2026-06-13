@@ -13,16 +13,17 @@
 
 ## Where we are
 
-Current: **v1.4.2**. The v1.0 surface is frozen and additive-only
+Current: **v1.4.3**. The v1.0 surface is frozen and additive-only
 ([`STABILITY.md`](../STABILITY.md)); the reusable numeric core lives in
 **[rosnet](https://github.com/MacCracken/rosnet)** + **[tyche](https://github.com/MacCracken/tyche)**
-(v1.1.0); the **1.x architecture arc** is underway — **M12, M13, and M14 rungs a+b
+(v1.1.0); the **1.x architecture arc** is underway — **M12, M13, and M14 rungs a+b+c
 are complete**: the attention/position axes (MLA core v1.2.0, latent KV-cache decode
 v1.2.1, coupled RoPE v1.2.2, decoupled RoPE v1.2.3), the **FFN-density axis**
 (Mixture of Experts v1.3.0 — `--experts N --expert-topk K`, checkpoint v5, ADR
-0008), and **two non-softmax sequence mixers** (gated linear attention v1.4.0 —
+0008), **two non-softmax sequence mixers** (gated linear attention v1.4.0 —
 `--attn-kind lin`, ADR 0009; the selective SSM v1.4.2 — `--attn-kind ssm`, ADR
-0010; with 1.4.1 a refactor sweep between them). See [`CHANGELOG.md`](../../CHANGELOG.md) for
+0010; with 1.4.1 a refactor sweep between them), and the **per-layer mixer hybrid**
+(v1.4.3 — `--attn-every K`, checkpoint v6, ADR 0011). See [`CHANGELOG.md`](../../CHANGELOG.md) for
 the full shipped narrative back to v0.1.0 and the M0–M11 / v1.0-cut history.
 
 ## Versioning
@@ -45,13 +46,14 @@ milestone below graduates one frontier experiment (the **E-series**, logged in
 [`experiments.md`](experiments.md)), is independently shippable, and lands ONE
 change at a time behind its own grad-check / bit-identity gate.
 
-> **M12 and M13 are complete; M14 rungs (a)+(b) have shipped.** M12 (MLA + RoPE,
+> **M12 and M13 are complete; M14 rungs (a)+(b)+(c) have shipped.** M12 (MLA + RoPE,
 > v1.2.0–v1.2.3) shipped the full `--attn-kind` × `--pos-kind` switch; M13
 > (Mixture of Experts, v1.3.0) shipped the FFN-density axis (ADR 0008, X009);
-> **M14 rung a** (gated linear attention, v1.4.0, ADR 0009, X010) and **rung b**
-> (selective SSM, v1.4.2, ADR 0010, X011) shipped the first two non-softmax
-> mixers (with 1.4.1 a refactor sweep between them). See the CHANGELOG and
-> X005–X011 for the shipped narrative. The arc continues below.
+> **M14 rung a** (gated linear attention, v1.4.0, ADR 0009, X010), **rung b**
+> (selective SSM, v1.4.2, ADR 0010, X011), and **rung c** (the per-layer mixer
+> hybrid, v1.4.3, ADR 0011, X012) shipped the two non-softmax mixers and the
+> interleaving lever (with 1.4.1 a refactor sweep along the way). See the CHANGELOG
+> and X005–X012 for the shipped narrative. The arc continues below.
 
 ### M14 — A second sequence-mixer family (v1.4.0+) — E4
 
@@ -66,10 +68,18 @@ change at a time behind its own grad-check / bit-identity gate.
   reusing Wq/Wo + `latent_dim` (state N, no checkpoint bump); hand-derived BPTT
   through the data-dependent scan (~1e-7), constant `C·N` decode cache. X011 adds
   it to the comparison (best bits/byte at reference scale).
-- **(c) a per-layer `kind` config** — next: turn the global `g_attn_kind` into a
-  per-layer kind (read inside the three `_attn_block_*` dispatch helpers — the
-  1.4.1 refactor localized that), interleave attention/linear/SSM, and sweep the
-  **hybrid ratio** at our scale.
+- **(c) a per-layer `kind` config** — **DONE (v1.4.3, ADR 0011).** `--attn-every K`:
+  the global `g_attn_kind` becomes a per-layer `g_layer_kind` read only by the three
+  `_attn_block_*` dispatch helpers (the 1.4.1 refactor localized it). Restricted to
+  layout-compatible kinds {mha, gqa, lin} so the per-block stride stays uniform — the
+  hybrid is parameter-free, and the decode cache scales with the attention fraction.
+  First checkpoint format bump (**v6** carries the per-layer pattern). X012 = the
+  attention-fraction sweep.
+- **(d) per-layer-layout hybrids** — next: lift the {mha, gqa, lin} restriction so
+  MLA/SSM layers can join a hybrid (the best single mixer at our scale, X011). Needs
+  a per-layer (or padded) parameter layout — every `_o_*` offset and `g_NP` become
+  per-layer, and v6 grows a per-layer `latent_dim`. Then a vidya-scale bake-off
+  across ratios (the standing M14 follow-on).
 
 **Gate**: every new backward grad-checked; perplexity vs the iso-param transformer
 on the vidya corpus, logged as an X-series entry.

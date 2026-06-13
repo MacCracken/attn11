@@ -4,6 +4,64 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.4.3] - 2026-06-13
+
+**A per-layer mixer hybrid (M14 rung c, E4) — interleave attention with a cheap
+mixer.** `--attn-every K` places a full-attention (MHA) block at every K-th layer
+and a gated-linear block elsewhere — the survey's "a few attention layers among
+many cheap recurrent ones" structural lever. The global `attn_kind` becomes a
+per-layer `g_layer_kind`, read only by the three mixer-dispatch helpers. The
+hybrid is restricted to LAYOUT-COMPATIBLE kinds {mha, gqa, lin} (gated-linear
+reuses MHA's projections, ADR 0009), so the per-block stride stays uniform — no
+per-layer parameter-offset refactor, and the hybrid is **parameter-free**. What it
+buys is a knob on the decode cache: the attention fraction sets how much of the
+cache is T-growing K/V vs constant state. Opt-in and additive — a no-flag run is
+byte-identical. First checkpoint **format bump (v6)**: a hybrid carries its
+per-layer pattern; uniform models still write v5, byte-identical.
+
+### Added
+- **`--attn-every K`**: a full-attention block every K-th layer (`L % K == 0`),
+  the `--attn-kind` base (mha/lin) elsewhere. The attention-fraction knob for the
+  hybrid-ratio sweep. Collapses to a uniform model when the pattern is one kind.
+- **Per-layer dispatch** (`g_layer_kind` + `_lk(L)`): the three `_attn_block_*`
+  helpers read the per-layer kind; uniform models (`g_layer_kind == 0`) get the
+  global back, so this is byte-identical until a hybrid is built. `model_init_full`
+  carries the per-layer array; `model_init_moe` is the uniform delegator.
+- **Hybrid validity** (`_hybrid_kinds_ok`): the uniform-stride invariant — every
+  layer's `_kvw` must equal the base's (so np/stride are unchanged), base in
+  {mha, lin}, learned-abs positions. Rejects MLA/SSM layers (different `_kvw`).
+- **Checkpoint v6** carries the NL per-layer kinds (after the fixed header, before
+  the vocab); the loader rebuilds the hybrid and rejects an image whose per-layer
+  kind breaks the invariant (`-46`). v≤5 synthesize the uniform default.
+- Hybrid tests: `test_model_hybrid` (mixed-mixer full-model grad-check, ~1e-5),
+  `test_kv_hybrid` (cached-decode bit-identity, two interleavings), `test_ckpt_hybrid`
+  (v6 round-trip + `-46` rejects), config-cap + alloc-accounting pins. **801 → 857**
+  checks. Hybrid-ratio sweep (X012) + a hybrid bench entry. ADR 0011.
+
+### Changed
+- `kv_cache_bytes` SUMS the per-layer caches for a hybrid (T-growing K/V for the
+  attention layers + constant lin state for the rest). `g_lin_state` is allocated
+  whenever ANY layer is linear; `model_alloc_bytes_hyb` accounts the per-layer
+  array + the lin-state extra. `_gen_bits` factored into a shared `_gen_verify`
+  body (uniform + hybrid drivers). The MHA/MLA/lin/SSM/MoE paths and the no-flag
+  run are unchanged.
+
+### Performance
+- Attention-fraction sweep (default config, 1200 steps, embedded corpus;
+  parameter-identical across the sweep — the hybrid only redistributes the cache):
+
+  | attention | config             | bits/byte | decode cache | vs MHA |
+  |-----------|--------------------|-----------|--------------|--------|
+  | 0/3 (0%)  | pure lin           | 0.239     | 6 144 B      | 0.25×  |
+  | 1/3 (33%) | lin --attn-every 3 | 0.244     | 12 288 B     | 0.50×  |
+  | 2/3 (67%) | lin --attn-every 2 | **0.234** | 18 432 B     | 0.75×  |
+  | 3/3 (100%)| pure mha           | 0.279     | 24 576 B     | 1.00×  |
+
+  The decode cache scales with the attention fraction (the lever); at this
+  reference scale the bits/byte spread is within noise (all hybrids beat pure-MHA,
+  edge pure-lin) — a "trains + grad-checks", not a scaling claim. Hybrid fwd+bwd
+  step ~3.73 ms (≈ the linear step; two of three blocks are linear).
+
 ## [1.4.2] - 2026-06-12
 
 **Selective state-space model (M14 rung b, E4) — the third sequence mixer.**

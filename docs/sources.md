@@ -126,6 +126,19 @@ BPTT, `ssm_fwd_row` the constant-state decode), `src/model.cyr` (`attn_kind == 3
 `y = Σ C·h + D·a`, with Δ = softplus(a·W_dt) (selective), state size N =
 `--latent-dim`, the ZOH first-order `B̄ = Δ·B`. See ADR 0010.
 
+### Per-layer attention/recurrence hybrid (interleave a few attention layers)
+**Lieber, O., Lenz, B., Bata, H., et al. (2024).** "Jamba: A Hybrid
+Transformer-Mamba Language Model." arXiv:[2403.19887](https://arxiv.org/abs/2403.19887)
+— interleaving a minority of attention layers among many cheap SSM layers matches
+or beats pure transformers at far lower KV-cache cost. **De, S., Smith, S.L.,
+Fernando, A., et al. (2024).** "Griffin: Mixing Gated Linear Recurrences with Local
+Attention for Efficient Language Models." arXiv:[2402.19427](https://arxiv.org/abs/2402.19427)
+— a gated-linear-recurrence + attention hybrid (the {linear, attention} mix attn11's
+rung c implements). Used in: `src/model.cyr` (`g_layer_kind` + `_lk(L)` per-layer
+dispatch, `_hybrid_kinds_ok`), `src/main.cyr` (`--attn-every K`). The hybrid is
+restricted to layout-compatible kinds {mha, gqa, lin} (so the per-block stride stays
+uniform); the decode cache scales with the attention fraction. See ADR 0011, X012.
+
 ### KV-cache inference (cache K/V per position, one row per decoded token)
 **Pope, R., Douglas, S., Chowdhery, A., et al. (2022).** "Efficiently Scaling
 Transformer Inference." *MLSys 2023.* arXiv:[2211.05102](https://arxiv.org/abs/2211.05102).

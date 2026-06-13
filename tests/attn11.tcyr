@@ -1012,6 +1012,43 @@ fn test_model_ssm(): i64 {
     return 0;
 }
 
+# Full-model grad-check of a per-layer HYBRID (M14 rung c): layers [mha, lin, mha]
+# over the shared {0,2} block layout. The mixed backward — attn_bwd for the MHA
+# blocks, attn_lin_bwd for the lin block — must compose through the residual stack
+# and the tied head. Grad-checks Wq at an MHA layer, Wk/Wv at the lin layer, Wo at
+# the trailing MHA layer, and the shared token embedding. The per-op proofs are
+# test_attention_grad / test_lin_core; this pins the per-layer DISPATCH wiring.
+fn test_model_hybrid(): i64 {
+    var V = 5; var C = 8; var T = 3; var nh = 2; var NL = 3;
+    var kinds[24];   # 3 i64: mha, lin, mha
+    store64(&kinds + 0, 0); store64(&kinds + 8, 2); store64(&kinds + 16, 0);
+    model_init_full(V, C, T, nh, nh, NL, 1, f64_from(0), 23, 2, 0, 0, 0, 1, 1, &kinds);   # base lin
+    assert(g_layer_kind != 0, "hybrid model built");
+    assert(_lk(0) == 0, "layer 0 is mha");
+    assert(_lk(1) == 2, "layer 1 is lin");
+    assert(_lk(2) == 0, "layer 2 is mha");
+    store64(A_tokens + 0, 1); store64(A_tokens + 8, 3); store64(A_tokens + 16, 0);
+    store64(A_targets + 0, 3); store64(A_targets + 8, 0); store64(A_targets + 16, 4);
+    model_forward(); model_zero_grads(); model_backward();
+    var Cc = C * C;
+    var aWq0 = t_alloc(Cc); t_copy(aWq0, GL(0, _o_Wq()), Cc);     # MHA layer
+    var aWk1 = t_alloc(Cc); t_copy(aWk1, GL(1, _o_Wk()), Cc);     # lin layer
+    var aWv1 = t_alloc(Cc); t_copy(aWv1, GL(1, _o_Wv()), Cc);     # lin layer
+    var aWo2 = t_alloc(Cc); t_copy(aWo2, GL(2, _o_Wo()), Cc);     # trailing MHA layer
+    var atok = t_alloc(V * C); t_copy(atok, G_tokemb(), V * C);
+    var nWq0 = t_alloc(Cc); model_ng(PL(0, _o_Wq()), nWq0, Cc);
+    var nWk1 = t_alloc(Cc); model_ng(PL(1, _o_Wk()), nWk1, Cc);
+    var nWv1 = t_alloc(Cc); model_ng(PL(1, _o_Wv()), nWv1, Cc);
+    var nWo2 = t_alloc(Cc); model_ng(PL(2, _o_Wo()), nWo2, Cc);
+    var ntok = t_alloc(V * C); model_ng(P_tokemb(), ntok, V * C);
+    check("hybrid model L0(mha) dWq", aWq0, nWq0, Cc, 1000);
+    check("hybrid model L1(lin) dWk", aWk1, nWk1, Cc, 1000);
+    check("hybrid model L1(lin) dWv", aWv1, nWv1, Cc, 1000);
+    check("hybrid model L2(mha) dWo", aWo2, nWo2, Cc, 1000);
+    check("hybrid model dtokemb", atok, ntok, V * C, 1000);
+    return 0;
+}
+
 # The M9 SIMD LM head (head_fwd_row) has a scalar tail for C % 4 != 0 that NO
 # other test exercises — every config above uses C ∈ {8,16}. C=6 (% 4 = 2)
 # hits it. Compare the vectorized head output to an independent scalar dot
@@ -1335,6 +1372,23 @@ fn test_alloc_accounting(): i64 {
     predicted = model_alloc_bytes_arch(5, 16, 8, 4, 4, 2, g_NP, 3, 4, 0, 0);
     assert(delta >= predicted, "ssm alloc accounting (under)");
     assert(delta <= predicted + 8192, "ssm alloc accounting (over)");
+    # per-layer HYBRID pin (M14 rung c): the per-layer g_layer_kind array (pl=NL) +
+    # the g_lin_state decode cache (held whenever ANY layer is lin) must be accounted
+    # by model_alloc_bytes_hyb. Two bases: lin (lin-state via attn_kind==2) and mha
+    # (lin-state via lin_extra=1, since a lin layer rides a non-lin base).
+    var hkA[16]; store64(&hkA + 0, 0); store64(&hkA + 8, 2);          # mha,lin
+    used0 = alloc_used();
+    model_init_full(5, 16, 8, 4, 4, 2, 1, f64_from(0), 4, 2, 0, 0, 0, 1, 1, &hkA);   # base lin
+    delta = alloc_used() - used0;
+    predicted = model_alloc_bytes_hyb(5, 16, 8, 4, 4, 2, g_NP, 2, 0, 0, 0, 1, 1, 0, 2);
+    assert(delta >= predicted, "hybrid(base lin) alloc accounting (under)");
+    assert(delta <= predicted + 8192, "hybrid(base lin) alloc accounting (over)");
+    used0 = alloc_used();
+    model_init_full(5, 16, 8, 4, 4, 2, 1, f64_from(0), 4, 0, 0, 0, 0, 1, 1, &hkA);   # base mha
+    delta = alloc_used() - used0;
+    predicted = model_alloc_bytes_hyb(5, 16, 8, 4, 4, 2, g_NP, 0, 0, 0, 0, 1, 1, 1, 2);
+    assert(delta >= predicted, "hybrid(base mha) alloc accounting (under)");
+    assert(delta <= predicted + 8192, "hybrid(base mha) alloc accounting (over)");
     return 0;
 }
 
@@ -1386,6 +1440,22 @@ fn test_config_caps(): i64 {
     assert(model_config_ok_arch(25, 32, 16, 4, 2, 3, 3, 16, 0, 0) == 0, "ssm with nkv != nh rejected");
     assert(model_config_ok_arch(25, 32, 16, 4, 4, 3, 3, 0, 0, 0) == 0, "ssm with N = 0 rejected");
     assert(model_config_ok_arch(25, 32, 16, 4, 4, 3, 3, 16, 1, 0) == 0, "ssm + rope rejected");
+    # per-layer HYBRID (M14 rung c): every layer must share the base {0,2} block
+    # layout (same _kvw), and the base must be a layout-compatible kind (mha/lin)
+    # with learned-abs positions. C=32,nh=nkv=4 -> Ckv=32, _kvw(mha/lin)=2048.
+    var hk[24];
+    store64(&hk + 0, 0); store64(&hk + 8, 2); store64(&hk + 16, 0);     # mha,lin,mha
+    assert(_hybrid_kinds_ok(&hk, 3, 32, 4, 4, 2, 0, 0, 0) == 1, "hybrid mha/lin over lin base accepted");
+    assert(_hybrid_kinds_ok(&hk, 3, 32, 4, 4, 0, 0, 0, 0) == 1, "hybrid mha/lin over mha base accepted");
+    store64(&hk + 8, 1);                                               # layer 1 -> mla (different _kvw)
+    assert(_hybrid_kinds_ok(&hk, 3, 32, 4, 4, 2, 0, 0, 0) == 0, "hybrid with an mla layer rejected (layout)");
+    store64(&hk + 8, 3);                                               # layer 1 -> ssm (different _kvw)
+    assert(_hybrid_kinds_ok(&hk, 3, 32, 4, 4, 2, 0, 0, 0) == 0, "hybrid with an ssm layer rejected (layout)");
+    store64(&hk + 8, 7);                                               # layer 1 -> bogus kind
+    assert(_hybrid_kinds_ok(&hk, 3, 32, 4, 4, 2, 0, 0, 0) == 0, "hybrid with a bogus kind rejected");
+    store64(&hk + 8, 2);                                               # restore lin
+    assert(_hybrid_kinds_ok(&hk, 3, 32, 4, 4, 1, 0, 0, 0) == 0, "hybrid over an mla base rejected (base layout)");
+    assert(_hybrid_kinds_ok(&hk, 3, 32, 4, 4, 2, 0, 1, 0) == 0, "hybrid + rope rejected (learned-abs only)");
     # MoE descriptor (M13): 1 <= num_experts <= 256, 1 <= topk <= num_experts.
     assert(model_config_ok_moe(25, 32, 16, 4, 4, 3, 0, 0, 0, 0, 8, 2) == 1, "valid moe (8 experts, top-2) accepted");
     assert(model_config_ok_moe(25, 32, 16, 4, 4, 3, 0, 0, 0, 0, 1, 1) == 1, "moe experts=1 (dense) accepted");
@@ -1681,6 +1751,50 @@ fn test_ckpt_ssm(): i64 {
     assert(ckpt_load_buf(bad, sz) == (0 - 41), "ssm + rope rejected (-41)");
     t_copy(bad, ck, sz / 8); store64(bad + 12 * 8, 1);     # nkv=1 < nh=2
     assert(ckpt_load_buf(bad, sz) == (0 - 40), "ssm with partial heads rejected (-40)");
+    return 0;
+}
+
+# Per-layer HYBRID checkpoint round-trip + hostile rejections (M14 rung c, v6,
+# ADR 0011). A hybrid is the FIRST model that can't ride the scalar descriptor —
+# it serializes as v6 with NL per-layer kinds at [22..22+NL), the vocab shifting
+# after. A uniform model still writes v5 (covered elsewhere). The loader rebuilds
+# the per-layer pattern, and rejects a v6 image whose per-layer kind breaks the
+# uniform-stride invariant (a kind with a different _kvw than the base) with -46.
+fn test_ckpt_hybrid(): i64 {
+    var V = build_corpus();
+    var NL = 3;
+    var kinds[24]; store64(&kinds + 0, 0); store64(&kinds + 8, 2); store64(&kinds + 16, 0);   # mha,lin,mha
+    model_init_full(V, 8, 4, 2, 2, NL, 1, f64_from(0), 33, 2, 0, 0, 0, 1, 1, &kinds);          # base lin
+    assert(g_layer_kind != 0, "hybrid model built");
+    var np = g_NP;
+    var snap = t_alloc(np); t_copy(snap, g_params, np);
+    var sz = ckpt_size();
+    var ck = alloc(sz); ckpt_serialize(ck);
+    assert(load64(ck + 1 * 8) == 6, "hybrid serializes as v6");
+    assert(load64(ck + 16 * 8) == 2, "base attn_kind=lin recorded");
+    assert(load64(ck + 22 * 8) == 0, "layer 0 kind=mha recorded (per-layer region)");
+    assert(load64(ck + 23 * 8) == 2, "layer 1 kind=lin recorded");
+    assert(load64(ck + 24 * 8) == 0, "layer 2 kind=mha recorded");
+    model_init(V, 8, 4, 2, 2, NL, 1, f64_from(0), 71);                  # scramble to uniform mha
+    assert(g_layer_kind == 0, "reset to uniform");
+    assert(ckpt_load_buf(ck, sz) == 0, "hybrid checkpoint loads");
+    assert(g_layer_kind != 0, "per-layer pattern restored");
+    assert(_lk(0) == 0, "layer 0 restored mha");
+    assert(_lk(1) == 2, "layer 1 restored lin");
+    assert(_lk(2) == 0, "layer 2 restored mha");
+    var mism = 0; var i = 0;
+    while (i < np) {
+        if (load64(g_params + i * 8) != load64(snap + i * 8)) { mism = mism + 1; }
+        i = i + 1;
+    }
+    assert(mism == 0, "hybrid params restored bit-for-bit");
+    var bad = alloc(sz);
+    t_copy(bad, ck, sz / 8); store64(bad + 22 * 8, 1);     # layer 0 -> mla (different _kvw)
+    assert(ckpt_load_buf(bad, sz) == (0 - 46), "hybrid layer with incompatible layout rejected (-46)");
+    t_copy(bad, ck, sz / 8); store64(bad + 23 * 8, 3);     # layer 1 -> ssm (different _kvw)
+    assert(ckpt_load_buf(bad, sz) == (0 - 46), "hybrid layer ssm-kind rejected (-46)");
+    t_copy(bad, ck, sz / 8); store64(bad + 23 * 8, 9);     # layer 1 -> bogus kind
+    assert(ckpt_load_buf(bad, sz) == (0 - 46), "hybrid bogus per-layer kind rejected (-46)");
     return 0;
 }
 
@@ -2139,6 +2253,22 @@ fn test_bpe_determinism(): i64 {
 fn _gen_bits(C, T, nh, nkv, NL, ak, dc, pk, dr, ne, tk, pstep, NG): i64 {
     var V = build_corpus();
     model_init_moe(V, C, T, nh, nkv, NL, 1, f64_from(0), 21, ak, dc, pk, dr, ne, tk);
+    return _gen_verify(pstep, NG);
+}
+# M14 rung-c hybrid bit-identity driver: same two-way contract as _gen_bits but
+# the model is a per-layer mha/lin hybrid (model_init_full, base lin). Each block's
+# decode path (MHA K/V cache vs lin retention state) must match its uncached
+# reference, AND the mixed stack must compose bit-for-bit through context-shifts.
+fn _gen_bits_hyb(C, T, nh, NL, kinds, pstep, NG): i64 {
+    var V = build_corpus();
+    model_init_full(V, C, T, nh, nh, NL, 1, f64_from(0), 21, 2, 0, 0, 0, 1, 1, kinds);   # base lin
+    return _gen_verify(pstep, NG);
+}
+# The shared post-init verification (extracted 1.4.3 so the uniform and hybrid
+# drivers share ONE body): train briefly, then (1) prefill logits bit-identical
+# at every prefix, (2) cached vs uncached decode ids + final logits across slides.
+fn _gen_verify(pstep, NG): i64 {
+    var T = g_T; var V = g_V;
     train(8, 8, 2, _lrc(3, 1000), _lrc(3, 10000), 2, f64_from(1), 1000000000);
     g_training = 0;
     var ids = t_alloc(T);
@@ -2274,6 +2404,24 @@ fn test_kv_ssm(): i64 {
     _gen_bits_ssm(12, 7, 2, 2, 2, 1, 21);    # odd T; small state N=2
     _gen_bits_ssm(8, 5, 2, 2, 4, 1, 15);     # C=8
     _gen_bits_ssm(12, 2, 2, 2, 4, 1, 6);     # degenerate 2-token window
+    return 0;
+}
+
+# M14 rung-c gate: a per-layer mha/lin HYBRID's cached decode must be bit-identical
+# to the uncached reference. Each block runs ITS OWN kind's decode path — the MHA
+# K/V cache for the attention layers, the constant lin retention state for the rest
+# — and the mixed stack must stay bit-for-bit across context-shifts (each path
+# resets at pos==0 on a re-prime). Two interleavings: attention every-2, and
+# attention at the ends only.
+fn test_kv_hybrid(): i64 {
+    var k4a[32];   # NL=4: mha,lin,mha,lin  (attention every 2)
+    store64(&k4a + 0, 0); store64(&k4a + 8, 2); store64(&k4a + 16, 0); store64(&k4a + 24, 2);
+    _gen_bits_hyb(16, 8, 2, 4, &k4a, 1, 24);    # hd=8
+    _gen_bits_hyb(12, 7, 2, 4, &k4a, 1, 21);    # hd=6 scalar; odd T (odd shift)
+    var k4b[32];   # NL=4: mha,lin,lin,mha  (attention at the ends)
+    store64(&k4b + 0, 0); store64(&k4b + 8, 2); store64(&k4b + 16, 2); store64(&k4b + 24, 0);
+    _gen_bits_hyb(8, 5, 2, 4, &k4b, 1, 15);     # C=8
+    _gen_bits_hyb(12, 2, 2, 4, &k4b, 1, 6);     # degenerate 2-token window
     return 0;
 }
 
@@ -2429,6 +2577,7 @@ fn main(): i64 {
     test_model_moe();
     test_model_lin();
     test_model_ssm();
+    test_model_hybrid();
     test_head_tail();
     test_group("persistence");
     test_resume_determinism();
@@ -2454,6 +2603,7 @@ fn main(): i64 {
     test_ckpt_moe();
     test_ckpt_lin();
     test_ckpt_ssm();
+    test_ckpt_hybrid();
     test_ckpt_vocab_mismatch();
     test_group("bpe tokenizer");
     test_bpe_known();
@@ -2472,6 +2622,7 @@ fn main(): i64 {
     test_kv_moe();
     test_kv_lin();
     test_kv_ssm();
+    test_kv_hybrid();
     test_kv_rope();
     test_kv_dec();
     test_group("robustness");
