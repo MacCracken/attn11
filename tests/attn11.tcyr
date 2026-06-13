@@ -12,6 +12,7 @@ include "src/fileio.cyr"
 include "src/ops.cyr"
 include "src/attn.cyr"
 include "src/attn_linear.cyr"
+include "src/attn_ssm.cyr"
 include "src/model.cyr"
 include "src/train.cyr"
 include "src/persist.cyr"
@@ -578,6 +579,72 @@ fn test_lin_core(): i64 {
     _lin_check(4, 12, 2);   # hd=6 (scalar; non-power-of-2 head dim)
     _lin_check(3, 16, 4);   # hd=4, 4 heads — exercises the per-head decay spread
     _lin_check(5, 8, 1);    # hd=8, single head
+    return 0;
+}
+
+# Selective SSM core grad-check (M14 rung b, 1.4.2). Isolates ssm_fwd/ssm_bwd: the
+# data-dependent scan (Δ/B/C all functions of the input), the exp(Δ·A)
+# discretization, and the BPTT through the per-channel×state recurrence. A is
+# inited mostly-negative (stable exp); 1e-4 (the exp+softplus+scan compose, like
+# MLA-dec). Verifies dWdt/dA/dWB/dWC/dD/dWo/dbdt/dbo and the input grad da.
+fn ssm_loss(a, Wdt, bdt, A, WB, WC, D, Wo, bo, out, Dlt, Bm, Cm, h, y, dout, T, C, N): i64 {
+    ssm_fwd(a, Wdt, bdt, A, WB, WC, D, Wo, bo, out, Dlt, Bm, Cm, h, y, T, C, N);
+    return dotsum(dout, out, T * C);
+}
+fn ssm_ng(p, np, n, a, Wdt, bdt, A, WB, WC, D, Wo, bo, out, Dlt, Bm, Cm, h, y, dout, T, C, N): i64 {
+    var eps = _eps(); var te = f64_mul(f64_from(2), eps); var i = 0;
+    while (i < n) {
+        var o = load64(p + i * 8);
+        store64(p + i * 8, f64_add(o, eps)); var lp = ssm_loss(a, Wdt, bdt, A, WB, WC, D, Wo, bo, out, Dlt, Bm, Cm, h, y, dout, T, C, N);
+        store64(p + i * 8, f64_sub(o, eps)); var lm = ssm_loss(a, Wdt, bdt, A, WB, WC, D, Wo, bo, out, Dlt, Bm, Cm, h, y, dout, T, C, N);
+        store64(p + i * 8, o); store64(np + i * 8, f64_div(f64_sub(lp, lm), te)); i = i + 1;
+    }
+    return 0;
+}
+fn _ssm_check(T, C, N): i64 {
+    var TC = T * C; var CC = C * C; var CN = C * N; var TN = T * N; var TCN = T * C * N;
+    var a = t_alloc(TC); var Wdt = t_alloc(CC); var bdt = t_alloc(C); var A = t_alloc(CN);
+    var WB = t_alloc(CN); var WC = t_alloc(CN); var D = t_alloc(C); var Wo = t_alloc(CC); var bo = t_alloc(C);
+    var out = t_alloc(TC); var dout = t_alloc(TC);
+    var Dlt = t_alloc(TC); var Bm = t_alloc(TN); var Cm = t_alloc(TN); var h = t_alloc(TCN); var y = t_alloc(TC);
+    var std = f64_div(f64_from(1), f64_from(2));
+    t_randn(a, TC, f64_from(1)); t_randn(Wdt, CC, std); t_randn(bdt, C, std);
+    t_randn(A, CN, std); var ai = 0;
+    while (ai < CN) { store64(A + ai * 8, f64_sub(load64(A + ai * 8), f64_from(1))); ai = ai + 1; }   # mostly negative
+    t_randn(WB, CN, std); t_randn(WC, CN, std); t_randn(D, C, std); t_randn(Wo, CC, std); t_randn(bo, C, std);
+    t_randn(dout, TC, f64_from(1));
+    var da = t_alloc(TC); var dWdt = t_alloc(CC); var dbdt = t_alloc(C); var dA = t_alloc(CN);
+    var dWB = t_alloc(CN); var dWC = t_alloc(CN); var dD = t_alloc(C); var dWo = t_alloc(CC); var dbo = t_alloc(C);
+    var dy = t_alloc(TC); var dDlt = t_alloc(TC); var dBm = t_alloc(TN); var dCm = t_alloc(TN);
+    var dhc = t_alloc(CN); var sc = t_alloc(TC);
+    ssm_fwd(a, Wdt, bdt, A, WB, WC, D, Wo, bo, out, Dlt, Bm, Cm, h, y, T, C, N);
+    ssm_bwd(a, Wdt, A, WB, WC, D, Wo, dout, da, dWdt, dbdt, dA, dWB, dWC, dD, dWo, dbo,
+            Dlt, Bm, Cm, h, y, dy, dDlt, dBm, dCm, dhc, sc, T, C, N);
+    var nWdt = t_alloc(CC); ssm_ng(Wdt, nWdt, CC, a, Wdt, bdt, A, WB, WC, D, Wo, bo, out, Dlt, Bm, Cm, h, y, dout, T, C, N);
+    var nA = t_alloc(CN); ssm_ng(A, nA, CN, a, Wdt, bdt, A, WB, WC, D, Wo, bo, out, Dlt, Bm, Cm, h, y, dout, T, C, N);
+    var nWB = t_alloc(CN); ssm_ng(WB, nWB, CN, a, Wdt, bdt, A, WB, WC, D, Wo, bo, out, Dlt, Bm, Cm, h, y, dout, T, C, N);
+    var nWC = t_alloc(CN); ssm_ng(WC, nWC, CN, a, Wdt, bdt, A, WB, WC, D, Wo, bo, out, Dlt, Bm, Cm, h, y, dout, T, C, N);
+    var nD = t_alloc(C); ssm_ng(D, nD, C, a, Wdt, bdt, A, WB, WC, D, Wo, bo, out, Dlt, Bm, Cm, h, y, dout, T, C, N);
+    var nWo = t_alloc(CC); ssm_ng(Wo, nWo, CC, a, Wdt, bdt, A, WB, WC, D, Wo, bo, out, Dlt, Bm, Cm, h, y, dout, T, C, N);
+    var nbdt = t_alloc(C); ssm_ng(bdt, nbdt, C, a, Wdt, bdt, A, WB, WC, D, Wo, bo, out, Dlt, Bm, Cm, h, y, dout, T, C, N);
+    var nbo = t_alloc(C); ssm_ng(bo, nbo, C, a, Wdt, bdt, A, WB, WC, D, Wo, bo, out, Dlt, Bm, Cm, h, y, dout, T, C, N);
+    var nda = t_alloc(TC); ssm_ng(a, nda, TC, a, Wdt, bdt, A, WB, WC, D, Wo, bo, out, Dlt, Bm, Cm, h, y, dout, T, C, N);
+    var atol = 10000;
+    check("ssm dWdt", dWdt, nWdt, CC, atol);
+    check("ssm dA", dA, nA, CN, atol);
+    check("ssm dWB", dWB, nWB, CN, atol);
+    check("ssm dWC", dWC, nWC, CN, atol);
+    check("ssm dD", dD, nD, C, atol);
+    check("ssm dWo", dWo, nWo, CC, atol);
+    check("ssm dbdt", dbdt, nbdt, C, atol);
+    check("ssm dbo", dbo, nbo, C, atol);
+    check("ssm da", da, nda, TC, atol);
+    return 0;
+}
+fn test_ssm_core(): i64 {
+    _ssm_check(3, 8, 4);    # C=8, N=4
+    _ssm_check(4, 6, 2);    # C=6, N=2 (small state)
+    _ssm_check(3, 16, 4);   # C=16, N=4
     return 0;
 }
 
@@ -2254,6 +2321,7 @@ fn main(): i64 {
     test_attention_mla();
     test_attention_mla_dec();
     test_lin_core();
+    test_ssm_core();
     test_rope_op();
     test_attention_rope();
     test_group("full-model grad-check");

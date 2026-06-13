@@ -12,6 +12,7 @@ include "src/fileio.cyr"
 include "src/ops.cyr"
 include "src/attn.cyr"
 include "src/attn_linear.cyr"
+include "src/attn_ssm.cyr"
 include "src/model.cyr"
 include "src/train.cyr"
 

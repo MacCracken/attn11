@@ -1,0 +1,137 @@
+# attn11 — minimal selective state-space model (Mamba-lite), a SEQUENCE-MIXER
+# family (M14 rung b, E4). The second non-softmax mixer, in its own file (the
+# one-file-per-mixer pattern from 1.4.1). Include AFTER src/attn.cyr.
+#
+# Per channel c, an N-dim diagonal state h[c,:]. SELECTIVE: Δ, B, C are functions
+# of the input a_t (vs S4's fixed SSM), which is the Mamba insight. The ZOH
+# discretization with the first-order input term B̄ = Δ·B:
+#
+#   Δ_t = softplus(a_t·W_dt + b_dt)   (T×C, positive)   B_t = a_t·W_B   C_t = a_t·W_C   (T×N)
+#   h_t[c,n] = exp(Δ_t[c]·A[c,n])·h_{t-1}[c,n] + Δ_t[c]·B_t[n]·a_t[c]
+#   y_t[c]   = Σ_n C_t[n]·h_t[c,n] + D[c]·a_t[c]            out_t = y_t·W_o + b_o
+#
+# A[c,n] is the learned diagonal state transition (negative → exp(ΔA) ∈ (0,1), a
+# stable forget gate). The decode cache is the constant C×N state h — like gated
+# linear attention, no T-growing K/V. Reuses Wq (as W_dt) and Wo (output proj) +
+# bq/bo from the attention layout; the SSM-specific A/W_B/W_C/D live in the K/V
+# region (attn_kind == 3). Hand-derived BPTT through the data-dependent scan,
+# finite-difference grad-checked (test_ssm_core). Sources: Gu & Dao 2023 (Mamba,
+# arXiv:2312.00752, the selective scan); Gu et al. 2022 (S4D, arXiv:2206.11893,
+# the diagonal SSM). See docs/sources.md + ADR (M14).
+
+# Numerically stable softplus: max(x,0) + ln(1 + exp(-|x|)).
+fn _ssm_softplus(x): i64 {
+    var ax = f64_abs(x);
+    var m = f64_from(0);
+    if (f64_gt(x, f64_from(0)) == 1) { m = x; }
+    return f64_add(m, f64_ln(f64_add(f64_from(1), f64_exp(f64_sub(f64_from(0), ax)))));
+}
+
+# Forward. a:(T,C) input (post-ln1). Caches for backward: Dlt = Δ (T,C), Bm (T,N),
+# Cm (T,N), h (T*C*N the per-step state), y (T,C the pre-Wo output). out:(T,C).
+fn ssm_fwd(a, Wdt, bdt, A, WB, WC, D, Wo, bo, out, Dlt, Bm, Cm, h, y, T, C, N): i64 {
+    var TC = T * C;
+    linear_fwd(a, Wdt, bdt, Dlt, T, C, C);                 # δ = a·W_dt + b_dt
+    var i = 0;
+    while (i < TC) { store64(Dlt + i * 8, _ssm_softplus(load64(Dlt + i * 8))); i = i + 1; }   # Δ = softplus(δ)
+    linear_fwd(a, WB, 0, Bm, T, C, N);                     # B = a·W_B
+    linear_fwd(a, WC, 0, Cm, T, C, N);                     # C = a·W_C
+    var t = 0;
+    while (t < T) {
+        var c = 0;
+        while (c < C) {
+            var dtc = load64(Dlt + (t * C + c) * 8);       # Δ_t[c]
+            var atc = load64(a + (t * C + c) * 8);         # a_t[c]
+            var hbase = h + ((t * C + c) * N) * 8;
+            var hprev = hbase - C * N * 8;                 # h[t-1, c, *]  (valid when t > 0)
+            var acc = f64_from(0);
+            var n = 0;
+            while (n < N) {
+                var abar = f64_exp(f64_mul(dtc, load64(A + (c * N + n) * 8)));
+                var prev = f64_from(0);
+                if (t > 0) { prev = load64(hprev + n * 8); }
+                var inp = f64_mul(f64_mul(dtc, load64(Bm + (t * N + n) * 8)), atc);   # Δ·B·a
+                var hv = f64_add(f64_mul(abar, prev), inp);
+                store64(hbase + n * 8, hv);
+                acc = f64_add(acc, f64_mul(load64(Cm + (t * N + n) * 8), hv));
+                n = n + 1;
+            }
+            store64(y + (t * C + c) * 8, f64_add(acc, f64_mul(load64(D + c * 8), atc)));   # Σ C·h + D·a
+            c = c + 1;
+        }
+        t = t + 1;
+    }
+    linear_fwd(y, Wo, bo, out, T, C, C);                   # out = y·W_o + b_o
+    return 0;
+}
+
+# Backward. dout:(T,C) -> da:(T,C) [written fresh]; ACCUMULATE dWdt/dbdt/dA/dWB/
+# dWC/dD/dWo/dbo. Scratch (caller-owned): dy(T,C), dDlt(T,C), dBm(T,N), dCm(T,N),
+# dhc(C*N reverse-scan carry), sc(T,C). Caches Dlt/Bm/Cm/h/y from ssm_fwd.
+fn ssm_bwd(a, Wdt, A, WB, WC, D, Wo, dout, da,
+           dWdt, dbdt, dA, dWB, dWC, dD, dWo, dbo,
+           Dlt, Bm, Cm, h, y, dy, dDlt, dBm, dCm, dhc, sc, T, C, N): i64 {
+    var TC = T * C; var TN = T * N; var CN = C * N;
+    linear_bwd(y, Wo, dout, dy, dWo, dbo, T, C, C);        # out = y·Wo + bo -> dy
+    var z = 0;
+    while (z < TN) { store64(dBm + z * 8, f64_from(0)); store64(dCm + z * 8, f64_from(0)); z = z + 1; }
+    z = 0;
+    while (z < CN) { store64(dhc + z * 8, f64_from(0)); z = z + 1; }
+    # reverse scan over t; dhc[c,n] carries dh_{t+1->t}
+    var t = T - 1;
+    while (t >= 0) {
+        var c = 0;
+        while (c < C) {
+            var dtc = load64(Dlt + (t * C + c) * 8);
+            var atc = load64(a + (t * C + c) * 8);
+            var dyc = load64(dy + (t * C + c) * 8);
+            var hbase = h + ((t * C + c) * N) * 8;
+            var hprev = hbase - C * N * 8;
+            store64(dD + c * 8, f64_add(load64(dD + c * 8), f64_mul(dyc, atc)));   # dD += dy·a
+            var datc = f64_mul(dyc, load64(D + c * 8));    # da from the D skip
+            var ddt = f64_from(0);                         # dΔ_t[c]
+            var n = 0;
+            while (n < N) {
+                var Acn = load64(A + (c * N + n) * 8);
+                var abar = f64_exp(f64_mul(dtc, Acn));
+                var hv = load64(hbase + n * 8);
+                var prev = f64_from(0);
+                if (t > 0) { prev = load64(hprev + n * 8); }
+                var cmn = load64(Cm + (t * N + n) * 8);
+                store64(dCm + (t * N + n) * 8, f64_add(load64(dCm + (t * N + n) * 8), f64_mul(dyc, hv)));
+                # total dh_t[c,n] = dy·C_t[n] (output) + carry from t+1
+                var dht = f64_add(f64_mul(dyc, cmn), load64(dhc + (c * N + n) * 8));
+                var dabar = f64_mul(dht, prev);            # ∂h_t/∂Abar = h_{t-1}
+                store64(dhc + (c * N + n) * 8, f64_mul(dht, abar));   # carry dh_{t-1} += dh_t·Abar
+                var btn = load64(Bm + (t * N + n) * 8);
+                ddt = f64_add(ddt, f64_mul(dht, f64_mul(btn, atc)));   # input term Δ·B·a: dΔ
+                store64(dBm + (t * N + n) * 8, f64_add(load64(dBm + (t * N + n) * 8), f64_mul(dht, f64_mul(dtc, atc))));
+                datc = f64_add(datc, f64_mul(dht, f64_mul(dtc, btn)));   # da from input term
+                # Abar = exp(Δ·A): dΔ += dAbar·Abar·A ; dA += dAbar·Abar·Δ
+                ddt = f64_add(ddt, f64_mul(dabar, f64_mul(abar, Acn)));
+                var dacn = dA + (c * N + n) * 8;
+                store64(dacn, f64_add(load64(dacn), f64_mul(dabar, f64_mul(abar, dtc))));
+                n = n + 1;
+            }
+            store64(dDlt + (t * C + c) * 8, ddt);          # dΔ_t[c] (fresh per t,c)
+            store64(da + (t * C + c) * 8, datc);           # da: skip + input (proj adds below)
+            c = c + 1;
+        }
+        t = t - 1;
+    }
+    # Δ = softplus(δ): dδ = dΔ · sigmoid(δ) = dΔ · (1 - exp(-Δ))
+    var j = 0;
+    while (j < TC) {
+        var sig = f64_sub(f64_from(1), f64_exp(f64_sub(f64_from(0), load64(Dlt + j * 8))));
+        store64(dDlt + j * 8, f64_mul(load64(dDlt + j * 8), sig));
+        j = j + 1;
+    }
+    # back through the three input projections; each dx adds into da
+    linear_bwd(a, Wdt, dDlt, sc, dWdt, dbdt, T, C, C);
+    j = 0; while (j < TC) { store64(da + j * 8, f64_add(load64(da + j * 8), load64(sc + j * 8))); j = j + 1; }
+    linear_bwd(a, WB, dBm, sc, dWB, 0, T, C, N);
+    j = 0; while (j < TC) { store64(da + j * 8, f64_add(load64(da + j * 8), load64(sc + j * 8))); j = j + 1; }
+    linear_bwd(a, WC, dCm, sc, dWC, 0, T, C, N);
+    j = 0; while (j < TC) { store64(da + j * 8, f64_add(load64(da + j * 8), load64(sc + j * 8))); j = j + 1; }
+    return 0;
+}
