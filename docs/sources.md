@@ -163,6 +163,33 @@ oldest `T/2` tokens and re-prime the kept context at its new positions (one
 window recompute amortized over `T/2` tokens); see ADR 0005 for why shifting
 the cache in place is unsound with learned absolute positions.
 
+## Training objectives
+
+### Masked absorbing-state diffusion (the dLLM objective, M15)
+**Austin, J., Johnson, D.D., Ho, J., Tarlow, D., van den Berg, R. (2021).**
+"Structured Denoising Diffusion Models in Discrete State-Spaces (D3PM)." *NeurIPS
+2021.* arXiv:[2107.03006](https://arxiv.org/abs/2107.03006) — the absorbing-state
+(`[MASK]`) discrete diffusion forward process attn11 implements. **Sahoo, S.S.,
+Arriola, M., Schiff, Y., et al. (2024).** "Simple and Effective Masked Diffusion
+Language Models (MDLM)." arXiv:[2406.07524](https://arxiv.org/abs/2406.07524) — the
+simplified masked-diffusion loss / NELBO whose `1/t` weight cancels the t-scaling
+of the masked count, leaving the per-masked-token CE averaged over the noise level
+(the ELBO bound attn11 reports). **Devlin, J., Chang, M.-W., Lee, K., Toutanova, K.
+(2019).** "BERT: Pre-training of Deep Bidirectional Transformers." *NAACL 2019.*
+arXiv:[1810.04805](https://arxiv.org/abs/1810.04805) — masked-LM with bidirectional
+context (the random-masking-ratio objective attn11 optimizes). Used in:
+`src/ops.cyr` (`softmax_xent_masked_fwd`/`_bwd`), `src/attn.cyr` (`g_bidir`
+bidirectional core), `src/model.cyr` (`mask_emb`, the embed mask branch, the
+masked-CE wiring), `src/train.cyr` (`diffuse_mask`, `sample_window_diffusion`,
+`eval_diffusion`). See ADR 0013, X015.
+
+### Confidence-ordered parallel decode (masked-diffusion sampling, M15)
+**Chang, H., Zhang, H., Jiang, L., Liu, C., Freeman, W.T. (2022).** "MaskGIT: Masked
+Generative Image Transformers." *CVPR 2022.* arXiv:[2202.04200](https://arxiv.org/abs/2202.04200)
+— iterative parallel decode that unmasks the most-confident positions each round on
+a cosine schedule (attn11's greedy, lowest-index-tie-break, deterministic variant).
+Used in: `src/train.cyr` (`gen_diffusion`, `_diff_keep`). See ADR 0013.
+
 ## Tokenization
 
 ### Byte-pair encoding (BPE) for subword vocabularies

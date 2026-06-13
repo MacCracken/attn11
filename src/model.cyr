@@ -82,6 +82,18 @@ var g_aux_loss = 0;
 var g_moe_disp = 0;   # MoE: per-expert dispatch histogram (N counts) for the
                       # utilization metric (routing entropy); accumulated by eval.
 
+# ---- training-objective descriptor (M15, E5; checkpoint v7, ADR 0013) -------
+# The default objective is autoregressive next-token CE. g_objective == 1 selects
+# masked absorbing-state DIFFUSION: a BIDIRECTIONAL model predicts the original
+# bytes at positions corrupted to a learned [MASK] embedding (mask_emb, appended
+# after lnf_b — see _o_maskemb). g_objective == 0 is byte-identical to today (the
+# AR path is literally unchanged). g_bidir gates the attention causal mask
+# (0 = causal, today; 1 = full square) and is set to 1 iff diffusion. g_nmask is
+# the masked-position count of the current window — the masked-CE normalizer.
+var g_objective = 0;
+var g_bidir = 0;
+var g_nmask = 0;
+
 # ---- packed parameter vectors ----------------------------------------------
 var g_params = 0;
 var g_grads = 0;
@@ -222,9 +234,21 @@ fn P_lnfg(): i64 { return g_params + (_emb_end() + g_NL * _blk()) * 8; }
 fn G_lnfg(): i64 { return g_grads + (_emb_end() + g_NL * _blk()) * 8; }
 fn P_lnfb(): i64 { return P_lnfg() + g_C * 8; }
 fn G_lnfb(): i64 { return G_lnfg() + g_C * 8; }
+# ---- diffusion [MASK] embedding (M15, E5) ----------------------------------
+# A single learned C-vector, appended to the param block AFTER lnf_b, present
+# ONLY when g_objective == 1 (g_NP grows by C only under diffusion, so an AR
+# model's layout / draw order / checkpoint stay byte-identical). It is fed as the
+# input embedding at masked positions; the weight-tied LM head is untouched
+# (still V logits). Its offset is the OLD (AR) g_NP — i.e. just past lnf_b.
+fn _o_maskemb(): i64 { return _emb_end() + g_NL * _blk() + 2 * g_C; }
+fn P_maskemb(): i64 { return g_params + _o_maskemb() * 8; }
+fn G_maskemb(): i64 { return g_grads + _o_maskemb() * 8; }
 
 # ---- shared activation caches ----------------------------------------------
 var A_tokens = 0; var A_targets = 0;  # T (integer ids)
+var A_mask = 0;   # T: 1 at masked (supervised) positions, 0 at given — diffusion
+                  # only (M15). Allocated for all models (tiny, T i64), read only
+                  # when g_objective == 1, so an AR run is byte-output-identical.
 var A_attn = 0;   # T x C  attention output (forward temp)
 var A_mlp = 0;    # T x C  MLP output       (forward temp)
 var A_f = 0;      # T x C  final-LN output (head input)
@@ -438,7 +462,7 @@ fn model_alloc_bytes_hyb(V, C, T, nh, nkv, NL, NP, attn_kind, d_c, pos_kind, d_r
     var Ckv = nkv * (C / nh);
     var asz = attn_arena_size(T, C, nh, nkv);
     var e = 4 * NP;                                   # params, grads, m, v
-    e = e + 2 * T + 3 * T * C + 2 * T * V + 2 * T;    # tokens/targets, A_*, meanf/rstdf
+    e = e + 3 * T + 3 * T * C + 2 * T * V + 2 * T;    # tokens/targets/mask (M15), A_*, meanf/rstdf
     e = e + (NL + 1) + 14 * NL;                       # pointer arrays (LA_* + KV_K/KV_V)
     e = e + (NL + 1) * T * C;                         # residual stream
     e = e + NL * (5 * T * C + 2 * T * F + 4 * T + asz + 2 * T * Ckv);  # per-layer caches + arena + KV
@@ -505,19 +529,30 @@ fn model_init_arch(V, C, T, nh, nkv, NL, attn_bias, dropout, seed, attn_kind, d_
 fn model_init_moe(V, C, T, nh, nkv, NL, attn_bias, dropout, seed,
                   attn_kind, d_c, pos_kind, d_rope, num_experts, topk): i64 {
     return model_init_full(V, C, T, nh, nkv, NL, attn_bias, dropout, seed,
-                           attn_kind, d_c, pos_kind, d_rope, num_experts, topk, 0);
+                           attn_kind, d_c, pos_kind, d_rope, num_experts, topk, 0, 0);
 }
 # hybrid_kinds: 0 = uniform (every block runs attn_kind); else a pointer to NL
 # i64 per-layer mixer kinds (copied into g_layer_kind). Rung d (1.4.4) admits any
 # mix of {mha,mla,lin,ssm} — the K/V region pads to the max _kvw — validated by
 # _hybrid_kinds_ok (learned-abs, full heads, a valid shared latent for mla/ssm).
 fn model_init_full(V, C, T, nh, nkv, NL, attn_bias, dropout, seed,
-                   attn_kind, d_c, pos_kind, d_rope, num_experts, topk, hybrid_kinds): i64 {
+                   attn_kind, d_c, pos_kind, d_rope, num_experts, topk, hybrid_kinds, objective): i64 {
     if (model_config_ok_moe(V, C, T, nh, nkv, NL, attn_kind, d_c, pos_kind, d_rope, num_experts, topk) == 0) {
         puts("attn11: model_init: invalid config (need nh | C, nkv | nh, nkv <= nh; ");
         puts("mla: nkv == nh, 1 <= d_c <= C; rope: mha + even hd; rope-decoupled: mla + even d_rope; ");
         puts("moe: 1 <= num_experts <= 256, 1 <= topk <= num_experts)\n");
         sys_exit(1);
+    }
+    # M15 diffusion backstop (the CLI + checkpoint loader are the primary gates):
+    # the masked-diffusion objective is MHA (kind 0) + learned-abs (pos 0) + dense
+    # (1 expert) + uniform (no hybrid) for v1.5.0. lin/ssm are causal recurrences
+    # (no bidirectional form); mla/moe/rope-diffusion are additive fast-follows.
+    if (objective != 0) {
+        if ((objective != 1) || (attn_kind != 0) || (pos_kind != 0)
+            || (num_experts != 1) || (hybrid_kinds != 0)) {
+            puts("attn11: model_init: diffusion objective requires mha + learned-abs + dense + uniform\n");
+            sys_exit(1);
+        }
     }
     g_V = V; g_C = C; g_T = T; g_nh = nh; g_nkv = nkv; g_NL = NL; g_F = 4 * C;
     g_attn_bias = attn_bias; g_dropout = dropout; g_training = 1; g_step = 0;
@@ -527,6 +562,12 @@ fn model_init_full(V, C, T, nh, nkv, NL, attn_bias, dropout, seed,
     # decoupled RoPE adds W_QR/W_KR, MoE swaps the MLP region for N experts + gate).
     g_attn_kind = attn_kind; g_pos_kind = pos_kind; g_latent_dim = d_c; g_rope_dim = d_rope;
     g_num_experts = num_experts; g_expert_topk = topk;
+    # M15 objective descriptor (E5). Set BEFORE g_NP — diffusion appends mask_emb
+    # (C) to the param block — and BEFORE the g_bidir-reading attention dispatch.
+    # g_bidir = 1 iff diffusion (the attention causal mask becomes the full square).
+    g_objective = objective;
+    g_bidir = 0;
+    if (objective == 1) { g_bidir = 1; }
     # per-layer hybrid (M14 rung c): copy the NL kinds into g_layer_kind, or stay
     # uniform (0). Reset FIRST so a re-init (tests build many models) never carries
     # a stale array from a prior hybrid. Set before g_NP/_any_lin reads it.
@@ -545,6 +586,11 @@ fn model_init_full(V, C, T, nh, nkv, NL, attn_bias, dropout, seed,
     if (num_experts > 1) { g_aux_alpha = f64_div(f64_from(1), f64_from(100)); }   # Switch α = 0.01
     var F = g_F;
     g_NP = _emb_end() + NL * _blk() + 2 * C;
+    # M15: the learned [MASK] embedding (C) is appended after lnf_b, present ONLY
+    # under diffusion — so an AR model's g_NP, draw order, Adam state, and v5/v6
+    # checkpoints are byte-identical. It rides g_params, so Adam / grad-clip /
+    # zero-grads / serialize (all of which iterate g_NP) handle it for free.
+    if (objective == 1) { g_NP = g_NP + C; }
 
     # Pre-allocation cap, mirroring the checkpoint loader's -18 (model_config_ok
     # has already bounded the dims, so this product cannot overflow): a
@@ -631,10 +677,14 @@ fn model_init_full(V, C, T, nh, nkv, NL, attn_bias, dropout, seed,
         L = L + 1;
     }
     t_fill(P_lnfg(), C, f64_from(1));
+    # M15: the learned [MASK] embedding, inited like the token embedding (0.02).
+    # AFTER every other param draw, so an AR run (objective 0, skipped) keeps its
+    # exact RNG draw order — byte-identical.
+    if (objective == 1) { t_randn(P_maskemb(), C, std); }
 
     # shared caches
     var TC = T * C; var TV = T * V;
-    A_tokens = t_alloc(T); A_targets = t_alloc(T);
+    A_tokens = t_alloc(T); A_targets = t_alloc(T); A_mask = t_alloc(T);
     A_attn = t_alloc(TC); A_mlp = t_alloc(TC); A_f = t_alloc(TC);
     A_logits = t_alloc(TV); A_probs = t_alloc(TV);
     A_meanf = t_alloc(T); A_rstdf = t_alloc(T);
@@ -923,12 +973,20 @@ fn embed_fwd_n(n): i64 {
     # but unused/untrained under RoPE.
     var add_pos = 1;
     if (g_pos_kind != 0) { add_pos = 0; }
+    # M15 diffusion: a masked position's input is the learned [MASK] embedding, not
+    # the token lookup. memb's address is computed unconditionally (cheap) but read
+    # only when masked == 1 — which is always 0 under AR (g_objective 0), so the AR
+    # path is byte-identical and never touches the (AR: nonexistent) mask_emb slot.
+    var memb = P_maskemb();
     var t = 0;
     while (t < T) {
         var tok = load64(A_tokens + t * 8);
+        var masked = 0;
+        if (g_objective == 1) { if (load64(A_mask + t * 8) != 0) { masked = 1; } }
         var c = 0;
         while (c < C) {
             var e = load64(emb + (tok * C + c) * 8);
+            if (masked == 1) { e = load64(memb + c * 8); }
             if (add_pos == 1) { e = f64_add(e, load64(pos + (t * C + c) * 8)); }
             store64(x0 + (t * C + c) * 8, e);
             c = c + 1;
@@ -947,14 +1005,28 @@ fn embed_bwd(dx0): i64 {
     var gemb = G_tokemb(); var gpos = G_posemb();
     var add_pos = 1;
     if (g_pos_kind != 0) { add_pos = 0; }
+    # M15 diffusion: a masked position fed the [MASK] embedding (not tokemb[tok]),
+    # so its input-side gradient routes to G_maskemb(), NOT gemb[tok]. tokemb still
+    # receives the tied-HEAD gradient at every position (head_bwd) — so tokemb gets
+    # head-grad (all) + lookup-grad (given only); mask_emb gets it at masked only.
+    # The posemb gradient is unchanged (a masked position still has a position).
+    # Under AR (masked always 0) this is byte-identical to before.
+    var gmemb = G_maskemb();
     var t = 0;
     while (t < T) {
         var tok = load64(A_tokens + t * 8);
+        var masked = 0;
+        if (g_objective == 1) { if (load64(A_mask + t * 8) != 0) { masked = 1; } }
         var c = 0;
         while (c < C) {
             var d = load64(dx0 + (t * C + c) * 8);
-            var te = gemb + (tok * C + c) * 8;
-            store64(te, f64_add(load64(te), d));
+            if (masked == 1) {
+                var me = gmemb + c * 8;
+                store64(me, f64_add(load64(me), d));
+            } else {
+                var te = gemb + (tok * C + c) * 8;
+                store64(te, f64_add(load64(te), d));
+            }
             if (add_pos == 1) {
                 var pe = gpos + (t * C + c) * 8;
                 store64(pe, f64_add(load64(pe), d));
@@ -1123,7 +1195,16 @@ fn model_forward(): i64 {
     }
     ln_fwd(La(LA_resid, g_NL), P_lnfg(), P_lnfb(), A_f, A_meanf, A_rstdf, T, C);
     head_fwd();
-    # total training objective = cross-entropy + Σ_blocks load-balance aux loss
+    # M15 masked diffusion: the loss is CE over the MASKED positions only (the
+    # model is bidirectional via g_bidir; no MoE aux term — MoE is disallowed with
+    # diffusion). g_nmask records the masked count for the training log / eval.
+    if (g_objective == 1) {
+        var nm = 0; var ti = 0;
+        while (ti < T) { if (load64(A_mask + ti * 8) != 0) { nm = nm + 1; } ti = ti + 1; }
+        g_nmask = nm;
+        return softmax_xent_masked_fwd(A_logits, A_targets, A_probs, A_mask, T, V);
+    }
+    # AR training objective = cross-entropy + Σ_blocks load-balance aux loss
     # (g_aux_loss is exactly 0 in the dense path, so a no-flag run is unchanged).
     return f64_add(softmax_xent_fwd(A_logits, A_targets, A_probs, T, V), g_aux_loss);
 }
@@ -1229,7 +1310,13 @@ fn model_eval_window(n): i64 {
 fn model_backward(): i64 {
     var T = g_T; var C = g_C; var F = g_F; var V = g_V;
     var TC = T * C;
-    softmax_xent_bwd(A_probs, A_targets, D_logits, T, V);
+    # M15: masked-CE backward (gradient only at masked positions) under diffusion;
+    # the byte-identical AR softmax-CE backward otherwise.
+    if (g_objective == 1) {
+        softmax_xent_masked_bwd(A_probs, A_targets, A_mask, D_logits, T, V);
+    } else {
+        softmax_xent_bwd(A_probs, A_targets, D_logits, T, V);
+    }
     head_bwd();                                   # -> D_f ; accum G_tokemb (head)
     # through final LN: D_f -> D_resid (= d resid[NL])
     ln_bwd(La(LA_resid, g_NL), P_lnfg(), D_f, A_meanf, A_rstdf, D_resid, G_lnfg(), G_lnfb(), T, C);

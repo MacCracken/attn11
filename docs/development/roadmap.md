@@ -13,12 +13,13 @@
 
 ## Where we are
 
-Current: **v1.4.6**. The v1.0 surface is frozen and additive-only
+Current: **v1.5.0**. The v1.0 surface is frozen and additive-only
 ([`STABILITY.md`](../STABILITY.md)); the reusable numeric core lives in
 **[rosnet](https://github.com/MacCracken/rosnet)** + **[tyche](https://github.com/MacCracken/tyche)**
 (v1.1.0). The 1.x architecture arc through M14 has shipped (the attention/KV, FFN-
-density, and sequence-mixer axes); **next up is M15** (below). For *what* shipped,
-see [`CHANGELOG.md`](../../CHANGELOG.md) (release narrative),
+density, and sequence-mixer axes), and **M15** (the char-diffusion *training
+objective*, v1.5.0) is the first objective departure; **next up is M16** (below).
+For *what* shipped, see [`CHANGELOG.md`](../../CHANGELOG.md) (release narrative),
 [`experiments.md`](experiments.md) (the X-series), and [`state.md`](state.md) (the
 live snapshot — current flags, counts, perf). This file is the plan ahead only.
 
@@ -43,21 +44,14 @@ milestone below graduates one frontier experiment (the **E-series**, logged in
 [`experiments.md`](experiments.md)), is independently shippable, and lands ONE
 change at a time behind its own grad-check / bit-identity gate.
 
-> **Shipped (M12–M14, v1.2.0–v1.4.6):** the attention/KV axis (MLA + the
-> `--pos-kind` RoPE switch), the FFN-density axis (MoE, `--experts`), and the
-> second sequence-mixer family (`--attn-kind {lin,ssm}` + the any-mixer per-layer
+> **Shipped (M12–M15, v1.2.0–v1.5.0):** the attention/KV axis (MLA + the
+> `--pos-kind` RoPE switch), the FFN-density axis (MoE, `--experts`), the second
+> sequence-mixer family (`--attn-kind {lin,ssm}` + the any-mixer per-layer
 > `--attn-every` hybrid), then 1.4.5 hardening + 1.4.6 benchmarking to close the
-> arc. Detail lives in [`CHANGELOG.md`](../../CHANGELOG.md), ADRs 0007–0012, and
-> [`experiments.md`](experiments.md) (X005–X014). **The plan ahead starts at M15.**
-
-### M15 — Char-diffusion objective (v1.5.0) — E5
-
-**A dLLM at reference scale** — same trunk, different *training objective*: a
-masked-denoising loss (drop the causal mask, predict masked bytes,
-confidence-aware parallel decode). Tests the survey's "diffusion LMs are super
-data learners" thesis honestly at tiny scale: AR vs diffusion on repeated epochs
-of the same small corpus. **Gate**: grad-check the masked-CE path; a
-matched-compute AR-vs-diffusion comparison logged as an X-series entry.
+> architecture arc, and **M15** the char-diffusion *training objective*
+> (`--objective diffusion`, v1.5.0) — the first objective departure. Detail lives
+> in [`CHANGELOG.md`](../../CHANGELOG.md), ADRs 0007–0013, and
+> [`experiments.md`](experiments.md) (X005–X015). **The plan ahead starts at M16.**
 
 ### M16 — Ternary (BitNet-style) training (v1.6.0) — E6
 

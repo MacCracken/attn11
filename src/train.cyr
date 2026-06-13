@@ -315,6 +315,52 @@ fn sample_window(): i64 {
     return 0;
 }
 
+# ---- masked-diffusion batch sampling (M15, E5) -----------------------------
+# Absorbing-state corruption: draw a per-example mask ratio t ~ U(0,1) (tyche),
+# then mask each position independently with probability t into A_mask (1 =
+# masked/supervised, 0 = given/context). Deterministic given the RNG state.
+# FLOOR: if no position got masked, force one — the masked-CE divides by the
+# masked count, and the train loop's NaN guard would otherwise abort on an empty
+# batch element. Source: D3PM absorbing (Austin 2021), MDLM (Sahoo 2024).
+fn diffuse_mask(): i64 {
+    var T = g_T;
+    var t = rng_uniform();              # per-example corruption ratio in [0,1)
+    var nm = 0;
+    var p = 0;
+    while (p < T) {
+        if (f64_lt(rng_uniform(), t) == 1) { store64(A_mask + p * 8, 1); nm = nm + 1; }
+        else { store64(A_mask + p * 8, 0); }
+        p = p + 1;
+    }
+    if (nm == 0) {                      # floor: at least one masked position
+        var idx = (rng_u64() & 0x7FFFFFFFFFFFFFFF) % T;
+        store64(A_mask + idx * 8, 1);
+    }
+    return 0;
+}
+
+# Diffusion batch element: input = a random corpus window (A_tokens kept as the
+# ORIGINAL ids — the embed substitutes the learned [MASK] vector at masked
+# positions), target = the SAME window (A_targets, NOT shifted — denoising, not
+# next-token), then diffuse_mask corrupts A_mask. The window is [s, s+T); main.cyr
+# guarantees g_datalen >= g_T + 1 before training, so span >= 1.
+fn sample_window_diffusion(): i64 {
+    var T = g_T;
+    var span = g_datalen - T;
+    var s = rng_u64() & 0x7FFFFFFFFFFFFFFF;
+    if (span < 1) { s = 0; }
+    else { s = s % span; }
+    var t = 0;
+    while (t < T) {
+        var tok = load64(g_data + (s + t) * 8);
+        store64(A_tokens + t * 8, tok);
+        store64(A_targets + t * 8, tok);
+        t = t + 1;
+    }
+    diffuse_mask();
+    return 0;
+}
+
 # ---- learning-rate schedule ------------------------------------------------
 # Linear warmup (Vaswani et al. 2017) then cosine decay (Loshchilov & Hutter
 # 2017, "SGDR", arXiv:1608.03983). See docs/sources.md.
@@ -364,7 +410,7 @@ fn train(run_until, total, batch, base_lr, min_lr, warmup, clip, log_every): i64
         var loss = f64_from(0);
         var bi = 0;
         while (bi < batch) {
-            sample_window();
+            if (g_objective == 1) { sample_window_diffusion(); } else { sample_window(); }
             loss = f64_add(loss, model_forward());
             model_backward();
             bi = bi + 1;
@@ -440,10 +486,80 @@ fn eval_corpus(): i64 {
     return g_eval_tokens;
 }
 
-# bits/byte over the last eval_corpus() pass
+# bits/byte over the last eval_corpus() / eval_diffusion() pass
 fn eval_bpb(): i64 {
     if (g_eval_bytes < 1) { return f64_from(0); }
     return f64_div(g_eval_nats, f64_mul(F64_LN2, f64_from(g_eval_bytes)));
+}
+
+# ---- diffusion denoising eval (M15, E5; the X015 shared probe) --------------
+# A deterministic, RNG-neutral pass over the corpus at stride T, masking an
+# EVENLY-SPREAD fixed fraction (pct%) of each window and accumulating the
+# masked-CE -> denoising bits/byte. This is the apples-to-apples axis for the
+# AR-vs-diffusion comparison; it is an ELBO-style *upper bound* on the NLL, NOT
+# AR's exact next-token NLL (X015 / ADR 0013 state the caveat). Diffusion only
+# (g_objective must be 1, so model_forward runs masked-CE + bidirectional).
+fn eval_diffusion(pct): i64 {
+    g_eval_nats = f64_from(0); g_eval_tokens = 0; g_eval_bytes = 0;
+    if ((g_data == 0) || (g_datalen < g_T)) { return 0 - 1; }
+    var was = g_training; g_training = 0;
+    var T = g_T;
+    var k = (T * pct) / 100;                 # masked positions per window
+    if (k < 1) { k = 1; }
+    if (k > T) { k = T; }
+    var s = 0;
+    while (s + T <= g_datalen) {
+        var t = 0;
+        while (t < T) {
+            var tok = load64(g_data + (s + t) * 8);
+            store64(A_tokens + t * 8, tok);
+            store64(A_targets + t * 8, tok);
+            # evenly-spread k masks: position p is masked iff floor((p+1)k/T) steps
+            # past floor(p·k/T) — exactly k positions over [0,T), deterministic.
+            if ((((t + 1) * k) / T) > ((t * k) / T)) { store64(A_mask + t * 8, 1); }
+            else { store64(A_mask + t * 8, 0); }
+            t = t + 1;
+        }
+        var loss = model_forward();          # masked-CE mean over this window's masks
+        g_eval_nats = f64_add(g_eval_nats, f64_mul(loss, f64_from(g_nmask)));
+        var p = 0;
+        while (p < T) {
+            if (load64(A_mask + p * 8) != 0) {
+                var tgt = load64(A_targets + p * 8);
+                if (g_bpe_on == 1) { g_eval_bytes = g_eval_bytes + load64(g_tok_len + tgt * 8); }
+                else { g_eval_bytes = g_eval_bytes + 1; }
+            }
+            p = p + 1;
+        }
+        g_eval_tokens = g_eval_tokens + g_nmask;
+        s = s + T;
+    }
+    g_training = was;
+    return g_eval_tokens;
+}
+
+# The X015 denoising grid: masked-CE bits/byte at {10,30,50,70,90}% + their mean.
+# The mean is the MDLM ELBO upper bound: the 1/t loss weight cancels the t-scaling
+# of the masked count, leaving the per-masked-token CE averaged over the noise
+# level t — so the unweighted grid mean is the bound (ADR 0013). Diffusion only.
+fn eval_diffusion_grid(): i64 {
+    var pcts[40];
+    store64(&pcts + 0, 10); store64(&pcts + 8, 30); store64(&pcts + 16, 50);
+    store64(&pcts + 24, 70); store64(&pcts + 32, 90);
+    var sum = f64_from(0); var n = 0; var i = 0;
+    while (i < 5) {
+        var pct = load64(&pcts + i * 8);
+        if (eval_diffusion(pct) > 0) {
+            var bpb = eval_bpb();
+            puts("  mask "); fmt_int(pct); puts("%  denoise bits/byte "); f_print(bpb, 5); _putc(10);
+            sum = f64_add(sum, bpb); n = n + 1;
+        }
+        i = i + 1;
+    }
+    if (n > 0) {
+        puts("  ELBO bound (mean over t) bits/byte "); f_print(f64_div(sum, f64_from(n)), 5); _putc(10);
+    }
+    return 0;
 }
 
 # ---- generation ------------------------------------------------------------
@@ -602,5 +718,112 @@ fn generate(prompt, plen, ngen, temp): i64 {
     gen_prime(G_win, n, 1);
     gen_decode(ngen, temp, 1, 0, 1);
     _putc(10);
+    return 0;
+}
+
+# ---- masked-diffusion decode (M15, E5) -------------------------------------
+# Confidence-aware iterative PARALLEL unmasking (MaskGIT, Chang et al. 2022,
+# arXiv:2202.04200; absorbing-state sampling, MDLM/D3PM). Unlike AR's
+# left-to-right KV-cached decode, this runs an UNCACHED BIDIRECTIONAL full-window
+# forward each step (the KV cache is causal/AR-only and would be wrong here),
+# fills the window from an all-[MASK] state (a prompt prefix stays given), and
+# each step commits the most-confident still-masked positions. Greedy + a frozen
+# lowest-index confidence tie-break, so it is fully deterministic (no RNG) and
+# cross-arch reproducible. See docs/sources.md and ADR 0013.
+
+# Number of maskable positions to KEEP masked AFTER step s (1..nsteps), over the
+# M0 initially-masked positions. sched 0 = cosine (M0·cos((π/2)·s/nsteps), MaskGIT's
+# default — commits fewer early), 1 = linear (M0·(1 − s/nsteps)). _cos_unit(x)
+# returns cos(π·x), so cos((π/2)·s/nsteps) = _cos_unit(s/(2·nsteps)).
+fn _diff_keep(M0, s, nsteps, sched): i64 {
+    if (s >= nsteps) { return 0; }
+    var frac = f64_div(f64_from(nsteps - s), f64_from(nsteps));        # linear
+    if (sched == 0) { frac = _cos_unit(f64_div(f64_from(s), f64_from(2 * nsteps))); }  # cosine
+    var v = f64_mul(f64_from(M0), frac);
+    var k = 0;                          # floor(v), capped at M0 (M0 is tiny)
+    while (k < M0) {
+        if (f64_le(f64_from(k + 1), v) == 1) { k = k + 1; }
+        else { break; }
+    }
+    return k;
+}
+
+# Denoise a full T-window: the prompt (plen bytes) is the GIVEN prefix, the rest
+# starts masked and is filled over nsteps confidence-ordered rounds. emit == 1
+# prints the prompt + the unmasked continuation. Leaves the result in A_tokens
+# (A_mask all 0 on return). Greedy (argmax); the temperature knob is reserved.
+fn gen_diffusion(prompt, plen, nsteps, sched, emit): i64 {
+    g_training = 0;                     # eval: no dropout
+    var T = g_T; var V = g_V;
+    var p = 0;
+    if (g_bpe_on == 0) {
+        p = plen; if (p > T) { p = T; }
+        var t = 0;
+        while (t < p) {
+            var id = load64(g_char2id + load8(prompt + (plen - p + t)) * 8);
+            if (id < 0) { id = 0; }
+            store64(A_tokens + t * 8, id); store64(A_mask + t * 8, 0);
+            t = t + 1;
+        }
+    } else {
+        var pb = plen; if (pb > ENC_MAX()) { pb = ENC_MAX(); }
+        var nids = tok_encode(prompt + plen - pb, pb, g_enc_buf);
+        p = nids; if (p > T) { p = T; }
+        var t2 = 0;
+        while (t2 < p) {
+            store64(A_tokens + t2 * 8, load64(g_enc_buf + (nids - p + t2) * 8));
+            store64(A_mask + t2 * 8, 0);
+            t2 = t2 + 1;
+        }
+    }
+    var q = p;                          # remaining positions start masked
+    while (q < T) { store64(A_mask + q * 8, 1); store64(A_tokens + q * 8, 0); q = q + 1; }
+    var M0 = T - p;
+    var s = 1;
+    while (s <= nsteps) {
+        var cur = 0; var ii = 0;
+        while (ii < T) { if (load64(A_mask + ii * 8) != 0) { cur = cur + 1; } ii = ii + 1; }
+        if (cur == 0) { break; }
+        var keep = _diff_keep(M0, s, nsteps, sched);
+        var nun = cur - keep;
+        if (nun < 1) { nun = 1; }
+        if (s == nsteps) { nun = cur; }     # final round: resolve everything left
+        model_eval_window(T);               # bidirectional uncached forward -> A_logits
+        var u = 0;
+        while (u < nun) {
+            var bestpos = 0 - 1; var bestconf = f64_from(0); var bestid = 0;
+            var pos = 0;
+            while (pos < T) {
+                if (load64(A_mask + pos * 8) != 0) {
+                    var row = A_logits + pos * V * 8;
+                    var mxl = load64(row); var arg = 0;
+                    var vv = 1;
+                    while (vv < V) {
+                        var lv = load64(row + vv * 8);
+                        if (f64_gt(lv, mxl) == 1) { mxl = lv; arg = vv; }
+                        vv = vv + 1;
+                    }
+                    # confidence = softmax(row)[argmax] = 1 / Σ_v exp(row_v − maxlogit)
+                    var sm = f64_from(0); vv = 0;
+                    while (vv < V) { sm = f64_add(sm, f64_exp(f64_sub(load64(row + vv * 8), mxl))); vv = vv + 1; }
+                    var conf = f64_div(f64_from(1), sm);
+                    if ((bestpos < 0) || (f64_gt(conf, bestconf) == 1)) {   # strict > = lowest-index tie-break
+                        bestconf = conf; bestpos = pos; bestid = arg;
+                    }
+                }
+                pos = pos + 1;
+            }
+            if (bestpos < 0) { break; }
+            store64(A_tokens + bestpos * 8, bestid); store64(A_mask + bestpos * 8, 0);
+            u = u + 1;
+        }
+        s = s + 1;
+    }
+    if (emit == 1) {
+        print(prompt, plen);
+        var e = p;
+        while (e < T) { tok_emit(load64(A_tokens + e * 8)); e = e + 1; }
+        _putc(10);
+    }
     return 0;
 }

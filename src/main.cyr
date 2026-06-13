@@ -88,7 +88,7 @@ fn _atoi(s): i64 {
 }
 
 # Kept in sync with the VERSION file (CI's docs job gates the match).
-fn CFG_VERSION(): i64 { return "1.4.6"; }
+fn CFG_VERSION(): i64 { return "1.5.0"; }
 
 fn usage(): i64 {
     puts("attn11 — a from-scratch GPT-style transformer, trained, in Cyrius\n");
@@ -112,6 +112,9 @@ fn usage(): i64 {
     puts("  --expert-topk K active experts per token (default 2; 1..N)\n");
     puts("  --bpe K         learn K BPE merges first (1..512; byte-level is the default)\n");
     puts("  --eval          print CE/token + bits-per-byte after training/save\n");
+    puts("  --objective O   training objective: ar (default) or diffusion (masked, bidirectional)\n");
+    puts("  --decode-steps N   diffusion decode iterations (default = ctx)\n");
+    puts("  --decode-schedule S  diffusion unmask schedule: cosine (default) or linear\n");
     puts("  --help, -h      show this help and exit\n");
     puts("  --version       print the version and exit\n");
     return 0;
@@ -145,6 +148,9 @@ fn main(): i64 {
     var cfg_hybrid = 0;                              # set post-parse if the per-layer kinds are mixed
     var lkinds[1024];                                # per-layer mixer kinds (128 i64 = max --layers)
     var use_bpe = 0; var bpe_k = 0; var do_eval = 0;
+    var cfg_objective = 0;                           # M15: 0 = AR (default), 1 = masked diffusion
+    var cfg_decode_steps = 0;                        # diffusion decode iterations (0 = default, resolved post-parse)
+    var cfg_decode_sched = 0;                        # diffusion decode schedule: 0 = cosine (default), 1 = linear
     var i = 1;
     while (i < argc()) {
         var a = argv(i);
@@ -182,6 +188,19 @@ fn main(): i64 {
         elif (streq(a, "--expert-topk") == 1) { i = i + 1; cfg_expert_topk = _atoi(_av(i, a)); }
         elif (streq(a, "--bpe") == 1) { use_bpe = 1; i = i + 1; bpe_k = _atoi(_av(i, a)); }
         elif (streq(a, "--eval") == 1) { do_eval = 1; }
+        elif (streq(a, "--objective") == 1) {
+            i = i + 1; var ob = _av(i, a);
+            if (streq(ob, "ar") == 1) { cfg_objective = 0; }
+            elif (streq(ob, "diffusion") == 1) { cfg_objective = 1; }
+            else { puts("attn11: --objective must be ar or diffusion\n"); return 1; }
+        }
+        elif (streq(a, "--decode-steps") == 1) { i = i + 1; cfg_decode_steps = _atoi(_av(i, a)); }
+        elif (streq(a, "--decode-schedule") == 1) {
+            i = i + 1; var ds = _av(i, a);
+            if (streq(ds, "cosine") == 1) { cfg_decode_sched = 0; }
+            elif (streq(ds, "linear") == 1) { cfg_decode_sched = 1; }
+            else { puts("attn11: --decode-schedule must be cosine or linear\n"); return 1; }
+        }
         else { puts("attn11: unknown argument "); puts(a); _putc(10); usage(); return 1; }
         i = i + 1;
     }
@@ -295,6 +314,35 @@ fn main(): i64 {
         }
         if (cfg_hybrid == 0) { cfg_attn_kind = load64(&lkinds); cfg_latent_dim = 0; }   # collapsed → uniform MHA
     }
+    # M15 masked-diffusion (E5). v1.5.0 scope: MHA (kind 0) + learned-abs + dense +
+    # uniform — lin/ssm are causal recurrences with no bidirectional form; mla/moe/
+    # rope-diffusion are additive fast-follows. Ignored under --load (the
+    # checkpoint's objective wins); model_init_full's backstop + the loader
+    # re-validate. Resolve the decode-step default (~ctx) post-parse so --preset's T
+    # is final.
+    if ((cfg_objective == 1) && (load_path == 0)) {
+        if (cfg_attn_kind != 0) {
+            puts("attn11: --objective diffusion requires --attn-kind mha (lin/ssm are causal; mla is a fast-follow)\n");
+            return 1;
+        }
+        if (cfg_pos_kind != 0) {
+            puts("attn11: --objective diffusion requires learned-abs positions (RoPE-diffusion is a fast-follow)\n");
+            return 1;
+        }
+        if (cfg_num_experts != 1) {
+            puts("attn11: --objective diffusion requires a dense MLP (--experts 1; MoE-diffusion is a fast-follow)\n");
+            return 1;
+        }
+        if (cfg_attn_every > 0) {
+            puts("attn11: --objective diffusion does not support --attn-every (uniform MHA only)\n");
+            return 1;
+        }
+        if ((cfg_decode_steps < 1) || (cfg_decode_steps > cfg_t)) { cfg_decode_steps = cfg_t; }
+    }
+    if ((cfg_decode_steps != 0) && (cfg_objective != 1) && (load_path == 0)) {
+        puts("attn11: --decode-steps / --decode-schedule require --objective diffusion\n");
+        return 1;
+    }
     # K is the experiment's key variable — a silent default would hide it
     if ((use_bpe == 1) && ((bpe_k < 1) || (bpe_k > BPE_MAX_MERGES()))) {
         puts("attn11: --bpe needs a merge count in 1..512\n");
@@ -327,11 +375,17 @@ fn main(): i64 {
         var rc = ckpt_load_file(load_path);
         if (rc < 0) { puts("attn11: checkpoint load failed (code "); fmt_int(rc); puts(")\n"); return 1; }
         puts("attn11: resumed from checkpoint at step "); fmt_int(g_step); _putc(10);
+    } elif (cfg_objective == 1) {
+        # M15 masked-diffusion (uniform MHA + learned-abs + dense; bidirectional)
+        model_init_full(V, cfg_c, cfg_t, cfg_nh, cfg_nkv, cfg_nl,
+                        CFG_ATTN_BIAS(), CFG_DROPOUT(), CFG_SEED(),
+                        cfg_attn_kind, cfg_latent_dim, cfg_pos_kind, cfg_rope_dim,
+                        cfg_num_experts, cfg_expert_topk, 0, 1);
     } elif (cfg_hybrid == 1) {
         model_init_full(V, cfg_c, cfg_t, cfg_nh, cfg_nkv, cfg_nl,
                         CFG_ATTN_BIAS(), CFG_DROPOUT(), CFG_SEED(),
                         cfg_attn_kind, cfg_latent_dim, cfg_pos_kind, cfg_rope_dim,
-                        cfg_num_experts, cfg_expert_topk, &lkinds);
+                        cfg_num_experts, cfg_expert_topk, &lkinds, 0);
     } else {
         model_init_moe(V, cfg_c, cfg_t, cfg_nh, cfg_nkv, cfg_nl,
                        CFG_ATTN_BIAS(), CFG_DROPOUT(), CFG_SEED(),
@@ -365,6 +419,7 @@ fn main(): i64 {
     if (g_num_experts > 1) {
         puts(" moe(experts="); fmt_int(g_num_experts); puts(",topk="); fmt_int(g_expert_topk); puts(")");
     }
+    if (g_objective == 1) { puts(" objective=diffusion(bidir)"); }
     puts(" params="); fmt_int(g_NP); _putc(10);
     puts("  tokenizer=");
     if (g_bpe_on == 1) { puts("bpe(merges="); fmt_int(g_bpe_nmerges); puts(")"); }
@@ -394,7 +449,18 @@ fn main(): i64 {
     }
 
     # ---- eval (after save, so the checkpoint is identical with or without) ----
-    if (do_eval == 1) {
+    if ((do_eval == 1) && (g_objective == 1)) {
+        # diffusion: the AR next-token CE is the wrong metric for a bidirectional
+        # denoiser. Report the masked-CE denoising bits/byte at a mask-ratio grid +
+        # the ELBO bound — an UPPER bound on NLL, NOT comparable head-to-head with
+        # AR's exact bits/byte (X015 / ADR 0013).
+        if ((g_data == 0) || (g_datalen < g_T)) { puts("attn11: no/short corpus; skipping eval\n"); }
+        else {
+            puts("eval (diffusion denoising; ELBO upper bound, not AR's exact NLL):\n");
+            eval_diffusion_grid();
+        }
+    }
+    if ((do_eval == 1) && (g_objective != 1)) {
         var et = eval_corpus();
         if (et < 0) { puts("attn11: no/short corpus; skipping eval\n"); }
         else {
@@ -420,11 +486,20 @@ fn main(): i64 {
     # ---- sample ----
     _putc(10);
     if (g_step == 0) { puts("attn11: NOTE model is untrained; sample output is random\n"); }
-    puts("greedy sample:\n");
-    generate("cyrius ", 7, 120, f64_from(0));
-    puts("\nsampled (temp 0.8):\n");
-    var temp = f64_div(f64_from(8), f64_from(10));
-    generate("a transformer ", 14, 120, temp);
+    if (g_objective == 1) {
+        # M15: confidence-ordered iterative unmasking (a diffusion model is
+        # bidirectional, so it denoises a whole window — not left-to-right AR).
+        if (cfg_decode_steps < 1) { cfg_decode_steps = g_T; }   # resolve for the --load path
+        puts("diffusion sample (confidence-ordered unmask):\n");
+        gen_diffusion("cyrius ", 7, cfg_decode_steps, cfg_decode_sched, 1);
+        gen_diffusion("a transformer ", 14, cfg_decode_steps, cfg_decode_sched, 1);
+    } else {
+        puts("greedy sample:\n");
+        generate("cyrius ", 7, 120, f64_from(0));
+        puts("\nsampled (temp 0.8):\n");
+        var temp = f64_div(f64_from(8), f64_from(10));
+        generate("a transformer ", 14, 120, temp);
+    }
 
     return rc;
 }

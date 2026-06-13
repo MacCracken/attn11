@@ -304,3 +304,23 @@ transformer as 0.9.0. The bench history confirms it — `fwd+bwd step` /
 1.4.6 (~3.6 ms, ~4 450 tok/s, b=16; [`bench-history.csv`](../bench-history.csv)),
 i.e. the entire M12–M14 architecture arc added five opt-in axes with **zero
 regression** to the default path.
+
+## The char-diffusion objective (1.5.0, M15)
+
+A *training-objective* axis, not an architecture: `--objective diffusion` runs a
+masked-denoising model that is **bidirectional** (full T×T attention vs the causal
+half-triangle). At the default config (x86_64):
+
+| metric                              | diffusion | AR (causal MHA) |
+|-------------------------------------|-----------|-----------------|
+| fwd+bwd step                        | ~3.98 ms  | ~3.57 ms (1.12×)|
+| decode                              | ~0.80 ms / window-round (uncached bidirectional) | 0.163 ms/token (KV-cached) |
+| params                              | 39 520    | 39 488 (+32 = mask_emb) |
+
+The step is only ~12% over causal — bidirectional doubles the attention's score/PV
+work, but attention is a fraction of the per-block cost (the LN/MLP/projections are
+shared). Decode is the headline difference: diffusion has **no KV cache** (the cache
+is causal/AR-only), so it re-runs an uncached full-window forward each unmask round
+— the cost of parallel, any-order generation. The +32 params are the single learned
+`[MASK]` embedding. Quality vs AR at this scale is X015 (a scale-limited negative
+result, not a perf one).

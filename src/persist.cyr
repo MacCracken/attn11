@@ -7,9 +7,14 @@
 #   [14] base_vocab Vb             [15] n_merges K       (V = Vb + K)
 #   [16] attn_kind [17] pos_kind   [18] latent_dim d_c   [19] rope_dim d_rope
 #   [20] num_experts (1 = dense)   [21] expert_topk      (MoE, M13, E8)
+#   --- v7 only (M15 char-diffusion, ADR 0013): ---
+#   [22] objective (0 = AR, 1 = masked diffusion). v7 is UNIFORM (no per-layer
+#        region) and carries an extra C in NP for the learned mask_emb (after lnf_b).
 #   --- v6 only (a per-layer mixer HYBRID, M14 rung c/d, ADR 0011/0012): ---
 #   [22 .. 22+NL)         per-layer mixer kinds (0=mha,1=mla,2=lin,3=ssm)
-#   --- vocab/merges follow the header + the (v6) per-layer region, base = 22+pl: ---
+#   (slot [22] is the objective for v7 OR the per-layer base for v6 — mutually
+#    exclusive: diffusion is uniform-only, a hybrid is AR-only.)
+#   --- vocab/merges follow the (version) header + the (v6) per-layer region: ---
 #   [base .. base+Vb)         base vocab (id -> byte value)          (pl = NL if v6, else 0)
 #   [base+Vb .. base+Vb+2K)   merge pairs (left id, right id), in learned order
 #   then NP f64 g_params, NP f64 g_adam_m, NP f64 g_adam_v
@@ -40,8 +45,15 @@ fn CKPT_MAGIC(): i64 { return 0x4154544E31317631; }   # "ATTN11v1" (file family)
 # The version the CURRENT model serializes as: v6 carries the M14 rung-c per-layer
 # mixer array (a hybrid); a uniform model writes v5 — byte-identical to pre-1.4.3,
 # so every existing v5 round-trip and the fuzz harness are unchanged.
-fn CKPT_VER(): i64 { if (g_layer_kind != 0) { return 6; } return 5; }
+fn CKPT_VER(): i64 { if (g_objective == 1) { return 7; } if (g_layer_kind != 0) { return 6; } return 5; }
 fn CKPT_HDR(): i64 { return 22; }                     # v5/v6 fixed header i64 fields
+# v7 (M15, char-diffusion): one extra fixed field, the training objective, at slot
+# [22]; the vocab base shifts to 23. Diffusion is uniform (no hybrid), so a v7
+# image carries NO per-layer region. A uniform AR model still writes v5 and a
+# hybrid AR model v6 — both byte-identical to before M15.
+fn CKPT_HDR_V7(): i64 { return 23; }
+# The fixed-header size the CURRENT model serializes with (23 iff diffusion).
+fn _ckpt_hdr_cur(): i64 { if (g_objective == 1) { return CKPT_HDR_V7(); } return CKPT_HDR(); }
 # per-layer mixer region (v6, ADR 0011): NL i64 kinds appended after the fixed
 # header, before the vocab. 0 (no region) for a uniform model (v5 and earlier).
 fn _ckpt_pl(): i64 { if (g_layer_kind != 0) { return g_NL; } return 0; }
@@ -100,7 +112,7 @@ fn _ckpt_vb(): i64 { if (g_bpe_on == 1) { return g_bpe_base; } return g_V; }
 fn _ckpt_k(): i64 { if (g_bpe_on == 1) { return g_bpe_nmerges; } return 0; }
 
 # Total checkpoint size in bytes for the current model.
-fn ckpt_size(): i64 { return (CKPT_HDR() + _ckpt_pl() + _ckpt_vb() + 2 * _ckpt_k() + 3 * g_NP) * 8; }
+fn ckpt_size(): i64 { return (_ckpt_hdr_cur() + _ckpt_pl() + _ckpt_vb() + 2 * _ckpt_k() + 3 * g_NP) * 8; }
 
 # Serialize the current model state into buf (caller allocs ckpt_size bytes).
 # The vocab loop runs to Vb, NOT g_V: g_vocab is a 256-entry base table, and
@@ -132,12 +144,18 @@ fn ckpt_serialize(buf): i64 {
     # M13 MoE descriptor (E8) — defaults to the dense MLP (1 expert, top-1)
     store64(buf + 20 * 8, g_num_experts);
     store64(buf + 21 * 8, g_expert_topk);
-    # M14 rung-c per-layer mixer kinds (v6) — only present when a hybrid (g_layer_kind
-    # set); a uniform model writes nothing here and stays a byte-identical v5.
+    # M15 v7: the training-objective descriptor at slot [22] — written ONLY for a
+    # diffusion image (g_objective == 1). A v5/v6 image writes nothing here, so
+    # [22] stays the per-layer/vocab base and AR checkpoints are byte-identical.
+    if (g_objective == 1) { store64(buf + 22 * 8, g_objective); }
+    # M14 rung-c per-layer mixer kinds (v6) — only present when a hybrid; appended
+    # after the (version-correct) fixed header. A v7 diffusion image is uniform, so
+    # pl == 0 here.
+    var hdr = _ckpt_hdr_cur();
     var pl = _ckpt_pl();
     var li = 0;
-    while (li < pl) { store64(buf + (CKPT_HDR() + li) * 8, load64(g_layer_kind + li * 8)); li = li + 1; }
-    var base = CKPT_HDR() + pl;
+    while (li < pl) { store64(buf + (hdr + li) * 8, load64(g_layer_kind + li * 8)); li = li + 1; }
+    var base = hdr + pl;
     var i = 0;
     while (i < vb) { store64(buf + (base + i) * 8, load64(g_vocab + i * 8)); i = i + 1; }
     i = 0;
@@ -158,13 +176,14 @@ fn ckpt_load_buf(buf, len): i64 {
     if (len < CKPT_HDR_V1() * 8) { return 0 - 1; }
     if (load64(buf + 0 * 8) != CKPT_MAGIC()) { return 0 - 2; }
     var ver = load64(buf + 1 * 8);
-    if ((ver != 1) && (ver != 2) && (ver != 3) && (ver != 4) && (ver != 5) && (ver != 6)) { return 0 - 3; }
+    if ((ver < 1) || (ver > 7)) { return 0 - 3; }   # versions 1..7 accepted (v7 = M15 char-diffusion)
     var hdr = CKPT_HDR_V1();
     if (ver == 2) { hdr = CKPT_HDR_V2(); }
     if (ver == 3) { hdr = CKPT_HDR_V3(); }
     if (ver == 4) { hdr = CKPT_HDR_V4(); }
     if (ver == 5) { hdr = CKPT_HDR(); }
     if (ver == 6) { hdr = CKPT_HDR(); }   # v6: 22 fixed fields + the NL per-layer region (added as pl below)
+    if (ver == 7) { hdr = CKPT_HDR_V7(); }   # v7: 23 fixed fields (objective at [22]); uniform, so no per-layer region
     if (len < hdr * 8) { return 0 - 1; }
     var V = load64(buf + 2 * 8);
     var C = load64(buf + 3 * 8);
@@ -281,6 +300,18 @@ fn ckpt_load_buf(buf, len): i64 {
     }
     if ((num_experts < 1) || (num_experts > 256)) { return 0 - 44; }
     if ((topk < 1) || (topk > num_experts)) { return 0 - 45; }
+    # M15 objective descriptor (v7). v1..v6 carry no objective field and synthesize
+    # AR (objective 0). Diffusion (1) appends a learned mask_emb (C) to NP and runs
+    # bidirectional, so it requires the bidirectional-compatible config — MHA
+    # (attn_kind 0), learned-abs (pos_kind 0), dense (num_experts 1), uniform (no
+    # per-layer hybrid, enforced because v7 carries no per-layer region). A hostile
+    # v7 that violates this is rejected (-47) before any allocation.
+    var objective = 0;
+    if (ver >= 7) { objective = load64(buf + 22 * 8); }
+    if ((objective != 0) && (objective != 1)) { return 0 - 47; }
+    if (objective == 1) {
+        if ((attn_kind != 0) || (pos_kind != 0) || (num_experts != 1)) { return 0 - 47; }
+    }
     # M14 per-layer hybrid (v6, ADR 0011; rung c+d). v1..v5 carry no per-layer
     # region and run uniform (the descriptor's attn_kind everywhere), so they cannot
     # hit -46. The NL kinds sit at [CKPT_HDR() .. CKPT_HDR()+NL); bound the read
@@ -301,6 +332,7 @@ fn ckpt_load_buf(buf, len): i64 {
         kvw_blk = _kvw_hyb(kinds, NL, C, nh, nkv, d_c, pos_kind, d_rope);
     }
     var expnp = ckpt_expected_np_kvw(V, C, T, nh, NL, bias, nkv, kvw_blk, num_experts);
+    if (objective == 1) { expnp = expnp + C; }   # M15: the learned mask_emb (C) appended after lnf_b
     if ((np < 1) || (np > CKPT_MAX_NP())) { return 0 - 13; }
     if (np != expnp) { return 0 - 10; }
     # shape-valid is not enough: the nh*T*T attention arenas (independent of
@@ -371,7 +403,12 @@ fn ckpt_load_buf(buf, len): i64 {
     var was_bpe = g_bpe_on;
     if (pl > 0) {
         model_init_full(V, C, T, nh, nkv, NL, bias, drop, 1, attn_kind, d_c, pos_kind, d_rope,
-                        num_experts, topk, buf + CKPT_HDR() * 8);
+                        num_experts, topk, buf + CKPT_HDR() * 8, 0);
+    } elif (objective == 1) {
+        # M15 diffusion (v7): uniform MHA; model_init_full sets g_objective/g_bidir
+        # and allocates the mask_emb (so the +C param region the loader counted exists).
+        model_init_full(V, C, T, nh, nkv, NL, bias, drop, 1, attn_kind, d_c, pos_kind, d_rope,
+                        num_experts, topk, 0, 1);
     } else {
         model_init_moe(V, C, T, nh, nkv, NL, bias, drop, 1, attn_kind, d_c, pos_kind, d_rope, num_experts, topk);
     }
@@ -421,6 +458,7 @@ fn ckpt_load_buf(buf, len): i64 {
     g_rope_dim = d_rope;
     g_num_experts = num_experts;
     g_expert_topk = topk;
+    g_objective = objective;   # M15 (model_init_full already set it + g_bidir; kept explicit)
     return 0;
 }
 

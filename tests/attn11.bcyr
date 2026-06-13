@@ -292,7 +292,7 @@ fn main(): i64 {
     # attention layers' T-growing K/V + the constant lin state — so it scales with
     # the attention fraction (here 1/3), trading cache for full attention.
     var hk[24]; store64(&hk + 0, 0); store64(&hk + 8, 2); store64(&hk + 16, 2);   # mha,lin,lin
-    model_init_full(V, 32, 16, 4, 4, 3, 1, f64_from(0), 1337, 2, 0, 0, 0, 1, 1, &hk);   # base lin
+    model_init_full(V, 32, 16, 4, 4, 3, 1, f64_from(0), 1337, 2, 0, 0, 0, 1, 1, &hk, 0);   # base lin
     model_forward(); model_zero_grads(); model_backward();   # prime
     s = now_ns(); i = 0;
     while (i < N) {
@@ -315,7 +315,7 @@ fn main(): i64 {
     # block K/V region pads to the max kind size; the decode cache sums the one
     # attention layer's T-growing K/V + the SSM layers' constant C×N state.
     var hks[24]; store64(&hks + 0, 0); store64(&hks + 8, 3); store64(&hks + 16, 3);   # mha,ssm,ssm
-    model_init_full(V, 32, 16, 4, 4, 3, 1, f64_from(0), 1337, 3, 16, 0, 0, 1, 1, &hks);   # base ssm
+    model_init_full(V, 32, 16, 4, 4, 3, 1, f64_from(0), 1337, 3, 16, 0, 0, 1, 1, &hks, 0);   # base ssm
     model_forward(); model_zero_grads(); model_backward();   # prime
     s = now_ns(); i = 0;
     while (i < N) {
@@ -332,6 +332,26 @@ fn main(): i64 {
     _report("gen kv-cached hyb-ssm", e - s, NGEN);
     puts("hyb-ssm(1/3 mha) cache bytes (mixed): "); fmt_int(kv_cache_bytes()); _putc(10);
     puts("hyb-ssm params (vs pure ssm 38048 — padding to MHA's region): "); fmt_int(g_NP); _putc(10);
+
+    # ---- masked DIFFUSION (M15, E5): the bidirectional fwd+bwd step (full O(T^2)
+    # attention vs causal's O(T^2/2)) over sample_window_diffusion, then the
+    # confidence-ordered PARALLEL decode (uncached bidirectional, T rounds). The
+    # decode is NOT KV-cached — diffusion denoises the whole window each round.
+    model_init_full(V, 32, 16, 4, 4, 3, 1, f64_from(0), 1337, 0, 0, 0, 0, 1, 1, 0, 1);   # diffusion (bidir)
+    sample_window_diffusion(); model_forward(); model_zero_grads(); model_backward();    # prime
+    s = now_ns(); i = 0;
+    while (i < N) {
+        model_zero_grads(); sample_window_diffusion(); model_forward(); model_backward();
+        i = i + 1;
+    }
+    e = now_ns();
+    _report("fwd+bwd step diffusion", e - s, N);
+    g_training = 0;
+    s = now_ns();
+    gen_diffusion("cyrius ", 7, g_T, 0, 0);   # T-round cosine unmask, no emit
+    e = now_ns();
+    _report("gen diffusion (T-round unmask)", e - s, g_T);
+    puts("diffusion params (vs dense 39488, +C mask_emb): "); fmt_int(g_NP); _putc(10);
 
     # ---- isolated tied LM head at BPE-scale vocab (V=768): the M9 lever-1
     # target. head_fwd_row is O(V*C) per row and runs in every training forward

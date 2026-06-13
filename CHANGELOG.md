@@ -4,6 +4,58 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-06-13
+
+**Char-diffusion objective** (M15, E5; ADR 0013) — the first *training-objective*
+departure from the autoregressive trunk. `--objective diffusion` trains a masked
+absorbing-state diffusion model (D3PM/MDLM lineage): drop the causal mask, corrupt
+a window by replacing positions with a learned `[MASK]` embedding, and predict the
+originals with a **bidirectional** model; decode is MaskGIT-style confidence-ordered
+parallel unmasking, not left-to-right. Opt-in and additive — the no-flag AR run is
+**byte-identical**, every v1–v6 checkpoint still loads, and the milestone's two
+hand-derived backwards (the masked-CE and the bidirectional attention) each land
+behind a finite-difference grad-check.
+
+### Added
+- **`--objective ar|diffusion`** (default `ar`) + `--decode-steps N` /
+  `--decode-schedule {cosine,linear}`. Scope for v1.5.0: MHA (GQA allowed) +
+  learned-abs + dense + uniform (lin/ssm are causal recurrences; mla/MoE/RoPE-
+  diffusion are additive fast-follows).
+- **Masked cross-entropy** (`softmax_xent_masked_fwd`/`_bwd`, `src/ops.cyr`): mean
+  CE over the masked positions only, gradient zeroed at given positions. Grad-check
+  `test_masked_ce` (all-ones ≡ plain CE; all-zeros ⇒ 0).
+- **Bidirectional attention** (`g_bidir`, `src/attn.cyr`): the causal `j<=i` loop
+  bound becomes the full square under diffusion; the softmax-backward sum uses the
+  same range. Grad-check `test_attn_bidir` (T≥3, with a future-attending pin that
+  catches a fwd+bwd-both-causal regression the FD alone would miss).
+- **Learned `[MASK]` embedding** (`src/model.cyr`): a `C`-vector appended after
+  `lnf_b`, present only under diffusion (`g_NP += C` gated), so AR layout / RNG draw
+  order / Adam state / checkpoints are byte-identical; the weight-tied head is
+  untouched. Full-model grad-check `test_model_diffusion` (FDs both `mask_emb` and
+  `tokemb` with mixed masked/given positions).
+- **Diffusion sampler + decode** (`src/train.cyr`): `sample_window_diffusion` /
+  `diffuse_mask` (per-example mask ratio t~U(0,1), ≥1-mask floor); `gen_diffusion`
+  (uncached bidirectional, cosine/linear schedule, greedy + frozen tie-break,
+  deterministic). Decode-determinism test.
+- **`eval_diffusion` / `eval_diffusion_grid`**: denoising bits/byte at a mask-ratio
+  grid {10,30,50,70,90}% + the ELBO bound (the mean — the MDLM 1/t weight cancels
+  the t-scaling of the masked count). `--eval` reports this for a diffusion model.
+- **Checkpoint v7**: the `objective` descriptor at slot [22] + the `+C` mask_emb in
+  NP. v7 round-trip + `-47` rejection tests; 500 v7 fuzz rounds. A diffusion image
+  writes v7; uniform AR still writes v5 and hybrid AR v6 (byte-identical).
+- Diffusion bench case (fwd+bwd step + T-round parallel decode); **X015** (the
+  honest matched-compute AR-vs-diffusion comparison).
+
+### Changed
+- `model_init_full` gains a trailing `objective` param (the delegators pass 0);
+  `persist.cyr` accepts versions 1..7 (v≤6 synthesize `objective = 0`).
+
+### Notes
+- Diffusion mode is bidirectional, so attention is O(T²) (vs causal's half). At
+  reference scale the greedy decode tends to collapse toward high-frequency tokens —
+  a known dLLM-at-small-scale limitation, not a correctness issue (the grad-checks
+  are tight); see X015 for the honest comparison and the ELBO-vs-exact-NLL caveat.
+
 ## [1.4.6] - 2026-06-13
 
 **Benchmarking pass.** A dedicated perf release: one canonical bench run across the

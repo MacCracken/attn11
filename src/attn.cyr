@@ -75,10 +75,17 @@ fn attn_core_fwd(Qc, Kc, Vc, Pc, concat, T, C, nh, nkv): i64 {
         var i = 0;
         while (i < T) {
             var prow = Pc + (h * T + i) * T * 8;
-            # raw scores for j = 0..i
+            # CAUSAL (g_bidir == 0, today): query i attends keys j = 0..i.
+            # BIDIRECTIONAL (g_bidir == 1, M15 diffusion): j = 0..T-1 (the full
+            # square; Pc is already nh*T*T, so the off-diagonal is just filled in).
+            # g_bidir is 1 only for MHA-diffusion (the loader/CLI reject mla/lin/ssm
+            # + diffusion), so MLA — which also calls this core — stays causal.
+            var jhi = i;
+            if (g_bidir == 1) { jhi = T - 1; }
+            # raw scores for j = 0..jhi
             var qbase = Qc + (i * C + base) * 8;
             var j = 0;
-            while (j <= i) {
+            while (j <= jhi) {
                 var kbase = Kc + (j * Ckv + kvb) * 8;
                 store64(&acc, f64_from(0)); store64(&acc + 8, f64_from(0));
                 store64(&acc + 16, f64_from(0)); store64(&acc + 24, f64_from(0));
@@ -96,17 +103,17 @@ fn attn_core_fwd(Qc, Kc, Vc, Pc, concat, T, C, nh, nkv): i64 {
                 store64(prow + j * 8, f64_mul(dot, scale));
                 j = j + 1;
             }
-            # softmax over j = 0..i
+            # softmax over j = 0..jhi
             var mx = load64(prow);
             j = 1;
-            while (j <= i) {
+            while (j <= jhi) {
                 var s = load64(prow + j * 8);
                 if (f64_gt(s, mx) == 1) { mx = s; }
                 j = j + 1;
             }
             var sum = f64_from(0);
             j = 0;
-            while (j <= i) {
+            while (j <= jhi) {
                 var e = f64_exp(f64_sub(load64(prow + j * 8), mx));
                 store64(prow + j * 8, e);
                 sum = f64_add(sum, e);
@@ -114,14 +121,14 @@ fn attn_core_fwd(Qc, Kc, Vc, Pc, concat, T, C, nh, nkv): i64 {
             }
             var inv = f64_div(f64_from(1), sum);
             j = 0;
-            while (j <= i) { store64(prow + j * 8, f64_mul(load64(prow + j * 8), inv)); j = j + 1; }
+            while (j <= jhi) { store64(prow + j * 8, f64_mul(load64(prow + j * 8), inv)); j = j + 1; }
             # concat[i, base+d] = sum_j P[i,j] * V[j, kvb+d]  (axpy over the
             # contiguous head dim d, broadcasting the scalar P[i,j] over j)
             var cbase = concat + (i * C + base) * 8;
             var dz = 0;
             while (dz < hd) { store64(cbase + dz * 8, f64_from(0)); dz = dz + 1; }
             j = 0;
-            while (j <= i) {
+            while (j <= jhi) {
                 var pij = load64(prow + j * 8);
                 store64(&pv, pij); store64(&pv + 8, pij);
                 store64(&pv + 16, pij); store64(&pv + 24, pij);
@@ -484,8 +491,14 @@ fn attn_core_bwd(Qc, Kc, Vc, Pc, dconcat, dQ, dK, dV, dprow, T, C, nh, nkv): i64
             # dP[i,j] = sum_d dconcat[i,base+d]*V[j,kvb+d]  (dot over d)
             # dV[j,kvb+d] += P[i,j]*dconcat[i,base+d]       (axpy over d)
             var dcbase = dconcat + (i * C + base) * 8;
+            # CAUSAL: j = 0..i. BIDIRECTIONAL (g_bidir==1, diffusion): j = 0..T-1 —
+            # mirroring attn_core_fwd. The dotPdP softmax sum below MUST use the SAME
+            # jhi range as the forward normalized over, else the off-diagonal
+            # (future-position) gradient terms come out wrong (M15 grad-check pins).
+            var jhi = i;
+            if (g_bidir == 1) { jhi = T - 1; }
             var j = 0;
-            while (j <= i) {
+            while (j <= jhi) {
                 var pij = load64(prow + j * 8);
                 store64(&bb, pij); store64(&bb + 8, pij);
                 store64(&bb + 16, pij); store64(&bb + 24, pij);
@@ -513,14 +526,14 @@ fn attn_core_bwd(Qc, Kc, Vc, Pc, dconcat, dQ, dK, dV, dprow, T, C, nh, nkv): i64
             # softmax backward: dscore[j] = P[j]*(dP[j] - sum_k P[k]*dP[k])
             var dotPdP = f64_from(0);
             j = 0;
-            while (j <= i) {
+            while (j <= jhi) {
                 dotPdP = f64_add(dotPdP, f64_mul(load64(prow + j * 8), load64(dprow + j * 8)));
                 j = j + 1;
             }
             var dqbase = dQ + (i * C + base) * 8;
             var qbase2 = Qc + (i * C + base) * 8;
             j = 0;
-            while (j <= i) {
+            while (j <= jhi) {
                 var ds = f64_mul(load64(prow + j * 8), f64_sub(load64(dprow + j * 8), dotPdP));
                 var sds = f64_mul(scale, ds);
                 # dQ[i,base+d] += sds*K[j,kvb+d]; dK[j,kvb+d] += sds*Q[i,base+d]

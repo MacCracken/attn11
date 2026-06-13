@@ -165,6 +165,48 @@ fn test_softmax_xent(): i64 {
     return 0;
 }
 
+# M15: masked cross-entropy (the diffusion objective's loss). The fwd returns the
+# scalar masked-mean loss directly, so the grad-check is a direct central-FD over
+# logits (like a loss layer). Mixed mask (rows 0,2 masked; 1,3 given) exercises the
+# zeroed-gradient path at given rows AND the 1/nmask normalizer. Two regression
+# pins: an all-ones mask must equal the plain softmax_xent (byte-for-byte), and an
+# all-zeros mask must give zero loss + zero dlogits.
+fn test_masked_ce(): i64 {
+    var M = 4; var V = 5;
+    var logits = t_alloc(M * V); var probs = t_alloc(M * V); var targets = t_alloc(M);
+    var mask = t_alloc(M);
+    t_randn(logits, M * V, f64_from(1));
+    store64(targets + 0, 2); store64(targets + 8, 0); store64(targets + 16, 4); store64(targets + 24, 1);
+    store64(mask + 0, 1); store64(mask + 8, 0); store64(mask + 16, 1); store64(mask + 24, 0);
+    var dlogits = t_alloc(M * V);
+    softmax_xent_masked_fwd(logits, targets, probs, mask, M, V);
+    softmax_xent_masked_bwd(probs, targets, mask, dlogits, M, V);
+    var eps = _eps(); var te = f64_mul(f64_from(2), eps);
+    var nd = t_alloc(M * V); var i = 0;
+    while (i < M * V) {
+        var o = load64(logits + i * 8);
+        store64(logits + i * 8, f64_add(o, eps)); var lp = softmax_xent_masked_fwd(logits, targets, probs, mask, M, V);
+        store64(logits + i * 8, f64_sub(o, eps)); var lm = softmax_xent_masked_fwd(logits, targets, probs, mask, M, V);
+        store64(logits + i * 8, o); store64(nd + i * 8, f64_div(f64_sub(lp, lm), te)); i = i + 1;
+    }
+    check("masked-ce dlogits", dlogits, nd, M * V, 100000);
+    # pin: an all-ones mask must reproduce the plain softmax_xent bit-for-bit
+    store64(mask + 8, 1); store64(mask + 24, 1);
+    var probs2 = t_alloc(M * V);
+    var l_masked = softmax_xent_masked_fwd(logits, targets, probs, mask, M, V);
+    var l_plain = softmax_xent_fwd(logits, targets, probs2, M, V);
+    assert(f64_eq(l_masked, l_plain) == 1, "all-ones mask == plain CE");
+    # pin: an all-zeros mask -> zero loss and zero dlogits
+    store64(mask + 0, 0); store64(mask + 8, 0); store64(mask + 16, 0); store64(mask + 24, 0);
+    var l_zero = softmax_xent_masked_fwd(logits, targets, probs, mask, M, V);
+    assert(f64_eq(l_zero, f64_from(0)) == 1, "all-zeros mask -> zero loss");
+    softmax_xent_masked_bwd(probs, targets, mask, dlogits, M, V);
+    var allzero = 1; var z = 0;
+    while (z < M * V) { if (f64_eq(load64(dlogits + z * 8), f64_from(0)) == 0) { allzero = 0; } z = z + 1; }
+    assert(allzero == 1, "all-zeros mask -> zero dlogits");
+    return 0;
+}
+
 fn attn_loss(Wq, bq, Wk, bk, Wv, bv, Wo, bo, x, out, dout, ar, T, C, nh, nkv, pk): i64 {
     attn_fwd(Wq, bq, Wk, bk, Wv, bv, Wo, bo, x, out, ar, T, C, nh, nkv, pk);
     return dotsum(dout, out, T * C);
@@ -263,6 +305,103 @@ fn test_attention(): i64 {
     _attn_check(3, 16, 4, 1);   # hd=4 MQA: 4 query heads share 1 K/V head
     _attn_check(3, 16, 4, 2);   # hd=4 GQA: 2 query heads per K/V head
     _attn_check(4, 16, 2, 1);   # hd=8 MQA: SIMD-chunk head dim, shared K/V
+    return 0;
+}
+# M15: BIDIRECTIONAL (diffusion) attention grad-check. Set g_bidir = 1 so the
+# shared core runs the full T×T square, then reuse the FD harness — the SAME
+# dx/dW*/db* checks now exercise FUTURE-attending gradients (query 0 attends keys
+# 1..T-1), so a causal-range bug in the dotPdP softmax sum (trap: backward not
+# matching the forward's range) would blow up dWk/dWv/dx here. T ≥ 3 throughout.
+# The explicit future-dependency pin below is ESSENTIAL: if BOTH fwd and bwd were
+# wrongly causal they would still AGREE (FD passes) yet not be bidirectional —
+# this assertion proves the forward actually attends future positions.
+fn test_attn_bidir(): i64 {
+    g_bidir = 1;
+    _attn_check_pos(3, 16, 2, 2, 0);   # hd=8, full heads
+    _attn_check_pos(4, 16, 2, 1, 0);   # hd=8, MQA — grouped dK/dV under bidir
+    _attn_check_pos(3, 12, 2, 2, 0);   # hd=6: 1 SIMD chunk + 2 tail
+    # explicit future-dependency pin: with bidirectional attention, out[0] MUST
+    # depend on a FUTURE input x[T-1] (causal attention would make this change 0).
+    var T = 3; var C = 16; var nh = 2; var nkv = 2;
+    var CC = C * C; var TC = T * C; var Ckv = nkv * (C / nh); var CK = C * Ckv;
+    var Wq = t_alloc(CC); var Wk = t_alloc(CK); var Wv = t_alloc(CK); var Wo = t_alloc(CC);
+    var x = t_alloc(TC); var out = t_alloc(TC); var ar = t_alloc(attn_arena_size(T, C, nh, nkv));
+    var std = f64_div(f64_from(1), f64_from(2));
+    t_randn(Wq, CC, std); t_randn(Wk, CK, std); t_randn(Wv, CK, std); t_randn(Wo, CC, std);
+    t_randn(x, TC, f64_from(1));
+    attn_fwd(Wq, 0, Wk, 0, Wv, 0, Wo, 0, x, out, ar, T, C, nh, nkv, 0);
+    var o0a = load64(out);                          # out[0,0] before touching the future
+    var last = (T - 1) * C * 8;
+    store64(x + last, f64_add(load64(x + last), f64_from(1)));   # bump x[T-1,0]
+    attn_fwd(Wq, 0, Wk, 0, Wv, 0, Wo, 0, x, out, ar, T, C, nh, nkv, 0);
+    assert(f64_gt(f64_abs(f64_sub(load64(out), o0a)), f64_div(f64_from(1), f64_from(1000000))) == 1,
+           "bidir: out[0] depends on future x[T-1]");
+    g_bidir = 0;   # reset so subsequent tests run the causal path
+    return 0;
+}
+# M15: the CENTERPIECE full-model diffusion grad-check — it composes the mask_emb
+# input path + bidirectional attention + the tied head + masked-CE in ONE finite
+# difference. NL=2 exercises the residual stack. The window has BOTH masked
+# (positions 0,2 — supervised) AND given (position 1 — context) positions, so:
+#  - mask_emb gets gradient (masked inputs) -> FD-checked,
+#  - tokemb gets BOTH the tied-head gradient (all positions) AND the input-lookup
+#    gradient (the given position only) -> FD-checked (the double-path trap), and
+#  - a mis-routed embed_bwd (masked grad into tokemb, or given grad into mask_emb)
+#    would fail one of the two checks.
+fn test_model_diffusion(): i64 {
+    var V = 5; var C = 4; var T = 3; var nh = 2; var NL = 2;
+    # objective = 1 (last arg): mha + learned-abs + dense; sets g_objective/g_bidir.
+    model_init_full(V, C, T, nh, nh, NL, 1, f64_from(0), 1, 0, 0, 0, 0, 1, 1, 0, 1);
+    assert(g_objective == 1, "diffusion model built");
+    assert(g_bidir == 1, "diffusion model is bidirectional");
+    # original window (A_tokens), same as targets; mask positions 0 and 2.
+    store64(A_tokens + 0, 1); store64(A_tokens + 8, 3); store64(A_tokens + 16, 0);
+    store64(A_targets + 0, 1); store64(A_targets + 8, 3); store64(A_targets + 16, 0);
+    store64(A_mask + 0, 1); store64(A_mask + 8, 0); store64(A_mask + 16, 1);
+    model_forward(); model_zero_grads(); model_backward();
+    assert(g_nmask == 2, "g_nmask counts masked positions");
+    var Cc = C * C; var n_tok = V * C;
+    var aMsk = t_alloc(C); t_copy(aMsk, G_maskemb(), C);          # the NEW learned [MASK] emb
+    var aTok = t_alloc(n_tok); t_copy(aTok, G_tokemb(), n_tok);   # double-path (head + lookup)
+    var aWq0 = t_alloc(Cc); t_copy(aWq0, GL(0, _o_Wq()), Cc);     # bidirectional attention block
+    var aPos = t_alloc(T * C); t_copy(aPos, G_posemb(), T * C);
+    var aLnf = t_alloc(C); t_copy(aLnf, G_lnfg(), C);
+    var nMsk = t_alloc(C); model_ng(P_maskemb(), nMsk, C);
+    var nTok = t_alloc(n_tok); model_ng(P_tokemb(), nTok, n_tok);
+    var nWq0 = t_alloc(Cc); model_ng(PL(0, _o_Wq()), nWq0, Cc);
+    var nPos = t_alloc(T * C); model_ng(P_posemb(), nPos, T * C);
+    var nLnf = t_alloc(C); model_ng(P_lnfg(), nLnf, C);
+    var atol = 10000;   # full-model FD tier (1e-4), as test_model
+    check("diffusion dmaskemb", aMsk, nMsk, C, atol);
+    check("diffusion dtokemb", aTok, nTok, n_tok, atol);
+    check("diffusion L0 dWq (bidir)", aWq0, nWq0, Cc, atol);
+    check("diffusion dposemb", aPos, nPos, T * C, atol);
+    check("diffusion dlnf_g", aLnf, nLnf, C, atol);
+    g_objective = 0; g_bidir = 0;   # reset for any later AR-building tests
+    return 0;
+}
+# M15: the confidence-ordered diffusion decoder. It uses NO RNG (greedy + frozen
+# lowest-index tie-break), so a second run with the same model/prompt/steps must be
+# bit-identical. Also pins that every position is resolved (A_mask all 0) and the
+# committed ids are valid — i.e. the iterative-unmask loop terminates correctly.
+fn test_diffusion_decode_determinism(): i64 {
+    var V = build_corpus();
+    model_init_full(V, 16, 16, 4, 4, 2, 1, f64_from(0), 7, 0, 0, 0, 0, 1, 1, 0, 1);
+    var T = g_T;
+    gen_diffusion("cyrius ", 7, 8, 0, 0);     # 8 steps, cosine schedule, no emit
+    var allun = 1; var i = 0;
+    while (i < T) { if (load64(A_mask + i * 8) != 0) { allun = 0; } i = i + 1; }
+    assert(allun == 1, "diffusion decode unmasks every position");
+    var valid = 1; i = 0;
+    while (i < T) { var id = load64(A_tokens + i * 8); if ((id < 0) || (id >= V)) { valid = 0; } i = i + 1; }
+    assert(valid == 1, "diffusion decode emits valid token ids");
+    var out1 = t_alloc(T);
+    i = 0; while (i < T) { store64(out1 + i * 8, load64(A_tokens + i * 8)); i = i + 1; }
+    gen_diffusion("cyrius ", 7, 8, 0, 0);
+    var same = 1; i = 0;
+    while (i < T) { if (load64(A_tokens + i * 8) != load64(out1 + i * 8)) { same = 0; } i = i + 1; }
+    assert(same == 1, "diffusion decode is deterministic (greedy, no RNG)");
+    g_objective = 0; g_bidir = 0;
     return 0;
 }
 # Coupled RoPE (M12 increment 4): the same attention grad-check at pos_kind=1.
@@ -1022,7 +1161,7 @@ fn test_model_hybrid(): i64 {
     var V = 5; var C = 8; var T = 3; var nh = 2; var NL = 3;
     var kinds[24];   # 3 i64: mha, lin, mha
     store64(&kinds + 0, 0); store64(&kinds + 8, 2); store64(&kinds + 16, 0);
-    model_init_full(V, C, T, nh, nh, NL, 1, f64_from(0), 23, 2, 0, 0, 0, 1, 1, &kinds);   # base lin
+    model_init_full(V, C, T, nh, nh, NL, 1, f64_from(0), 23, 2, 0, 0, 0, 1, 1, &kinds, 0);   # base lin
     assert(g_layer_kind != 0, "hybrid model built");
     assert(_lk(0) == 0, "layer 0 is mha");
     assert(_lk(1) == 2, "layer 1 is lin");
@@ -1058,7 +1197,7 @@ fn test_model_hybrid(): i64 {
 fn test_model_hybrid_ssm(): i64 {
     var V = 5; var C = 8; var T = 3; var nh = 2; var NL = 3; var N = 4;
     var kinds[24]; store64(&kinds + 0, 3); store64(&kinds + 8, 0); store64(&kinds + 16, 3);   # ssm, mha, ssm
-    model_init_full(V, C, T, nh, nh, NL, 1, f64_from(0), 31, 3, N, 0, 0, 1, 1, &kinds);        # base ssm
+    model_init_full(V, C, T, nh, nh, NL, 1, f64_from(0), 31, 3, N, 0, 0, 1, 1, &kinds, 0);        # base ssm
     assert(g_layer_kind != 0, "ssm-hybrid model built");
     assert(_lk(0) == 3, "layer 0 ssm"); assert(_lk(1) == 0, "layer 1 mha"); assert(_lk(2) == 3, "layer 2 ssm");
     store64(A_tokens + 0, 1); store64(A_tokens + 8, 3); store64(A_tokens + 16, 0);
@@ -1090,7 +1229,7 @@ fn test_model_hybrid_ssm(): i64 {
 fn test_model_hybrid_mla(): i64 {
     var V = 5; var C = 8; var T = 3; var nh = 2; var NL = 3; var dc = 4;
     var kinds[24]; store64(&kinds + 0, 1); store64(&kinds + 8, 0); store64(&kinds + 16, 1);   # mla, mha, mla
-    model_init_full(V, C, T, nh, nh, NL, 1, f64_from(0), 37, 1, dc, 0, 0, 1, 1, &kinds);       # base mla
+    model_init_full(V, C, T, nh, nh, NL, 1, f64_from(0), 37, 1, dc, 0, 0, 1, 1, &kinds, 0);       # base mla
     assert(g_layer_kind != 0, "mla-hybrid model built");
     assert(_lk(1) == 0, "layer 1 mha");
     store64(A_tokens + 0, 1); store64(A_tokens + 8, 3); store64(A_tokens + 16, 0);
@@ -1441,13 +1580,13 @@ fn test_alloc_accounting(): i64 {
     # (lin-state via lin_extra=1, since a lin layer rides a non-lin base).
     var hkA[16]; store64(&hkA + 0, 0); store64(&hkA + 8, 2);          # mha,lin
     used0 = alloc_used();
-    model_init_full(5, 16, 8, 4, 4, 2, 1, f64_from(0), 4, 2, 0, 0, 0, 1, 1, &hkA);   # base lin
+    model_init_full(5, 16, 8, 4, 4, 2, 1, f64_from(0), 4, 2, 0, 0, 0, 1, 1, &hkA, 0);   # base lin
     delta = alloc_used() - used0;
     predicted = model_alloc_bytes_hyb(5, 16, 8, 4, 4, 2, g_NP, 2, 0, 0, 0, 1, 1, &hkA);
     assert(delta >= predicted, "hybrid(base lin) alloc accounting (under)");
     assert(delta <= predicted + 8192, "hybrid(base lin) alloc accounting (over)");
     used0 = alloc_used();
-    model_init_full(5, 16, 8, 4, 4, 2, 1, f64_from(0), 4, 0, 0, 0, 0, 1, 1, &hkA);   # base mha
+    model_init_full(5, 16, 8, 4, 4, 2, 1, f64_from(0), 4, 0, 0, 0, 0, 1, 1, &hkA, 0);   # base mha
     delta = alloc_used() - used0;
     predicted = model_alloc_bytes_hyb(5, 16, 8, 4, 4, 2, g_NP, 0, 0, 0, 0, 1, 1, &hkA);
     assert(delta >= predicted, "hybrid(base mha) alloc accounting (under)");
@@ -1458,14 +1597,14 @@ fn test_alloc_accounting(): i64 {
     # array overrides one block to MHA.
     var hkM[16]; store64(&hkM + 0, 0); store64(&hkM + 8, 1);          # mha,mla
     used0 = alloc_used();
-    model_init_full(5, 16, 8, 4, 4, 2, 1, f64_from(0), 4, 1, 6, 0, 0, 1, 1, &hkM);   # base mla, latent 6
+    model_init_full(5, 16, 8, 4, 4, 2, 1, f64_from(0), 4, 1, 6, 0, 0, 1, 1, &hkM, 0);   # base mla, latent 6
     delta = alloc_used() - used0;
     predicted = model_alloc_bytes_hyb(5, 16, 8, 4, 4, 2, g_NP, 1, 6, 0, 0, 1, 1, &hkM);
     assert(delta >= predicted, "hybrid(mha/mla) alloc accounting (under)");
     assert(delta <= predicted + 8192, "hybrid(mha/mla) alloc accounting (over)");
     var hkS[16]; store64(&hkS + 0, 0); store64(&hkS + 8, 3);          # mha,ssm
     used0 = alloc_used();
-    model_init_full(5, 16, 8, 4, 4, 2, 1, f64_from(0), 4, 3, 4, 0, 0, 1, 1, &hkS);   # base ssm, state N=4
+    model_init_full(5, 16, 8, 4, 4, 2, 1, f64_from(0), 4, 3, 4, 0, 0, 1, 1, &hkS, 0);   # base ssm, state N=4
     delta = alloc_used() - used0;
     predicted = model_alloc_bytes_hyb(5, 16, 8, 4, 4, 2, g_NP, 3, 4, 0, 0, 1, 1, &hkS);
     assert(delta >= predicted, "hybrid(mha/ssm) alloc accounting (under)");
@@ -1838,6 +1977,51 @@ fn test_ckpt_ssm(): i64 {
     return 0;
 }
 
+# M15: char-diffusion checkpoint v7 round-trip + back-compat + hostile rejections.
+# Pins: (1) an AR model STILL serializes as v5 (M15 must not bump AR's version);
+# (2) a diffusion model serializes as v7 with objective at [22] and round-trips the
+# +C mask_emb bit-for-bit; (3) hostile v7 images reject cleanly (-47). v5/v6
+# back-compat (objective synthesized 0) is covered by the existing v3/v4/hybrid
+# round-trips, which still pass after this milestone.
+fn test_ckpt_diffusion(): i64 {
+    var V = build_corpus();
+    model_init(V, 8, 4, 2, 2, 1, 1, f64_from(0), 5);             # uniform AR
+    assert(CKPT_VER() == 5, "AR model still serializes as v5 after M15");
+    # diffusion model: mha + learned-abs + dense + uniform, NL=2
+    model_init_full(V, 8, 4, 2, 2, 2, 1, f64_from(0), 33, 0, 0, 0, 0, 1, 1, 0, 1);
+    assert(g_objective == 1, "diffusion model built");
+    assert(g_bidir == 1, "diffusion model is bidirectional");
+    assert(CKPT_VER() == 7, "diffusion serializes as v7");
+    var np = g_NP;
+    var snap = t_alloc(np); t_copy(snap, g_params, np);
+    var sz = ckpt_size();
+    var ck = alloc(sz); ckpt_serialize(ck);
+    assert(load64(ck + 1 * 8) == 7, "version field = 7");
+    assert(load64(ck + 22 * 8) == 1, "objective = diffusion recorded at [22]");
+    model_init(V, 8, 4, 2, 2, 2, 1, f64_from(0), 61);            # scramble to AR
+    assert(g_objective == 0, "reset to AR");
+    assert(g_bidir == 0, "reset to causal");
+    assert(ckpt_load_buf(ck, sz) == 0, "v7 diffusion checkpoint loads");
+    assert(g_objective == 1, "objective restored");
+    assert(g_bidir == 1, "bidirectional restored");
+    assert(g_NP == np, "NP restored (incl. +C mask_emb)");
+    var mism = 0; var i = 0;
+    while (i < np) {
+        if (load64(g_params + i * 8) != load64(snap + i * 8)) { mism = mism + 1; }
+        i = i + 1;
+    }
+    assert(mism == 0, "v7 params (incl. mask_emb) restored bit-for-bit");
+    # hostile rejections (-47), each before any allocation:
+    var bad = alloc(sz);
+    t_copy(bad, ck, sz / 8); store64(bad + 22 * 8, 2);            # objective out of {0,1}
+    assert(ckpt_load_buf(bad, sz) == (0 - 47), "objective=2 rejected (-47)");
+    t_copy(bad, ck, sz / 8); store64(bad + 17 * 8, 1);            # diffusion + rope (pos_kind=1)
+    assert(ckpt_load_buf(bad, sz) == (0 - 47), "diffusion + rope rejected (-47)");
+    t_copy(bad, ck, sz / 8); store64(bad + 20 * 8, 2);            # diffusion + MoE (num_experts=2)
+    assert(ckpt_load_buf(bad, sz) == (0 - 47), "diffusion + moe rejected (-47)");
+    return 0;
+}
+
 # Per-layer HYBRID checkpoint round-trip + hostile rejections (M14 rung c, v6,
 # ADR 0011). A hybrid is the FIRST model that can't ride the scalar descriptor —
 # it serializes as v6 with NL per-layer kinds at [22..22+NL), the vocab shifting
@@ -1848,7 +2032,7 @@ fn test_ckpt_hybrid(): i64 {
     var V = build_corpus();
     var NL = 3;
     var kinds[24]; store64(&kinds + 0, 0); store64(&kinds + 8, 2); store64(&kinds + 16, 0);   # mha,lin,mha
-    model_init_full(V, 8, 4, 2, 2, NL, 1, f64_from(0), 33, 2, 0, 0, 0, 1, 1, &kinds);          # base lin
+    model_init_full(V, 8, 4, 2, 2, NL, 1, f64_from(0), 33, 2, 0, 0, 0, 1, 1, &kinds, 0);          # base lin
     assert(g_layer_kind != 0, "hybrid model built");
     var np = g_NP;
     var snap = t_alloc(np); t_copy(snap, g_params, np);
@@ -1885,7 +2069,7 @@ fn test_ckpt_hybrid(): i64 {
     # rung d: a DIFFERENT-LAYOUT hybrid (mha ⊕ ssm, base ssm) round-trips through v6
     # — the per-layer kinds + the padded np must reconstruct exactly. NL=3, N=4.
     var ksm[24]; store64(&ksm + 0, 3); store64(&ksm + 8, 0); store64(&ksm + 16, 3);   # ssm,mha,ssm
-    model_init_full(V, 8, 4, 2, 2, 3, 1, f64_from(0), 41, 3, 4, 0, 0, 1, 1, &ksm);    # base ssm, N=4
+    model_init_full(V, 8, 4, 2, 2, 3, 1, f64_from(0), 41, 3, 4, 0, 0, 1, 1, &ksm, 0);    # base ssm, N=4
     assert(g_layer_kind != 0, "ssm-hybrid built");
     var np2 = g_NP;
     var snap2 = t_alloc(np2); t_copy(snap2, g_params, np2);
@@ -2373,7 +2557,7 @@ fn _gen_bits(C, T, nh, nkv, NL, ak, dc, pk, dr, ne, tk, pstep, NG): i64 {
 # mla/ssm hybrids); `kinds` is the NL per-layer array.
 fn _gen_bits_hybk(C, T, nh, NL, base, latent, kinds, pstep, NG): i64 {
     var V = build_corpus();
-    model_init_full(V, C, T, nh, nh, NL, 1, f64_from(0), 21, base, latent, 0, 0, 1, 1, kinds);
+    model_init_full(V, C, T, nh, nh, NL, 1, f64_from(0), 21, base, latent, 0, 0, 1, 1, kinds, 0);
     return _gen_verify(pstep, NG);
 }
 fn _gen_bits_hyb(C, T, nh, NL, kinds, pstep, NG): i64 {
@@ -2756,6 +2940,15 @@ fn main(): i64 {
     test_group("robustness");
     test_soak();
     test_nan_guard();
+    # M15 char-diffusion — registered LAST so the shared RNG stream the earlier
+    # tests are tuned to (e.g. the MoE op test's comfortable top-K margin) is
+    # byte-for-byte unchanged from before this milestone.
+    test_group("char-diffusion (M15)");
+    test_masked_ce();
+    test_attn_bidir();
+    test_model_diffusion();
+    test_diffusion_decode_determinism();
+    test_ckpt_diffusion();
     return assert_summary();
 }
 

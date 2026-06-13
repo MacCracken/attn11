@@ -5,7 +5,29 @@
 
 ## Version
 
-**1.4.6** — *Benchmarking pass*. A dedicated perf release: one canonical
+**1.5.0** — *Char-diffusion objective* (M15, E5; ADR 0013, X015). The first
+*training-objective* departure from the AR trunk: `--objective diffusion` trains a
+masked absorbing-state diffusion model (D3PM/MDLM) — drop the causal mask, corrupt a
+window by replacing positions with a **learned `[MASK]` embedding** (mask_emb, +C
+appended after lnf_b, gated on diffusion), and predict the originals with a
+**bidirectional** model (`g_bidir`: the `j<=i` causal loop bound becomes the full
+square); the loss is masked-CE over the masked positions only. Decode is MaskGIT-
+style confidence-ordered parallel unmasking (uncached bidirectional — the KV cache is
+AR-only). Two hand-derived backwards, each finite-difference grad-checked:
+`test_masked_ce` (the masked-CE, ~0) and `test_attn_bidir` (the bidirectional core,
+T≥3 + a future-attending pin); the full-model `test_model_diffusion` FDs both
+mask_emb AND tokemb at mixed masked/given positions (~1e-5..1e-4). Scope: MHA (GQA
+ok) + learned-abs + dense + uniform (lin/ssm are causal; mla/MoE/RoPE-diffusion are
+fast-follows). **Checkpoint v7** adds one `objective` field at slot [22] + the +C
+mask_emb (`-47` rejects a hostile v7; v≤6 synthesize AR); a uniform AR model still
+writes v5 and a hybrid AR v6, **byte-identical**. X015 (matched 2000-step compute,
+default config): AR memorizes the corpus (exact **0.254** bits/byte) while diffusion
+only edges below uniform (ELBO bound **3.79**) — the "super data learner" advantage
+is a scale phenomenon, absent at 39 K params / 190 bytes; honest negative result,
+the gate is the grad-checks + a logged comparison, not a win. A no-flag run is
+byte-identical. Verified: **966** checks x86_64 AND aarch64/qemu, agnos, fuzz, lint,
+smoke.
+(1.4.6 — *Benchmarking pass*. A dedicated perf release: one canonical
 `./build/bench` run across the whole mixer family on the current binary, with the
 time series (`bench-history.csv`, stale at 0.9.0) and the perf doc
 (`docs/benchmarks.md`, no MoE/linear/SSM/hybrid sections) brought current, and the
@@ -18,7 +40,7 @@ step is **flat 0.4.0 → 1.4.6** (~3.6 ms, ~4 450 tok/s) — the M12–M14 arc a
 opt-in axes with zero regression to the no-flag path. No behavior change
 (measurement + docs + two bench param-prints). Verified: **907** checks x86_64 AND
 aarch64/qemu, agnos, fuzz, lint, smoke.
-(1.4.5 — *Hardening pass* (P(-1), **closes the 1.4.x arc**). A security/correctness
+1.4.5 — *Hardening pass* (P(-1), **closes the 1.4.x arc**). A security/correctness
 audit of the 1.4.x surface (the per-layer hybrid dispatch, the rung-d padded
 uniform-stride layout, checkpoint v6, the `--attn-every` CLI) via an adversarial
 multi-agent review — five read-only dimensions, each finding adversarially verified
@@ -256,6 +278,12 @@ deterministic resume. 0.2.0: stacked layers, grad clipping, LR schedule.)
   vs dense 39 488; cached gen ~273 µs/token. Per-token compute scales with `topk`,
   parameter count with `N` (X009 density sweep).
 - BPE merge training (`--bpe K`): one-shot ~110 ms for 256 KB at K=128.
+- **Char-diffusion** (1.5.0, default config): fwd+bwd step **~3.98 ms** (~1.12× the
+  causal MHA ~3.57 ms — bidirectional attention is the full T×T square vs causal's
+  half-triangle); parallel decode **~0.80 ms/round** over the window (uncached
+  bidirectional — diffusion denoises the whole window each round, no KV cache). +32
+  params (the mask_emb) over dense's 39 488. Quality at this scale: X015 (AR's exact
+  0.254 bits/byte vs diffusion's 3.79 ELBO bound).
 - **Canonical mixer/hybrid snapshot (1.4.6, X014):** one bench run cross-compares
   every mixer (step / cached-decode / cache bytes / params) — linear ≈ MHA, SSM
   ~1.58× the step, MoE ~1.95× at top-2; the **padded hybrid is memory-only** (its
@@ -375,11 +403,21 @@ checkpoint vs Linux at fixed CPU — `scripts/agnos-smoke.sh`):
   kind); the loader sizes the padded block via `ckpt_expected_np_kvw`; v≤5
   synthesize uniform. Mixed SSM/MLA ⊕ MHA full-model grad-check + cached-decode
   bit-identity green. Trains + checkpoints + samples (X012, X013).
+- **Char-diffusion objective** (1.5.0, `--objective diffusion`, ADR 0013): a masked
+  absorbing-state diffusion model on the MHA trunk — a learned `[MASK]` embedding
+  (`mask_emb`, +C after lnf_b), **bidirectional** attention (`g_bidir`), masked-CE
+  over the masked positions (`softmax_xent_masked_*`), confidence-ordered parallel
+  decode (`gen_diffusion`). Deterministic mask sampling (`diffuse_mask`, per-example
+  t~U(0,1), ≥1-mask floor); `eval_diffusion` reports denoising bits/byte at a mask
+  grid + the ELBO bound. MHA + learned-abs + dense + uniform only. Checkpoint v7;
+  grad-checked per-op + full-model (X015). A no-flag run is byte-identical.
 - CLI: `--corpus --stdin --load --save --steps --gen-only --preset --heads
   --kv-heads --layers --attn-kind --latent-dim --attn-every --pos-kind --rope-dim
-  --experts --expert-topk --bpe --eval` (`--attn-kind` takes `mha`/`mla`/`lin`/`ssm`;
-  `--latent-dim` is the MLA latent / SSM state size; `--attn-every K` builds the
-  per-layer hybrid over the `--attn-kind` base)
+  --experts --expert-topk --bpe --eval --objective --decode-steps --decode-schedule`
+  (`--attn-kind` takes `mha`/`mla`/`lin`/`ssm`; `--latent-dim` is the MLA latent /
+  SSM state size; `--attn-every K` builds the per-layer hybrid over the `--attn-kind`
+  base; `--objective diffusion` opts into masked diffusion, with `--decode-steps` /
+  `--decode-schedule {cosine,linear}` for its parallel decode)
 
 Default run (`./build/attn11`, 3 layers): loss `~3.2 → ~0.13` over 2000 steps;
 sampled output reproduces real corpus phrases.
@@ -509,7 +547,7 @@ constant `nh·hd²` state instead of a T-growing K/V.
 
 ## Tests
 
-- `tests/attn11.tcyr` — **907 checks**: finite-difference gradient checks
+- `tests/attn11.tcyr` — **966 checks**: finite-difference gradient checks
   (every op incl. dropout; attention at head dims 6/8/10 and GQA/MQA at
   `nkv ∈ {1, 2, nh}` incl. `dWk`/`dWv`/`dbv`; the `|dbk| ≈ 0`
   softmax-shift-invariance pin; 2-layer full model at MHA and GQA), the **MLA
@@ -562,20 +600,30 @@ constant `nh·hd²` state instead of a T-growing K/V.
   mixed backward through the padded layout ~1e-4; `test_kv_hybrid` — cached-decode
   bit-identity across mha/lin, mha/ssm, mha/mla interleavings; `test_ckpt_hybrid` —
   the v6 per-layer round-trip (incl. a padded mha/ssm image) + `-46` rejects; hybrid
-  config-cap + alloc-accounting pins for all kinds), a
+  config-cap + alloc-accounting pins for all kinds), the **char-diffusion suite**
+  (1.5.0: `test_masked_ce` — the masked-CE backward vs FD (+ all-ones ≡ plain CE,
+  all-zeros ⇒ 0 pins); `test_attn_bidir` — the bidirectional attention backward at
+  T≥3 + a future-dependency pin; `test_model_diffusion` — the full-model FD over
+  mask_emb AND tokemb at mixed masked/given positions; `test_diffusion_decode_-
+  determinism` — the greedy parallel decode resolves every position + is
+  reproducible; `test_ckpt_diffusion` — the v7 round-trip + `-47` rejects + the
+  AR-still-v5 pin), a
   **soak/leak** test and a **NaN guard** test. All pass on x86_64 AND aarch64
   (`cyrius test`; aarch64 via qemu).
 - `tests/attn11.bcyr` — benchmark harness (training timings + tokens/sec,
   generation cached/uncached, KV bytes per nkv, MQA timings, **preset
   train+gen**, **MLA latent-cache gen + the cache-bytes table** (latent vs
   MHA/MQA full-K/V), **RoPE train-step + cached-gen overhead**, **MoE train-step +
-  cached-gen + param count**, **`bpe_learn` cost**).
+  cached-gen + param count**, **`bpe_learn` cost**, **diffusion fwd+bwd step +
+  T-round parallel decode** (1.5.0)).
 - `tests/attn11.fcyr` — fuzz harness: 500 mutated-checkpoint rounds (v2/v3
   header fields incl. nkv/step, + a **boundary-combination** mode: every size
   field at/over its cap at once) + **500 BPE-image rounds** (merge-slot
   clobber, (V,Vb,K) triple inconsistency, expansion-bomb rewrite, + the
-  **max-vocab triple** `V=768/Vb=256/K=512`) + 100 random corpora + a **BPE
-  round-trip** property; loaders reject malformed input without crashing.
+  **max-vocab triple** `V=768/Vb=256/K=512`) + **500 v7 diffusion-image rounds**
+  (1.5.0: objective-field clobbers + diffusion-vs-mixer/rope/MoE combos) + 100
+  random corpora + a **BPE round-trip** property; loaders reject malformed input
+  without crashing.
 - **`make smoke`** (1.4.5, in the `release` gate) — a CLI-arg regression: hostile
   `--layers`/`--attn-every` combinations must reject cleanly (exit < 128, never a
   signal) and a valid hybrid must still build. Closes the CLI arg path the
@@ -619,23 +667,26 @@ See [`roadmap.md`](roadmap.md). **Shipped: v1.0.0 (clean cut) → v1.1.0
 decoupled RoPE; then 1.2.4 toolchain realign + docs) → v1.3.0 (M13: Mixture of
 Experts) → v1.4.0 (M14 rung a: gated linear attention) → 1.4.1 (refactor sweep) →
 v1.4.2 (M14 rung b: selective SSM) → v1.4.3 (M14 rung c: per-layer hybrid) → v1.4.4
-(M14 rung d: any-mixer hybrids — completes M14).** The surface is frozen
-([`STABILITY.md`](../STABILITY.md)) and additive-only past 1.0; the numeric core
-lives in **rosnet** + **tyche**. The 1.x arc now has the attention/position axes
+(M14 rung d: any-mixer hybrids — completes M14) → v1.5.0 (M15: char-diffusion
+objective).** The surface is frozen ([`STABILITY.md`](../STABILITY.md)) and
+additive-only past 1.0; the numeric core lives in **rosnet** + **tyche**. The 1.x
+arc now has the attention/position axes
 `--attn-kind {mha, mla, lin, ssm}` × `--pos-kind {learned, rope, rope-decoupled}`,
 the FFN-density axis `--experts N --expert-topk K`, **two non-softmax mixers**
-(gated linear attention + the selective SSM), and the **per-layer hybrid**
-`--attn-every K` (any mix of the four). **M12, M13, and M14 are all complete.**
+(gated linear attention + the selective SSM), the **per-layer hybrid**
+`--attn-every K` (any mix of the four), and the **training-objective axis**
+`--objective {ar, diffusion}`. **M12, M13, M14, and M15 are all complete.**
 
-**Next — M15+.** The 1.4.x arc is fully closed: M12–M14 (MLA/RoPE, MoE, the
-mixer family + hybrid), 1.4.5 the P(-1) hardening pass (audit; one CLI finding
-fixed), and 1.4.6 the benchmarking pass (the canonical mixer/hybrid perf picture in
-`docs/benchmarks.md` + `bench-history.csv`; X014). Next is E5–E6 (diffusion
-objective / ternary) as M15–M16 and **M17** reinforcement learning (E9), per
-[`roadmap.md`](roadmap.md). M15 (char-diffusion) is the natural head of the queue: a
-masked-denoising training objective on the existing trunk. A vidya-scale bake-off
-across mixers AND hybrid ratios is the standing X-entry (X010–X014 ran the
-reference-scale comparisons; the scaled run is the follow-on).
+**Next — M16+.** M12–M15 have shipped: the architecture arc (MLA/RoPE, MoE, the
+mixer family + hybrid) closed at 1.4.6, then M15 (1.5.0) the first *training-
+objective* departure (char-diffusion; X015 logged the honest matched-compute
+AR-vs-diffusion comparison — AR wins at this tiny scale, the super-data-learner
+advantage is a scale phenomenon). Next is **M16** ternary (BitNet-style) training
+(E6) then **M17** reinforcement learning (E9), per [`roadmap.md`](roadmap.md). Open
+diffusion fast-follows: MLA/MoE/RoPE-diffusion, a stochastic/temperature decode, and
+a scaled (preset / larger-corpus) AR-vs-diffusion run to probe the data-efficiency
+crossover. A vidya-scale bake-off across mixers AND hybrid ratios remains the
+standing X-entry (X010–X014 ran the reference-scale comparisons).
 
 ### Handoff — how to pick this up
 

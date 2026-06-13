@@ -246,6 +246,88 @@ fn softmax_xent_bwd(probs, targets, dlogits, M, V): i64 {
 }
 
 # ===========================================================================
+# Masked softmax cross-entropy (M15, E5; masked-diffusion objective). Identical
+# softmax math to softmax_xent_fwd, but the loss is the MEAN over the MASKED
+# positions only: mask(M) is nonzero (1) at masked/supervised rows, 0 at given
+# rows. Probabilities are written for ALL rows (the backward and the decode
+# confidence need them); only masked rows contribute to the loss. nmask is the
+# masked-row count (recomputed from `mask`, so fwd and bwd agree without a shared
+# global). Returns the mean loss over nmask rows (0 if none — the caller's
+# >= 1-mask floor keeps nmask >= 1 in training, so this guard is defensive).
+# Source: absorbing-state masked diffusion — Austin et al. 2021 (D3PM,
+# arXiv:2107.03006), Sahoo et al. 2024 (MDLM, arXiv:2406.07524). The 1/t ELBO
+# reweighting is reported at eval, NOT applied here (the training objective is the
+# unweighted per-masked-token mean — low variance, fair at matched compute).
+# See docs/sources.md and ADR 0013.
+fn softmax_xent_masked_fwd(logits, targets, probs, mask, M, V): i64 {
+    var total = f64_from(0);
+    var nmask = 0;
+    var m = 0;
+    while (m < M) {
+        var row = logits + m * V * 8;
+        var prow = probs + m * V * 8;
+        var mx = load64(row);
+        var i = 1;
+        while (i < V) {
+            var lv = load64(row + i * 8);
+            if (f64_gt(lv, mx) == 1) { mx = lv; }
+            i = i + 1;
+        }
+        var sum = f64_from(0);
+        i = 0;
+        while (i < V) {
+            var e = f64_exp(f64_sub(load64(row + i * 8), mx));
+            store64(prow + i * 8, e);
+            sum = f64_add(sum, e);
+            i = i + 1;
+        }
+        var inv = f64_div(f64_from(1), sum);
+        i = 0;
+        while (i < V) {
+            store64(prow + i * 8, f64_mul(load64(prow + i * 8), inv));
+            i = i + 1;
+        }
+        if (load64(mask + m * 8) != 0) {
+            var tgt = load64(targets + m * 8);
+            var p_t = load64(prow + tgt * 8);
+            total = f64_sub(total, f64_ln(p_t));
+            nmask = nmask + 1;
+        }
+        m = m + 1;
+    }
+    if (nmask == 0) { return f64_from(0); }
+    return f64_div(total, f64_from(nmask));
+}
+
+# Backward: dlogits(M,V) = mask · (probs - onehot(targets)) / nmask; rows where
+# mask == 0 (given positions / context) get a zeroed gradient (no loss there).
+fn softmax_xent_masked_bwd(probs, targets, mask, dlogits, M, V): i64 {
+    var nmask = 0;
+    var mm = 0;
+    while (mm < M) { if (load64(mask + mm * 8) != 0) { nmask = nmask + 1; } mm = mm + 1; }
+    var invN = f64_from(0);
+    if (nmask > 0) { invN = f64_div(f64_from(1), f64_from(nmask)); }
+    var m = 0;
+    while (m < M) {
+        if (load64(mask + m * 8) == 0) {
+            var z = 0;
+            while (z < V) { store64(dlogits + (m * V + z) * 8, f64_from(0)); z = z + 1; }
+        } else {
+            var tgt = load64(targets + m * 8);
+            var i = 0;
+            while (i < V) {
+                var g = load64(probs + (m * V + i) * 8);
+                if (i == tgt) { g = f64_sub(g, f64_from(1)); }
+                store64(dlogits + (m * V + i) * 8, f64_mul(g, invN));
+                i = i + 1;
+            }
+        }
+        m = m + 1;
+    }
+    return 0;
+}
+
+# ===========================================================================
 # Mixture of Experts (MoE) FFN — the dense GELU MLP becomes N experts + a
 # top-K router (M13, E8). The dense block runs ONE MLP; MoE runs K of N.
 #

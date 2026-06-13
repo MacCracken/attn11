@@ -638,3 +638,51 @@ added to the hybrid bench entries.
    entire M12–M14 arc (MLA, RoPE, MoE, linear, SSM, hybrid) added five opt-in axes
    without touching the default run. MoE is the one big-param axis (5.5× params at
    N=8, ~2× step for top-2) — capacity at near-constant active compute.
+
+## X015 — AR vs char-diffusion at matched compute (M15, v1.5.0) (2026-06-13)
+
+**Setup**: 1.5.0, the first *training-objective* comparison. Matched trunk + matched
+compute: the default config (V=25, d_model 32, ctx 16, 4 heads, 3 layers, dense,
+learned-abs), seed 1337, the embedded 190-byte corpus, **2000 steps × batch 16** for
+BOTH objectives — the only difference is `--objective`. The "super data learner"
+regime: a tiny corpus seen for many epochs. x86_64. The two objectives are NOT
+directly comparable head-to-head (see takeaway 3), so three clearly-scoped numbers:
+
+| objective         | metric                                  | bits/byte |
+|-------------------|-----------------------------------------|-----------|
+| **AR**            | exact next-token NLL (`eval_corpus`)    | **0.254** |
+| diffusion         | denoising, mask 10% (1 of 16 masked)    | 3.725     |
+| diffusion         | denoising, mask 30%                      | 3.670     |
+| diffusion         | denoising, mask 50%                      | 3.713     |
+| diffusion         | denoising, mask 70%                      | 3.876     |
+| diffusion         | denoising, mask 90%                      | 3.944     |
+| **diffusion**     | **ELBO bound (mean over t)**            | **3.786** |
+
+(uniform baseline = ln(25)/ln 2 ≈ 4.64 bits/byte.)
+
+**Takeaways**:
+1. **At this reference scale, AR wins decisively** — it memorizes the tiny corpus
+   (0.254 bits/byte) while diffusion only edges below uniform (3.79 ELBO bound). The
+   "super data learner" advantage does NOT appear here: it is a *scale* phenomenon
+   (the survey's claim is for large models / large repeated corpora), and a 39 K-param
+   model over 190 bytes is far below where dLLMs overtake AR. This is the honest
+   negative result the milestone gate asked for — "a logged comparison, not a
+   required win."
+2. **Diffusion learns, but slowly.** Even at 10% masking (predict 1 char from 15
+   bidirectional neighbours) it reaches only 3.73 bits/byte: training samples a
+   *random* mask ratio t~U(0,1) per example, so the easy low-mask regime is seen
+   rarely, and the high-variance objective converges far slower than AR's
+   full-left-context next-token loss on a memorizable corpus. The grad-checks are
+   tight (`test_model_diffusion` ~1e-5..1e-4), so the gradient is correct — this is
+   training dynamics, not a bug.
+3. **The comparison is intrinsically asymmetric — stated, not hidden.** AR's number
+   is the *exact* NLL; diffusion's is an *ELBO upper bound* on its NLL (the MDLM 1/t
+   weight cancels the t-scaling of the masked count, so the unweighted per-masked-
+   token CE averaged over t IS the bound). A bound ≥ AR proves nothing on its own —
+   BUT here the gap (3.5 bits) dwarfs any plausible bound-looseness, so AR genuinely
+   wins at this scale. The shared, objective-neutral axis is the denoising grid.
+4. **Greedy decode collapses to high-frequency tokens** at this scale (the demo
+   samples skew toward spaces) — a documented small-dLLM limitation, not a
+   correctness issue. A stochastic/temperature decode and larger scale are the
+   fast-follows. Regeneration: `./build/attn11 --steps 2000 --eval` (AR) and
+   `./build/attn11 --objective diffusion --steps 2000 --eval` (diffusion grid).

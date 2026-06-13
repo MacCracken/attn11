@@ -143,6 +143,38 @@ fn main(): i64 {
     }
     if (brejected < 1) { sys_write(2, "FAIL: no BPE image rejected\n", 28); sys_exit(4); }
 
+    # ---- a valid v7 (M15 char-diffusion) reference: objective-field mutations ----
+    # v7 carries the objective at [22] and a +C mask_emb in NP. Hostile v7 headers
+    # (objective out of {0,1}, diffusion paired with a causal mixer / rope / MoE,
+    # bit-flips) must reject cleanly (-47/-10/...), never crash or over-read.
+    var dV = build_corpus();
+    model_init_full(dV, 8, 4, 2, 2, 1, 0, f64_from(0), 5, 0, 0, 0, 0, 1, 1, 0, 1);   # diffusion
+    var dsz = ckpt_size();
+    var dgood = alloc(dsz);
+    ckpt_serialize(dgood);
+    var dwork = alloc(dsz);
+    var drej = 0; var dacc = 0;
+    var dr = 0;
+    while (dr < 500) {
+        t_copy(dwork, dgood, dsz / 8);
+        var dmode = fz_pos() % 5;
+        var dmlen = dsz;
+        if (dmode == 0) { store64(dwork + 22 * 8, fz_next()); }              # wild objective field
+        elif (dmode == 1) { store64(dwork + 16 * 8, fz_pos() % 4); }         # attn_kind vs diffusion
+        elif (dmode == 2) { store64(dwork + 17 * 8, fz_pos() % 3); }         # pos_kind vs diffusion
+        elif (dmode == 3) {                                                  # wild header field 2..22
+            var dfld = 2 + (fz_pos() % (CKPT_HDR_V7() - 2));
+            store64(dwork + dfld * 8, fz_next());
+        } else {                                                            # flip a random byte
+            var doff = fz_pos() % dsz;
+            store8(dwork + doff, (load8(dwork + doff) ^ (fz_pos() & 0xFF)) & 0xFF);
+        }
+        var drc = ckpt_load_buf(dwork, dmlen);
+        if (drc < 0) { drej = drej + 1; } else { dacc = dacc + 1; }
+        dr = dr + 1;
+    }
+    if (drej < 1) { sys_write(2, "FAIL: no v7 image rejected\n", 27); sys_exit(7); }
+
     # ---- corpus tokenizer on random byte buffers (+ BPE round-trip) ----
     var cb = alloc(2048);
     var cr = 0;
@@ -184,6 +216,8 @@ fn main(): i64 {
     fmt_int(rejected); puts(" rejected / "); fmt_int(accepted);
     puts(" accepted; "); fmt_int(br); puts(" bpe rounds, ");
     fmt_int(brejected); puts(" rejected / "); fmt_int(baccepted);
+    puts(" accepted; "); fmt_int(dr); puts(" v7 rounds, ");
+    fmt_int(drej); puts(" rejected / "); fmt_int(dacc);
     puts(" accepted; 100 random corpora + bpe roundtrip)\n");
     return 0;
 }
