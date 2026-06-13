@@ -135,3 +135,38 @@ fn ssm_bwd(a, Wdt, A, WB, WC, D, Wo, dout, da,
     j = 0; while (j < TC) { store64(da + j * 8, f64_add(load64(da + j * 8), load64(sc + j * 8))); j = j + 1; }
     return 0;
 }
+
+# Cached single-row decode (b.2): ONE scan step against the persistent per-layer
+# state (C×N — the constant-size cache). pos == 0 starts a fresh state (window
+# start / context-shift re-prime). Runs the EXACT ops of ssm_fwd's t-th iteration,
+# so a decoded row is bit-identical to the batch scan (test_kv_ssm). a:(C) row,
+# out:(C). dtrow(C), brow(N), crow(N), yrow(C): caller scratch.
+fn ssm_fwd_row(a, Wdt, bdt, A, WB, WC, D, Wo, bo, out, state, dtrow, brow, crow, yrow, pos, C, N): i64 {
+    linear_fwd(a, Wdt, bdt, dtrow, 1, C, C);
+    var i = 0;
+    while (i < C) { store64(dtrow + i * 8, _ssm_softplus(load64(dtrow + i * 8))); i = i + 1; }
+    linear_fwd(a, WB, 0, brow, 1, C, N);
+    linear_fwd(a, WC, 0, crow, 1, C, N);
+    var c = 0;
+    while (c < C) {
+        var dtc = load64(dtrow + c * 8);
+        var atc = load64(a + c * 8);
+        var sbase = state + (c * N) * 8;
+        var acc = f64_from(0);
+        var n = 0;
+        while (n < N) {
+            var abar = f64_exp(f64_mul(dtc, load64(A + (c * N + n) * 8)));
+            var prev = f64_from(0);
+            if (pos > 0) { prev = load64(sbase + n * 8); }
+            var inp = f64_mul(f64_mul(dtc, load64(brow + n * 8)), atc);
+            var hv = f64_add(f64_mul(abar, prev), inp);
+            store64(sbase + n * 8, hv);
+            acc = f64_add(acc, f64_mul(load64(crow + n * 8), hv));
+            n = n + 1;
+        }
+        store64(yrow + c * 8, f64_add(acc, f64_mul(load64(D + c * 8), atc)));
+        c = c + 1;
+    }
+    linear_fwd(yrow, Wo, bo, out, 1, C, C);
+    return 0;
+}

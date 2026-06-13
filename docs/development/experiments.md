@@ -430,3 +430,46 @@ T** — at the preset (T=64) it is 16 384 B vs MHA's 262 144 B (**16×**).
 4. M14's remaining rungs — (b) a minimal selective SSM (BPTT through the scan) and
    (c) per-layer mixer interleaving with a hybrid-ratio sweep — build on this core.
    A vidya-scale bake-off (linear vs softmax vs the hybrid) is the follow-on.
+
+## X011 — selective SSM vs the other mixers (M14 rung b, v1.4.2) (2026-06-12)
+
+**Setup**: 1.4.2, default config (d_model 32, ctx 16, 4 heads, 3 layers), 1200
+steps on the embedded corpus, `--eval`. Extends X010 with the selective SSM
+(`--attn-kind ssm`, state size N = 16): a Mamba-lite diagonal SSM with
+input-dependent Δ/B/C (the selective scan) and a learned diagonal A. x86_64.
+
+**Correctness** (grad-checks, both arches): the BPTT through the data-dependent
+scan is the milestone. `test_ssm_core` (per-op, ~1e-7) grad-checks dWdt/dA/dWB/
+dWC/dD/dWo/dbdt/dbo and the input grad through `exp(Δ·A)` + softplus + the reverse
+`dh` accumulation. `test_model_ssm` (full-model 1e-3); `test_kv_ssm`
+(cached-vs-uncached **bit-identity** across context-shifts — the constant C×N
+state replayed on re-prime); v5 round-trip + hostile rejects. **727 → 801** checks.
+
+**Comparison**:
+
+| mixer  | bits/byte | params | decode cache | scaling |
+|--------|-----------|--------|--------------|---------|
+| MHA    | 0.279     | 39 488 | 24 576 B     | ∝ T     |
+| MLA    | 0.273     | 37 952 | 6 144 B      | ∝ T     |
+| linear | 0.239     | 39 488 | 6 144 B      | constant|
+| **SSM**| **0.218** | 38 048 | 12 288 B     | **constant** |
+
+**Cost** (`./build/bench`): SSM train step ~5.6 ms (the O(T·C·N) scan + the Δ/B/C
+projections + exp/softplus; ~1.56× the dense ~3.6 ms); cached gen ~258 µs/token.
+The C×N state cache (12 288 B at N=16) does NOT grow with T — at the preset
+(T=64) it is 32 768 B vs MHA's 262 144 B (8×).
+
+**Takeaways**:
+1. **The selective scan grad-checks.** The hardest backward in the project — BPTT
+   through a recurrence whose coefficients depend on the input — lands at ~1e-7,
+   the deliverable for "the idea is expressible, hand-derived, in an i64 systems
+   language." Δ, B, C, A, D and the input all receive gradient (the selectivity).
+2. **Best bits/byte at reference scale** (0.218), edging linear (0.239) and the
+   softmax mixers. Read honestly: the tiny repetitive corpus rewards the per-channel
+   state + the input-dependent gating; this is a "competitive + grad-checked", not a
+   scaling claim. SSMs are built for long contexts the reference scale can't show.
+3. **Constant decode cache** (C×N, here 12 288 B; tunable by N) — the third
+   constant-cache mixer (with linear attention), vs MHA/MLA's T-growing K/V.
+4. The `--attn-kind {mha, mla, lin, ssm}` switch is now four mixers wide. Rung (c)
+   — per-layer interleaving + the hybrid-ratio sweep — and a vidya-scale bake-off
+   are the follow-ons.

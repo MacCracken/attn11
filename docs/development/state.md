@@ -5,9 +5,22 @@
 
 ## Version
 
-**1.4.1** — *Refactoring sweep* (maintenance; no behavior change — the no-flag
+**1.4.2** — *Selective SSM* (M14 rung b, E4, **the third sequence mixer**; ADR
+0010). `--attn-kind ssm` adds a minimal Mamba-lite diagonal SSM: a per-channel
+N-state recurrence `h_t = exp(Δ·A)·h_{t-1} + Δ·B·a`, `y = Σ C·h + D·a`, with
+Δ/B/C all functions of the input (the *selective* scan). The milestone is the
+**hand-derived BPTT through the data-dependent scan** — `test_ssm_core` grad-checks
+every parameter + the input at **~1e-7**. Reuses Wq (W_dt) + Wo (output proj) and
+the `latent_dim` field (= state size N), so it rides `attn_kind = 3` — **checkpoint
+v5, no format bump**. The decode cache is the constant `C·N` state (a third
+constant-cache mixer). Mixer comparison (X011, default config, 1200 steps): SSM
+**bits/byte 0.218** — best of the four (vs linear 0.239, MLA 0.273, MHA 0.279) — at
+38 048 params, cache constant in T (8× under MHA at the preset). Full-model +
+cached bit-identity green; lands in its own `attn_ssm.cyr`. A no-flag run is
+byte-identical. Verified: **801** checks x86_64 AND aarch64/qemu, agnos, fuzz, lint.
+(1.4.1 — *Refactoring sweep* (maintenance; no behavior change — the no-flag
 run byte-identical, **727** checks unchanged on both arches, every checkpoint
-round-trips). Reorganizes the mixer machinery so the upcoming M14 rungs are cheap:
+round-trips). Reorganizes the mixer machinery so the M14 rungs are cheap:
 (1) the `attn_kind` dispatch is now ONE point each — `_attn_block_fwd`/`_bwd`/
 `_fwd_row` in `model.cyr` (was inlined in four functions); (2) the per-block param
 arithmetic is shared pure helpers `_kvw`/`_mlpw` used by both the offset helpers
@@ -15,7 +28,7 @@ and the checkpoint validator (the model↔persist keep-in-sync hazard is gone);
 (3) the gated-linear mixer moved to its own `attn_linear.cyr` (one-file-per-mixer
 pattern; `attn.cyr` 1266→976); (4) the six `_gen_bits_*` test helpers collapsed
 to one driver. `src/*.cyr` identical in effect to 1.4.0.
-(1.4.0 — *Gated linear attention* (M14 rung a, E4, **opens the second
+1.4.0 — *Gated linear attention* (M14 rung a, E4, **opens the second
 sequence-mixer family**; ADR 0009). `--attn-kind lin` swaps the softmax/PV core
 for a causal RetNet-style **retention recurrence** `S_t = γ_h·S_{t-1} + k_t⊗v_t`,
 `out_t = (1/√hd)·S_t^T q_t`, fixed per-head decay `γ_h = 1−2^{−(3+h)}`
@@ -156,6 +169,10 @@ deterministic resume. 0.2.0: stacked layers, grad clipping, LR schedule.)
   update beats the O(T·hd) cache scan). Decode cache **6 144 B, constant in T**
   (16× under MHA at the preset); bits/byte 0.239 vs MHA 0.279 at the same params
   (X010).
+- **Selective SSM** (1.4.2, default config, N=16): fwd+bwd step **~5.6 ms** (the
+  O(T·C·N) scan, ~1.56× the dense ~3.6 ms); cached gen **~258 µs/token**. Decode
+  cache **12 288 B, constant in T** (8× under MHA at the preset). Best bits/byte of
+  the four mixers at reference scale — **0.218** (X011).
 - **MoE** (default config, 8 experts, top-2): fwd+bwd step **~6.9 ms** vs the
   dense ~3.6 ms (top-2 = two active expert MLPs + the `C→N` router), 215 648 params
   vs dense 39 488; cached gen ~273 µs/token. Per-token compute scales with `topk`,
@@ -252,9 +269,18 @@ checkpoint vs Linux at fixed CPU — `scripts/agnos-smoke.sh`):
   (`lin_core_fwd_row`, per-layer `g_lin_state`) is the **constant** `nh·hd²` state
   — bit-identical to the batch scan. Rides `attn_kind=2` (checkpoint v5, no bump);
   full heads, learned-abs positions. Trains + checkpoints + samples (X010).
+- **Selective SSM** (1.4.2, `--attn-kind ssm`, ADR 0010): a minimal Mamba-lite
+  diagonal SSM — per-channel N-state `h_t = exp(Δ·A)·h_{t-1} + Δ·B·a`,
+  `y = Σ C·h + D·a`, with Δ=softplus(a·W_dt)/B=a·W_B/C=a·W_C all input-dependent
+  (selective). Core `ssm_fwd`/`bwd` + `ssm_fwd_row` (`attn_ssm.cyr`); hand-derived
+  BPTT through the data-dependent scan (grad-checked ~1e-7). Reuses Wq (W_dt) + Wo
+  (output proj) + `latent_dim` (= state N), so it rides `attn_kind=3` (checkpoint
+  v5, no bump). Constant `C·N` decode cache (`g_ssm_state`); A inits to a negative
+  ramp, D to 1. Best bits/byte of the four mixers at reference scale (X011).
 - CLI: `--corpus --stdin --load --save --steps --gen-only --preset --heads
   --kv-heads --layers --attn-kind --latent-dim --pos-kind --rope-dim --experts
-  --expert-topk --bpe --eval` (`--attn-kind` now takes `mha`/`mla`/`lin`)
+  --expert-topk --bpe --eval` (`--attn-kind` now takes `mha`/`mla`/`lin`/`ssm`;
+  `--latent-dim` is the MLA latent / SSM state size)
 
 Default run (`./build/attn11`, 3 layers): loss `~3.2 → ~0.13` over 2000 steps;
 sampled output reproduces real corpus phrases.
@@ -322,7 +348,11 @@ constant `nh·hd²` state instead of a T-growing K/V.
   in 1.4.1, the one-file-per-mixer pattern): `lin_core_fwd`/`bwd` (retention
   recurrence `S_t = γ_h S_{t-1} + k_t⊗v_t`, fixed per-head decay) + `attn_lin_fwd`/
   `bwd` wrappers + `lin_core_fwd_row`/`attn_lin_fwd_row` (the constant-state cached
-  decode). Included after `attn.cyr` in each entry; the next mixer (SSM) lands here-style.
+  decode). Included after `attn.cyr` in each entry.
+- `attn_ssm.cyr` — the **selective SSM** mixer (1.4.2, ADR 0010; one-file-per-mixer):
+  `ssm_fwd`/`ssm_bwd` (the data-dependent scan + the hand-derived BPTT through
+  `exp(Δ·A)`) + `ssm_fwd_row` (constant `C·N`-state cached decode) + `_ssm_softplus`.
+  Reuses Wq (W_dt) + Wo (output proj); A/W_B/W_C/D are the `attn_kind=3` K/V region.
 - `fileio.cyr` — secure file I/O (`O_NOFOLLOW`, `fstat` size, looped read/write),
   stdin reader
 - `model.cyr` — per-layer packed parameters (block stride + `_o_*`/`PL`/`GL`
@@ -367,7 +397,7 @@ constant `nh·hd²` state instead of a T-growing K/V.
 
 ## Tests
 
-- `tests/attn11.tcyr` — **727 checks**: finite-difference gradient checks
+- `tests/attn11.tcyr` — **801 checks**: finite-difference gradient checks
   (every op incl. dropout; attention at head dims 6/8/10 and GQA/MQA at
   `nkv ∈ {1, 2, nh}` incl. `dWk`/`dWv`/`dbv`; the `|dbk| ≈ 0`
   softmax-shift-invariance pin; 2-layer full model at MHA and GQA), the **MLA
@@ -464,20 +494,21 @@ _None yet._
 See [`roadmap.md`](roadmap.md). **Shipped: v1.0.0 (clean cut) → v1.1.0
 (extraction) → v1.2.0–1.2.4 (M12: MLA core, latent KV-cache decode, coupled +
 decoupled RoPE; then 1.2.4 toolchain realign + docs) → v1.3.0 (M13: Mixture of
-Experts) → v1.4.0 (M14 rung a: gated linear attention).** The surface is frozen
+Experts) → v1.4.0 (M14 rung a: gated linear attention) → 1.4.1 (refactor sweep) →
+v1.4.2 (M14 rung b: selective SSM).** The surface is frozen
 ([`STABILITY.md`](../STABILITY.md)) and additive-only past 1.0; the numeric core
 lives in **rosnet** + **tyche**. The 1.x arc now has the attention/position axes
-`--attn-kind {mha, mla, lin}` × `--pos-kind {learned, rope, rope-decoupled}`, the
-FFN-density axis `--experts N --expert-topk K`, and the first non-softmax mixer
-(gated linear attention). **M12, M13, and M14 rung a are complete.**
+`--attn-kind {mha, mla, lin, ssm}` × `--pos-kind {learned, rope, rope-decoupled}`, the
+FFN-density axis `--experts N --expert-topk K`, and **two non-softmax mixers**
+(gated linear attention + the selective SSM). **M12, M13, and M14 rungs a+b are complete.**
 
-**Next on the arc — M14 rungs (b)/(c), then M15+.** M14 (b) is a minimal selective
-SSM (BPTT through the scan, the harder mixer backward); (c) is a per-layer mixer
-`kind` to interleave attention/linear/SSM and sweep the **hybrid ratio** (the
-survey's "~10–25% attention layers beat pure transformers"). Then E5–E6
-(diffusion objective / ternary) as M15–M16 and **M17** reinforcement learning
-(E9). A vidya-scale bake-off across the mixer/attention axes (linear vs softmax vs
-MLA vs the hybrid) is the natural next X-entry, pairing with X010.
+**Next on the arc — M14 rung (c), then M15+.** Rung (c) is the per-layer mixer
+`kind` config: turn the global `g_attn_kind` into a per-layer kind (read inside the
+three `_attn_block_*` dispatch helpers — the 1.4.1 refactor localized that),
+interleave attention/linear/SSM, and sweep the **hybrid ratio** (the survey's
+"~10–25% attention layers beat pure transformers"). Then E5–E6 (diffusion objective
+/ ternary) as M15–M16 and **M17** reinforcement learning (E9). A vidya-scale
+bake-off across all four mixers (X011 at scale) is the natural next X-entry.
 
 ### Handoff — how to pick this up
 

@@ -13,15 +13,16 @@
 
 ## Where we are
 
-Current: **v1.4.0**. The v1.0 surface is frozen and additive-only
+Current: **v1.4.2**. The v1.0 surface is frozen and additive-only
 ([`STABILITY.md`](../STABILITY.md)); the reusable numeric core lives in
 **[rosnet](https://github.com/MacCracken/rosnet)** + **[tyche](https://github.com/MacCracken/tyche)**
-(v1.1.0); the **1.x architecture arc** is underway — **M12, M13, and M14 rung a are
-complete**: the attention/position axes (MLA core v1.2.0, latent KV-cache decode
+(v1.1.0); the **1.x architecture arc** is underway — **M12, M13, and M14 rungs a+b
+are complete**: the attention/position axes (MLA core v1.2.0, latent KV-cache decode
 v1.2.1, coupled RoPE v1.2.2, decoupled RoPE v1.2.3), the **FFN-density axis**
 (Mixture of Experts v1.3.0 — `--experts N --expert-topk K`, checkpoint v5, ADR
-0008), and the first **non-softmax sequence mixer** (gated linear attention
-v1.4.0 — `--attn-kind lin`, ADR 0009). See [`CHANGELOG.md`](../../CHANGELOG.md) for
+0008), and **two non-softmax sequence mixers** (gated linear attention v1.4.0 —
+`--attn-kind lin`, ADR 0009; the selective SSM v1.4.2 — `--attn-kind ssm`, ADR
+0010; with 1.4.1 a refactor sweep between them). See [`CHANGELOG.md`](../../CHANGELOG.md) for
 the full shipped narrative back to v0.1.0 and the M0–M11 / v1.0-cut history.
 
 ## Versioning
@@ -44,29 +45,31 @@ milestone below graduates one frontier experiment (the **E-series**, logged in
 [`experiments.md`](experiments.md)), is independently shippable, and lands ONE
 change at a time behind its own grad-check / bit-identity gate.
 
-> **M12 and M13 are complete; M14 rung (a) has shipped.** M12 (MLA + RoPE,
+> **M12 and M13 are complete; M14 rungs (a)+(b) have shipped.** M12 (MLA + RoPE,
 > v1.2.0–v1.2.3) shipped the full `--attn-kind` × `--pos-kind` switch; M13
-> (Mixture of Experts, v1.3.0) shipped the FFN-density axis `--experts N
-> --expert-topk K` (ADR 0008, X009); **M14 rung a** (gated linear attention,
-> v1.4.0) shipped the first non-softmax sequence mixer `--attn-kind lin` (ADR 0009,
-> X010). See the CHANGELOG and X005–X010 for the shipped narrative. The arc
-> continues below.
+> (Mixture of Experts, v1.3.0) shipped the FFN-density axis (ADR 0008, X009);
+> **M14 rung a** (gated linear attention, v1.4.0, ADR 0009, X010) and **rung b**
+> (selective SSM, v1.4.2, ADR 0010, X011) shipped the first two non-softmax
+> mixers (with 1.4.1 a refactor sweep between them). See the CHANGELOG and
+> X005–X011 for the shipped narrative. The arc continues below.
 
 ### M14 — A second sequence-mixer family (v1.4.0+) — E4
 
-**Linear attention → selective SSM**, the survey's structural shift (hybrids with
-~10–25% attention layers beat pure transformers). Ladder:
+**Linear attention → selective SSM → hybrid**, the survey's structural shift
+(hybrids with ~10–25% attention layers beat pure transformers). Ladder:
 
 - **(a) gated linear-attention/RetNet-style block** — **DONE (v1.4.0, ADR 0009).**
-  `--attn-kind lin`: causal retention recurrence with a fixed per-head decay
-  (parameter-free), reusing the MHA projections (`attn_kind = 2`, no checkpoint
-  bump); the decode cache is the constant `nh·hd²` state. Per-op grad-check ~1e-9,
-  full-model + cached bit-identity; X010 = the MHA/MLA/linear comparison.
-- **(b) a minimal selective-SSM block** — next: BPTT through the scan (the harder
-  mixer backward; `attn_kind = 3`). Grad-check the scan backward.
-- **(c) a per-layer `kind` config** to interleave mixer types and sweep the
-  **hybrid ratio** at our scale — needs a per-layer mixer array (the descriptor's
-  global `attn_kind` becomes per-layer).
+  `--attn-kind lin`: constant-`nh·hd²`-state retention, parameter-free, `attn_kind = 2`,
+  per-op grad-check ~1e-9. X010 = the MHA/MLA/linear comparison.
+- **(b) a minimal selective-SSM block** — **DONE (v1.4.2, ADR 0010).** `--attn-kind
+  ssm`: a Mamba-lite diagonal SSM with input-dependent Δ/B/C, `attn_kind = 3`
+  reusing Wq/Wo + `latent_dim` (state N, no checkpoint bump); hand-derived BPTT
+  through the data-dependent scan (~1e-7), constant `C·N` decode cache. X011 adds
+  it to the comparison (best bits/byte at reference scale).
+- **(c) a per-layer `kind` config** — next: turn the global `g_attn_kind` into a
+  per-layer kind (read inside the three `_attn_block_*` dispatch helpers — the
+  1.4.1 refactor localized that), interleave attention/linear/SSM, and sweep the
+  **hybrid ratio** at our scale.
 
 **Gate**: every new backward grad-checked; perplexity vs the iso-param transformer
 on the vidya corpus, logged as an X-series entry.

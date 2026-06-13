@@ -84,7 +84,7 @@ fn _atoi(s): i64 {
 }
 
 # Kept in sync with the VERSION file (CI's docs job gates the match).
-fn CFG_VERSION(): i64 { return "1.4.1"; }
+fn CFG_VERSION(): i64 { return "1.4.2"; }
 
 fn usage(): i64 {
     puts("attn11 — a from-scratch GPT-style transformer, trained, in Cyrius\n");
@@ -99,8 +99,8 @@ fn usage(): i64 {
     puts("  --heads N       attention heads (must divide d_model)\n");
     puts("  --kv-heads N    K/V heads (must divide heads; 1 = MQA; default = heads)\n");
     puts("  --layers N      transformer blocks (1..128)\n");
-    puts("  --attn-kind K   attention variant: mha (default), mla (latent KV), or lin (gated linear)\n");
-    puts("  --latent-dim N  MLA latent width d_c (1..d_model; default d_model/2)\n");
+    puts("  --attn-kind K   mixer: mha (default), mla (latent KV), lin (gated linear), ssm (selective SSM)\n");
+    puts("  --latent-dim N  MLA latent width / SSM state size (1..d_model; MLA default d_model/2, SSM 16)\n");
     puts("  --pos-kind K    positions: learned (default), rope (coupled, mha/gqa), or rope-decoupled (mla)\n");
     puts("  --rope-dim N    decoupled-RoPE channel width d_rope (even, 2..d_model; default ~hd/2)\n");
     puts("  --experts N     MoE: N experts per block (1=dense; >1 enables top-K routing, 1..256)\n");
@@ -157,7 +157,8 @@ fn main(): i64 {
             if (streq(ak, "mha") == 1) { cfg_attn_kind = 0; }
             elif (streq(ak, "mla") == 1) { cfg_attn_kind = 1; }
             elif (streq(ak, "lin") == 1) { cfg_attn_kind = 2; }
-            else { puts("attn11: --attn-kind must be mha, mla, or lin\n"); return 1; }
+            elif (streq(ak, "ssm") == 1) { cfg_attn_kind = 3; }
+            else { puts("attn11: --attn-kind must be mha, mla, lin, or ssm\n"); return 1; }
         }
         elif (streq(a, "--latent-dim") == 1) { i = i + 1; cfg_latent_dim = _atoi(_av(i, a)); }
         elif (streq(a, "--pos-kind") == 1) {
@@ -189,6 +190,12 @@ fn main(): i64 {
     # Gated linear attention (M14): full K/V, learned-abs positions (the pos-kind
     # checks below reject RoPE on it). model_config_ok_moe is the backstop.
     if (cfg_attn_kind == 2) { cfg_nkv = cfg_nh; }
+    # Selective SSM (M14 rung b): full heads; --latent-dim is the state size N
+    # (default 16, capped at d_model). model_config_ok_moe is the backstop.
+    if (cfg_attn_kind == 3) {
+        cfg_nkv = cfg_nh;
+        if (cfg_latent_dim == 0) { cfg_latent_dim = 16; if (cfg_latent_dim > cfg_c) { cfg_latent_dim = cfg_c; } }
+    }
     # Coupled RoPE (1.2.2) ships on dense MHA/GQA with an even head dim. Surface a
     # clear CLI error before model_init (model_config_ok_arch is the backstop).
     # Ignored under --load — the checkpoint's descriptor wins.
@@ -296,6 +303,7 @@ fn main(): i64 {
     puts(" layers="); fmt_int(g_NL);
     if (g_attn_kind == 1) { puts(" attn=mla(d_c="); fmt_int(g_latent_dim); puts(")"); }
     if (g_attn_kind == 2) { puts(" attn=linear"); }
+    if (g_attn_kind == 3) { puts(" attn=ssm(N="); fmt_int(g_latent_dim); puts(")"); }
     if (g_pos_kind == 1) { puts(" pos=rope"); }
     if (g_pos_kind == 2) { puts(" pos=rope-decoupled(d_rope="); fmt_int(g_rope_dim); puts(")"); }
     if (g_num_experts > 1) {

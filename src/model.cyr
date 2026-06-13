@@ -85,6 +85,7 @@ fn _kvw(C, nh, nkv, ak, dc, pk, dr): i64 {
         if (pk == 2) { s = s + C * nh * dr + C * dr; }   # + decoupled-RoPE W_QR/W_KR
         return s;
     }
+    if (ak == 3) { return 3 * C * dc + C; }              # SSM (dc = state size N): A + W_B + W_C + D
     return 2 * C * (nkv * (C / nh));                      # MHA/GQA/lin: Wk + Wv (Ckv = nkv*hd)
 }
 fn _mlpw(C, F, ne): i64 {
@@ -125,6 +126,12 @@ fn _o_Wuv(): i64 { return 2 * g_C + g_C * g_C + g_C * g_latent_dim + g_latent_di
 # decoupled-RoPE rope projections (pos_kind == 2), after the up-projections
 fn _o_Wqr(): i64 { return _o_Wuv() + g_latent_dim * g_C; }              # C x nh*d_rope
 fn _o_Wkr(): i64 { return _o_Wqr() + g_C * g_nh * g_rope_dim; }         # C x d_rope
+# SSM (attn_kind == 3) K/V-region offsets: A/W_B/W_C/D (latent_dim = state N);
+# Wq doubles as W_dt and Wo as the output projection (the MLA reuse pattern).
+fn _o_ssmA(): i64 { return 2 * g_C + g_C * g_C; }                       # C x N (diagonal transition)
+fn _o_ssmWB(): i64 { return _o_ssmA() + g_C * g_latent_dim; }          # C x N (B projection)
+fn _o_ssmWC(): i64 { return _o_ssmWB() + g_C * g_latent_dim; }         # C x N (C projection)
+fn _o_ssmD(): i64 { return _o_ssmWC() + g_C * g_latent_dim; }          # C (skip)
 fn _o_Wo(): i64 { return 2 * g_C + g_C * g_C + _kv_weight_size(); }
 fn _o_ln2g(): i64 { return _o_Wo() + g_C * g_C; }
 fn _o_ln2b(): i64 { return _o_ln2g() + g_C; }
@@ -220,6 +227,12 @@ var KV_K = 0;     # NL pointers, each T x Ckv (per-layer K cache)
 var KV_V = 0;     # NL pointers, each T x Ckv (per-layer V cache)
 var g_lin_state = 0;  # gated-linear (attn_kind==2) only: NL pointers, each nh*hd^2
                       # — the per-layer retention STATE (the constant-size decode cache)
+# selective SSM (attn_kind==3) only. Per-layer forward caches for the backward
+# (Δ, B, C, the per-step state h, and the pre-Wo output y); the shared reverse-scan
+# scratch; and g_ssm_state, the per-layer C*N decode STATE (constant-size cache).
+var LA_ssm_dlt = 0; var LA_ssm_B = 0; var LA_ssm_C = 0; var LA_ssm_h = 0; var LA_ssm_y = 0;
+var g_ssm_dy = 0; var g_ssm_dDlt = 0; var g_ssm_dBm = 0; var g_ssm_dCm = 0; var g_ssm_dhc = 0; var g_ssm_sc = 0;
+var g_ssm_state = 0;  # NL pointers, each C*N
 var R_x = 0;      # C  residual-stream row
 var R_a = 0;      # C  ln1 out / attn in
 var R_attn = 0;   # C  attention out
@@ -270,15 +283,20 @@ fn model_config_ok_moe(V, C, T, nh, nkv, NL, attn_kind, d_c, pos_kind, d_rope, n
     # attn_kind 2 = gated linear attention (M14, E4): a non-softmax sequence mixer
     # over the MHA projection layout — full heads (nkv == nh), no latent (d_c == 0),
     # learned-absolute positions only (RoPE is softmax-only). Parameter-free core.
-    if ((attn_kind != 0) && (attn_kind != 1) && (attn_kind != 2)) { return 0; }
-    if (attn_kind == 1) {
+    # attn_kind 3 = selective SSM (M14 rung b): d_c reused as the state size N
+    # (1..C); full heads, learned-abs; reuses Wq (W_dt) + Wo (output proj).
+    if ((attn_kind != 0) && (attn_kind != 1) && (attn_kind != 2) && (attn_kind != 3)) { return 0; }
+    if ((attn_kind == 1) || (attn_kind == 3)) {
         if (nkv != nh) { return 0; }
-        if ((d_c < 1) || (d_c > C)) { return 0; }
+        if ((d_c < 1) || (d_c > C)) { return 0; }   # MLA latent / SSM state size
     }
     if (attn_kind == 2) {
         if (nkv != nh) { return 0; }       # full K/V (no GQA in the basic linear mixer)
         if (d_c != 0) { return 0; }        # no latent
         if (pos_kind != 0) { return 0; }   # learned-abs only (RoPE is softmax attention)
+    }
+    if (attn_kind == 3) {
+        if (pos_kind != 0) { return 0; }   # learned-abs only (the scan carries position)
     }
     # pos_kind (ADR 0007 / M12 increment 4): 0 = learned-abs (default), 1 = coupled
     # RoPE. RoPE rotates dimension PAIRS (2k, 2k+1) within each head, so the head
@@ -346,6 +364,13 @@ fn model_alloc_bytes_moe(V, C, T, nh, nkv, NL, NP, attn_kind, d_c, pos_kind, d_r
     # gated-linear (attn_kind==2): the per-layer retention state cache (NL pointers
     # + NL·nh·hd^2). The arena's 2·hd^2 lin scratch is already in `asz` above.
     if (attn_kind == 2) { e = e + NL + NL * nh * (C / nh) * (C / nh); }
+    # selective SSM (attn_kind==3, d_c = state N): 6 per-layer pointer arrays +
+    # per-layer caches (Δ/B/C/h/y + the C*N decode state) + shared reverse scratch.
+    if (attn_kind == 3) {
+        e = e + 6 * NL;
+        e = e + NL * (2 * T * C + 2 * T * d_c + T * C * d_c + C * d_c);
+        e = e + 3 * T * C + 2 * T * d_c + C * d_c;
+    }
     # MoE buffers (M13, num_experts > 1): 5 per-layer pointer arrays (LA_mlogits/
     # msel/mgate/mefc/megg) + per-layer router/expert caches logits(T*N) +
     # sel/gate(2*T*K) + efc/egg(2*T*K*F) + shared scratch g_moe_sc(2F+2C+3N+K) +
@@ -439,6 +464,22 @@ fn model_init_moe(V, C, T, nh, nkv, NL, attn_bias, dropout, seed,
                 t_randn(PL(L, _o_Wqr()), C * nh * d_rope, std);
                 t_randn(PL(L, _o_Wkr()), C * d_rope, std);
             }
+        } elif (attn_kind == 3) {
+            # SSM (Wq=W_dt above, Wo=output proj below): B/C projections randn; the
+            # diagonal A is a fixed negative ramp -(n+1) (S4D-style — a spread of
+            # decay rates exp(Δ·A) across state dims); D is the identity skip (=1).
+            t_randn(PL(L, _o_ssmWB()), C * d_c, std);
+            t_randn(PL(L, _o_ssmWC()), C * d_c, std);
+            t_fill(PL(L, _o_ssmD()), C, f64_from(1));
+            var ci = 0;
+            while (ci < C) {
+                var ni = 0;
+                while (ni < d_c) {
+                    store64(PL(L, _o_ssmA()) + (ci * d_c + ni) * 8, f64_sub(f64_from(0), f64_from(ni + 1)));
+                    ni = ni + 1;
+                }
+                ci = ci + 1;
+            }
         } else {
             t_randn(PL(L, _o_Wk()), C * Ckv, std);
             t_randn(PL(L, _o_Wv()), C * Ckv, std);
@@ -484,6 +525,10 @@ fn model_init_moe(V, C, T, nh, nkv, NL, attn_bias, dropout, seed,
         LA_mlogits = t_alloc(NL); LA_msel = t_alloc(NL); LA_mgate = t_alloc(NL);
         LA_mefc = t_alloc(NL); LA_megg = t_alloc(NL);
     }
+    if (attn_kind == 3) {
+        LA_ssm_dlt = t_alloc(NL); LA_ssm_B = t_alloc(NL); LA_ssm_C = t_alloc(NL);
+        LA_ssm_h = t_alloc(NL); LA_ssm_y = t_alloc(NL); g_ssm_state = t_alloc(NL);
+    }
     var i = 0;
     while (i < NL + 1) { store64(LA_resid + i * 8, t_alloc(TC)); i = i + 1; }
     var TF = T * F; var asz = attn_arena_size(T, C, nh, nkv);
@@ -513,6 +558,14 @@ fn model_init_moe(V, C, T, nh, nkv, NL, attn_bias, dropout, seed,
             store64(LA_mefc + L * 8, t_alloc(T * topk * F));
             store64(LA_megg + L * 8, t_alloc(T * topk * F));
         }
+        if (attn_kind == 3) {
+            store64(LA_ssm_dlt + L * 8, t_alloc(TC));
+            store64(LA_ssm_B + L * 8, t_alloc(T * d_c));
+            store64(LA_ssm_C + L * 8, t_alloc(T * d_c));
+            store64(LA_ssm_h + L * 8, t_alloc(T * C * d_c));
+            store64(LA_ssm_y + L * 8, t_alloc(TC));
+            store64(g_ssm_state + L * 8, t_alloc(C * d_c));
+        }
         L = L + 1;
     }
 
@@ -526,6 +579,10 @@ fn model_init_moe(V, C, T, nh, nkv, NL, attn_bias, dropout, seed,
         g_moe_sc = t_alloc(2 * F + 2 * C + 3 * num_experts + topk);
         g_moe_dlaux = t_alloc(T * num_experts);
         g_moe_disp = t_alloc(num_experts);
+    }
+    if (attn_kind == 3) {                       # shared SSM reverse-scan scratch
+        g_ssm_dy = t_alloc(TC); g_ssm_dDlt = t_alloc(TC); g_ssm_sc = t_alloc(TC);
+        g_ssm_dBm = t_alloc(T * d_c); g_ssm_dCm = t_alloc(T * d_c); g_ssm_dhc = t_alloc(C * d_c);
     }
 
     # KV caches + single-row scratch (generation)
@@ -563,6 +620,8 @@ fn kv_cache_bytes(): i64 {
     # gated linear attention (M14): the cache is the per-layer retention STATE
     # (nh·hd^2), CONSTANT in T — the headline vs MHA/MLA's T-growing K/V.
     if (g_attn_kind == 2) { var hd = g_C / g_nh; return g_NL * g_nh * hd * hd * 8; }
+    # selective SSM (M14 rung b): the cache is the per-layer C×N state, CONSTANT in T.
+    if (g_attn_kind == 3) { return g_NL * g_C * g_latent_dim * 8; }
     if (g_attn_kind == 1) {
         if (g_pos_kind == 2) { return g_NL * g_T * (g_latent_dim + g_rope_dim) * 8; }
         return g_NL * g_T * g_latent_dim * 8;
@@ -768,6 +827,11 @@ fn _attn_block_fwd(L, rows): i64 {
         attn_lin_fwd(PL(L, _o_Wq()), P_bq(L), PL(L, _o_Wk()), P_bk(L),
                      PL(L, _o_Wv()), P_bv(L), PL(L, _o_Wo()), P_bo(L),
                      a, A_attn, La(LA_arena, L), rows, g_C, g_nh);
+    } elif (g_attn_kind == 3) {
+        ssm_fwd(a, PL(L, _o_Wq()), P_bq(L), PL(L, _o_ssmA()), PL(L, _o_ssmWB()), PL(L, _o_ssmWC()),
+                PL(L, _o_ssmD()), PL(L, _o_Wo()), P_bo(L), A_attn,
+                La(LA_ssm_dlt, L), La(LA_ssm_B, L), La(LA_ssm_C, L), La(LA_ssm_h, L), La(LA_ssm_y, L),
+                rows, g_C, g_latent_dim);
     } elif (g_attn_kind == 1) {
         if (g_pos_kind == 2) {
             attn_mla_dec_fwd(PL(L, _o_Wq()), P_bq(L), PL(L, _o_Wdkv()), PL(L, _o_Wuk()), P_bk(L),
@@ -793,6 +857,13 @@ fn _attn_block_bwd(L): i64 {
                      GL(L, _o_Wq()), G_bq(L), GL(L, _o_Wk()), G_bk(L),
                      GL(L, _o_Wv()), G_bv(L), GL(L, _o_Wo()), G_bo(L),
                      La(LA_arena, L), g_T, g_C, g_nh);
+    } elif (g_attn_kind == 3) {
+        ssm_bwd(La(LA_a, L), PL(L, _o_Wq()), PL(L, _o_ssmA()), PL(L, _o_ssmWB()), PL(L, _o_ssmWC()),
+                PL(L, _o_ssmD()), PL(L, _o_Wo()), D_drop, D_a,
+                GL(L, _o_Wq()), G_bq(L), GL(L, _o_ssmA()), GL(L, _o_ssmWB()), GL(L, _o_ssmWC()),
+                GL(L, _o_ssmD()), GL(L, _o_Wo()), G_bo(L),
+                La(LA_ssm_dlt, L), La(LA_ssm_B, L), La(LA_ssm_C, L), La(LA_ssm_h, L), La(LA_ssm_y, L),
+                g_ssm_dy, g_ssm_dDlt, g_ssm_dBm, g_ssm_dCm, g_ssm_dhc, g_ssm_sc, g_T, g_C, g_latent_dim);
     } elif (g_attn_kind == 1) {
         if (g_pos_kind == 2) {
             attn_mla_dec_bwd(PL(L, _o_Wq()), PL(L, _o_Wdkv()), PL(L, _o_Wuk()), PL(L, _o_Wuv()),
@@ -823,6 +894,10 @@ fn _attn_block_fwd_row(L, pos): i64 {
         attn_lin_fwd_row(PL(L, _o_Wq()), P_bq(L), PL(L, _o_Wk()), P_bk(L),
                          PL(L, _o_Wv()), P_bv(L), PL(L, _o_Wo()), P_bo(L),
                          R_a, R_attn, La(LA_arena, L), La(g_lin_state, L), pos, g_C, g_nh);
+    } elif (g_attn_kind == 3) {
+        ssm_fwd_row(R_a, PL(L, _o_Wq()), P_bq(L), PL(L, _o_ssmA()), PL(L, _o_ssmWB()), PL(L, _o_ssmWC()),
+                    PL(L, _o_ssmD()), PL(L, _o_Wo()), P_bo(L), R_attn, La(g_ssm_state, L),
+                    R_q, R_fc, R_g, R_concat, pos, g_C, g_latent_dim);
     } elif (g_attn_kind == 1) {
         var ar = La(LA_arena, L);
         if (g_pos_kind == 2) {

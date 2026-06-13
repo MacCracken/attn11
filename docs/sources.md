@@ -113,6 +113,19 @@ constant-state decode, `attn_lin_fwd`/`attn_lin_bwd` wrappers), `src/model.cyr`
 `S_t = γ_h·S_{t-1} + k_t⊗v_t`, `out_t = (1/√hd)·S_t^T q_t`, fixed per-head decay
 (parameter-free) over the MHA projections. See ADR 0009.
 
+### Selective state-space model (Mamba-lite — input-dependent diagonal SSM)
+**Gu, A., Dao, T. (2023).** "Mamba: Linear-Time Sequence Modeling with Selective
+State Spaces." arXiv:[2312.00752](https://arxiv.org/abs/2312.00752) — the selective
+scan (Δ, B, C are functions of the input). **Gu, A., Goel, K., Gupta, A., Ré, C.
+(2022).** "On the Parameterization and Initialization of Diagonal State Space
+Models" (S4D). arXiv:[2206.11893](https://arxiv.org/abs/2206.11893) — the diagonal
+SSM and the negative-ramp A initialization.
+Used in: `src/attn_ssm.cyr` (`ssm_fwd`/`ssm_bwd` the selective scan + hand-derived
+BPTT, `ssm_fwd_row` the constant-state decode), `src/model.cyr` (`attn_kind == 3`
++ the `g_ssm_state` cache). `--attn-kind ssm`: `h_t = exp(Δ·A)·h_{t-1} + Δ·B·a`,
+`y = Σ C·h + D·a`, with Δ = softplus(a·W_dt) (selective), state size N =
+`--latent-dim`, the ZOH first-order `B̄ = Δ·B`. See ADR 0010.
+
 ### KV-cache inference (cache K/V per position, one row per decoded token)
 **Pope, R., Douglas, S., Chowdhery, A., et al. (2022).** "Efficiently Scaling
 Transformer Inference." *MLSys 2023.* arXiv:[2211.05102](https://arxiv.org/abs/2211.05102).

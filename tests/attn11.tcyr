@@ -975,6 +975,43 @@ fn test_model_lin(): i64 {
     return 0;
 }
 
+# Full-model grad-check with the selective SSM mixer (M14 rung b, attn_kind=3):
+# the data-dependent scan composes through the residual stack. The tight per-op
+# proof is test_ssm_core (~1e-7); this is the 1e-3 wiring check. W_dt rides the Wq
+# slot, the output proj rides Wo; A/W_B/W_C/D are the SSM K/V region; D inits to 1.
+fn test_model_ssm(): i64 {
+    var V = 5; var C = 8; var T = 3; var nh = 2; var NL = 2; var N = 4;
+    model_init_arch(V, C, T, nh, nh, NL, 1, f64_from(0), 29, 3, N, 0, 0);   # selective SSM
+    assert(g_attn_kind == 3, "ssm model built");
+    assert(g_latent_dim == N, "ssm state size installed");
+    store64(A_tokens + 0, 1); store64(A_tokens + 8, 3); store64(A_tokens + 16, 0);
+    store64(A_targets + 0, 3); store64(A_targets + 8, 0); store64(A_targets + 16, 4);
+    model_forward(); model_zero_grads(); model_backward();
+    var Cc = C * C; var CN = C * N;
+    var aWdt0 = t_alloc(Cc); t_copy(aWdt0, GL(0, _o_Wq()), Cc);     # W_dt (Wq slot)
+    var aA1 = t_alloc(CN); t_copy(aA1, GL(1, _o_ssmA()), CN);
+    var aWB0 = t_alloc(CN); t_copy(aWB0, GL(0, _o_ssmWB()), CN);
+    var aWC1 = t_alloc(CN); t_copy(aWC1, GL(1, _o_ssmWC()), CN);
+    var aD0 = t_alloc(C); t_copy(aD0, GL(0, _o_ssmD()), C);
+    var aWo1 = t_alloc(Cc); t_copy(aWo1, GL(1, _o_Wo()), Cc);
+    var atok = t_alloc(V * C); t_copy(atok, G_tokemb(), V * C);
+    var nWdt0 = t_alloc(Cc); model_ng(PL(0, _o_Wq()), nWdt0, Cc);
+    var nA1 = t_alloc(CN); model_ng(PL(1, _o_ssmA()), nA1, CN);
+    var nWB0 = t_alloc(CN); model_ng(PL(0, _o_ssmWB()), nWB0, CN);
+    var nWC1 = t_alloc(CN); model_ng(PL(1, _o_ssmWC()), nWC1, CN);
+    var nD0 = t_alloc(C); model_ng(PL(0, _o_ssmD()), nD0, C);
+    var nWo1 = t_alloc(Cc); model_ng(PL(1, _o_Wo()), nWo1, Cc);
+    var ntok = t_alloc(V * C); model_ng(P_tokemb(), ntok, V * C);
+    check("ssm model L0 dWdt", aWdt0, nWdt0, Cc, 1000);
+    check("ssm model L1 dA", aA1, nA1, CN, 1000);
+    check("ssm model L0 dWB", aWB0, nWB0, CN, 1000);
+    check("ssm model L1 dWC", aWC1, nWC1, CN, 1000);
+    check("ssm model L0 dD", aD0, nD0, C, 1000);
+    check("ssm model L1 dWo", aWo1, nWo1, Cc, 1000);
+    check("ssm model dtokemb", atok, ntok, V * C, 1000);
+    return 0;
+}
+
 # The M9 SIMD LM head (head_fwd_row) has a scalar tail for C % 4 != 0 that NO
 # other test exercises — every config above uses C ∈ {8,16}. C=6 (% 4 = 2)
 # hits it. Compare the vectorized head output to an independent scalar dot
@@ -1290,6 +1327,14 @@ fn test_alloc_accounting(): i64 {
     predicted = model_alloc_bytes_arch(5, 16, 8, 4, 4, 2, g_NP, 2, 0, 0, 0);
     assert(delta >= predicted, "lin alloc accounting (under)");
     assert(delta <= predicted + 8192, "lin alloc accounting (over)");
+    # selective-SSM pin (1.4.2): the per-layer Δ/B/C/h/y caches + the C*N decode
+    # state + the shared reverse-scan scratch must be accounted (attn_kind=3, N=4).
+    used0 = alloc_used();
+    model_init_arch(5, 16, 8, 4, 4, 2, 1, f64_from(0), 4, 3, 4, 0, 0);
+    delta = alloc_used() - used0;
+    predicted = model_alloc_bytes_arch(5, 16, 8, 4, 4, 2, g_NP, 3, 4, 0, 0);
+    assert(delta >= predicted, "ssm alloc accounting (under)");
+    assert(delta <= predicted + 8192, "ssm alloc accounting (over)");
     return 0;
 }
 
@@ -1318,7 +1363,7 @@ fn test_config_caps(): i64 {
     assert(model_config_ok_arch(25, 32, 16, 4, 2, 3, 1, 16, 0, 0) == 0, "MLA with nkv != nh rejected");
     assert(model_config_ok_arch(25, 32, 16, 4, 4, 3, 1, 0, 0, 0) == 0, "MLA d_c = 0 rejected");
     assert(model_config_ok_arch(25, 32, 16, 4, 4, 3, 1, 33, 0, 0) == 0, "MLA d_c > C rejected");
-    assert(model_config_ok_arch(25, 32, 16, 4, 4, 3, 3, 16, 0, 0) == 0, "unknown attn_kind (3) rejected");
+    assert(model_config_ok_arch(25, 32, 16, 4, 4, 3, 4, 16, 0, 0) == 0, "unknown attn_kind (4) rejected");
     # pos_kind descriptor (M12 increment 4): rope (1) on mha with even head dim
     assert(model_config_ok_arch(25, 32, 16, 4, 4, 3, 0, 0, 1, 0) == 1, "rope on mha (hd=8) accepted");
     assert(model_config_ok_arch(25, 16, 16, 2, 1, 3, 0, 0, 1, 0) == 1, "rope on mqa (hd=8) accepted");
@@ -1336,6 +1381,11 @@ fn test_config_caps(): i64 {
     assert(model_config_ok_arch(25, 32, 16, 4, 2, 3, 2, 0, 0, 0) == 0, "linear with nkv != nh rejected");
     assert(model_config_ok_arch(25, 32, 16, 4, 4, 3, 2, 8, 0, 0) == 0, "linear with a latent dim rejected");
     assert(model_config_ok_arch(25, 32, 16, 4, 4, 3, 2, 0, 1, 0) == 0, "linear + rope rejected (softmax-only)");
+    # selective SSM (M14 rung b, attn_kind=3): d_c = state N in 1..C, full heads, learned-abs
+    assert(model_config_ok_arch(25, 32, 16, 4, 4, 3, 3, 16, 0, 0) == 1, "ssm (attn_kind=3, N=16) accepted");
+    assert(model_config_ok_arch(25, 32, 16, 4, 2, 3, 3, 16, 0, 0) == 0, "ssm with nkv != nh rejected");
+    assert(model_config_ok_arch(25, 32, 16, 4, 4, 3, 3, 0, 0, 0) == 0, "ssm with N = 0 rejected");
+    assert(model_config_ok_arch(25, 32, 16, 4, 4, 3, 3, 16, 1, 0) == 0, "ssm + rope rejected");
     # MoE descriptor (M13): 1 <= num_experts <= 256, 1 <= topk <= num_experts.
     assert(model_config_ok_moe(25, 32, 16, 4, 4, 3, 0, 0, 0, 0, 8, 2) == 1, "valid moe (8 experts, top-2) accepted");
     assert(model_config_ok_moe(25, 32, 16, 4, 4, 3, 0, 0, 0, 0, 1, 1) == 1, "moe experts=1 (dense) accepted");
@@ -1599,6 +1649,41 @@ fn test_ckpt_lin(): i64 {
     return 0;
 }
 
+# Selective-SSM checkpoint round-trip + hostile rejections (1.4.2 b.3). Rides the
+# v5 attn_kind slot (value 3) reusing latent_dim as the state size N — no format
+# bump. Rejects a missing state size (-42), RoPE on the SSM (-41), partial heads (-40).
+fn test_ckpt_ssm(): i64 {
+    var V = build_corpus();
+    model_init_arch(V, 8, 4, 2, 2, 1, 1, f64_from(0), 33, 3, 4, 0, 0);   # SSM, N=4
+    assert(g_attn_kind == 3, "ssm model built");
+    assert(g_latent_dim == 4, "ssm state size installed");
+    var np = g_NP;
+    var snap = t_alloc(np); t_copy(snap, g_params, np);
+    var sz = ckpt_size();
+    var ck = alloc(sz); ckpt_serialize(ck);
+    assert(load64(ck + 16 * 8) == 3, "attn_kind=ssm recorded");
+    assert(load64(ck + 18 * 8) == 4, "state size recorded");
+    model_init(V, 8, 4, 2, 2, 1, 1, f64_from(0), 61);                    # scramble to mha
+    assert(g_attn_kind == 0, "reset to mha");
+    assert(ckpt_load_buf(ck, sz) == 0, "ssm checkpoint loads");
+    assert(g_attn_kind == 3, "attn_kind restored");
+    assert(g_latent_dim == 4, "state size restored");
+    var mism = 0; var i = 0;
+    while (i < np) {
+        if (load64(g_params + i * 8) != load64(snap + i * 8)) { mism = mism + 1; }
+        i = i + 1;
+    }
+    assert(mism == 0, "ssm params restored bit-for-bit");
+    var bad = alloc(sz);
+    t_copy(bad, ck, sz / 8); store64(bad + 18 * 8, 0);     # state size 0
+    assert(ckpt_load_buf(bad, sz) == (0 - 42), "ssm with N=0 rejected (-42)");
+    t_copy(bad, ck, sz / 8); store64(bad + 17 * 8, 1);     # pos_kind=1 (rope) on ssm
+    assert(ckpt_load_buf(bad, sz) == (0 - 41), "ssm + rope rejected (-41)");
+    t_copy(bad, ck, sz / 8); store64(bad + 12 * 8, 1);     # nkv=1 < nh=2
+    assert(ckpt_load_buf(bad, sz) == (0 - 40), "ssm with partial heads rejected (-40)");
+    return 0;
+}
+
 # With a corpus already loaded, a checkpoint whose vocab differs must be
 # rejected (-15) rather than silently mis-indexing g_data.
 fn test_ckpt_vocab_mismatch(): i64 {
@@ -1779,13 +1864,13 @@ fn test_ckpt_v4_descriptor(): i64 {
     assert(g_latent_dim == 0, "latent_dim restored");
     assert(g_rope_dim == 0, "rope_dim restored");
     # reserved / unsupported descriptor values reject before allocating. attn_kind
-    # 1 (MLA) and 2 (gated-linear, M14) are now SUPPORTED; pos_kind 1 (RoPE) is now
-    # SUPPORTED on this even-hd mha image (test_ckpt_rope below). An unknown
-    # attn_kind (3) hits -40, a latent dim on mha hits -42, pos_kind 2
+    # 1 (MLA), 2 (gated-linear), 3 (selective SSM) are now SUPPORTED; pos_kind 1
+    # (RoPE) is now SUPPORTED on this even-hd mha image (test_ckpt_rope below). An
+    # unknown attn_kind (4) hits -40, a latent dim on mha hits -42, pos_kind 2
     # (rope-decoupled) on mha hits -41, and a nonzero rope_dim hits -43.
     var bad = alloc(sz);
-    t_copy(bad, ck, sz / 8); store64(bad + 16 * 8, 3);
-    assert(ckpt_load_buf(bad, sz) == (0 - 40), "attn_kind=3 (unknown) rejected (-40)");
+    t_copy(bad, ck, sz / 8); store64(bad + 16 * 8, 4);
+    assert(ckpt_load_buf(bad, sz) == (0 - 40), "attn_kind=4 (unknown) rejected (-40)");
     t_copy(bad, ck, sz / 8); store64(bad + 17 * 8, 2);
     assert(ckpt_load_buf(bad, sz) == (0 - 41), "pos_kind=2 (rope-decoupled reserved) rejected (-41)");
     t_copy(bad, ck, sz / 8); store64(bad + 18 * 8, 8);
@@ -2180,6 +2265,17 @@ fn test_kv_lin(): i64 {
     _gen_bits_lin(12, 2, 2, 2, 1, 6);     # degenerate 2-token window
     return 0;
 }
+# Selective-SSM cached decode (1.4.2 b.2): the per-layer C×N state advances one
+# scan step/token; must be bit-identical to the uncached batch scan across
+# context-shifts (state resets at pos==0 on each re-prime). N = the state size.
+fn _gen_bits_ssm(C, T, nh, NL, N, pstep, NG): i64 { return _gen_bits(C, T, nh, nh, NL, 3, N, 0, 0, 1, 1, pstep, NG); }
+fn test_kv_ssm(): i64 {
+    _gen_bits_ssm(16, 8, 2, 2, 4, 1, 24);    # C=16, N=4
+    _gen_bits_ssm(12, 7, 2, 2, 2, 1, 21);    # odd T; small state N=2
+    _gen_bits_ssm(8, 5, 2, 2, 4, 1, 15);     # C=8
+    _gen_bits_ssm(12, 2, 2, 2, 4, 1, 6);     # degenerate 2-token window
+    return 0;
+}
 
 # M12.2/increment-4 gate: coupled RoPE (pos_kind=1) cached decode must be
 # BIT-IDENTICAL to the uncached reference. Same two-way verification as the MHA
@@ -2332,6 +2428,7 @@ fn main(): i64 {
     test_model_mla_dec();
     test_model_moe();
     test_model_lin();
+    test_model_ssm();
     test_head_tail();
     test_group("persistence");
     test_resume_determinism();
@@ -2356,6 +2453,7 @@ fn main(): i64 {
     test_ckpt_v4_descriptor();
     test_ckpt_moe();
     test_ckpt_lin();
+    test_ckpt_ssm();
     test_ckpt_vocab_mismatch();
     test_group("bpe tokenizer");
     test_bpe_known();
@@ -2373,6 +2471,7 @@ fn main(): i64 {
     test_kv_mla();
     test_kv_moe();
     test_kv_lin();
+    test_kv_ssm();
     test_kv_rope();
     test_kv_dec();
     test_group("robustness");

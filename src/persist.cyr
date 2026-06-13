@@ -208,8 +208,8 @@ fn ckpt_load_buf(buf, len): i64 {
         d_c = load64(buf + 18 * 8);
         d_rope = load64(buf + 19 * 8);
     }
-    # 0 = mha, 1 = mla, 2 = gated-linear (M14)
-    if ((attn_kind != 0) && (attn_kind != 1) && (attn_kind != 2)) { return 0 - 40; }
+    # 0 = mha, 1 = mla, 2 = gated-linear, 3 = selective SSM (M14)
+    if ((attn_kind != 0) && (attn_kind != 1) && (attn_kind != 2) && (attn_kind != 3)) { return 0 - 40; }
     if ((pos_kind != 0) && (pos_kind != 1) && (pos_kind != 2)) { return 0 - 41; }  # learned/rope/rope-decoupled
     if ((pos_kind != 2) && (d_rope != 0)) { return 0 - 43; }   # rope_dim 0 unless decoupled
     # Coupled RoPE (pos_kind == 1, M12 increment 4) ships on dense MHA/GQA with an
@@ -227,8 +227,9 @@ fn ckpt_load_buf(buf, len): i64 {
         if ((d_rope < 2) || (d_rope > C)) { return 0 - 43; }
         if ((d_rope % 2) != 0) { return 0 - 43; }
     }
-    if (attn_kind == 1) {
-        # MLA: full heads (compression is the latent), low-rank 1 <= d_c <= C
+    if ((attn_kind == 1) || (attn_kind == 3)) {
+        # MLA: full heads + low-rank latent 1<=d_c<=C. SSM (3): full heads + state
+        # size 1<=d_c<=N<=C. Both reuse d_c as their extra-dimension parameter.
         if (nkv != nh) { return 0 - 40; }
         if ((d_c < 1) || (d_c > C)) { return 0 - 42; }
     } else {
@@ -236,7 +237,8 @@ fn ckpt_load_buf(buf, len): i64 {
     }
     # gated linear attention (attn_kind == 2, M14): full K/V (nkv == nh); the
     # pos_kind gates above already reject RoPE on it (rope is softmax-only), and
-    # the else-branch above already requires d_c == 0.
+    # the else-branch above already requires d_c == 0. SSM (3): the pos_kind gates
+    # likewise force learned-abs (rope requires attn_kind 0/1), and nkv==nh above.
     if (attn_kind == 2) {
         if (nkv != nh) { return 0 - 40; }
     }

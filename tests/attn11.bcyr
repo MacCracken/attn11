@@ -266,6 +266,26 @@ fn main(): i64 {
     print("lin state cache bytes (constant in T): ", 40); fmt_int(kv_cache_bytes()); _putc(10);
     print("  vs MHA full K/V at this config:       ", 40); fmt_int(2 * 3 * 16 * 32 * 8); _putc(10);
 
+    # ---- selective SSM (M14 rung b): training step + cached generation at the
+    # default config, state N=16. The data-dependent scan (Δ/B/C from the input,
+    # the exp(Δ·A) discretization); the decode cache is the constant C×N state.
+    model_init_arch(V, 32, 16, 4, 4, 3, 1, f64_from(0), 1337, 3, 16, 0, 0);   # selective SSM
+    model_forward(); model_zero_grads(); model_backward();   # prime
+    s = now_ns(); i = 0;
+    while (i < N) {
+        model_zero_grads(); sample_window(); model_forward(); model_backward();
+        i = i + 1;
+    }
+    e = now_ns();
+    _report("fwd+bwd step ssm ", e - s, N);
+    g_training = 0;
+    s = now_ns();
+    gen_prime(pids, 1, 1);
+    gen_decode(NGEN, f64_from(0), 1, 0, 0);
+    e = now_ns();
+    _report("gen kv-cached ssm", e - s, NGEN);
+    print("ssm state cache bytes (constant in T): ", 40); fmt_int(kv_cache_bytes()); _putc(10);
+
     # ---- isolated tied LM head at BPE-scale vocab (V=768): the M9 lever-1
     # target. head_fwd_row is O(V*C) per row and runs in every training forward
     # and every generated token; its share grows with the vocab, so bench it

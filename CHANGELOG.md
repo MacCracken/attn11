@@ -4,6 +4,65 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.4.2] - 2026-06-12
+
+**Selective state-space model (M14 rung b, E4) — the third sequence mixer.**
+`--attn-kind ssm` adds a minimal Mamba-lite diagonal SSM: a per-channel `N`-state
+recurrence whose Δ, B, C are all functions of the input (the *selective* scan),
+with the `exp(Δ·A)` discretization and a learned diagonal `A`. The earned
+milestone is the **hand-derived BPTT through the data-dependent scan** —
+grad-checked bit-tight. Like gated linear attention, the decode cache is the
+constant `C·N` state, not a T-growing K/V. Opt-in and additive — a no-flag run is
+byte-identical; it lands in its own `attn_ssm.cyr` (the 1.4.1 pattern).
+
+### Added
+- **`--attn-kind ssm`** (`attn_ssm.cyr`): the selective SSM. Per channel c, state
+  `h_t[c,n] = exp(Δ_t[c]·A[c,n])·h_{t-1}[c,n] + Δ_t[c]·B_t[n]·a_t[c]`,
+  `y_t[c] = Σ_n C_t[n]·h_t[c,n] + D[c]·a_t[c]`, with `Δ = softplus(a·W_dt)`,
+  `B = a·W_B`, `C = a·W_C` (selective). Reuses Wq (as W_dt) and Wo (output
+  proj) — so it rides `attn_kind = 3` and **checkpoint v5 carries it (no format
+  bump)**, with the state size `N` reusing the `latent_dim` field. A inits to a
+  negative ramp (S4D-style decay spread), D to 1 (identity skip).
+- **Hand-derived BPTT** (`ssm_fwd`/`ssm_bwd`): the reverse scan accumulates `dh`
+  through the data-dependent `exp(Δ·A)` transition; Δ/B/C/A/D/x all receive
+  gradient (the selectivity). Grad-checked (`test_ssm_core`, ~1e-7) on every
+  parameter + the input. Constant-state cached decode (`ssm_fwd_row`) bit-identical
+  to the batch scan (`test_kv_ssm`).
+- Mixer comparison (X011: SSM vs linear vs MLA vs MHA) + an SSM bench entry. ADR
+  0010 (the selective-SSM design + the Wq/Wo + latent_dim reuse).
+
+### Changed
+- `_kvw` gets the `attn_kind == 3` region (`3·C·N + C` = A/W_B/W_C/D); `_o_ssm*`
+  offsets; the 3 dispatch helpers + config/init/alloc/persist gain the SSM case.
+  `kv_cache_bytes` reports the constant `NL·C·N` state for the SSM. The MHA/MLA/
+  linear/MoE paths and the no-flag run are unchanged.
+
+### Performance
+- Mixer comparison (default config, 1200 steps, embedded corpus):
+
+  | mixer | bits/byte | params | decode cache |
+  |-------|-----------|--------|--------------|
+  | MHA   | 0.279     | 39 488 | 24 576 B (∝ T) |
+  | MLA   | 0.273     | 37 952 | 6 144 B (∝ T)  |
+  | linear| 0.239     | 39 488 | 6 144 B (const)|
+  | **SSM** | **0.218** | 38 048 | 12 288 B (const) |
+
+  At this reference scale the selective SSM edges every other mixer on bits/byte,
+  with a cache that is constant in T (8× under MHA at the preset T=64). Train step
+  ~5.6 ms (the O(T·C·N) scan, ~1.56× the dense ~3.6 ms); cached gen ~258 µs/token.
+
+### Tests
+- **727 → 801** checks (x86_64 AND aarch64/qemu): `test_ssm_core` (per-op BPTT,
+  ~1e-7), `test_model_ssm` (full-model 1e-3), `test_kv_ssm` (cached bit-identity),
+  `test_ckpt_ssm` (v5 round-trip + `-40`/`-41`/`-42` rejections), SSM alloc-accounting
+  + config-cap pins.
+
+### Notes
+- M14's remaining rung (c) — per-layer mixer interleaving (the hybrid-ratio sweep)
+  — is next: turn the global `g_attn_kind` into a per-layer kind read inside the
+  three dispatch helpers (the 1.4.1 refactor localized that). A vidya-scale bake-off
+  across all four mixers is the natural follow-on X-entry.
+
 ## [1.4.1] - 2026-06-12
 
 **Refactoring sweep — no behavior change.** A maintenance release that reorganizes
