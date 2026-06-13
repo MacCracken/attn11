@@ -4,6 +4,68 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-06-12
+
+**Gated linear attention (M14 rung a, E4) — the arc's first non-softmax sequence
+mixer.** `--attn-kind lin` replaces the softmax/PV core with a causal RetNet-style
+**retention recurrence** `S_t = γ_h·S_{t-1} + k_t⊗v_t`,
+`out_t = (1/√hd)·S_t^T q_t`, with a fixed per-head decay `γ_h = 1−2^{−(3+h)}`
+(parameter-free, like RoPE). It reuses the MHA Q/K/V/O projections, so it rides
+the existing `attn_kind` descriptor (value 2) and **checkpoint v5 — no format
+bump**. The headline: the decode cache is the **constant** `nh·hd²` retention
+state, not a T-growing K/V. Opt-in and additive — a no-flag run is byte-identical.
+
+### Added
+- **`--attn-kind lin`**: gated linear attention (full heads, learned-abs
+  positions; RoPE is softmax-only). New core `lin_core_fwd`/`lin_core_bwd` +
+  wrappers `attn_lin_fwd`/`attn_lin_bwd` (`attn.cyr`). The hand-derived backward
+  needs **no state caching** — `dq` via a forward S-recompute, `dk`/`dv` via a
+  reverse `dS` accumulator. Pure multiply/add (no softmax/exp), so the grad-check
+  is bit-tight (`test_lin_core` ~1e-9) and there's no x86-only trig/exp.
+- **Constant-state cached decode** (`lin_core_fwd_row`/`attn_lin_fwd_row`,
+  per-layer `g_lin_state`): one recurrence step per token against the persistent
+  `nh·hd²` state (reset at window start / context-shift re-prime). Bit-identical
+  to the uncached batch scan (`test_kv_lin`). `kv_cache_bytes` reports the state
+  size — independent of T.
+- A mixer comparison (X010, MHA vs MLA vs linear) + a linear bench entry
+  (train-step, cached-gen, constant cache bytes). **ADR 0009** (the sequence-mixer
+  axis: `attn_kind` as a mixer family, RetNet retention, fixed decay, MHA-layout reuse).
+
+### Changed
+- `model_config_ok` / `model_alloc_bytes` / the persist loader accept
+  `attn_kind == 2` (full heads, no latent, learned-abs); `attn_arena_size` carries
+  a small `2·hd²` lin scratch (S/dS), `model_alloc_bytes` the per-layer state cache.
+  The MHA/MLA/MoE paths and the no-flag run are unchanged.
+
+### Performance
+- Mixer comparison (default config, 1200 steps, embedded corpus):
+
+  | mixer | bits/byte | params | decode cache (B) |
+  |-------|-----------|--------|------------------|
+  | MHA   | 0.279     | 39 488 | 24 576 (∝ T)     |
+  | MLA   | 0.273     | 37 952 | 6 144 (∝ T)      |
+  | **linear** | **0.239** | 39 488 | **6 144 (constant in T)** |
+
+  Linear matches MHA's parameter count (parameter-free over the projections) and,
+  at this reference scale, edges it on bits/byte while holding a **constant** cache
+  — at the preset (T=64) that's 16 384 B vs MHA's 262 144 B (16×). Train step
+  ~3.8 ms (~6% over the dense ~3.6 ms); cached gen ~160 µs/token (the O(hd²) state
+  update beats the O(T·hd) cache scan).
+
+### Tests
+- **673 → 727** checks (x86_64 AND aarch64/qemu): `test_lin_core` (per-op, 1e-9),
+  `test_model_lin` (full-model 1e-3, incl. the now-real K-bias gradient),
+  `test_kv_lin` (cached-vs-uncached bit-identity across shifts), `test_ckpt_lin`
+  (attn_kind=2 round-trip + `-40`/`-41`/`-42` rejections), plus linear
+  alloc-accounting and config-cap pins.
+
+### Notes
+- The retention backward is the only new hand-derived math; everything else
+  composes grad-checked pieces. M14's rungs (b) a minimal selective SSM and
+  (c) per-layer mixer interleaving (the hybrid-ratio sweep) are the follow-on
+  increments; a vidya-scale perplexity bake-off across the mixer/attention axes is
+  the natural next X-entry.
+
 ## [1.3.0] - 2026-06-12
 
 **Mixture of Experts (M13, E8) — the first FFN-density axis on the 1.x arc.** The

@@ -98,6 +98,21 @@ Used in: `src/ops.cyr` (`moe_fwd`/`moe_bwd` router + combine, `moe_aux_*`),
 frozen lower-index tie-break (bit-reproducible cross-arch), differentiated
 straight-through; see ADR 0008 for the combine/balance/dense-invariant decisions.
 
+### Gated linear attention (retention recurrence — constant-state sequence mixer)
+**Katharopoulos, A., Vyas, A., Pappas, N., Fleuret, F. (2020).** "Transformers are
+RNNs: Fast Autoregressive Transformers with Linear Attention." *ICML 2020.*
+arXiv:[2006.16236](https://arxiv.org/abs/2006.16236) — linear attention as a
+constant-state recurrence (the cache is an `hd×hd` state, not a growing K/V).
+**Sun, Y., Dong, L., Huang, S., Ma, S., Xia, Y., Xue, J., Wang, J., Wei, F.
+(2023).** "Retentive Network: A Successor to Transformer for Large Language
+Models." arXiv:[2307.08621](https://arxiv.org/abs/2307.08621) — the per-head decay
+`γ_h` (retention) attn11 uses.
+Used in: `src/attn.cyr` (`lin_core_fwd`/`lin_core_bwd` + `lin_core_fwd_row` the
+constant-state decode, `attn_lin_fwd`/`attn_lin_bwd` wrappers), `src/model.cyr`
+(the `attn_kind == 2` branch + `g_lin_state` cache). `--attn-kind lin`: a causal
+`S_t = γ_h·S_{t-1} + k_t⊗v_t`, `out_t = (1/√hd)·S_t^T q_t`, fixed per-head decay
+(parameter-free) over the MHA projections. See ADR 0009.
+
 ### KV-cache inference (cache K/V per position, one row per decoded token)
 **Pope, R., Douglas, S., Chowdhery, A., et al. (2022).** "Efficiently Scaling
 Transformer Inference." *MLSys 2023.* arXiv:[2211.05102](https://arxiv.org/abs/2211.05102).

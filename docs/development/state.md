@@ -5,7 +5,21 @@
 
 ## Version
 
-**1.3.0** — *Mixture of Experts* (M13, E8, **opens the FFN-density axis**; ADR
+**1.4.0** — *Gated linear attention* (M14 rung a, E4, **opens the second
+sequence-mixer family**; ADR 0009). `--attn-kind lin` swaps the softmax/PV core
+for a causal RetNet-style **retention recurrence** `S_t = γ_h·S_{t-1} + k_t⊗v_t`,
+`out_t = (1/√hd)·S_t^T q_t`, fixed per-head decay `γ_h = 1−2^{−(3+h)}`
+(parameter-free). It reuses the MHA Q/K/V/O projections, so it rides the existing
+`attn_kind` slot (value 2) — checkpoint **v5, no format bump**. The headline: the
+decode cache is the **constant** `nh·hd²` retention state, not a T-growing K/V. The
+hand-derived backward needs no state caching (`dq` via a forward S-recompute,
+`dk`/`dv` via a reverse `dS`); pure multiply/add, so `test_lin_core` grad-checks at
+**~1e-9**, full-model + cached bit-identity green. Mixer comparison (X010, default
+config, 1200 steps): linear **bits/byte 0.239** (vs MHA 0.279, MLA 0.273) at MHA's
+exact param count (39 488), with a 6 144 B cache that is **constant in T** (16×
+under MHA at the preset). A no-flag run is byte-identical. Verified green: **727**
+checks x86_64 AND aarch64/qemu, the `--agnos` static-ELF build, fuzz, lint.
+(1.3.0 — *Mixture of Experts* (M13, E8, **opens the FFN-density axis**; ADR
 0008). The dense GELU MLP in each block becomes **N experts + a top-K router**:
 `--experts N --expert-topk K` (N in 1..256, default topk 2; `--experts 1` = the
 byte-identical dense baseline). The milestone is the **router backward** —
@@ -22,7 +36,7 @@ density sweep (X009, `scripts/moe-sweep.sh`): total params scale ~linearly with 
 moved **6.2.1 → 6.2.2** (clean patch realign, byte-identical `./lib/` snapshot).
 Verified green: **673** checks x86_64 AND aarch64/qemu, the `--agnos` static-ELF
 build, fuzz, lint — `make release` exit 0.
-(1.2.4 — *Toolchain realignment + docs* (maintenance): pin **6.1.37 → 6.2.1**,
+1.2.4 — *Toolchain realignment + docs* (maintenance): pin **6.1.37 → 6.2.1**,
 `./lib/` resynced, **572** checks green on both arches + agnos + fuzz; roadmap
 trimmed forward-facing, handoff section added. `src/*.cyr` identical to 1.2.3.
 1.2.3 — *Decoupled RoPE* (M12 increment 5, **closes M12**; ADR 0007):
@@ -127,6 +141,11 @@ deterministic resume. 0.2.0: stacked layers, grad clipping, LR schedule.)
   amortizes over T/2 = 32 tokens at ctx 64.
 - KV cache bytes (default config): 24 576 at `nkv=4` → 12 288 (`nkv=2`) →
   6 144 (`nkv=1`).
+- **Gated linear attention** (1.4.0, default config): fwd+bwd step **~3.8 ms**
+  (~6% over the dense ~3.6 ms); cached gen **~160 µs/token** (the O(hd²) state
+  update beats the O(T·hd) cache scan). Decode cache **6 144 B, constant in T**
+  (16× under MHA at the preset); bits/byte 0.239 vs MHA 0.279 at the same params
+  (X010).
 - **MoE** (default config, 8 experts, top-2): fwd+bwd step **~6.9 ms** vs the
   dense ~3.6 ms (top-2 = two active expert MLPs + the `C→N` router), 215 648 params
   vs dense 39 488; cached gen ~273 µs/token. Per-token compute scales with `topk`,
@@ -215,9 +234,17 @@ checkpoint vs Linux at fixed CPU — `scripts/agnos-smoke.sh`):
   position-independent). Checkpoint v5 carries `num_experts`/`topk`. `--eval`
   reports total / per-token-active params + routing entropy. Trains + checkpoints
   + samples; the density sweep is X009 (`scripts/moe-sweep.sh`).
+- **Gated linear attention** (1.4.0, `--attn-kind lin`, ADR 0009): a non-softmax
+  sequence mixer — causal RetNet retention `S_t = γ_h·S_{t-1} + k_t⊗v_t`,
+  `out_t = (1/√hd)·S_t^T q_t`, fixed per-head decay (parameter-free), over the MHA
+  projections. New core `lin_core_fwd`/`bwd` + `attn_lin_fwd`/`bwd` (`attn.cyr`);
+  hand-derived backward with no state caching (grad-checked ~1e-9). Cached decode
+  (`lin_core_fwd_row`, per-layer `g_lin_state`) is the **constant** `nh·hd²` state
+  — bit-identical to the batch scan. Rides `attn_kind=2` (checkpoint v5, no bump);
+  full heads, learned-abs positions. Trains + checkpoints + samples (X010).
 - CLI: `--corpus --stdin --load --save --steps --gen-only --preset --heads
   --kv-heads --layers --attn-kind --latent-dim --pos-kind --rope-dim --experts
-  --expert-topk --bpe --eval`
+  --expert-topk --bpe --eval` (`--attn-kind` now takes `mha`/`mla`/`lin`)
 
 Default run (`./build/attn11`, 3 layers): loss `~3.2 → ~0.13` over 2000 steps;
 sampled output reproduces real corpus phrases.
@@ -250,7 +277,10 @@ learned-abs positions for coupled RoPE — parameter-free, so `params` is unchan
 `--experts N --expert-topk K` (1.3.0; N ≤ 256, default topk 2) replaces the dense
 MLP with N experts + a `C→N` gate: total params scale with N (215 648 at N=8 vs
 39 488 dense) while per-token-active compute scales with topk; `--experts 1` is
-the dense default (params unchanged).
+the dense default (params unchanged). `--attn-kind lin` (1.4.0; full heads,
+learned-abs) swaps the softmax core for the gated retention recurrence —
+parameter-free (same 39 488 params as MHA), and the decode cache becomes the
+constant `nh·hd²` state instead of a T-growing K/V.
 
 ## Source (`src/`, ~1500 LOC)
 
@@ -275,7 +305,10 @@ the dense default (params unchanged).
   no x86-only `f64_sin`/`f64_cos`; `docs/architecture/005`); plus the **decoupled
   RoPE** core (1.2.3) `attn_dec_core_fwd`/`bwd` + `attn_mla_dec_fwd`/`bwd` +
   `attn_mla_dec_fwd_row` (two-term content+position score, shared `K^R`, the
-  latent+rope decode cache)
+  latent+rope decode cache); plus the **gated-linear** core (1.4.0)
+  `lin_core_fwd`/`bwd` (retention recurrence, fixed per-head decay) +
+  `attn_lin_fwd`/`bwd` wrappers + `lin_core_fwd_row`/`attn_lin_fwd_row` (the
+  constant-state cached decode); `attn_arena_size` carries a `2·hd²` S/dS scratch
 - `fileio.cyr` — secure file I/O (`O_NOFOLLOW`, `fstat` size, looped read/write),
   stdin reader
 - `model.cyr` — per-layer packed parameters (block stride + `_o_*`/`PL`/`GL`
@@ -295,7 +328,10 @@ the dense default (params unchanged).
   index the experts + gate; the `_moe` forms (`model_init_moe`/`model_config_ok_moe`/
   `model_alloc_bytes_moe`) carry `num_experts`/`topk` (the `_arch` forms delegate as
   dense); the block MLP fwd/bwd + `model_fwd_row` + `model_eval_window` branch on
-  `g_num_experts > 1`; `moe_entropy`/`moe_disp_*` report routing-entropy utilization
+  `g_num_experts > 1`; `moe_entropy`/`moe_disp_*` report routing-entropy utilization.
+  **Gated linear** (1.4.0): the attention sublayer branches on `g_attn_kind == 2`
+  (`attn_lin_*` in fwd/bwd/eval-window/`model_fwd_row`), the per-layer retention
+  state `g_lin_state` is the constant decode cache, and `kv_cache_bytes` reports it
 - `train.cyr` — byte + **BPE** tokenizer (`bpe_learn`/`tok_encode`/
   `bpe_build_spans`/`tok_emit`), corpus (embedded/file/stdin, raw bytes
   retained), batch sampling, LR schedule, resumable training loop, KV-cached
@@ -315,7 +351,7 @@ the dense default (params unchanged).
 
 ## Tests
 
-- `tests/attn11.tcyr` — **673 checks**: finite-difference gradient checks
+- `tests/attn11.tcyr` — **727 checks**: finite-difference gradient checks
   (every op incl. dropout; attention at head dims 6/8/10 and GQA/MQA at
   `nkv ∈ {1, 2, nh}` incl. `dWk`/`dWv`/`dbv`; the `|dbk| ≈ 0`
   softmax-shift-invariance pin; 2-layer full model at MHA and GQA), the **MLA
@@ -412,20 +448,20 @@ _None yet._
 See [`roadmap.md`](roadmap.md). **Shipped: v1.0.0 (clean cut) → v1.1.0
 (extraction) → v1.2.0–1.2.4 (M12: MLA core, latent KV-cache decode, coupled +
 decoupled RoPE; then 1.2.4 toolchain realign + docs) → v1.3.0 (M13: Mixture of
-Experts).** The surface is frozen ([`STABILITY.md`](../STABILITY.md)) and
-additive-only past 1.0; the numeric core lives in **rosnet** + **tyche**. The 1.x
-arc now has the full attention/position axes `--attn-kind {mha, mla}` ×
-`--pos-kind {learned, rope, rope-decoupled}` **and** the FFN-density axis
-`--experts N --expert-topk K` (checkpoint v5). **M12 and M13 are complete.**
+Experts) → v1.4.0 (M14 rung a: gated linear attention).** The surface is frozen
+([`STABILITY.md`](../STABILITY.md)) and additive-only past 1.0; the numeric core
+lives in **rosnet** + **tyche**. The 1.x arc now has the attention/position axes
+`--attn-kind {mha, mla, lin}` × `--pos-kind {learned, rope, rope-decoupled}`, the
+FFN-density axis `--experts N --expert-topk K`, and the first non-softmax mixer
+(gated linear attention). **M12, M13, and M14 rung a are complete.**
 
-**Next on the arc — M14 (v1.4.0), a second sequence-mixer family** (E4; full spec
-in [`roadmap.md`](roadmap.md)): linear attention → a minimal selective SSM, then a
-per-layer `kind` config to interleave mixer types and sweep the hybrid ratio. This
-is the first non-attention mixer (a large departure), so each new backward lands
-behind its grad-check, perplexity vs the iso-param transformer logged as an
-X-entry. Then E5–E6 (diffusion objective / ternary) as M15–M16 and **M17**
-reinforcement learning (E9). A vidya-corpus bake-off across the M12/M13 axes is
-the natural next X-entry.
+**Next on the arc — M14 rungs (b)/(c), then M15+.** M14 (b) is a minimal selective
+SSM (BPTT through the scan, the harder mixer backward); (c) is a per-layer mixer
+`kind` to interleave attention/linear/SSM and sweep the **hybrid ratio** (the
+survey's "~10–25% attention layers beat pure transformers"). Then E5–E6
+(diffusion objective / ternary) as M15–M16 and **M17** reinforcement learning
+(E9). A vidya-scale bake-off across the mixer/attention axes (linear vs softmax vs
+MLA vs the hybrid) is the natural next X-entry, pairing with X010.
 
 ### Handoff — how to pick this up
 

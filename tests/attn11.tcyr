@@ -537,6 +537,49 @@ fn test_attention_mla_dec(): i64 {
     return 0;
 }
 
+# Gated linear-attention core grad-check (M14.0). Isolates lin_core_fwd/bwd: the
+# causal retention recurrence (per-head decay γ_h) over post-projection Q/K/V.
+# Pure multiply/add (no softmax/exp), so a tight 1e-5 holds on both arches; the
+# backward recomputes S forward (dq) + accumulates dS in reverse (dk/dv).
+fn lin_loss_c(Q, K, V, out, S, dout, T, C, nh): i64 {
+    lin_core_fwd(Q, K, V, out, S, T, C, nh);
+    return dotsum(dout, out, T * C);
+}
+fn lin_ng(p, np, n, Q, K, V, out, S, dout, T, C, nh): i64 {
+    var eps = _eps(); var te = f64_mul(f64_from(2), eps); var i = 0;
+    while (i < n) {
+        var o = load64(p + i * 8);
+        store64(p + i * 8, f64_add(o, eps)); var lp = lin_loss_c(Q, K, V, out, S, dout, T, C, nh);
+        store64(p + i * 8, f64_sub(o, eps)); var lm = lin_loss_c(Q, K, V, out, S, dout, T, C, nh);
+        store64(p + i * 8, o); store64(np + i * 8, f64_div(f64_sub(lp, lm), te)); i = i + 1;
+    }
+    return 0;
+}
+fn _lin_check(T, C, nh): i64 {
+    var TC = T * C; var hd = C / nh; var hh = hd * hd;
+    var Q = t_alloc(TC); var K = t_alloc(TC); var V = t_alloc(TC);
+    var out = t_alloc(TC); var dout = t_alloc(TC);
+    var S = t_alloc(hh); var dS = t_alloc(hh);
+    t_randn(Q, TC, f64_from(1)); t_randn(K, TC, f64_from(1)); t_randn(V, TC, f64_from(1)); t_randn(dout, TC, f64_from(1));
+    var dQ = t_alloc(TC); var dK = t_alloc(TC); var dV = t_alloc(TC);
+    lin_core_fwd(Q, K, V, out, S, T, C, nh);
+    lin_core_bwd(Q, K, V, dout, dQ, dK, dV, S, dS, T, C, nh);
+    var nQ = t_alloc(TC); lin_ng(Q, nQ, TC, Q, K, V, out, S, dout, T, C, nh);
+    var nK = t_alloc(TC); lin_ng(K, nK, TC, Q, K, V, out, S, dout, T, C, nh);
+    var nV = t_alloc(TC); lin_ng(V, nV, TC, Q, K, V, out, S, dout, T, C, nh);
+    check("lin dQ", dQ, nQ, TC, 100000);
+    check("lin dK", dK, nK, TC, 100000);
+    check("lin dV", dV, nV, TC, 100000);
+    return 0;
+}
+fn test_lin_core(): i64 {
+    _lin_check(3, 8, 2);    # hd=4
+    _lin_check(4, 12, 2);   # hd=6 (scalar; non-power-of-2 head dim)
+    _lin_check(3, 16, 4);   # hd=4, 4 heads — exercises the per-head decay spread
+    _lin_check(5, 8, 1);    # hd=8, single head
+    return 0;
+}
+
 # dropout: verify dropout_bwd matches finite differences of dropout_apply with a
 # FIXED mask (the mask is generated once and held constant, so forward is
 # deterministic).
@@ -826,6 +869,41 @@ fn test_model_moe(): i64 {
     check("moe model L0 dWgate", aWg0, nWg0, CN, 1000);
     check("moe model L1 dWq", aWq1, nWq1, Cc, 1000);
     check("moe model dtokemb", atok, ntok, V * C, 1000);
+    return 0;
+}
+
+# Full-model grad-check with the gated linear-attention mixer (M14.1, attn_kind=2):
+# the softmax core is replaced by the retention recurrence, reusing the Q/K/V/O
+# projections. Verifies the wiring through the residual stack. Unlike softmax
+# attention, the K-bias is a REAL gradient here (no shift-invariance — k enters
+# the score linearly), so dbk is FD-checked like any other parameter. 1e-3, like
+# the other full-model checks; the tight per-op proof is test_lin_core (1e-9).
+fn test_model_lin(): i64 {
+    var V = 5; var C = 8; var T = 3; var nh = 2; var NL = 2;
+    model_init_arch(V, C, T, nh, nh, NL, 1, f64_from(0), 19, 2, 0, 0, 0);   # gated linear attention
+    assert(g_attn_kind == 2, "linear-attention model built");
+    store64(A_tokens + 0, 1); store64(A_tokens + 8, 3); store64(A_tokens + 16, 0);
+    store64(A_targets + 0, 3); store64(A_targets + 8, 0); store64(A_targets + 16, 4);
+    model_forward(); model_zero_grads(); model_backward();
+    var Cc = C * C;
+    var aWq0 = t_alloc(Cc); t_copy(aWq0, GL(0, _o_Wq()), Cc);
+    var aWk1 = t_alloc(Cc); t_copy(aWk1, GL(1, _o_Wk()), Cc);
+    var abk0 = t_alloc(C); t_copy(abk0, G_bk(0), C);
+    var aWv0 = t_alloc(Cc); t_copy(aWv0, GL(0, _o_Wv()), Cc);
+    var aWo1 = t_alloc(Cc); t_copy(aWo1, GL(1, _o_Wo()), Cc);
+    var atok = t_alloc(V * C); t_copy(atok, G_tokemb(), V * C);
+    var nWq0 = t_alloc(Cc); model_ng(PL(0, _o_Wq()), nWq0, Cc);
+    var nWk1 = t_alloc(Cc); model_ng(PL(1, _o_Wk()), nWk1, Cc);
+    var nbk0 = t_alloc(C); model_ng(P_bk(0), nbk0, C);
+    var nWv0 = t_alloc(Cc); model_ng(PL(0, _o_Wv()), nWv0, Cc);
+    var nWo1 = t_alloc(Cc); model_ng(PL(1, _o_Wo()), nWo1, Cc);
+    var ntok = t_alloc(V * C); model_ng(P_tokemb(), ntok, V * C);
+    check("lin model L0 dWq", aWq0, nWq0, Cc, 1000);
+    check("lin model L1 dWk", aWk1, nWk1, Cc, 1000);
+    check("lin model L0 dbk", abk0, nbk0, C, 1000);
+    check("lin model L0 dWv", aWv0, nWv0, Cc, 1000);
+    check("lin model L1 dWo", aWo1, nWo1, Cc, 1000);
+    check("lin model dtokemb", atok, ntok, V * C, 1000);
     return 0;
 }
 
@@ -1136,6 +1214,14 @@ fn test_alloc_accounting(): i64 {
     predicted = model_alloc_bytes_moe(5, 16, 8, 4, 4, 2, g_NP, 0, 0, 0, 0, 8, 2);
     assert(delta >= predicted, "moe alloc accounting (under)");
     assert(delta <= predicted + 8192, "moe alloc accounting (over)");
+    # gated-linear pin (M14): the per-layer retention state cache (g_lin_state)
+    # + the arena's 2*hd^2 lin scratch must be accounted (attn_kind=2).
+    used0 = alloc_used();
+    model_init_arch(5, 16, 8, 4, 4, 2, 1, f64_from(0), 4, 2, 0, 0, 0);
+    delta = alloc_used() - used0;
+    predicted = model_alloc_bytes_arch(5, 16, 8, 4, 4, 2, g_NP, 2, 0, 0, 0);
+    assert(delta >= predicted, "lin alloc accounting (under)");
+    assert(delta <= predicted + 8192, "lin alloc accounting (over)");
     return 0;
 }
 
@@ -1164,7 +1250,7 @@ fn test_config_caps(): i64 {
     assert(model_config_ok_arch(25, 32, 16, 4, 2, 3, 1, 16, 0, 0) == 0, "MLA with nkv != nh rejected");
     assert(model_config_ok_arch(25, 32, 16, 4, 4, 3, 1, 0, 0, 0) == 0, "MLA d_c = 0 rejected");
     assert(model_config_ok_arch(25, 32, 16, 4, 4, 3, 1, 33, 0, 0) == 0, "MLA d_c > C rejected");
-    assert(model_config_ok_arch(25, 32, 16, 4, 4, 3, 2, 16, 0, 0) == 0, "unknown attn_kind rejected");
+    assert(model_config_ok_arch(25, 32, 16, 4, 4, 3, 3, 16, 0, 0) == 0, "unknown attn_kind (3) rejected");
     # pos_kind descriptor (M12 increment 4): rope (1) on mha with even head dim
     assert(model_config_ok_arch(25, 32, 16, 4, 4, 3, 0, 0, 1, 0) == 1, "rope on mha (hd=8) accepted");
     assert(model_config_ok_arch(25, 16, 16, 2, 1, 3, 0, 0, 1, 0) == 1, "rope on mqa (hd=8) accepted");
@@ -1177,6 +1263,11 @@ fn test_config_caps(): i64 {
     assert(model_config_ok_arch(25, 32, 16, 4, 4, 3, 1, 16, 2, 0) == 0, "decoupled d_rope < 2 rejected");
     assert(model_config_ok_arch(25, 32, 16, 4, 4, 3, 1, 16, 2, 34) == 0, "decoupled d_rope > C rejected");
     assert(model_config_ok_arch(25, 32, 16, 4, 4, 3, 1, 16, 1, 4) == 0, "non-decoupled with rope_dim != 0 rejected");
+    # gated linear attention (M14, attn_kind=2): full heads, no latent, learned-abs
+    assert(model_config_ok_arch(25, 32, 16, 4, 4, 3, 2, 0, 0, 0) == 1, "linear attention (attn_kind=2) accepted");
+    assert(model_config_ok_arch(25, 32, 16, 4, 2, 3, 2, 0, 0, 0) == 0, "linear with nkv != nh rejected");
+    assert(model_config_ok_arch(25, 32, 16, 4, 4, 3, 2, 8, 0, 0) == 0, "linear with a latent dim rejected");
+    assert(model_config_ok_arch(25, 32, 16, 4, 4, 3, 2, 0, 1, 0) == 0, "linear + rope rejected (softmax-only)");
     # MoE descriptor (M13): 1 <= num_experts <= 256, 1 <= topk <= num_experts.
     assert(model_config_ok_moe(25, 32, 16, 4, 4, 3, 0, 0, 0, 0, 8, 2) == 1, "valid moe (8 experts, top-2) accepted");
     assert(model_config_ok_moe(25, 32, 16, 4, 4, 3, 0, 0, 0, 0, 1, 1) == 1, "moe experts=1 (dense) accepted");
@@ -1407,6 +1498,39 @@ fn test_ckpt_moe(): i64 {
     return 0;
 }
 
+# Checkpoint round-trip + hostile rejections for the gated-linear descriptor
+# (M14.3, attn_kind=2). Rides the existing v5 attn_kind slot — no format bump
+# (linear is parameter-free over the MHA layout, so NP is unchanged). The loader
+# rejects a linear image carrying a latent (-42), RoPE (-41), or partial heads (-40).
+fn test_ckpt_lin(): i64 {
+    var V = build_corpus();
+    model_init_arch(V, 8, 4, 2, 2, 1, 1, f64_from(0), 27, 2, 0, 0, 0);   # gated linear
+    assert(g_attn_kind == 2, "linear model built");
+    var np = g_NP;
+    var snap = t_alloc(np); t_copy(snap, g_params, np);
+    var sz = ckpt_size();
+    var ck = alloc(sz); ckpt_serialize(ck);
+    assert(load64(ck + 16 * 8) == 2, "attn_kind=lin recorded");
+    model_init(V, 8, 4, 2, 2, 1, 1, f64_from(0), 53);                    # scramble to mha
+    assert(g_attn_kind == 0, "reset to mha");
+    assert(ckpt_load_buf(ck, sz) == 0, "linear checkpoint loads");
+    assert(g_attn_kind == 2, "attn_kind restored");
+    var mism = 0; var i = 0;
+    while (i < np) {
+        if (load64(g_params + i * 8) != load64(snap + i * 8)) { mism = mism + 1; }
+        i = i + 1;
+    }
+    assert(mism == 0, "linear params restored bit-for-bit");
+    var bad = alloc(sz);
+    t_copy(bad, ck, sz / 8); store64(bad + 18 * 8, 4);     # d_c != 0 on linear
+    assert(ckpt_load_buf(bad, sz) == (0 - 42), "linear + latent rejected (-42)");
+    t_copy(bad, ck, sz / 8); store64(bad + 17 * 8, 1);     # pos_kind=1 (rope) on linear
+    assert(ckpt_load_buf(bad, sz) == (0 - 41), "linear + rope rejected (-41)");
+    t_copy(bad, ck, sz / 8); store64(bad + 12 * 8, 1);     # nkv=1 < nh=2 on linear
+    assert(ckpt_load_buf(bad, sz) == (0 - 40), "linear with partial heads rejected (-40)");
+    return 0;
+}
+
 # With a corpus already loaded, a checkpoint whose vocab differs must be
 # rejected (-15) rather than silently mis-indexing g_data.
 fn test_ckpt_vocab_mismatch(): i64 {
@@ -1587,13 +1711,13 @@ fn test_ckpt_v4_descriptor(): i64 {
     assert(g_latent_dim == 0, "latent_dim restored");
     assert(g_rope_dim == 0, "rope_dim restored");
     # reserved / unsupported descriptor values reject before allocating. attn_kind
-    # 1 (MLA) is now SUPPORTED (test_ckpt_mla_roundtrip); pos_kind 1 (RoPE) is now
+    # 1 (MLA) and 2 (gated-linear, M14) are now SUPPORTED; pos_kind 1 (RoPE) is now
     # SUPPORTED on this even-hd mha image (test_ckpt_rope below). An unknown
-    # attn_kind (2) hits -40, a latent dim on mha hits -42, pos_kind 2
-    # (rope-decoupled, reserved) hits -41, and a nonzero rope_dim hits -43.
+    # attn_kind (3) hits -40, a latent dim on mha hits -42, pos_kind 2
+    # (rope-decoupled) on mha hits -41, and a nonzero rope_dim hits -43.
     var bad = alloc(sz);
-    t_copy(bad, ck, sz / 8); store64(bad + 16 * 8, 2);
-    assert(ckpt_load_buf(bad, sz) == (0 - 40), "attn_kind=2 (unknown) rejected (-40)");
+    t_copy(bad, ck, sz / 8); store64(bad + 16 * 8, 3);
+    assert(ckpt_load_buf(bad, sz) == (0 - 40), "attn_kind=3 (unknown) rejected (-40)");
     t_copy(bad, ck, sz / 8); store64(bad + 17 * 8, 2);
     assert(ckpt_load_buf(bad, sz) == (0 - 41), "pos_kind=2 (rope-decoupled reserved) rejected (-41)");
     t_copy(bad, ck, sz / 8); store64(bad + 18 * 8, 8);
@@ -2082,6 +2206,75 @@ fn test_kv_moe(): i64 {
     return 0;
 }
 
+# M14.2 gate: gated linear-attention cached decode must be BIT-IDENTICAL to the
+# uncached reference. The cached path advances the constant-size per-layer state
+# (one recurrence step/token, resetting at pos==0); the uncached path re-scans
+# the window. Both run the same recurrence, so they must agree bit-for-bit —
+# including across context-shifts (the re-prime rebuilds the state from pos 0).
+fn _gen_bits_lin(C, T, nh, NL, pstep, NG): i64 {
+    var V = build_corpus();
+    model_init_arch(V, C, T, nh, nh, NL, 1, f64_from(0), 21, 2, 0, 0, 0);   # gated linear attention
+    train(8, 8, 2, _lrc(3, 1000), _lrc(3, 10000), 2, f64_from(1), 1000000000);
+    g_training = 0;
+    var ids = t_alloc(T);
+    var i = 0;
+    while (i < T) { store64(ids + i * 8, (i * 3 + 1) % V); i = i + 1; }
+    var mism = 0;
+    var m = 1;
+    while (m <= T) {
+        gen_prime(ids, m, 1);
+        var cs = t_alloc(V); t_copy(cs, R_logits, V);
+        gen_prime(ids, m, 0);
+        var urow = A_logits + (m - 1) * g_V * 8;
+        var v = 0;
+        while (v < V) {
+            if (load64(cs + v * 8) != load64(urow + v * 8)) { mism = mism + 1; }
+            v = v + 1;
+        }
+        if ((m < T) && (m + pstep > T)) { m = T; }
+        else { m = m + pstep; }
+    }
+    assert(mism == 0, "lin prefill logits bit-identical at every prefix");
+    var outA = t_alloc(NG); var outB = t_alloc(NG);
+    var fin = t_alloc(V);
+    var tt = 0;
+    while (tt < 2) {
+        var temp = f64_from(0);
+        if (tt == 1) { temp = _lrc(8, 10); }
+        _rng_state = 424242 + tt;
+        gen_prime(ids, T, 1);
+        gen_decode(NG, temp, 1, outA, 0);
+        t_copy(fin, R_logits, V);
+        _rng_state = 424242 + tt;
+        gen_prime(ids, T, 0);
+        gen_decode(NG, temp, 0, outB, 0);
+        var dm = 0;
+        i = 0;
+        while (i < NG) {
+            if (load64(outA + i * 8) != load64(outB + i * 8)) { dm = dm + 1; }
+            i = i + 1;
+        }
+        assert(dm == 0, "lin decode ids identical (cached vs uncached)");
+        var urow2 = A_logits + (G_n - 1) * g_V * 8;
+        var lm = 0;
+        var v2 = 0;
+        while (v2 < V) {
+            if (load64(fin + v2 * 8) != load64(urow2 + v2 * 8)) { lm = lm + 1; }
+            v2 = v2 + 1;
+        }
+        assert(lm == 0, "lin final logits bit-identical after slides");
+        tt = tt + 1;
+    }
+    return 0;
+}
+fn test_kv_lin(): i64 {
+    _gen_bits_lin(16, 8, 2, 2, 1, 24);    # hd=8
+    _gen_bits_lin(12, 7, 2, 2, 1, 21);    # hd=6 scalar; odd T (odd shift)
+    _gen_bits_lin(20, 5, 4, 2, 1, 15);    # hd=5 (odd head dim); 4 heads
+    _gen_bits_lin(12, 2, 2, 2, 1, 6);     # degenerate 2-token window
+    return 0;
+}
+
 # M12.2/increment-4 gate: coupled RoPE (pos_kind=1) cached decode must be
 # BIT-IDENTICAL to the uncached reference. Same two-way verification as the MHA
 # suite, on the rope path: the cached row rotates q_row + the appended K row by
@@ -2335,6 +2528,7 @@ fn main(): i64 {
     test_attention();
     test_attention_mla();
     test_attention_mla_dec();
+    test_lin_core();
     test_rope_op();
     test_attention_rope();
     test_group("full-model grad-check");
@@ -2344,6 +2538,7 @@ fn main(): i64 {
     test_model_rope();
     test_model_mla_dec();
     test_model_moe();
+    test_model_lin();
     test_head_tail();
     test_group("persistence");
     test_resume_determinism();
@@ -2367,6 +2562,7 @@ fn main(): i64 {
     test_ckpt_v4_compat();
     test_ckpt_v4_descriptor();
     test_ckpt_moe();
+    test_ckpt_lin();
     test_ckpt_vocab_mismatch();
     test_group("bpe tokenizer");
     test_bpe_known();
@@ -2383,6 +2579,7 @@ fn main(): i64 {
     test_kv_vocab300();
     test_kv_mla();
     test_kv_moe();
+    test_kv_lin();
     test_kv_rope();
     test_kv_dec();
     test_group("robustness");

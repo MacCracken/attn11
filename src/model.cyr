@@ -212,6 +212,8 @@ var D_kr = 0;     # decoupled RoPE only: T x d_rope (shared rope-key gradient)
 # ---- KV caches + single-row scratch (inference/generation path, E1) ---------
 var KV_K = 0;     # NL pointers, each T x Ckv (per-layer K cache)
 var KV_V = 0;     # NL pointers, each T x Ckv (per-layer V cache)
+var g_lin_state = 0;  # gated-linear (attn_kind==2) only: NL pointers, each nh*hd^2
+                      # — the per-layer retention STATE (the constant-size decode cache)
 var R_x = 0;      # C  residual-stream row
 var R_a = 0;      # C  ln1 out / attn in
 var R_attn = 0;   # C  attention out
@@ -259,10 +261,18 @@ fn model_config_ok_moe(V, C, T, nh, nkv, NL, attn_kind, d_c, pos_kind, d_rope, n
     # MLA (attn_kind == 1): full heads — the cache compression is the latent, not
     # head-sharing — and a positive low-rank d_c bounded by C (so C*d_c <= C*C,
     # already inside the alloc budget). mha (0) ignores d_c.
-    if ((attn_kind != 0) && (attn_kind != 1)) { return 0; }
+    # attn_kind 2 = gated linear attention (M14, E4): a non-softmax sequence mixer
+    # over the MHA projection layout — full heads (nkv == nh), no latent (d_c == 0),
+    # learned-absolute positions only (RoPE is softmax-only). Parameter-free core.
+    if ((attn_kind != 0) && (attn_kind != 1) && (attn_kind != 2)) { return 0; }
     if (attn_kind == 1) {
         if (nkv != nh) { return 0; }
         if ((d_c < 1) || (d_c > C)) { return 0; }
+    }
+    if (attn_kind == 2) {
+        if (nkv != nh) { return 0; }       # full K/V (no GQA in the basic linear mixer)
+        if (d_c != 0) { return 0; }        # no latent
+        if (pos_kind != 0) { return 0; }   # learned-abs only (RoPE is softmax attention)
     }
     # pos_kind (ADR 0007 / M12 increment 4): 0 = learned-abs (default), 1 = coupled
     # RoPE. RoPE rotates dimension PAIRS (2k, 2k+1) within each head, so the head
@@ -327,6 +337,9 @@ fn model_alloc_bytes_moe(V, C, T, nh, nkv, NL, NP, attn_kind, d_c, pos_kind, d_r
         e = e + 2 * NL + NL * (T * nh * d_rope + T * d_rope) + T * nh * d_rope + T * d_rope;
         e = e + nh * d_rope;   # R_qr single-row scratch
     }
+    # gated-linear (attn_kind==2): the per-layer retention state cache (NL pointers
+    # + NL·nh·hd^2). The arena's 2·hd^2 lin scratch is already in `asz` above.
+    if (attn_kind == 2) { e = e + NL + NL * nh * (C / nh) * (C / nh); }
     # MoE buffers (M13, num_experts > 1): 5 per-layer pointer arrays (LA_mlogits/
     # msel/mgate/mefc/megg) + per-layer router/expert caches logits(T*N) +
     # sel/gate(2*T*K) + efc/egg(2*T*K*F) + shared scratch g_moe_sc(2F+2C+3N+K) +
@@ -518,6 +531,13 @@ fn model_init_moe(V, C, T, nh, nkv, NL, attn_bias, dropout, seed,
         store64(KV_V + L * 8, t_alloc(TKv));
         L = L + 1;
     }
+    # gated-linear decode state (attn_kind==2): per-layer nh*hd^2 retention state
+    if (attn_kind == 2) {
+        var hdl = C / nh;
+        g_lin_state = t_alloc(NL);
+        L = 0;
+        while (L < NL) { store64(g_lin_state + L * 8, t_alloc(nh * hdl * hdl)); L = L + 1; }
+    }
     R_x = t_alloc(C); R_a = t_alloc(C); R_attn = t_alloc(C); R_xmid = t_alloc(C);
     R_b = t_alloc(C); R_fc = t_alloc(F); R_g = t_alloc(F); R_mlp = t_alloc(C);
     R_f = t_alloc(C); R_q = t_alloc(C); R_concat = t_alloc(C);
@@ -534,6 +554,9 @@ fn model_init_moe(V, C, T, nh, nkv, NL, attn_bias, dropout, seed,
 # Decoupled-RoPE MLA (M12 incr 5) also caches the shared rope key K^R (d_rope per
 # token per layer), so the cache is d_c + d_rope per token.
 fn kv_cache_bytes(): i64 {
+    # gated linear attention (M14): the cache is the per-layer retention STATE
+    # (nh·hd^2), CONSTANT in T — the headline vs MHA/MLA's T-growing K/V.
+    if (g_attn_kind == 2) { var hd = g_C / g_nh; return g_NL * g_nh * hd * hd * 8; }
     if (g_attn_kind == 1) {
         if (g_pos_kind == 2) { return g_NL * g_T * (g_latent_dim + g_rope_dim) * 8; }
         return g_NL * g_T * g_latent_dim * 8;
@@ -736,7 +759,11 @@ fn model_forward(): i64 {
         var xin = La(LA_resid, L);
         var a = La(LA_a, L);
         ln_fwd(xin, PL(L, _o_ln1g()), PL(L, _o_ln1b()), a, La(LA_m1, L), La(LA_r1, L), T, C);
-        if (g_attn_kind == 1) {
+        if (g_attn_kind == 2) {
+            attn_lin_fwd(PL(L, _o_Wq()), P_bq(L), PL(L, _o_Wk()), P_bk(L),
+                         PL(L, _o_Wv()), P_bv(L), PL(L, _o_Wo()), P_bo(L),
+                         a, A_attn, La(LA_arena, L), T, C, nh);
+        } elif (g_attn_kind == 1) {
             if (g_pos_kind == 2) {
                 attn_mla_dec_fwd(PL(L, _o_Wq()), P_bq(L), PL(L, _o_Wdkv()), PL(L, _o_Wuk()), P_bk(L),
                                  PL(L, _o_Wuv()), P_bv(L), PL(L, _o_Wqr()), PL(L, _o_Wkr()), PL(L, _o_Wo()), P_bo(L),
@@ -815,7 +842,14 @@ fn model_fwd_row(tok, pos): i64 {
     var L = 0;
     while (L < g_NL) {
         ln_fwd(R_x, PL(L, _o_ln1g()), PL(L, _o_ln1b()), R_a, R_mean, R_rstd, 1, C);
-        if (g_attn_kind == 1) {
+        if (g_attn_kind == 2) {
+            # gated-linear decode (M14.2): the persistent per-layer state IS the
+            # cache (constant nh*hd^2, not a growing K/V). One recurrence step per
+            # token; pos==0 resets the state (fresh window / context-shift re-prime).
+            attn_lin_fwd_row(PL(L, _o_Wq()), P_bq(L), PL(L, _o_Wk()), P_bk(L),
+                             PL(L, _o_Wv()), P_bv(L), PL(L, _o_Wo()), P_bo(L),
+                             R_a, R_attn, La(LA_arena, L), La(g_lin_state, L), pos, C, g_nh);
+        } elif (g_attn_kind == 1) {
             # MLA latent KV-cache decode (M12.2): the per-layer latent buffer
             # La(LA_c, L) is the persistent d_c-wide cache; the arena's Kc/Vc
             # region serves as the transient up-projection scratch (Ckv == C).
@@ -885,7 +919,11 @@ fn model_eval_window(n): i64 {
         var xin = La(LA_resid, L);
         var a = La(LA_a, L);
         ln_fwd(xin, PL(L, _o_ln1g()), PL(L, _o_ln1b()), a, La(LA_m1, L), La(LA_r1, L), n, C);
-        if (g_attn_kind == 1) {
+        if (g_attn_kind == 2) {
+            attn_lin_fwd(PL(L, _o_Wq()), P_bq(L), PL(L, _o_Wk()), P_bk(L),
+                         PL(L, _o_Wv()), P_bv(L), PL(L, _o_Wo()), P_bo(L),
+                         a, A_attn, La(LA_arena, L), n, C, nh);
+        } elif (g_attn_kind == 1) {
             if (g_pos_kind == 2) {
                 attn_mla_dec_fwd(PL(L, _o_Wq()), P_bq(L), PL(L, _o_Wdkv()), PL(L, _o_Wuk()), P_bk(L),
                                  PL(L, _o_Wuv()), P_bv(L), PL(L, _o_Wqr()), PL(L, _o_Wkr()), PL(L, _o_Wo()), P_bo(L),
@@ -964,7 +1002,13 @@ fn model_backward(): i64 {
         t_add_into(D_xmid, D_tmp, TC);
         # attention: d(attn branch output) = D_xmid; back through its dropout, then attn.
         dropout_bwd(La(LA_dmask_attn, L), D_xmid, D_drop, TC);
-        if (g_attn_kind == 1) {
+        if (g_attn_kind == 2) {
+            attn_lin_bwd(PL(L, _o_Wq()), PL(L, _o_Wk()), PL(L, _o_Wv()), PL(L, _o_Wo()),
+                         La(LA_a, L), D_drop, D_a,
+                         GL(L, _o_Wq()), G_bq(L), GL(L, _o_Wk()), G_bk(L),
+                         GL(L, _o_Wv()), G_bv(L), GL(L, _o_Wo()), G_bo(L),
+                         La(LA_arena, L), T, C, nh);
+        } elif (g_attn_kind == 1) {
             if (g_pos_kind == 2) {
                 attn_mla_dec_bwd(PL(L, _o_Wq()), PL(L, _o_Wdkv()), PL(L, _o_Wuk()), PL(L, _o_Wuv()),
                                  PL(L, _o_Wqr()), PL(L, _o_Wkr()), PL(L, _o_Wo()),

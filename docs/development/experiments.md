@@ -386,3 +386,47 @@ Cached generation ~273 µs/token. So per-token compute scales with **topk**, not
    128 MB alloc cap at this config (rejected cleanly), bounding the sweep.
 4. A vidya-corpus bake-off (MoE density vs dense vs the M12 attention variants, at
    matched compute) is the natural follow-on, pairing with X003/X006/X008.
+
+## X010 — gated linear attention vs softmax (M14 rung a, v1.4.0) (2026-06-12)
+
+**Setup**: 1.4.0, default config (d_model 32, ctx 16, 4 heads, 3 layers), 1200
+steps on the embedded reference corpus, `--eval` (pure cross-entropy bits/byte).
+Compares the three attention mixers at matched config/steps: MHA (softmax), MLA
+(low-rank latent, d_c=16), and the new gated linear attention (`--attn-kind lin`,
+RetNet retention, fixed per-head decay). x86_64.
+
+**Correctness** (grad-checks, both arches): `test_lin_core` (per-op, **1e-9** — the
+recurrence is pure multiply/add, no softmax/exp); `test_model_lin` (full-model
+1e-3, incl. the now-real K-bias gradient — linear attention has no softmax
+shift-invariance); `test_kv_lin` (cached-vs-uncached **bit-identity** across
+context-shifts). **673 → 727** checks.
+
+**Comparison**:
+
+| mixer  | bits/byte | params | decode cache | cache scaling |
+|--------|-----------|--------|--------------|---------------|
+| MHA    | 0.279     | 39 488 | 24 576 B     | ∝ T           |
+| MLA    | 0.273     | 37 952 | 6 144 B      | ∝ T           |
+| **linear** | **0.239** | 39 488 | **6 144 B** | **constant in T** |
+
+**Cost** (`./build/bench`, default config): linear train step ~3.8 ms (~6% over
+the dense ~3.6 ms — the O(T·hd²) recurrence is comparable to softmax's O(T²·hd) at
+small T); cached gen ~160 µs/token (the O(hd²) state update beats the O(T·hd)
+cache scan). The state cache is 6 144 B at this config and **does not grow with
+T** — at the preset (T=64) it is 16 384 B vs MHA's 262 144 B (**16×**).
+
+**Takeaways**:
+1. **Parameter-free, same projections.** Linear attention reuses the MHA Q/K/V/O
+   layout with a fixed per-head decay, so it has the *same* parameter count as MHA
+   (39 488) and rides the existing `attn_kind` checkpoint slot (no format bump).
+2. **The cache is constant in T** — the structural win the survey points at
+   (the KV cache as the central inference object). MHA/MLA caches grow with the
+   window; the retention state is `nh·hd²` regardless of T.
+3. **At reference scale it edges softmax on bits/byte** (0.239 vs 0.279). Read
+   honestly: the tiny, repetitive corpus rewards the decay's strong recency bias,
+   and there is no normalizer — this is a "the grad-checked mixer learns and is
+   competitive here," not a general quality claim. The deliverable is the
+   grad-checked retention reference + the constant-cache property.
+4. M14's remaining rungs — (b) a minimal selective SSM (BPTT through the scan) and
+   (c) per-layer mixer interleaving with a hybrid-ratio sweep — build on this core.
+   A vidya-scale bake-off (linear vs softmax vs the hybrid) is the follow-on.

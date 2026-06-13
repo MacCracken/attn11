@@ -242,6 +242,28 @@ fn main(): i64 {
     e = now_ns();
     _report("gen kv-cached moe8", e - s, NGEN);
 
+    # ---- gated linear attention (M14, E4): training step + cached generation at
+    # the default config. Parameter-free over the MHA projections (same g_NP as
+    # the dense baseline), and the decode cache is the CONSTANT per-layer state
+    # (nh*hd^2), independent of T — the headline vs MHA/MLA's T-growing K/V.
+    model_init_arch(V, 32, 16, 4, 4, 3, 1, f64_from(0), 1337, 2, 0, 0, 0);   # gated linear
+    model_forward(); model_zero_grads(); model_backward();   # prime
+    s = now_ns(); i = 0;
+    while (i < N) {
+        model_zero_grads(); sample_window(); model_forward(); model_backward();
+        i = i + 1;
+    }
+    e = now_ns();
+    _report("fwd+bwd step lin ", e - s, N);
+    g_training = 0;
+    s = now_ns();
+    gen_prime(pids, 1, 1);
+    gen_decode(NGEN, f64_from(0), 1, 0, 0);
+    e = now_ns();
+    _report("gen kv-cached lin", e - s, NGEN);
+    print("lin state cache bytes (constant in T): ", 40); fmt_int(kv_cache_bytes()); _putc(10);
+    print("  vs MHA full K/V at this config:       ", 40); fmt_int(2 * 3 * 16 * 32 * 8); _putc(10);
+
     # ---- isolated tied LM head at BPE-scale vocab (V=768): the M9 lever-1
     # target. head_fwd_row is O(V*C) per row and runs in every training forward
     # and every generated token; its share grows with the vocab, so bench it

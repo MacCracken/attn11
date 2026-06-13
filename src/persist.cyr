@@ -214,7 +214,8 @@ fn ckpt_load_buf(buf, len): i64 {
         d_c = load64(buf + 18 * 8);
         d_rope = load64(buf + 19 * 8);
     }
-    if ((attn_kind != 0) && (attn_kind != 1)) { return 0 - 40; }   # 0 = mha, 1 = mla
+    # 0 = mha, 1 = mla, 2 = gated-linear (M14)
+    if ((attn_kind != 0) && (attn_kind != 1) && (attn_kind != 2)) { return 0 - 40; }
     if ((pos_kind != 0) && (pos_kind != 1) && (pos_kind != 2)) { return 0 - 41; }  # learned/rope/rope-decoupled
     if ((pos_kind != 2) && (d_rope != 0)) { return 0 - 43; }   # rope_dim 0 unless decoupled
     # Coupled RoPE (pos_kind == 1, M12 increment 4) ships on dense MHA/GQA with an
@@ -237,7 +238,13 @@ fn ckpt_load_buf(buf, len): i64 {
         if (nkv != nh) { return 0 - 40; }
         if ((d_c < 1) || (d_c > C)) { return 0 - 42; }
     } else {
-        if (d_c != 0) { return 0 - 42; }     # mha must not carry a latent dim
+        if (d_c != 0) { return 0 - 42; }     # mha / gated-linear must not carry a latent dim
+    }
+    # gated linear attention (attn_kind == 2, M14): full K/V (nkv == nh); the
+    # pos_kind gates above already reject RoPE on it (rope is softmax-only), and
+    # the else-branch above already requires d_c == 0.
+    if (attn_kind == 2) {
+        if (nkv != nh) { return 0 - 40; }
     }
     # M13 MoE descriptor (v5). v1..v4 carry no MoE fields and synthesize the dense
     # MLP (num_experts = 1, top-1), so they cannot hit -44/-45. Validated BEFORE
