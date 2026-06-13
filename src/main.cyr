@@ -88,7 +88,7 @@ fn _atoi(s): i64 {
 }
 
 # Kept in sync with the VERSION file (CI's docs job gates the match).
-fn CFG_VERSION(): i64 { return "1.4.4"; }
+fn CFG_VERSION(): i64 { return "1.4.5"; }
 
 fn usage(): i64 {
     puts("attn11 — a from-scratch GPT-style transformer, trained, in Cyrius\n");
@@ -275,6 +275,14 @@ fn main(): i64 {
     if ((cfg_attn_every > 0) && (load_path == 0)) {
         if (cfg_pos_kind != 0) {
             puts("attn11: --attn-every requires learned-abs positions (no RoPE in a hybrid)\n");
+            return 1;
+        }
+        # Bound cfg_nl to the lkinds[1024] capacity (128 i64 = model_config_ok's NL
+        # cap) BEFORE the loop indexes it — an unvalidated --layers (the NL cap lives
+        # in model_init, which runs LATER) would otherwise overflow the stack buffer
+        # (the M7 --layers OOB lesson; a hostile `--layers N --attn-every K` SIGSEGV).
+        if ((cfg_nl < 1) || (cfg_nl > 128)) {
+            puts("attn11: --layers must be 1..128 (the transformer-block cap)\n");
             return 1;
         }
         var hl = 0;

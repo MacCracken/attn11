@@ -4,7 +4,43 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-## [1.4.4] - 2026-06-13
+## [1.4.5] - 2026-06-13
+
+**Hardening pass (P(-1)) — closes the 1.4.x arc.** A security/correctness audit of
+the 1.4.x surface (the per-layer hybrid dispatch, the rung-d padded uniform-stride
+layout, checkpoint v6, and the `--attn-every` CLI) via an adversarial multi-agent
+review: five independent read-only dimensions, each finding then adversarially
+verified against the committed code and live repro builds. **One** confirmed
+finding (a CLI memory-safety bug), fixed; the other four dimensions came back
+clean. No behavior change to training, the checkpoint format, or any valid run.
+
+### Fixed
+- **CLI stack-buffer overflow (security).** `--attn-every K` filled the fixed
+  128-slot stack buffer `lkinds[1024]` with one entry per layer, but `--layers`
+  (`cfg_nl`) was not bounded before that loop — the NL≤128 cap is enforced inside
+  `model_init`, which runs *after*. So `--layers N --attn-every K` with N>128 (no
+  `--load`) wrote 8·N bytes past the buffer — confirmed **SIGSEGV** at
+  `--layers 100000 --attn-every 2`. Same class as the M7 `--layers` heap-OOB. Fixed
+  with a `cfg_nl` bound (`1..128`, the buffer/`model_config_ok` cap) before the
+  loop; the exploit now rejects cleanly. (`--layers` without `--attn-every` was
+  always safe — `model_config_ok` rejects it before any allocation.)
+
+### Added
+- **`make smoke`** (in the `release` gate): a CLI regression that asserts hostile
+  `--layers`/`--attn-every` combinations reject cleanly (exit < 128, never a
+  signal) and a valid hybrid still builds — the grad-check and fuzz harnesses cover
+  the math and the checkpoint loader but not the CLI arg path, which this closes.
+- **Audit report** `docs/audit/2026-06-13-1.4.x-hardening-audit.md` (5 dimensions,
+  dispositions, the finding + fix + regression, accepted residuals). The checkpoint
+  format spec comment (persist.cyr) updated to document the **v6** per-layer region
+  + v1–v5 back-compat (uniform models still write v5, byte-identical).
+
+### Verified (audit, no change needed)
+- Hostile v6 images are rejected cleanly (`-46`/`-10`/`-11`/`-18`); the per-layer
+  region read is bounded before access; the padded-`np` math cannot overflow under
+  the dim caps; v1–v5 load unchanged; the no-flag run stays byte-identical; the
+  padded-region tail is zero by construction (`t_alloc` zeroes) and untrained; the
+  mixed hybrid backward + cached decode are grad-/bit-checked (X012/X013 suites).
 
 **Any-mixer hybrids (M14 rung d, E4) — completes M14.** Lifts 1.4.3's layout
 restriction so a hybrid can interleave ANY of the four mixers `{mha, mla, lin, ssm}`

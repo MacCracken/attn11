@@ -5,7 +5,23 @@
 
 ## Version
 
-**1.4.4** — *Any-mixer hybrids* (M14 rung d, E4, **completes M14**; ADR 0012).
+**1.4.5** — *Hardening pass* (P(-1), **closes the 1.4.x arc**). A security/correctness
+audit of the 1.4.x surface (the per-layer hybrid dispatch, the rung-d padded
+uniform-stride layout, checkpoint v6, the `--attn-every` CLI) via an adversarial
+multi-agent review — five read-only dimensions, each finding adversarially verified
+against the committed code + live repro builds. **One** confirmed finding, fixed: a
+**CLI stack-buffer overflow** — `--attn-every K` filled the 128-slot `lkinds[1024]`
+buffer one entry per layer, but `--layers` was unbounded before that loop (the
+NL≤128 cap is in `model_init`, which runs after), so `--layers 100000 --attn-every 2`
+wrote past the buffer (**SIGSEGV**, the M7 `--layers`-OOB class). Fixed with a
+`cfg_nl` 1..128 guard before the loop; now a clean reject. New **`make smoke`** (in
+the release gate) regression-guards hostile `--layers`/`--attn-every` combos (the
+CLI arg path the grad-check/fuzz harnesses don't cover). The other four review
+dimensions came back clean; audit at `docs/audit/2026-06-13-1.4.x-hardening-audit.md`,
+and the checkpoint format comment now documents v6 + v1–v5 back-compat. NO behavior
+change to training, the format, or any valid run. Verified: **907** checks x86_64
+AND aarch64/qemu, agnos, fuzz, lint, smoke.
+(1.4.4 — *Any-mixer hybrids* (M14 rung d, E4, **completes M14**; ADR 0012).
 Lifts 1.4.3's layout restriction so a hybrid interleaves ANY of the four mixers
 `{mha, mla, lin, ssm}` — including full attention ⊕ the selective SSM (the survey's
 strongest pairing, attn11's best single mixer). The trick: each block's K/V region
@@ -22,7 +38,7 @@ Attention-fraction sweep (X013, base ssm): bits/byte within noise (0.218 pure-ss
 0.279 pure-mha), the decode cache a continuous knob from constant `C·N` to ∝T K/V.
 `{mha,gqa,lin}` hybrids stay exact (no pad). A no-flag run is byte-identical.
 Verified: **907** checks x86_64 AND aarch64/qemu, agnos, fuzz, lint.
-(1.4.3 — *Per-layer mixer hybrid* (M14 rung c, E4, **the interleaving lever**;
+1.4.3 — *Per-layer mixer hybrid* (M14 rung c, E4, **the interleaving lever**;
 ADR 0011). `--attn-every K` places a full-attention (MHA) block at every K-th layer
 and a gated-linear block elsewhere — the survey's "a few attention layers among
 many cheap recurrent ones" structural shift. The global `attn_kind` becomes a
@@ -539,6 +555,10 @@ constant `nh·hd²` state instead of a T-growing K/V.
   clobber, (V,Vb,K) triple inconsistency, expansion-bomb rewrite, + the
   **max-vocab triple** `V=768/Vb=256/K=512`) + 100 random corpora + a **BPE
   round-trip** property; loaders reject malformed input without crashing.
+- **`make smoke`** (1.4.5, in the `release` gate) — a CLI-arg regression: hostile
+  `--layers`/`--attn-every` combinations must reject cleanly (exit < 128, never a
+  signal) and a valid hybrid must still build. Closes the CLI arg path the
+  grad-check/fuzz harnesses don't exercise (pins the 1.4.5 stack-overflow fix).
 - The M2 (persistence), M3 (SIMD), M5 (AGNOS port), M6 (KV-cache/GQA),
   **M7 (BPE/preset/v3)**, and **M8 (security sweep)** code each passed an
   adversarial multi-agent review; all confirmed findings fixed and
@@ -586,14 +606,15 @@ the FFN-density axis `--experts N --expert-topk K`, **two non-softmax mixers**
 (gated linear attention + the selective SSM), and the **per-layer hybrid**
 `--attn-every K` (any mix of the four). **M12, M13, and M14 are all complete.**
 
-**Next — 1.4.5 hardening pass (P(-1)), then M15+.** With four feature releases
-stacked (1.4.0–1.4.4, incl. checkpoint v6, per-layer dispatch, and the padded
-hybrid layout), 1.4.5 is a consolidation/hardening pass: security/correctness audit
-(input handling, the v6 load path, buffer/bounds), a benchmark baseline refresh, a
-deep review of the 1.4.x complexity, and a doc/ADR audit (file in `docs/audit/`).
-Then E5–E6 (diffusion objective / ternary) as M15–M16 and **M17** reinforcement
-learning (E9). A vidya-scale bake-off across mixers AND hybrid ratios is the
-standing X-entry (X012/X013 ran the ratio sweeps at reference scale).
+**Next — 1.4.6 benchmarking, then M15+.** 1.4.5 (the P(-1) hardening pass) closed
+the 1.4.x feature arc with a security/correctness audit (one finding — the CLI
+stack overflow — fixed; the rest clean; `docs/audit/2026-06-13-1.4.x-hardening-audit.md`).
+**1.4.6** is a dedicated benchmarking release: refresh the full bench across all
+mixers + hybrid ratios, update `bench-history.csv` + `docs/benchmarks.md`, and
+profile the padded hybrid layout. Then E5–E6 (diffusion objective / ternary) as
+M15–M16 and **M17** reinforcement learning (E9). A vidya-scale bake-off across
+mixers AND hybrid ratios is the standing X-entry (X012/X013 ran the ratio sweeps at
+reference scale).
 
 ### Handoff — how to pick this up
 
