@@ -57,7 +57,19 @@ smoke: build
 	./build/attn11 --gen-only --eval-corpus /nonexistent/attn11-smoke >/dev/null 2>&1; rc=$$?; \
 	if [ $$rc -ge 128 ]; then echo "smoke: CRASH (signal $$((rc-128))) on missing --eval-corpus file"; exit 1; fi; \
 	if [ $$rc -eq 0 ]; then echo "smoke: missing --eval-corpus file should set a non-zero exit"; exit 1; fi; \
-	echo "smoke: ok (hostile --layers/--attn-every/--ternary rejected; valid hybrid + ternary build; held-out eval errors cleanly)"
+	printf 'streaming smoke corpus -- the quick brown fox jumps. ' > /tmp/attn11-smoke-seed.txt; \
+	for i in 1 2 3 4 5 6 7 8; do cat /tmp/attn11-smoke-seed.txt; done > /tmp/attn11-smoke-corpus.txt; \
+	./build/attn11 --corpus /tmp/attn11-smoke-corpus.txt --encode-shard /tmp/attn11-smoke.tsh >/dev/null 2>&1; \
+	if [ $$? -ne 0 ]; then echo "smoke: --encode-shard failed on a valid corpus"; exit 1; fi; \
+	./build/attn11 --stream-corpus /tmp/attn11-smoke.tsh --steps 5 >/dev/null 2>&1; \
+	if [ $$? -ne 0 ]; then echo "smoke: a valid --stream-corpus run failed"; exit 1; fi; \
+	for sa in "--stream-corpus /nonexistent/attn11-smoke.tsh" "--stream-corpus /tmp/attn11-smoke-corpus.txt" "--stream-corpus /tmp/attn11-smoke.tsh --corpus /tmp/attn11-smoke-corpus.txt" "--stream-corpus /tmp/attn11-smoke.tsh --bpe 8"; do \
+	  ./build/attn11 $$sa --gen-only >/dev/null 2>&1; rc=$$?; \
+	  if [ $$rc -ge 128 ]; then echo "smoke: CRASH (signal $$((rc-128))) on: $$sa"; exit 1; fi; \
+	  if [ $$rc -eq 0 ]; then echo "smoke: expected rejection but succeeded on: $$sa"; exit 1; fi; \
+	done; \
+	rm -f /tmp/attn11-smoke-seed.txt /tmp/attn11-smoke-corpus.txt /tmp/attn11-smoke.tsh; \
+	echo "smoke: ok (hostile --layers/--attn-every/--ternary rejected; valid hybrid + ternary + stream; bad shard / held-out eval error cleanly)"
 
 clean:
 	rm -rf build/

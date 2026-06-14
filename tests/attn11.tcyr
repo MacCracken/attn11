@@ -16,6 +16,7 @@ include "src/attn_ssm.cyr"
 include "src/model.cyr"
 include "src/train.cyr"
 include "src/persist.cyr"
+include "src/stream.cyr"
 
 fn _eps(): i64 { return f64_div(f64_from(1), f64_from(10000)); }     # 1e-4
 fn dotsum(a, b, n): i64 {
@@ -3164,6 +3165,95 @@ fn test_ternary_matmul(): i64 {
     return 0;
 }
 
+# Streaming token-shard ingestion (1.6.x). Pins the gate: a model trained from a
+# STREAMED shard is BIT-FOR-BIT identical to one trained on the same corpus
+# in-memory (gd_ld is the only token reader, so the chunk cache returning the same
+# ids leaves every sampling/eval path unchanged), and a shard round-trips its token
+# stream byte-exactly at byte + BPE width. Uses real /tmp shard files — the genuine
+# open/lseek/read path, like test_ckpt_file_roundtrip — and forces a tiny chunk cap
+# to exercise multi-chunk reloads + offset seeks across the corpus. RNG-consuming
+# (it trains) and reseeds via model_init, so registered DEAD-LAST (X019/X015).
+fn test_stream_ingest(): i64 {
+    g_stream = 0; g_data_w = 1;
+    var sp = "/tmp/attn11-stream-rt.tsh";
+
+    # (a) byte-identity: in-memory train vs streamed train, same corpus + seed.
+    var V = build_corpus();
+    model_init(V, 8, 4, 2, 2, 1, 0, f64_from(0), 7);
+    train(20, 20, 4, _lrc(3, 1000), _lrc(3, 10000), 5, f64_from(1), 1000000000);
+    var npA = g_NP;
+    var snapA = t_alloc(npA); t_copy(snapA, g_params, npA);
+    # write a shard from the (still-intact) in-memory corpus, then stream from it
+    assert(shard_save_file(sp, V) == 0, "shard_save_file writes ok");
+    var Vs = shard_open(sp);
+    assert(Vs == V, "shard_open returns the same vocab size");
+    assert((g_stream == 1) && (g_data == 0), "shard_open enters streaming (tokens not in RAM)");
+    model_init(Vs, 8, 4, 2, 2, 1, 0, f64_from(0), 7);
+    train(20, 20, 4, _lrc(3, 1000), _lrc(3, 10000), 5, f64_from(1), 1000000000);
+    var mism = 0; var i = 0;
+    while (i < g_NP) { if (load64(g_params + i * 8) != load64(snapA + i * 8)) { mism = mism + 1; } i = i + 1; }
+    assert(g_NP == npA, "streamed param count matches");
+    assert(mism == 0, "streamed training reproduces in-memory params BIT-FOR-BIT");
+    file_close(g_stream_fd); g_stream = 0;
+
+    # (b) round-trip fidelity, byte-level, ACROSS CHUNK BOUNDARIES: capture the
+    # in-memory ids, encode, reopen with a tiny chunk cap, compare every streamed id.
+    g_data_w = 1;
+    var V2 = build_corpus();
+    var n = g_datalen;
+    var ref = t_alloc(n);
+    i = 0; while (i < n) { store64(ref + i * 8, gd_ld(i)); i = i + 1; }
+    assert(shard_save_file(sp, V2) == 0, "shard_save_file (fidelity) writes ok");
+    assert(shard_open(sp) == V2, "shard_open (fidelity) ok");
+    g_stream_cap = 7; g_stream_lo = 0 - 1; g_stream_clen = 0;   # force multi-chunk reloads
+    var bad = 0; i = 0;
+    while (i < n) { if (gd_ld(i) != load64(ref + i * 8)) { bad = bad + 1; } i = i + 1; }
+    assert(bad == 0, "streamed byte ids match in-memory across chunk boundaries");
+    file_close(g_stream_fd); g_stream = 0; g_stream_cap = STREAM_CHUNK();
+
+    # (c) round-trip fidelity, BPE (u16) width.
+    g_data_w = 1;
+    build_corpus();
+    var Vb = bpe_learn(16);
+    var nb = g_datalen;
+    var refb = t_alloc(nb);
+    i = 0; while (i < nb) { store64(refb + i * 8, gd_ld(i)); i = i + 1; }
+    assert(shard_save_file(sp, Vb) == 0, "shard_save_file (bpe) writes ok");
+    assert(shard_open(sp) == Vb, "shard_open (bpe) ok");
+    assert(g_data_w == 2, "bpe shard streams at u16 width");
+    g_stream_cap = 5; g_stream_lo = 0 - 1; g_stream_clen = 0;
+    var badb = 0; i = 0;
+    while (i < nb) { if (gd_ld(i) != load64(refb + i * 8)) { badb = badb + 1; } i = i + 1; }
+    assert(badb == 0, "streamed bpe ids match in-memory across chunk boundaries");
+    file_close(g_stream_fd); g_stream = 0; g_stream_cap = STREAM_CHUNK();
+
+    # (d) hostile metadata: shard_validate_buf rejects cleanly, no crash/alloc.
+    var meta = t_alloc(16);
+    store64(meta + 0 * 8, SHARD_MAGIC()); store64(meta + 1 * 8, 1);
+    store64(meta + 2 * 8, 0); store64(meta + 3 * 8, 3);    # tok_kind byte, Vb 3
+    store64(meta + 4 * 8, 0); store64(meta + 5 * 8, 3);    # K 0, V 3
+    store64(meta + 6 * 8, 1); store64(meta + 7 * 8, 100);  # width 1, ntok 100
+    store64(meta + 8 * 8, 97); store64(meta + 9 * 8, 98); store64(meta + 10 * 8, 99);  # vocab bytes
+    assert(shard_validate_buf(meta, 11 * 8) == 0, "valid shard metadata accepted");
+    store64(meta + 0 * 8, SHARD_MAGIC() + 1);
+    assert(shard_validate_buf(meta, 11 * 8) == (0 - 60), "bad magic rejected (-60)");
+    store64(meta + 0 * 8, SHARD_MAGIC());
+    store64(meta + 1 * 8, 2);
+    assert(shard_validate_buf(meta, 11 * 8) == (0 - 61), "bad version rejected (-61)");
+    store64(meta + 1 * 8, 1);
+    store64(meta + 5 * 8, 4);
+    assert(shard_validate_buf(meta, 11 * 8) == (0 - 65), "V != Vb+K rejected (-65)");
+    store64(meta + 5 * 8, 3);
+    store64(meta + 6 * 8, 2);            # byte-level shard must be width 1
+    assert(shard_validate_buf(meta, 11 * 8) == (0 - 66), "byte-level width!=1 rejected (-66)");
+    store64(meta + 6 * 8, 1);
+    assert(shard_validate_buf(meta, 4 * 8) == (0 - 60), "too-short metadata rejected (-60)");
+
+    _unlink(sp);
+    g_stream = 0; g_data_w = 1;          # restore defaults
+    return 0;
+}
+
 fn main(): i64 {
     alloc_init();
     rng_seed(123);
@@ -3270,6 +3360,11 @@ fn main(): i64 {
     test_model_ternary();
     test_ckpt_ternary();
     test_ternary_matmul();
+    # Streaming token-shard ingestion (1.6.x) — RNG-consuming + model_init-reseeding,
+    # so dead-last keeps every earlier test's shared-stream position byte-for-byte
+    # unchanged (the X019/X015 discipline).
+    test_group("streaming token-shard (1.6.x)");
+    test_stream_ingest();
     return assert_summary();
 }
 

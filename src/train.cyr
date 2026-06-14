@@ -51,6 +51,24 @@ var g_paircnt = 0;      # BPE_VMAX^2 i64: pair counts (bpe_learn only)
 var g_text = 0;         # raw corpus bytes, retained by corpus_set
 var g_textlen = 0;
 
+# ---- streaming token-shard corpus (1.6.x; the RAM-independent large-corpus path)
+# When g_stream != 0 the corpus is NOT held in g_data; gd_ld pulls tokens from a
+# pre-encoded token-shard (src/stream.cyr) on demand through ONE chunk cache
+# (g_stream_buf, g_stream_cap tokens) via lseek + read on g_stream_fd. RAM is then
+# O(model + chunk), independent of corpus size — so a GB-scale shard trains in
+# bounded RAM. The cached tokens are IDENTICAL to what an in-memory g_data would
+# hold, so every sampling/eval path that reads through gd_ld stays byte-for-byte
+# unchanged — no edits to sample_window / eval_corpus / the model, so byte-identity
+# is structural (test_stream_ingest pins it through the real open/lseek/read path).
+var g_stream = 0;          # 1 = corpus is streamed (gd_ld reads from the shard)
+var g_stream_fd = 0 - 1;   # the open shard fd (held for the run)
+var g_stream_doff = 0;     # byte offset of the token data within the file
+var g_stream_buf = 0;      # chunk cache: g_stream_cap tokens at g_data_w bytes
+var g_stream_cap = 0;      # chunk capacity in tokens (= STREAM_CHUNK())
+var g_stream_lo = 0;       # token index of the first cached token
+var g_stream_clen = 0;     # tokens currently cached (0 = empty)
+fn STREAM_CHUNK(): i64 { return 65536; }   # tokens per chunk read (> the 8192 ctx cap)
+
 fn MAX_CORPUS_BYTES(): i64 { return 67108864; }  # 64 MB cap on loaded corpora
                                                  # (1.5.3: u16 g_data = 128 MB < the
                                                  # 256 MB single-alloc cap, margin)
@@ -71,10 +89,50 @@ fn _tw_st(buf, i, w, v): i64 {
     else { store64(buf + i * 8, v); }
     return 0;
 }
+# Fetch token `i` from the streamed shard via the single chunk cache (1.6.x). A
+# miss (re)loads [i, i+cap) — clamped to g_datalen — in ONE read; every window's
+# accesses are then local (a window spans <= ctx+1 tokens << cap), so the amortized
+# cost is ~one read per window. The returned value equals an in-memory
+# _tw_ld(g_data, i, g_data_w) byte-for-byte, which is the whole point. Bounds are
+# the caller's contract (sample_window/eval guard g_datalen); a hostile shard is
+# rejected at open time (file size vs ntokens), so a chunk read never passes EOF.
+fn stream_tok(i): i64 {
+    if ((i < g_stream_lo) || (i >= g_stream_lo + g_stream_clen)) {
+        var lo = i;
+        var want = g_datalen - lo;
+        if (want > g_stream_cap) { want = g_stream_cap; }
+        var nbytes = want * g_data_w;
+        if (file_seek(g_stream_fd, g_stream_doff + lo * g_data_w) < 0) {
+            puts("attn11: stream seek failed -- corrupt/truncated shard\n"); sys_exit(1);
+        }
+        var got = 0;
+        while (got < nbytes) {
+            var n = file_read(g_stream_fd, g_stream_buf + got, nbytes - got);
+            if (n <= 0) { break; }
+            got = got + n;
+        }
+        # open-time validation (ntokens vs the real file size) guarantees a full
+        # read; a short read here means the shard was truncated AFTER open (TOCTOU)
+        # or an I/O error — unrecoverable, so fail loud rather than set clen to the
+        # full window and train on a stale buffer tail (the NaN-guard philosophy:
+        # stop cleanly, never poison the weights).
+        if (got < nbytes) {
+            puts("attn11: stream read short -- corrupt/truncated shard\n"); sys_exit(1);
+        }
+        g_stream_lo = lo; g_stream_clen = want;
+    }
+    return _tw_ld(g_stream_buf, i - g_stream_lo, g_data_w);
+}
+
 # g_data at the active token width. Token-COUNT indexing (i is a token index, not
 # a byte offset) — identical semantics to the old load64(g_data + i*8), so every
 # call site's index math is unchanged and the loss curve stays byte-identical.
-fn gd_ld(i): i64 { return _tw_ld(g_data, i, g_data_w); }
+# When the corpus is streamed (g_stream != 0) the read routes through the chunk
+# cache instead of g_data; the returned id is identical, so callers don't change.
+fn gd_ld(i): i64 {
+    if (g_stream != 0) { return stream_tok(i); }
+    return _tw_ld(g_data, i, g_data_w);
+}
 fn gd_st(i, v): i64 { return _tw_st(g_data, i, g_data_w, v); }
 
 # Byte-level tokenize+encode of an arbitrary `len`-byte buffer. Builds the
@@ -502,7 +560,7 @@ fn eval_corpus(): i64 {
     g_eval_nats = f64_from(0);
     g_eval_tokens = 0;
     g_eval_bytes = 0;
-    if ((g_data == 0) || (g_datalen < g_T + 1)) { return 0 - 1; }
+    if (((g_stream == 0) && (g_data == 0)) || (g_datalen < g_T + 1)) { return 0 - 1; }
     var was_training = g_training;
     g_training = 0;
     moe_disp_reset();                  # MoE: measure routing entropy over this pass
@@ -547,7 +605,7 @@ fn eval_bpb(): i64 {
 # (g_objective must be 1, so model_forward runs masked-CE + bidirectional).
 fn eval_diffusion(pct): i64 {
     g_eval_nats = f64_from(0); g_eval_tokens = 0; g_eval_bytes = 0;
-    if ((g_data == 0) || (g_datalen < g_T)) { return 0 - 1; }
+    if (((g_stream == 0) && (g_data == 0)) || (g_datalen < g_T)) { return 0 - 1; }
     var was = g_training; g_training = 0;
     var T = g_T;
     var k = (T * pct) / 100;                 # masked positions per window
@@ -643,6 +701,10 @@ fn eval_corpus_buf(text, len): i64 {
     if (enc == 0) { return 0 - 4; }
     var ntok = tok_encode(text, len, enc, g_data_w);
     if (ntok < g_T + 1) { return 0 - 1; }
+    # Swap the held-out buffer in for the eval pass. A streamed training corpus
+    # (g_stream != 0) is held out too: disable streaming so gd_ld reads the
+    # in-memory `enc` (the held-out file is already in RAM, <= 64 MB), then restore.
+    var sv_stream = g_stream; g_stream = 0;
     var sv_data = g_data; var sv_len = g_datalen;
     g_data = enc; g_datalen = ntok;
     var rc = 0;
@@ -653,6 +715,7 @@ fn eval_corpus_buf(text, len): i64 {
         rc = eval_corpus();
     }
     g_data = sv_data; g_datalen = sv_len;
+    g_stream = sv_stream;
     return rc;
 }
 

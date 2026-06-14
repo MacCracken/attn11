@@ -13,7 +13,7 @@
 
 ## Where we are
 
-Current: **v1.6.1**. The v1.0 surface is frozen and additive-only
+Current: **v1.6.2**. The v1.0 surface is frozen and additive-only
 ([`STABILITY.md`](../STABILITY.md)); the reusable numeric core lives in
 **[rosnet](https://github.com/MacCracken/rosnet)** + **[tyche](https://github.com/MacCracken/tyche)**
 (v1.1.0). The 1.x architecture arc through M14 has shipped (the attention/KV, FFN-
@@ -140,16 +140,24 @@ already a near-unbiased generalization proxy (validating X016–X019). The data-
 held-out win (train-4MB vs train-24MB, eval a third disjoint set) is the **X021**
 follow-on, landing at M16+ where a model can actually overfit a small corpus.
 
-### Streaming token-shard ingestion — 1.6.x (with M16)
+### Streaming token-shard ingestion — ✅ shipped (v1.6.2)
 
-The RAM-independent large-corpus path: **pre-encode** a corpus to a token file once,
-then **mmap / sample windows by offset** — decoupling corpus size from RAM (GB+),
-the standard large-corpus training pattern. Sequenced into the **1.6.x group with
-M16**, not the 1.5.x arc, because large-corpus ingestion only pays off once the model
-is big enough to keep absorbing data (a model-scale precondition); it pairs with
-`scripts/c4_sample.py` emitting shards + the one-time pre-encoder. **Gate**:
-byte-identical sampling vs the in-memory path on a small corpus; a GB-scale corpus
-trains within bounded RAM; cross-arch.
+The RAM-independent large-corpus path: **pre-encode** a corpus to a token-shard once
+(`--encode-shard`), then **sample windows by offset** (`--stream-corpus`) — decoupling
+corpus size from RAM (GB+). Shipped as **lseek+read by offset** through a single
+64 K-token chunk cache inside `gd_ld` (NOT `mmap` — the lib `mmap` wrapper is x86_64-only
+and the agnos target has no file-backed mmap; lseek+read is portable, so the cross-arch
+gate holds). Because `gd_ld` is the only corpus-token reader, `sample_window`/`eval_corpus`/
+the model are untouched and byte-identity is structural. `scripts/c4_sample.py --emit-shard`
+is the GB-scale byte-level producer (byte-identical to `--encode-shard`). **Gate met**:
+streamed training reproduces the in-memory run BIT-FOR-BIT (byte + BPE, across chunk
+boundaries) on x86_64 **and** aarch64/qemu; RSS is flat ~13 MB as the corpus grows
+(bounded RAM, the GB precondition); the no-flag run is byte-identical; lint + fuzz
+(500 shard rounds) + `make smoke` green. New file `src/stream.cyr`,
+[`../architecture/007-streaming-token-shards.md`](../architecture/007-streaming-token-shards.md).
+**Fast-follows** (additive): resume-from-stream (`--load` + `--stream-corpus`) and BPE
+GB-scale shards (whole-corpus merge stats don't stream — the c4 emitter is byte-level;
+`attn11 --bpe --encode-shard` covers the ≤ 64 MB BPE case).
 
 ### Data-volume held-out win (X021) — 1.6.x (with M16)
 
@@ -225,12 +233,12 @@ SIMD-f64 path**; the collapse ships as the grad-checked + benched reference kern
 into no run — ternary *and* default runs byte-identical to 1.6.0). The remaining ternary
 fast-follows (mla/ssm/lin/MoE/rope/diffusion) and activation quantization are additive.
 
-> **The 1.6.x group also folds in two data items** defined in the data-ingestion
+> **The 1.6.x group also folded in two data items** defined in the data-ingestion
 > section above: **streaming token-shard ingestion** (the RAM-independent large-corpus
-> path that pays off once a scaled ternary/larger model can keep absorbing data) and
-> the **data-volume held-out win (X021)** (train-4MB vs train-24MB scored on a third
+> path) — **✅ shipped in v1.6.2** (`--encode-shard` / `--stream-corpus`; see above) —
+> and the **data-volume held-out win (X021)** (train-4MB vs train-24MB scored on a third
 > disjoint set — the X019/X020 follow-on that needs a model able to overfit the small
-> corpus). Both ride M16's added capacity; sequencing within the group is TBD.
+> corpus), still **open** because it needs a capacity/budget that overfits 4 MB.
 
 ### M17 — Reinforcement learning (v1.7.0) — E9
 
@@ -339,10 +347,11 @@ quality-curating sampler ✓ → 1.5.3 token-packing ✓ → 1.5.4 curation at s
 models see and lifted the corpus ceiling, before any new model-scale work. The
 *precision* departure — **ternary training (M16, E6)** — is **complete** (v1.6.0 the
 grad-checked STE X022 → v1.6.1 the i64-add matmul + bench X023, closing the gate). Its
-**1.6.x group** still folds in two data items: **streaming token-shard** ingestion (the
-RAM-independent large-corpus path) and the **data-volume held-out win (X021)** (the
-X019/X020 follow-on), both of which only pay off once a scaled model can absorb / overfit
-a corpus. **RL (M17, E9)** is next (and last in the milestone chain)
+**1.6.x group** shipped **streaming token-shard ingestion** (the RAM-independent
+large-corpus path, **v1.6.2** — `--encode-shard` / `--stream-corpus`); the one item
+still **open** is the **data-volume held-out win (X021)** (the X019/X020 follow-on),
+which only pays off once a scaled model can overfit a small corpus. **RL (M17, E9)** is
+next (and last in the milestone chain)
 because it is an objective layer over a finished trunk, and the GPU *compute* backend
 (M18, E-infra) is sequenced TBD (it unblocks the B4 GPU benchmark).
 The E-series is informed by the

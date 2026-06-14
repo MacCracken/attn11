@@ -25,6 +25,7 @@ include "src/attn_ssm.cyr"
 include "src/model.cyr"
 include "src/train.cyr"
 include "src/persist.cyr"
+include "src/stream.cyr"
 
 var _fz = 0;
 fn fz_seed(s): i64 { _fz = s; return 0; }
@@ -175,6 +176,45 @@ fn main(): i64 {
     }
     if (drej < 1) { sys_write(2, "FAIL: no v7 image rejected\n", 27); sys_exit(7); }
 
+    # ---- token-shard metadata loader (1.6.x): hostile shards must reject ----
+    # shard_validate_buf is the single authority shard_open routes through; it must
+    # bound every read against the buffer length and reject any malformed header /
+    # tokenizer (wild triple, clobbered merge slot, expansion bomb, flipped bytes)
+    # with a negative -60.. code, never crash or over-read. Built on a BPE shard so
+    # the vocab AND merge-DAG paths are both exercised.
+    var sV = build_corpus();
+    var sKv = bpe_learn(16);
+    var sVb = g_bpe_base; var sK = g_bpe_nmerges;
+    var sneed = (SHARD_HDR() + sVb + 2 * sK) * 8;
+    var sgood = alloc(sneed);
+    store64(sgood + 0 * 8, SHARD_MAGIC()); store64(sgood + 1 * 8, 1);
+    store64(sgood + 2 * 8, 1);                                   # tok_kind BPE
+    store64(sgood + 3 * 8, sVb); store64(sgood + 4 * 8, sK); store64(sgood + 5 * 8, sVb + sK);
+    store64(sgood + 6 * 8, 2); store64(sgood + 7 * 8, 1000);     # width 2, ntok 1000
+    var svi = 0;
+    while (svi < sVb) { store64(sgood + (SHARD_HDR() + svi) * 8, load64(g_vocab + svi * 8)); svi = svi + 1; }
+    svi = 0;
+    while (svi < 2 * sK) { store64(sgood + (SHARD_HDR() + sVb + svi) * 8, load64(g_merges + svi * 8)); svi = svi + 1; }
+    if (shard_validate_buf(sgood, sneed) != 0) { sys_write(2, "FAIL: valid shard rejected\n", 27); sys_exit(8); }
+    var swork = alloc(sneed);
+    var srej = 0; var sacc = 0;
+    var sr = 0;
+    while (sr < 500) {
+        t_copy(swork, sgood, sneed / 8);
+        var smode = fz_pos() % 6;
+        var slen = sneed;
+        if (smode == 0) { var so = fz_pos() % sneed; store8(swork + so, (load8(swork + so) ^ (fz_pos() & 0xFF)) & 0xFF); }  # flip byte
+        elif (smode == 1) { slen = 1 + (fz_pos() % sneed); }                                   # truncate
+        elif (smode == 2) { var sf = 2 + (fz_pos() % 6); store64(swork + sf * 8, fz_next()); } # wild header field 2..7
+        elif (smode == 3) { store64(swork + 0 * 8, fz_next()); }                               # clobber magic
+        elif (smode == 4) { store64(swork + (SHARD_HDR() + sVb + (fz_pos() % (2 * sK))) * 8, fz_next()); }  # clobber a merge id
+        else { var k2 = 0; while (k2 < SHARD_HDR()) { store64(swork + k2 * 8, fz_next()); k2 = k2 + 1; } }   # random header
+        var src = shard_validate_buf(swork, slen);
+        if (src < 0) { srej = srej + 1; } else { sacc = sacc + 1; }
+        sr = sr + 1;
+    }
+    if (srej < 1) { sys_write(2, "FAIL: no shard rejected\n", 24); sys_exit(8); }
+
     # ---- corpus tokenizer on random byte buffers (+ BPE round-trip) ----
     var cb = alloc(2048);
     var cr = 0;
@@ -218,6 +258,8 @@ fn main(): i64 {
     fmt_int(brejected); puts(" rejected / "); fmt_int(baccepted);
     puts(" accepted; "); fmt_int(dr); puts(" v7 rounds, ");
     fmt_int(drej); puts(" rejected / "); fmt_int(dacc);
+    puts(" accepted; "); fmt_int(sr); puts(" shard rounds, ");
+    fmt_int(srej); puts(" rejected / "); fmt_int(sacc);
     puts(" accepted; 100 random corpora + bpe roundtrip)\n");
     return 0;
 }

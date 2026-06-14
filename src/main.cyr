@@ -35,6 +35,10 @@
 #                                   through the loaded tokenizer and score
 #                                   bits/byte on it (the generalization metric;
 #                                   no vocab-order check; combines with --eval)
+#   attn11 --encode-shard PATH      pre-encode the corpus to a token-shard file
+#                                   (header + tokenizer + packed ids), then exit
+#   attn11 --stream-corpus PATH     train/eval from a token-shard WITHOUT loading
+#                                   it into RAM (windows by offset; GB-scale path)
 #   attn11 --ternary                BitNet-style ternary weights {-1,0,+1} with a
 #                                   straight-through estimator (mha + dense + AR;
 #                                   master weights stay f64, fake-quant matmul)
@@ -58,6 +62,7 @@ include "src/attn_ssm.cyr"
 include "src/model.cyr"
 include "src/train.cyr"
 include "src/persist.cyr"
+include "src/stream.cyr"
 
 # ---- hyperparameters -------------------------------------------------------
 fn CFG_C(): i64 { return 32; }       # d_model
@@ -95,7 +100,7 @@ fn _atoi(s): i64 {
 }
 
 # Kept in sync with the VERSION file (CI's docs job gates the match).
-fn CFG_VERSION(): i64 { return "1.6.1"; }
+fn CFG_VERSION(): i64 { return "1.6.2"; }
 
 fn usage(): i64 {
     puts("attn11 — a from-scratch GPT-style transformer, trained, in Cyrius\n");
@@ -120,6 +125,8 @@ fn usage(): i64 {
     puts("  --bpe K         learn K BPE merges first (1..512; byte-level is the default)\n");
     puts("  --eval          print CE/token + bits-per-byte after training/save\n");
     puts("  --eval-corpus P held-out eval on a disjoint corpus via the loaded tokenizer\n");
+    puts("  --encode-shard P pre-encode the corpus to a token-shard file, then exit\n");
+    puts("  --stream-corpus P train/eval from a token-shard without loading it into RAM\n");
     puts("  --objective O   training objective: ar (default) or diffusion (masked, bidirectional)\n");
     puts("  --ternary       BitNet-style ternary weights {-1,0,+1} (mha + dense + ar; STE backward)\n");
     puts("  --decode-steps N   diffusion decode iterations (default = ctx)\n");
@@ -157,6 +164,7 @@ fn main(): i64 {
     var cfg_hybrid = 0;                              # set post-parse if the per-layer kinds are mixed
     var lkinds[1024];                                # per-layer mixer kinds (128 i64 = max --layers)
     var use_bpe = 0; var bpe_k = 0; var do_eval = 0; var eval_corpus_path = 0;
+    var encode_shard_path = 0; var stream_corpus_path = 0;   # 1.6.x token-shard streaming
     var cfg_objective = 0;                           # M15: 0 = AR (default), 1 = masked diffusion
     var cfg_decode_steps = 0;                        # diffusion decode iterations (0 = default, resolved post-parse)
     var cfg_decode_sched = 0;                        # diffusion decode schedule: 0 = cosine (default), 1 = linear
@@ -199,6 +207,8 @@ fn main(): i64 {
         elif (streq(a, "--bpe") == 1) { use_bpe = 1; i = i + 1; bpe_k = _atoi(_av(i, a)); }
         elif (streq(a, "--eval") == 1) { do_eval = 1; }
         elif (streq(a, "--eval-corpus") == 1) { i = i + 1; eval_corpus_path = _av(i, a); }
+        elif (streq(a, "--encode-shard") == 1) { i = i + 1; encode_shard_path = _av(i, a); }
+        elif (streq(a, "--stream-corpus") == 1) { i = i + 1; stream_corpus_path = _av(i, a); }
         elif (streq(a, "--objective") == 1) {
             i = i + 1; var ob = _av(i, a);
             if (streq(ob, "ar") == 1) { cfg_objective = 0; }
@@ -381,6 +391,30 @@ fn main(): i64 {
         puts("attn11: --bpe needs a merge count in 1..512\n");
         return 1;
     }
+    # Streaming token-shard ingestion (1.6.x). --stream-corpus is a self-contained
+    # corpus + tokenizer (a pre-encoded shard), so it is mutually exclusive with
+    # the other corpus sources and with --load / --bpe (the shard carries its own
+    # tokenizer). Resume-from-stream (--load + --stream-corpus) is a fast-follow.
+    if (stream_corpus_path != 0) {
+        if ((corpus_path != 0) || (use_stdin == 1)) {
+            puts("attn11: --stream-corpus conflicts with --corpus/--stdin\n"); return 1;
+        }
+        if (load_path != 0) {
+            puts("attn11: --stream-corpus + --load unsupported (resume-from-stream is a fast-follow)\n");
+            return 1;
+        }
+        if (use_bpe == 1) {
+            puts("attn11: --bpe conflicts with --stream-corpus (the shard carries its tokenizer)\n"); return 1;
+        }
+        if (encode_shard_path != 0) {
+            puts("attn11: --stream-corpus and --encode-shard are mutually exclusive\n"); return 1;
+        }
+    }
+    # --encode-shard writes a token-shard from an in-memory corpus, then exits (a
+    # one-shot pre-encode). It needs a corpus source and no checkpoint.
+    if ((encode_shard_path != 0) && (load_path != 0)) {
+        puts("attn11: --encode-shard cannot be combined with --load\n"); return 1;
+    }
 
     # ---- corpus ----
     # Token-store width (1.5.3): g_data packs one byte/token for byte-level
@@ -392,10 +426,17 @@ fn main(): i64 {
     if (use_bpe == 1) { g_data_w = 2; }
     if (load_path != 0) { g_data_w = 2; }
     var V = 0;
-    if (use_stdin == 1) { V = corpus_load_stdin(); }
-    elif (corpus_path != 0) { V = corpus_load_file(corpus_path); }
-    elif (load_path == 0) { V = build_corpus(); }    # default embedded corpus
-    if (V < 0) { puts("attn11: corpus load failed (code "); fmt_int(V); puts(")\n"); return 1; }
+    if (stream_corpus_path != 0) {
+        # streaming (1.6.x): the shard sets g_data_w / g_datalen / the tokenizer and
+        # leaves the tokens on disk (gd_ld streams them); RAM stays O(model + chunk).
+        V = shard_open(stream_corpus_path);
+        if (V < 0) { puts("attn11: stream-corpus open failed (code "); fmt_int(V); puts(")\n"); return 1; }
+    } else {
+        if (use_stdin == 1) { V = corpus_load_stdin(); }
+        elif (corpus_path != 0) { V = corpus_load_file(corpus_path); }
+        elif (load_path == 0) { V = build_corpus(); }    # default embedded corpus
+        if (V < 0) { puts("attn11: corpus load failed (code "); fmt_int(V); puts(")\n"); return 1; }
+    }
 
     # ---- BPE (opt-in; a loaded checkpoint's tokenizer always wins) ----
     # Runs AFTER the corpus is loaded and BEFORE model_init: the model's
@@ -407,6 +448,19 @@ fn main(): i64 {
             V = bpe_learn(bpe_k);
             if (V < 0) { puts("attn11: bpe merge training failed (code "); fmt_int(V); puts(")\n"); return 1; }
         }
+    }
+
+    # ---- encode-shard (1.6.x): pre-encode the corpus, then exit ----
+    # A one-shot tool mode: the corpus (+ optional --bpe) is loaded and tokenized
+    # above; write it as a token-shard (header + tokenizer + packed ids) and stop
+    # before any model is built. The shard then feeds --stream-corpus in bounded RAM.
+    if (encode_shard_path != 0) {
+        var er = shard_save_file(encode_shard_path, V);
+        if (er < 0) { puts("attn11: encode-shard failed (code "); fmt_int(er); puts(")\n"); return 1; }
+        puts("attn11: wrote token-shard "); puts(encode_shard_path);
+        puts(" (tokens "); fmt_int(g_datalen);
+        puts(", vocab "); fmt_int(V); puts(")\n");
+        return 0;
     }
 
     # ---- model: fresh or resumed ----
@@ -475,7 +529,7 @@ fn main(): i64 {
 
     # ---- train ----
     if (gen_only == 0) {
-        if ((g_data == 0) || (g_datalen < g_T + 1)) {
+        if (((g_stream == 0) && (g_data == 0)) || (g_datalen < g_T + 1)) {
             puts("attn11: no/short corpus (need >= ctx+1 bytes); skipping training\n");
         } else {
             puts("training:\n");
@@ -500,7 +554,8 @@ fn main(): i64 {
         # denoiser. Report the masked-CE denoising bits/byte at a mask-ratio grid +
         # the ELBO bound — an UPPER bound on NLL, NOT comparable head-to-head with
         # AR's exact bits/byte (X015 / ADR 0013).
-        if ((g_data == 0) || (g_datalen < g_T)) { puts("attn11: no/short corpus; skipping eval\n"); }
+        var noc = ((g_stream == 0) && (g_data == 0)) || (g_datalen < g_T);
+        if (noc == 1) { puts("attn11: no/short corpus; skipping eval\n"); }
         else {
             puts("eval (diffusion denoising; ELBO upper bound, not AR's exact NLL):\n");
             eval_diffusion_grid();

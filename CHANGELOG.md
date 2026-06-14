@@ -4,6 +4,67 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.6.2] - 2026-06-14
+
+**Streaming token-shard ingestion (1.6.x group; the RAM-independent large-corpus
+path).** Two new flags decouple corpus size from RAM. **`--encode-shard PATH`**
+pre-encodes the loaded corpus (byte-level or `--bpe`) to a self-describing
+**token-shard** — a small header + the tokenizer (byte vocab + BPE merges, exactly
+as a checkpoint carries it) + the packed token ids — then exits.
+**`--stream-corpus PATH`** trains / evals *from* a shard **without loading the
+tokens into RAM**: `gd_ld` pulls corpus windows by offset through a single 64 K-token
+chunk cache (file `lseek`+`read`, or a memory blob in the test), so RAM is
+O(model + chunk) regardless of corpus size — a GB shard trains in ~13 MB. The key
+design property: `gd_ld` is the *only* corpus-token reader, so streaming is a
+read-through cache inside it and **`sample_window` / `eval_corpus` / the model are
+untouched** — byte-identity is structural, not re-verified per call site. Verified
+bit-for-bit: a streamed run reproduces the in-memory run's params at byte + BPE
+width, across chunk boundaries, on x86_64 **and** aarch64/qemu (the real
+`open`/`lseek`/`read` path). `scripts/c4_sample.py --emit-shard` is the GB-scale
+producer: it streams C4 and writes a byte-level shard in bounded RAM, **byte-identical
+to `attn11 --encode-shard`** on the same text (matching adaptive first-appearance
+vocab). Hostile shards are rejected before the tokenizer is installed (a distinct
+`-60..` code range, mirroring the checkpoint loader's tokenizer/merge-DAG checks)
+and validated against the real file size, so a window seek can never pass EOF; the
+fuzz harness adds 500 shard-metadata rounds. The **default run stays byte-identical**
+to 1.6.1 (default / preset / BPE / ternary / diffusion / ssm-hybrid all verified).
+Streaming is Linux-only (`lseek`); the agnos target rejects `--stream-corpus` (-73).
+Resume-from-stream (`--load` + `--stream-corpus`) and BPE GB-scale shards are
+documented fast-follows. **1014 → 1032** checks green x86_64 + aarch64/qemu; lint +
+fuzz + `make smoke` (new encode/stream + bad-shard cases) green. See
+[`docs/architecture/007-streaming-token-shards.md`](docs/architecture/007-streaming-token-shards.md).
+
+### Added
+- **`--encode-shard PATH`** (`src/main.cyr`, `src/stream.cyr`): write the in-memory
+  corpus (byte or BPE) to a token-shard, then exit — a one-shot pre-encode.
+- **`--stream-corpus PATH`** (`src/main.cyr`, `src/stream.cyr`, `src/train.cyr`):
+  train / eval from a token-shard with RAM independent of corpus size.
+- **`src/stream.cyr`**: the token-shard format — `SHARD_MAGIC` "ATTNSH01", the
+  serializer (`shard_serialize` / `shard_save_file`), the hostile-input-safe reader
+  (`shard_open`), and the shared metadata validator (`shard_validate_buf` /
+  `shard_validate_tok`, the merge table as a well-founded DAG with bounded expansion).
+- **Streaming chunk cache** (`src/train.cyr`): `g_stream*` state + `stream_tok` (a
+  read-through single-chunk cache) behind a `gd_ld` branch; `STREAM_CHUNK()` = 65536.
+- **`file_seek`** (`src/fileio.cyr`): a raw `lseek`(SEEK_SET) wrapper, arch-dispatched
+  like `_fdatasync` (the stdlib ships none).
+- **`scripts/c4_sample.py --emit-shard PATH`**: emit a byte-level GB-scale shard in
+  bounded RAM (two streaming passes), byte-identical to `attn11 --encode-shard`.
+- **`test_stream_ingest`** (`tests/attn11.tcyr`): pins streamed-vs-in-memory training
+  bit-for-bit (byte + BPE), round-trip fidelity across chunk boundaries (tiny forced
+  cap), and hostile-metadata rejection. **+18 checks** (1014 → 1032), dead-last
+  (RNG-consuming + `model_init`-reseeding, X019/X015 discipline).
+- **Fuzz** (`tests/attn11.fcyr`): 500 shard-metadata rounds (wild triples, clobbered
+  merges, truncation, random headers) — `shard_validate_buf` must reject, never crash.
+- **Smoke** (`Makefile`): a valid `--encode-shard` → `--stream-corpus` round-trip plus
+  missing / non-shard / conflicting-flag cases (reject cleanly, never crash).
+
+### Changed
+- `gd_ld` (`src/train.cyr`) routes through the chunk cache when `g_stream != 0`
+  (never taken on the default path — the no-flag run is byte-identical); the
+  training/eval guards (`eval_corpus`, `eval_diffusion`, `main`) accept a streamed
+  corpus; `eval_corpus_buf` disables streaming for the held-out pass so it reads the
+  in-memory held-out buffer, then restores.
+
 ## [1.6.1] - 2026-06-14
 
 **M16 — the i64-add ternary matmul + bench, increment 2 (E6); closes the M16 gate.**

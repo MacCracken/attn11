@@ -109,6 +109,21 @@ fn _fdatasync(fd): i64 {
     return syscall(n, fd);
 }
 
+# Seek an open fd to an ABSOLUTE byte offset (whence = SEEK_SET). Used by the
+# streaming token-shard reader (src/stream.cyr) to fetch corpus windows by offset
+# without loading the whole corpus into RAM. The stdlib ships no sys_lseek wrapper
+# (the SysNr enum exists but no peer function), so we issue the raw syscall,
+# arch-dispatched exactly like _fdatasync above. Linux-only: the frozen agnos ABI
+# has no lseek, and shard_open rejects the agnos target before any seek (streaming
+# is a Linux feature). Returns the new offset (>= 0) or a negative errno.
+fn file_seek(fd, off): i64 {
+    var n = 8;                   # SYS_LSEEK (x86_64)
+    #ifdef CYRIUS_ARCH_AARCH64
+    n = 62;                      # SYS_LSEEK (aarch64)
+    #endif
+    return syscall(n, fd, off, 0);   # whence = SEEK_SET (0)
+}
+
 # Crash-atomic write: write to `path`.tmp (O_NOFOLLOW), fsync, then rename over
 # the target. A failed/interrupted write leaves the prior file intact (the
 # rename is the only mutation of `path`, and it is atomic). Returns bytes

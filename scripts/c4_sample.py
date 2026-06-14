@@ -34,6 +34,7 @@ import sys
 import time
 import gzip
 import json
+import struct
 import argparse
 import hashlib
 import urllib.request
@@ -41,6 +42,51 @@ import urllib.request
 SHARD_FMT = ("https://huggingface.co/datasets/allenai/c4/resolve/main/"
              "en/c4-train.%05d-of-01024.json.gz")
 N_SHARDS_TOTAL = 1024
+
+# attn11 token-shard (1.6.x): the GB-scale, RAM-independent corpus producer for
+# `attn11 --stream-corpus`. A token-shard is a self-describing pre-encoded corpus
+# (header + byte vocab + packed token ids); see src/stream.cyr for the on-disk
+# layout. "ATTNSH01" as a little-endian i64 (the supported targets — x86_64,
+# aarch64 — are both little-endian, matching attn11's native store64).
+SHARD_MAGIC = 0x4154544E53483031
+
+
+def emit_shard(text_path, shard_path):
+    """Encode a byte-level corpus TEXT file into an attn11 token-shard, in bounded
+    RAM (two streaming passes — never the whole corpus in memory), so a GB corpus
+    becomes a shard `attn11 --stream-corpus` trains from without loading it. The
+    adaptive byte vocab is built in FIRST-APPEARANCE order, exactly matching
+    src/train.cyr corpus_set, so the result is byte-identical to
+    `attn11 --corpus <text> --encode-shard <shard>` on the same file (a free
+    cross-check). BPE shards are produced by attn11 itself — whole-corpus merge
+    statistics do not stream — so this is the byte-level path. Returns (Vb, ntok)."""
+    char2id = [-1] * 256          # byte value -> id (first-appearance order)
+    vocab = []                    # id -> byte value
+    ntok = 0
+    with open(text_path, "rb") as f:
+        while True:
+            chunk = f.read(1 << 20)
+            if not chunk:
+                break
+            ntok += len(chunk)
+            for b in chunk:
+                if char2id[b] < 0:
+                    char2id[b] = len(vocab)
+                    vocab.append(b)
+    Vb = len(vocab)
+    if Vb < 1:
+        raise SystemExit("c4_sample: --emit-shard on an empty corpus")
+    with open(shard_path, "wb") as out:
+        # header: magic, version=1, tok_kind=0 (byte), Vb, K=0, V=Vb, width=1, ntok
+        out.write(struct.pack("<8q", SHARD_MAGIC, 1, 0, Vb, 0, Vb, 1, ntok))
+        out.write(struct.pack("<%dq" % Vb, *vocab))     # vocab table (id -> byte)
+        with open(text_path, "rb") as f:                # packed u8 token stream
+            while True:
+                chunk = f.read(1 << 20)
+                if not chunk:
+                    break
+                out.write(bytes(char2id[b] for b in chunk))
+    return Vb, ntok
 
 
 def shard_urls(n):
@@ -140,6 +186,9 @@ def main():
     ap.add_argument("--curate", action="store_true", help="de-dup + prose-quality filters (1.5.2)")
     ap.add_argument("--shards", type=int, default=1, help="number of C4 shards to sample across (diversity)")
     ap.add_argument("--url", default=None, help="single shard URL, or '-' for stdin (overrides --shards)")
+    ap.add_argument("--emit-shard", default=None,
+                    help="after writing the text corpus, also pre-encode it to an attn11 "
+                         "token-shard at this path (byte-level; for --stream-corpus)")
     args = ap.parse_args()
 
     urls = [args.url] if args.url is not None else shard_urls(args.shards)
@@ -228,6 +277,13 @@ def main():
         "c4_sample: wrote %d bytes -> %s (%s; shards=%d failed=%d scanned=%d kept=%d dup=%d lowq=%d oversized=%d)\n"
         % (written, args.out, "curated" if args.curate else "raw",
            nshards, failed, scanned, kept, dup, lowq, ov[0]))
+    if args.emit_shard is not None:
+        if written < 1:
+            sys.stderr.write("c4_sample: nothing written; skipping --emit-shard\n")
+        else:
+            vb, ntok = emit_shard(args.out, args.emit_shard)
+            sys.stderr.write("c4_sample: emitted token-shard -> %s (vocab=%d tokens=%d)\n"
+                             % (args.emit_shard, vb, ntok))
 
 
 if __name__ == "__main__":

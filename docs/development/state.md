@@ -5,7 +5,35 @@
 
 ## Version
 
-**1.6.1** — *i64-add ternary matmul + bench, M16 increment 2* (E6; ADR 0014, X023;
+**1.6.2** — *Streaming token-shard ingestion* (1.6.x group; the RAM-independent
+large-corpus path). Two new flags decouple corpus size from RAM. **`--encode-shard
+PATH`** pre-encodes the loaded corpus (byte or `--bpe`) to a self-describing
+**token-shard** — header + tokenizer (byte vocab + BPE merges, as a checkpoint
+carries) + packed token ids (`width` bytes/token, the on-disk `g_data`) — then exits.
+**`--stream-corpus PATH`** trains/evals *from* a shard **without loading the tokens
+into RAM**: `gd_ld` pulls windows by offset through one 64 K-token chunk cache
+(`stream_tok`; file `lseek`+`read`, or a memory blob in the test), so RAM is
+O(model + chunk) regardless of corpus size — empirically **flat ~13 MB** as the corpus
+grows 1.9 → 8.1 MB (in-memory grows with it; at GB scale in-memory is impossible vs the
+256 MB alloc cap). The design property: `gd_ld` is the *only* corpus-token reader, so
+streaming is a read-through cache inside it and **`sample_window`/`eval_corpus`/the
+model are untouched** — byte-identity is structural. Verified bit-for-bit: a streamed
+run reproduces the in-memory run's params at byte + BPE width, across chunk boundaries
+(449 K-token shard, 7× one chunk), on x86_64 **and** aarch64/qemu (the real
+`open`/`lseek`/`read` path). `scripts/c4_sample.py --emit-shard` is the GB-scale
+producer (streams C4, byte-level shard in bounded RAM, **byte-identical to `attn11
+--encode-shard`** on the same text). Hostile shards rejected before the tokenizer is
+installed (distinct `-60..-73` codes; the merge table validated as a well-founded DAG
+with bounded expansion, mirroring the checkpoint loader) and validated against the real
+file size, so a window seek never passes EOF; fuzz adds 500 shard rounds (487 rejected).
+The **default run stays byte-identical** to 1.6.1 (default/preset/BPE/ternary/diffusion/
+ssm-hybrid all verified). Streaming is Linux-only (`lseek`); agnos rejects `--stream-corpus`
+(-73). Resume-from-stream + BPE GB shards are documented fast-follows. **1014 → 1032**
+checks green x86_64 + aarch64/qemu; lint + fuzz + `make smoke` (new encode/stream + bad-shard
+cases) green; `make release` exit 0. New file `src/stream.cyr`; invariants in
+[`../architecture/007-streaming-token-shards.md`](../architecture/007-streaming-token-shards.md).
+
+(**1.6.1** — *i64-add ternary matmul + bench, M16 increment 2* (E6; ADR 0014, X023;
 **closes the M16 gate**). The BitNet realization of `--ternary`: `x·W_eff = γ·(x·t)`,
 `t ∈ {−1, 0, +1}`, collapses the contracted-dim multiply to **add / subtract / skip** with
 one γ-scale per output (M·N multiplies vs the dense M·K·N). Two attn11-local reference
@@ -25,7 +53,7 @@ the scoped-out heavier follow-on) and/or non-FMA hardware; the orthogonal **memo
 (1.58 bits/weight) is real and unmeasured by this kernel. So the **default ternary forward
 keeps the SIMD-f64 path**; the collapse ships as the grad-checked + benched reference
 kernel, wired into no run — **ternary *and* default runs stay byte-identical to 1.6.0**
-(default, preset, BPE verified). lint + fuzz + `make smoke` green; `make release` exit 0.
+(default, preset, BPE verified). lint + fuzz + `make smoke` green; `make release` exit 0.)
 
 (1.6.0 — *Ternary (BitNet-style) training, M16 increment 1* (E6; ADR 0014, X022). A
 new **`--ternary`** flag trains with weights quantized to **{−1, 0, +1}**: each quantized
@@ -588,15 +616,28 @@ checkpoint vs Linux at fixed CPU — `scripts/agnos-smoke.sh`):
   the integer-add win needs activation quant / non-FMA hardware). The default ternary
   forward keeps the SIMD-f64 path — the collapse is wired into no run, so ternary *and*
   default runs stay byte-identical to 1.6.0.
+- **Streaming token-shard ingestion** (1.6.2, `--encode-shard` / `--stream-corpus`,
+  1.6.x group): the RAM-independent large-corpus path. `--encode-shard PATH` pre-encodes
+  the loaded corpus to a self-describing **token-shard** (header + tokenizer + packed ids,
+  `src/stream.cyr`); `--stream-corpus PATH` trains/evals from one with RAM independent of
+  corpus size — `gd_ld` reads windows by offset through one 64 K-token chunk cache
+  (`stream_tok`), so `sample_window`/`eval_corpus`/the model are unchanged and a streamed
+  run is **byte-identical** to in-memory (byte + BPE, across chunk boundaries, x86_64 +
+  aarch64/qemu). `scripts/c4_sample.py --emit-shard` is the GB-scale byte-level producer
+  (byte-identical to `--encode-shard`). Hostile shards rejected before install (`-60..-73`;
+  merge-DAG + file-size validated). Linux-only; mutually exclusive with `--corpus`/`--stdin`/
+  `--bpe`/`--load` (resume-from-stream is a fast-follow). `test_stream_ingest`, +18 checks;
+  no-flag run byte-identical. [`../architecture/007-streaming-token-shards.md`](../architecture/007-streaming-token-shards.md)
 - CLI: `--corpus --stdin --load --save --steps --gen-only --preset --heads
   --kv-heads --layers --attn-kind --latent-dim --attn-every --pos-kind --rope-dim
-  --experts --expert-topk --bpe --eval --eval-corpus --objective --decode-steps
-  --decode-schedule --ternary`
+  --experts --expert-topk --bpe --eval --eval-corpus --encode-shard --stream-corpus
+  --objective --decode-steps --decode-schedule --ternary`
   (`--attn-kind` takes `mha`/`mla`/`lin`/`ssm`; `--latent-dim` is the MLA latent /
   SSM state size; `--attn-every K` builds the per-layer hybrid over the `--attn-kind`
   base; `--objective diffusion` opts into masked diffusion, with `--decode-steps` /
   `--decode-schedule {cosine,linear}` for its parallel decode; `--ternary` is M16
-  BitNet-style ternary weights on mha + dense + AR)
+  BitNet-style ternary weights on mha + dense + AR; `--encode-shard` writes a token-shard
+  + exits, `--stream-corpus` trains from one in bounded RAM)
 
 Default run (`./build/attn11`, 3 layers): loss `~3.2 → ~0.13` over 2000 steps;
 sampled output reproduces real corpus phrases.

@@ -185,3 +185,29 @@ cross-corpus eval** (train on A, eval on a disjoint B); that needs a small addit
 `--eval-corpus` flag (a deferred 1.5.x follow-on — 1.5.4 is binary-unchanged). The
 crossover where more clean data clearly wins lives there + at **M16+** capacity. Full
 write-up: [X019](../development/experiments.md).
+
+## Streaming a large corpus without loading it (1.6.2)
+
+The in-memory `--corpus` path caps the corpus at 64 MB (the packed store vs the 256 MB
+single-allocation cap). For a bigger corpus, **pre-encode it to a token-shard once** and
+**stream** it — RAM then stays O(model + one 64 K-token chunk), independent of corpus
+size (a GB shard trains in ~13 MB). Two ways to make a shard:
+
+```sh
+# (a) from a curated text corpus already on disk (byte-level; ≤ 64 MB), via attn11:
+./build/attn11 --corpus data/c4-curated-24mb.txt --encode-shard data/c4-24mb.tsh
+# (b) GB-scale, straight from C4 in bounded RAM (byte-level), via the sampler:
+python3 scripts/c4_sample.py --curate --shards 64 --max-bytes 1000000000 \
+        --out data/c4-1gb.txt --emit-shard data/c4-1gb.tsh
+# then train/eval from the shard — the tokens never load into RAM:
+./build/attn11 --stream-corpus data/c4-24mb.tsh --preset --steps 2000 --eval
+```
+
+The shard is **self-describing** (it carries its own tokenizer), so `--stream-corpus`
+needs no other flags; it is mutually exclusive with `--corpus`/`--stdin`/`--bpe`/`--load`.
+A streamed run is **byte-identical** to the equivalent in-memory run (verified on x86_64
+and aarch64), and `c4_sample.py --emit-shard` produces a shard byte-identical to
+`attn11 --encode-shard` on the same text. BPE shards: use `attn11 --bpe K --encode-shard`
+(≤ 64 MB; whole-corpus merge statistics don't stream, so the sampler's GB path is
+byte-level). Format + invariants:
+[`../architecture/007-streaming-token-shards.md`](../architecture/007-streaming-token-shards.md).

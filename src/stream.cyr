@@ -1,0 +1,235 @@
+# attn11 — streaming token-shard corpus (1.6.x; the RAM-independent large-corpus
+# path). A token-shard is a self-describing, PRE-ENCODED corpus: a small fixed
+# header, the tokenizer (byte vocab + BPE merges, exactly as a checkpoint carries
+# it), then the packed token ids (g_data_w bytes/token). `--encode-shard OUT`
+# writes one from an in-memory corpus; `--stream-corpus FILE` trains/evals from
+# one WITHOUT loading the tokens into RAM — gd_ld (train.cyr) pulls windows by
+# offset through the chunk cache. Decoupling corpus size from RAM is the whole
+# point: scripts/c4_sample.py emits GB-scale byte-level shards that train in
+# bounded RAM, and the in-memory writer here is the small-corpus / test producer.
+#
+# On-disk layout (all i64 native-endian via store64/load64, like the checkpoint;
+# a shard, like a checkpoint, is consumed on the same arch/endianness it was
+# written on — both are local artifacts, not a network format):
+#   [0] magic   [1] version = 1   [2] tok_kind (0 byte / 1 BPE)
+#   [3] Vb (base vocab 1..256)    [4] K (merges 0..512)   [5] V (= Vb + K)
+#   [6] width (bytes/token: 1 byte-level, 2 BPE)          [7] ntokens
+#   [8 .. 8+Vb)            base vocab (id -> byte 0..255)
+#   [8+Vb .. 8+Vb+2K)      merge pairs (left, right), in learned order
+#   then ntokens * width raw bytes of packed token ids
+#
+# Loading is hostile-input-safe: the (kind,Vb,K,V) triple, the width, ntokens,
+# and the merge table (a well-founded DAG with bounded expansion) are all checked
+# BEFORE the tokenizer is installed, and ntokens is validated against the REAL
+# file size so a lying/truncated header is rejected — a window seek can never read
+# past EOF. The error codes are a distinct -60.. range (checkpoint uses ..-49).
+# Streaming is Linux-only (lseek); shard_open rejects the agnos target (-73).
+
+fn SHARD_MAGIC(): i64 { return 0x4154544E53483031; }   # "ATTNSH01" (shard family)
+fn SHARD_HDR(): i64 { return 8; }                       # fixed i64 header fields
+
+# ---- writer (--encode-shard) -----------------------------------------------
+# Bytes to serialize the current in-memory corpus as a shard.
+fn shard_size(Vb, K): i64 {
+    return (SHARD_HDR() + Vb + 2 * K) * 8 + g_datalen * g_data_w;
+}
+# Serialize header + tokenizer + the packed g_data into buf (caller allocs
+# shard_size). The vocab loop runs to Vb (g_vocab is the 256-entry base table;
+# under BPE V = Vb + K > Vb), mirroring ckpt_serialize. The token data is g_data's
+# raw bytes copied verbatim — exactly the bytes stream_tok will read back.
+fn shard_serialize(buf, V, Vb, K): i64 {
+    store64(buf + 0 * 8, SHARD_MAGIC());
+    store64(buf + 1 * 8, 1);
+    store64(buf + 2 * 8, g_bpe_on);
+    store64(buf + 3 * 8, Vb);
+    store64(buf + 4 * 8, K);
+    store64(buf + 5 * 8, V);
+    store64(buf + 6 * 8, g_data_w);
+    store64(buf + 7 * 8, g_datalen);
+    var i = 0;
+    while (i < Vb) { store64(buf + (SHARD_HDR() + i) * 8, load64(g_vocab + i * 8)); i = i + 1; }
+    i = 0;
+    while (i < 2 * K) { store64(buf + (SHARD_HDR() + Vb + i) * 8, load64(g_merges + i * 8)); i = i + 1; }
+    # packed token data: copy g_data's raw bytes (8-byte strides + a byte tail).
+    var doff = (SHARD_HDR() + Vb + 2 * K) * 8;
+    var nb = g_datalen * g_data_w;
+    var w8 = nb / 8;
+    var k = 0;
+    while (k < w8) { store64(buf + doff + k * 8, load64(g_data + k * 8)); k = k + 1; }
+    var bi = w8 * 8;
+    while (bi < nb) { store8(buf + doff + bi, load8(g_data + bi)); bi = bi + 1; }
+    return doff + nb;
+}
+# Write the in-memory corpus to `path` as a token-shard, crash-atomically (temp +
+# fdatasync + rename, O_NOFOLLOW; same path as ckpt_save_file). V is the vocab the
+# corpus loader returned (g_V is unset before model_init, so it is passed in).
+# Returns 0, or a negative error (alloc -72, write error, short write -20).
+fn shard_save_file(path, V): i64 {
+    var Vb = V; var K = 0;
+    if (g_bpe_on == 1) { Vb = g_bpe_base; K = g_bpe_nmerges; }
+    var sz = shard_size(Vb, K);
+    var buf = alloc(sz);
+    if (buf == 0) { return 0 - 72; }
+    shard_serialize(buf, V, Vb, K);
+    var w = secure_write_atomic(path, buf, sz);
+    if (w < 0) { return w; }
+    if (w != sz) { return 0 - 20; }
+    return 0;
+}
+
+# ---- reader (--stream-corpus) ----------------------------------------------
+# Validate the tokenizer blob in `buf` at i64 field-offset `base`: base vocab
+# codes 0..255, then the merge table as a well-founded DAG (each merge references
+# only already-minted ids; strict-decrease ⇒ no cycles/forward refs/self-ref) with
+# bounded per-token expansion (kills 2^K bombs). Mirrors the audited ckpt_load_buf
+# block (persist.cyr, codes -12/-37/-38); the BPE format is frozen, so this stays
+# in step. Fixed stack scratch — hostile input drives ZERO allocation. 0 or neg.
+fn shard_validate_tok(buf, base, Vb, K): i64 {
+    var i = 0;
+    while (i < Vb) {
+        var code = load64(buf + (base + i) * 8);
+        if ((code < 0) || (code > 255)) { return 0 - 69; }
+        i = i + 1;
+    }
+    if (K > 0) {
+        var lens[6144];                 # 768 i64 = BPE_VMAX, fixed stack scratch
+        var li = 0;
+        while (li < Vb) { store64(&lens + li * 8, 1); li = li + 1; }
+        var j = 0;
+        while (j < K) {
+            var ml = load64(buf + (base + Vb + 2 * j) * 8);
+            var mr = load64(buf + (base + Vb + 2 * j + 1) * 8);
+            if ((ml < 0) || (ml >= Vb + j) || (mr < 0) || (mr >= Vb + j)) { return 0 - 70; }
+            if ((Vb + j) >= 768) { return 0 - 70; }   # pin to lens[] capacity (defense-in-depth)
+            var e = load64(&lens + ml * 8) + load64(&lens + mr * 8);
+            if (e > BPE_MAX_TOKLEN()) { return 0 - 71; }
+            store64(&lens + (Vb + j) * 8, e);
+            j = j + 1;
+        }
+    }
+    return 0;
+}
+# Validate a shard's METADATA region (header + tokenizer blob) held in `buf` of
+# `len` bytes. Bounds every read against len first, so it is safe on arbitrary
+# (fuzz) buffers, and is the single validation authority shared by shard_open and
+# the fuzz harness. Does NOT touch token data (that is file-size-checked in
+# shard_open). Returns 0, or a negative -60.. error.
+fn shard_validate_buf(buf, len): i64 {
+    if (len < SHARD_HDR() * 8) { return 0 - 60; }
+    if (load64(buf + 0 * 8) != SHARD_MAGIC()) { return 0 - 60; }
+    if (load64(buf + 1 * 8) != 1) { return 0 - 61; }
+    var tok_kind = load64(buf + 2 * 8);
+    var Vb = load64(buf + 3 * 8);
+    var K = load64(buf + 4 * 8);
+    var V = load64(buf + 5 * 8);
+    var width = load64(buf + 6 * 8);
+    var ntok = load64(buf + 7 * 8);
+    if ((tok_kind != 0) && (tok_kind != 1)) { return 0 - 62; }
+    if ((Vb < 1) || (Vb > 256)) { return 0 - 63; }
+    # K's range is checked BEFORE the V = Vb + K identity so a wild K never feeds
+    # the merge-table arithmetic (mirrors persist.cyr's -34/-35 ordering).
+    if ((K < 0) || (K > BPE_MAX_MERGES())) { return 0 - 64; }
+    if (V != Vb + K) { return 0 - 65; }
+    # a byte-level shard carries no merges; width must match the tokenizer
+    if ((tok_kind == 0) && (K != 0)) { return 0 - 66; }
+    if ((tok_kind == 0) && (width != 1)) { return 0 - 66; }
+    if ((tok_kind == 1) && (width != 2)) { return 0 - 66; }
+    if (ntok < 1) { return 0 - 67; }
+    var need = (SHARD_HDR() + Vb + 2 * K) * 8;
+    if (len < need) { return 0 - 60; }
+    return shard_validate_tok(buf, SHARD_HDR(), Vb, K);
+}
+
+# Open a token-shard for streaming: validate the header + tokenizer (NO token data
+# is read into RAM), install the tokenizer (g_vocab/g_char2id/g_merges/spans), set
+# the streamed-corpus state (g_stream*, g_datalen, g_data_w), and return V (the
+# vocab size) or a negative error. The fd stays open for the run; gd_ld ->
+# stream_tok reads windows from it. Bounded RAM: only the tokenizer + the one
+# chunk cache (g_stream_buf, reused across opens) are allocated.
+fn shard_open(path): i64 {
+    #ifdef CYRIUS_TARGET_AGNOS
+    return 0 - 73;     # streaming is Linux-only (the frozen agnos ABI has no lseek)
+    #endif
+    var fd = file_open(path, _O_RDONLY() | _O_NOFOLLOW(), 0);
+    if (fd < 0) { return fd; }
+    var fsz = _file_size(fd, path);
+    if (fsz < 0) { file_close(fd); return fsz; }
+    if (fsz < SHARD_HDR() * 8) { file_close(fd); return 0 - 60; }
+    # read the fixed header (8 i64); reject obvious garbage before any allocation
+    var hdr[64];
+    var got = 0;
+    while (got < SHARD_HDR() * 8) {
+        var n = file_read(fd, &hdr + got, SHARD_HDR() * 8 - got);
+        if (n <= 0) { file_close(fd); return 0 - 60; }
+        got = got + n;
+    }
+    if (load64(&hdr + 0 * 8) != SHARD_MAGIC()) { file_close(fd); return 0 - 60; }
+    if (load64(&hdr + 1 * 8) != 1) { file_close(fd); return 0 - 61; }
+    var tok_kind = load64(&hdr + 2 * 8);
+    var Vb = load64(&hdr + 3 * 8);
+    var K = load64(&hdr + 4 * 8);
+    var width = load64(&hdr + 6 * 8);
+    var ntok = load64(&hdr + 7 * 8);
+    # bound Vb/K BEFORE computing the metadata size, so a hostile header can't
+    # drive a huge alloc (bound-before-alloc; the `--layers` heap-OOB lesson)
+    if ((Vb < 1) || (Vb > 256)) { file_close(fd); return 0 - 63; }
+    if ((K < 0) || (K > BPE_MAX_MERGES())) { file_close(fd); return 0 - 64; }
+    var need = (SHARD_HDR() + Vb + 2 * K) * 8;
+    if (fsz < need) { file_close(fd); return 0 - 60; }
+    if ((width != 1) && (width != 2)) { file_close(fd); return 0 - 66; }
+    if (ntok < 1) { file_close(fd); return 0 - 67; }
+    # the claimed token data must actually be present (reject a truncated/lying
+    # header so a later window seek can never read past EOF). doff = need.
+    var avail = fsz - need;
+    if (ntok > avail / width) { file_close(fd); return 0 - 68; }
+    # slurp the metadata region (header + tokenizer blob) and validate it whole
+    var meta = alloc(need);
+    if (meta == 0) { file_close(fd); return 0 - 72; }
+    var hi = 0;
+    while (hi < SHARD_HDR() * 8) { store8(meta + hi, load8(&hdr + hi)); hi = hi + 1; }
+    got = SHARD_HDR() * 8;
+    while (got < need) {
+        var n = file_read(fd, meta + got, need - got);
+        if (n <= 0) { file_close(fd); return 0 - 60; }
+        got = got + n;
+    }
+    var vrc = shard_validate_buf(meta, need);
+    if (vrc < 0) { file_close(fd); return vrc; }
+    var V = load64(meta + 5 * 8);
+    # install the tokenizer (mirrors persist.cyr's ckpt load install)
+    g_vocab = t_alloc(256);
+    g_char2id = t_alloc(256);
+    var i = 0;
+    while (i < 256) { store64(g_char2id + i * 8, 0 - 1); i = i + 1; }
+    i = 0;
+    while (i < Vb) {
+        var code = load64(meta + (SHARD_HDR() + i) * 8);
+        store64(g_vocab + i * 8, code);
+        store64(g_char2id + code * 8, i);
+        i = i + 1;
+    }
+    g_bpe_base = Vb;
+    g_bpe_nmerges = K;
+    g_bpe_on = tok_kind;
+    if (tok_kind == 1) {
+        bpe_alloc_once();
+        var mi = 0;
+        while (mi < 2 * K) { store64(g_merges + mi * 8, load64(meta + (SHARD_HDR() + Vb + mi) * 8)); mi = mi + 1; }
+        bpe_build_spans();
+    }
+    g_corpus_vlen = Vb;
+    g_data_w = width;
+    g_datalen = ntok;
+    g_data = 0;                         # tokens are NOT in RAM — streamed
+    g_text = 0; g_textlen = 0;          # no retained raw bytes (no in-mem re-encode)
+    # streaming state + the one (reused) chunk cache, sized at the max width (2)
+    g_stream = 1;
+    g_stream_fd = fd;
+    g_stream_doff = need;
+    g_stream_cap = STREAM_CHUNK();
+    if (g_stream_buf == 0) { g_stream_buf = alloc(g_stream_cap * 2); }
+    if (g_stream_buf == 0) { file_close(fd); g_stream = 0; return 0 - 72; }
+    g_stream_lo = 0 - 1;                # force a chunk load on first access
+    g_stream_clen = 0;
+    return V;
+}
