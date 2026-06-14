@@ -13,15 +13,17 @@
 
 ## Where we are
 
-Current: **v1.5.3**. The v1.0 surface is frozen and additive-only
+Current: **v1.5.4**. The v1.0 surface is frozen and additive-only
 ([`STABILITY.md`](../STABILITY.md)); the reusable numeric core lives in
 **[rosnet](https://github.com/MacCracken/rosnet)** + **[tyche](https://github.com/MacCracken/tyche)**
 (v1.1.0). The 1.x architecture arc through M14 has shipped (the attention/KV, FFN-
 density, and sequence-mixer axes), **M15** (the char-diffusion *training objective*,
 v1.5.0) is the first objective departure, and the data-ingestion 1.5.x arc is under
 way — v1.5.1 the C4 tooling (X016), v1.5.2 the quality-curating sampler (X017),
-**v1.5.3 the token-packing unlock (X018 — u8/u16 `g_data`, the 4 MB → 64 MB cap)**.
-**Next up is 1.5.4 (curation at scale), then 1.5.5 (hardening/audit), then M16.** For *what* shipped,
+v1.5.3 the token-packing unlock (X018 — u8/u16 `g_data`, the 4 MB → 64 MB cap),
+**v1.5.4 curation at scale (X019 — a 24 MB/12-shard corpus; the diversity penalty
+halves with capacity)**.
+**Next up is 1.5.5 (hardening/audit, closes the arc), then M16.** For *what* shipped,
 see [`CHANGELOG.md`](../../CHANGELOG.md)
 (release narrative), [`experiments.md`](experiments.md) (the X-series), and
 [`state.md`](state.md) (the
@@ -79,14 +81,21 @@ rebuild). See [`../architecture/006-packed-token-store.md`](../architecture/006-
 767 fit u8/u16), but diversity/volume remains a *scale* lever — this lifts the ceiling
 1.5.4 will fill.
 
-### 1.5.4 — Curation at scale
+### 1.5.4 — Curation at scale — ✅ shipped (X019)
 
-With 1.5.3's higher ceiling, curate a **larger, multi-source** corpus (e.g. 16–32 MB
-across many C4 shards, optionally mixing registers) and run the scaled
-data + capacity experiment — does more *clean* data + a bigger model move English
-fluency? Tooling + data + a logged run; the binary is unchanged. **Gate**: a
-documented scaled AR (and/or diffusion) run vs the 4 MB baseline at matched compute,
-logged as an X-series entry (an honest result, win or not).
+Used 1.5.3's higher ceiling to curate a **24 MB / 12-shard** C4-en corpus (6× the old
+4 MB cap, impossible before the packed store) and ran the scaled data+capacity
+experiment vs the 4 MB curated baseline: two model sizes (default ≈53 K, preset
+≈232 K) × two corpora, BPE 256, matched compute. Tooling + data + a logged run; binary
+unchanged. **Gate met** (an honest result): eval bits/byte default 3.232/3.405 (4/24
+MB), preset 2.666/2.741. Capacity dominates (default→preset −17.5%/−19.5%), and the
+**diversity/volume penalty halves with capacity** (default +5.4% → preset +2.8% going
+4→24 MB) — the first attn11 evidence that more clean data starts paying off as the
+model grows; the 4 MB default cell reproduces X017's 3.232 bit-for-bit (curation +
+1.5.3 packing both transparent). Honest caveat: bits/byte-on-own-corpus understates
+data's *generalization* value — a held-out **`--eval-corpus FILE`** flag (re-encode a
+disjoint corpus through the loaded tokenizer) is the clean way to score it, a small
+additive follow-on deferred to keep 1.5.4 binary-unchanged.
 
 ### 1.5.5 — Hardening / audit / security pass (P(-1))
 
@@ -244,9 +253,9 @@ gets reported, no dropped or cherry-picked rows (the "no silent caps" discipline
 ## Sequencing intent
 
 The remaining order is **value ÷ risk** and re-orderable (the axes are
-orthogonal). The **data-ingestion & curation 1.5.x arc** is mid-flight (1.5.2
-quality-curating sampler ✓ → 1.5.3 token-packing ✓ → **1.5.4 curation at scale** →
-1.5.5 hardening/audit) — cheap, high-ROW infra that improves the data the *existing*
+orthogonal). The **data-ingestion & curation 1.5.x arc** is nearly done (1.5.2
+quality-curating sampler ✓ → 1.5.3 token-packing ✓ → 1.5.4 curation at scale ✓ →
+**1.5.5 hardening/audit**, which closes the arc) — cheap, high-ROW infra that improves the data the *existing*
 models see and lifts the corpus ceiling, before any new model-scale work. Then the
 *precision* departure — **ternary training (M16, E6)** — into whose **1.6.x group**
 the **streaming token-shard** ingestion folds (the RAM-independent large-corpus path,

@@ -811,3 +811,67 @@ step 250); a 65 MB corpus rejects cleanly (code −2, no crash).
    the *same* RAM; decoupling corpus size from RAM entirely waits for a model big
    enough to need it. Regeneration: `./build/attn11 [--bpe K] --steps N --eval`
    (deterministic; compare to a 1.5.2 binary for the byte-identity check).
+
+## X019 — curation at scale: more clean data pays off with capacity (v1.5.4) (2026-06-13)
+
+**Setup**: 1.5.4, the data-ingestion arc's scaled run — the first to use 1.5.3's
+raised corpus ceiling. Two C4-en corpora, both `scripts/c4_sample.py --curate` (the
+prose-quality filter), BPE 256, seed 1337, x86_64:
+- **4 MB / 1-shard** (`--shards 1 --max-bytes 4000000`) — 4,000,061 B, the X017
+  curated-s0 corpus, byte-for-byte reproduced (1812 docs, dup 0, lowq 110).
+- **24 MB / 12-shard** (`--shards 12 --max-bytes 24000000`) — 24,004,524 B
+  (11,143 docs across 12 shards spread over the crawl; dup 4, lowq 712). **6× the old
+  4 MB cap** — impossible before 1.5.3's packed store; loads + trains under the 64 MB
+  cap. The model-facing slice is real multi-source web English, not one block.
+
+Two model sizes at **matched compute** (fixed steps per model class): **default**
+(C=32, ctx 16, 3 layers, ~53 K params, 600 steps) and **preset** (C=64, ctx 64, 4
+layers, ~232 K params, 1500 steps). Metric: `--eval` bits/byte over each model's
+**own** corpus (the caveat below).
+
+**Result** (eval bits/byte, lower = better):
+
+| model | 4 MB curated (1-shard) | 24 MB curated (12-shard) | **capacity Δ (same corpus)** |
+|-------|------------------------|--------------------------|------------------------------|
+| default (≈53 K) | **3.232** | **3.405** | — |
+| preset (≈232 K) | **2.666** | **2.741** | — |
+| **data Δ (4 → 24 MB, same model)** | — | — | |
+
+- capacity (default → preset): **−17.5%** on 4 MB, **−19.5%** on 24 MB.
+- data/diversity (4 MB → 24 MB): **+5.4%** for default, **+2.8%** for preset.
+- the 4 MB default cell **reproduces X017's curated-s0 (3.232) bit-for-bit** —
+  confirming the curation pipeline is deterministic AND that 1.5.3's packed store
+  trains identically to 1.5.2 (the transparency gate, re-verified end-to-end).
+- preset on 4 MB *curated* (2.666) edges X016's 4 MB *raw* (2.695) by −1.1% — the
+  quality filter helps the bigger model too (smaller effect than at default scale).
+
+**Takeaways**:
+1. **Capacity is the dominant, reliable lever.** default → preset cuts bits/byte
+   ~17–20% on BOTH corpora, and the temp-0.8 samples jump from broken fragments to
+   sentence-shaped English with real function words. No surprise, but it anchors the
+   scale: a 4× bigger model beats any data move at this regime.
+2. **The diversity/volume penalty HALVES with capacity** — the headline. On its own
+   corpus a bigger, more diverse corpus reads as *higher* bits/byte (more entropy to
+   fit): the tiny model pays **+5.4%** and its samples get visibly MORE garbled
+   (it can't fit the variety — exactly X017's finding). The preset pays only **+2.8%**
+   and stays fluent with **richer vocabulary** ("…sciences of… margizes… This a
+   safter…" vs the 4 MB preset's flatter "…service and service…"), and its capacity
+   benefit is actually **larger** on the diverse corpus (−19.5% vs −17.5%). So the
+   bigger model extracts MORE from the richer data — the first attn11 evidence that
+   **diversity/volume starts paying off as capacity grows**, validating the roadmap's
+   sequencing of streaming + larger corpora with model scale (M16+).
+3. **The metric understates data's value — stated, not hidden.** bits/byte-on-own-
+   corpus penalizes the higher-entropy 24 MB corpus in ABSOLUTE terms, so it can't
+   show a clean "more data → better generalization" win; the fair test is a **held-out
+   cross-corpus eval** (train on A, eval on a disjoint B). attn11's `--eval` only
+   scores the training corpus, and `--load`+`--corpus` enforces a tokenizer-vocab
+   match, so held-out eval needs a small additive **`--eval-corpus FILE`** flag
+   (re-encode a second file through the loaded tokenizer, no vocab-order check) — a
+   clean 1.5.x follow-on, deferred (1.5.4 is binary-unchanged). With it, the +2.8%
+   own-corpus penalty would very plausibly flip to a generalization win for the preset.
+4. **Honest bottom line**: at attn11's reference + preset scales, **capacity binds**;
+   curation-at-scale + 1.5.3's headroom have the data side ready, and the crossover
+   where more clean data clearly wins lives at M16+ (bigger models) plus the held-out
+   eval. Regeneration:
+   `python3 scripts/c4_sample.py --curate --shards 12 --out data/c4-curated-24mb.txt --max-bytes 24000000`
+   then `./build/attn11 --corpus data/c4-curated-24mb.txt [--preset] --bpe 256 --steps {600|1500} --eval`.

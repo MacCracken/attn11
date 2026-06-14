@@ -4,6 +4,43 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.5.4] - 2026-06-13
+
+**Curation at scale** (data-ingestion & curation 1.5.x arc, step 3; X019). The first
+run to use 1.5.3's raised corpus ceiling: curate a **24 MB multi-shard** C4-en corpus
+(6× the old 4 MB cap) and run the scaled data+capacity experiment vs the 4 MB
+baseline. **Data + experiment only — the binary is unchanged** (CFG_VERSION bump for
+`--version`; **977** checks unchanged).
+
+### Added
+- **X019** — scaled data+capacity experiment. Two curated C4-en corpora (4 MB/1-shard
+  and **24 MB/12-shard**, both `c4_sample.py --curate`, BPE 256) × two model sizes
+  (default ≈53 K, preset ≈232 K), matched compute. Eval bits/byte:
+
+  | model | 4 MB curated | 24 MB curated |
+  |-------|--------------|---------------|
+  | default | 3.232 | 3.405 |
+  | preset  | 2.666 | 2.741 |
+
+  **Finding**: capacity is the dominant lever (default→preset −17.5% on 4 MB, −19.5%
+  on 24 MB), and the diversity/volume penalty **halves with capacity** — the tiny
+  model pays +5.4% bits/byte on the bigger diverse corpus (and its samples get more
+  garbled), the preset only +2.8% (fluent, richer vocabulary). First attn11 evidence
+  that diversity/volume starts paying off as capacity grows — validating the roadmap's
+  sequencing of streaming + larger corpora with model scale (M16+). The 4 MB default
+  cell **reproduces X017's 3.232 bit-for-bit**, re-confirming 1.5.3's transparency.
+  Full analysis + the honest own-corpus-metric caveat in `docs/development/experiments.md`.
+
+### Changed
+- **`docs/examples/c4-english.md`** — added a "Curation at scale (1.5.4)" section with
+  the recipe (`--shards 12 --max-bytes 24000000`) and the X019 grid.
+
+### Noted (follow-on, not in this release)
+- A held-out **`--eval-corpus FILE`** flag (eval on a disjoint corpus through the
+  loaded tokenizer, no vocab-order check) is the clean way to score data's
+  *generalization* benefit — bits/byte-on-own-corpus understates it. A small additive
+  1.5.x follow-on; deferred to keep 1.5.4 binary-unchanged.
+
 ## [1.5.3] - 2026-06-13
 
 **Token-packing unlock** (data-ingestion & curation 1.5.x arc, step 2; X018). The

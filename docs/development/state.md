@@ -5,7 +5,24 @@
 
 ## Version
 
-**1.5.3** — *Token-packing unlock* (X018; the data-ingestion & curation 1.5.x arc,
+**1.5.4** — *Curation at scale* (X019; the data-ingestion & curation 1.5.x arc,
+step 3). The first run on 1.5.3's raised ceiling: curate a **24 MB / 12-shard** C4-en
+corpus (`c4_sample.py --curate --shards 12`, 6× the old 4 MB cap, impossible before
+the packed store) and run the scaled data+capacity experiment vs the 4 MB curated
+baseline — two model sizes (default ≈53 K, preset ≈232 K) × two corpora, BPE 256,
+matched compute. Eval bits/byte: default 3.232 (4 MB) / 3.405 (24 MB); preset 2.666 /
+2.741. **Finding (X019)**: capacity is the dominant lever (default→preset −17.5% on
+4 MB, −19.5% on 24 MB), and the diversity/volume penalty **halves with capacity** —
+the tiny model pays +5.4% bits/byte on the bigger diverse corpus (samples more
+garbled), the preset only +2.8% (fluent, richer vocabulary): the first attn11 evidence
+that diversity/volume starts paying off with scale, validating sequencing larger
+corpora + streaming with M16+. The 4 MB default cell reproduces X017's 3.232
+bit-for-bit (curation + 1.5.3 packing both deterministic/transparent). **Data +
+experiment only — binary unchanged** (CFG_VERSION bump; **977** checks unchanged).
+Honest caveat: bits/byte-on-own-corpus understates data's generalization value; a
+held-out **`--eval-corpus`** flag is the clean follow-on (deferred, additive). Recipe
++ grid in [`../examples/c4-english.md`](../examples/c4-english.md).
+(1.5.3 — *Token-packing unlock* (X018; the data-ingestion & curation 1.5.x arc,
 step 2). The corpus token stream `g_data` was one **i64 per token (8 B)**; 1.5.3
 stores it **packed** — `u8` for byte-level (vocab ≤ 256), `u16` for BPE (vocab ≤ 768)
 — removing the 8×/4× bloat and raising `MAX_CORPUS_BYTES` **4 MB → 64 MB** (the u16
@@ -22,7 +39,7 @@ byte-for-byte). New `test_token_packing` (round-trip at u8/u16 incl. boundary id
 255/256/767, width-invariance, the self-widen) takes **966 → 977** checks. Invariants
 in [`../architecture/006-packed-token-store.md`](../architecture/006-packed-token-store.md).
 A larger corpus (6 MB byte + BPE) loads/trains; a 65 MB corpus rejects cleanly (−2).
-(1.5.2 — *Quality-curating C4 sampler* (X017; the data-ingestion & curation 1.5.x
+1.5.2 — *Quality-curating C4 sampler* (X017; the data-ingestion & curation 1.5.x
 arc, step 1). `scripts/c4_sample.py --curate` adds de-duplication (exact + prefix),
 **multi-shard sampling** (`--shards N`, spread across the crawl), and prose/register
 quality filters — all stdlib + deterministic, with a resilient multi-shard download
@@ -732,9 +749,11 @@ v1.5.1 the C4 data-ingestion tooling (X016). The **1.5.x data arc** (per [`roadm
 **1.5.2** quality-curating sampler **shipped** (X017 — the prose-quality filter cut
 bits/byte 5.9%; multi-shard diversity is a scale lever); **1.5.3** token-packing unlock
 **shipped** (X018 — u8/u16 `g_data` vs i64; removed the 8×/4× bloat, raised
-`MAX_CORPUS_BYTES` 4 MB → 64 MB; default run byte-identical); next is **1.5.4**
-curation at scale → **1.5.5** hardening/audit/security pass (P(-1)) closing the arc.
-Then **M16** ternary
+`MAX_CORPUS_BYTES` 4 MB → 64 MB; default run byte-identical); **1.5.4** curation at
+scale **shipped** (X019 — a 24 MB/12-shard curated corpus, 6× the old cap; the
+diversity/volume penalty halves with capacity, +5.4%→+2.8%, so more clean data starts
+paying off at scale; binary unchanged); next is **1.5.5** hardening/audit/security
+pass (P(-1)) closing the arc. Then **M16** ternary
 (BitNet-style) training (E6), into whose 1.6.x group **streaming token-shard
 ingestion** folds (RAM-independent large corpora — it pays off once a scaled model
 can absorb the data); **M17** RL (E9) last. Open diffusion fast-follows:

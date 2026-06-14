@@ -135,3 +135,53 @@ still collapses to a frequent phrase (`... service and service and ...`); temper
 is the readable view. Fluency keeps coming with more model, more context, and a
 bigger step/data budget — the **token-packing (1.5.3) + curation-at-scale (1.5.4)**
 data arc and the **M16+** capacity work are where that crossover lives.
+
+## Curation at scale (1.5.4, X019)
+
+1.5.3's packed token store raised the corpus cap 4 MB → 64 MB, so we can finally
+curate a corpus bigger than a tiny model has seen and ask: **does more clean data pay
+off, and does a bigger model use it better?** Curate a **24 MB / 12-shard** corpus
+(6× the old cap) and compare both model sizes against the 4 MB curated baseline, all
+BPE 256, matched compute:
+
+```sh
+# the scaled corpus (multi-shard quality-curated; ~7 MB downloaded, ~11 s)
+python3 scripts/c4_sample.py --curate --shards 12 --out data/c4-curated-24mb.txt --max-bytes 24000000
+python3 scripts/c4_sample.py --curate --shards 1  --out data/c4-curated-4mb.txt  --max-bytes 4000000
+# four cells: {default, --preset} x {4 MB, 24 MB}
+./build/attn11 --corpus data/c4-curated-4mb.txt          --bpe 256 --steps 600  --eval
+./build/attn11 --corpus data/c4-curated-24mb.txt         --bpe 256 --steps 600  --eval
+./build/attn11 --corpus data/c4-curated-4mb.txt  --preset --bpe 256 --steps 1500 --eval
+./build/attn11 --corpus data/c4-curated-24mb.txt --preset --bpe 256 --steps 1500 --eval
+```
+
+Eval bits/byte (lower = better):
+
+| model | 4 MB curated | 24 MB curated | data Δ (4→24 MB) |
+|-------|--------------|---------------|------------------|
+| default (≈53 K) | 3.232 | 3.405 | **+5.4%** |
+| **preset (≈232 K)** | 2.666 | 2.741 | **+2.8%** |
+| capacity Δ | −17.5% | **−19.5%** | |
+
+**The diversity/volume penalty halves with capacity.** On its OWN corpus a bigger,
+more diverse corpus reads as *higher* bits/byte (more entropy to fit) — but the tiny
+model pays +5.4% (and its samples get more garbled), while the preset pays only +2.8%
+and stays fluent with **richer vocabulary**, and its capacity gain is actually larger
+on the diverse corpus (−19.5%). So the bigger model extracts more from richer data —
+the first sign that diversity/volume starts paying off with scale. The 4 MB default
+cell reproduces X017's 3.232 exactly (the curation + the 1.5.3 packed store are both
+deterministic/transparent). preset-24mb temp-0.8 sample:
+
+```
+a transformer commoss. Nonal can see fintermence pleous we post your impect of the
+weeken misies of a charchery of the compage. Yous free new to dother like take suppa
+and inally sease the percing. Got weatime anirey, you were you were to juse of need
+```
+
+**Caveat (the honest part):** bits/byte here is measured on each model's *own*
+corpus, which penalizes the higher-entropy 24 MB set in absolute terms — so it can't
+show a clean "more data → better generalization" win. The fair test is a **held-out
+cross-corpus eval** (train on A, eval on a disjoint B); that needs a small additive
+`--eval-corpus` flag (a deferred 1.5.x follow-on — 1.5.4 is binary-unchanged). The
+crossover where more clean data clearly wins lives there + at **M16+** capacity. Full
+write-up: [X019](../development/experiments.md).
