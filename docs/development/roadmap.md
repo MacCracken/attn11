@@ -127,6 +127,27 @@ is big enough to keep absorbing data (a model-scale precondition); it pairs with
 byte-identical sampling vs the in-memory path on a small corpus; a GB-scale corpus
 trains within bounded RAM; cross-arch.
 
+### Held-out cross-corpus eval — `--eval-corpus FILE` — 1.6.x
+
+The clean way to score **data's generalization value**, the open follow-on from X019
+(v1.5.4): today `--eval` only measures bits/byte over the model's OWN training corpus,
+which penalizes a larger/more-diverse corpus's higher intrinsic entropy in ABSOLUTE
+terms — so it understated whether "more clean data" actually helps (X019's stated
+caveat; the +2.8% own-corpus penalty for the preset on 24 MB would very plausibly flip
+to a generalization win on a held-out set). A small additive **`--eval-corpus FILE`**
+flag evaluates a trained model on a **disjoint** corpus: re-encode FILE through the
+**loaded/trained tokenizer** (reusing `tok_encode`, no `corpus_set` vocab re-derive, so
+NO vocab-order match check — the blocker that makes `--load --corpus` reject a held-out
+file today) into the packed `g_data`, then run the existing `eval_corpus` /
+`eval_diffusion` pass. It pairs with `c4_sample.py` emitting a held-out split (e.g. a
+distinct shard range). Sequenced into the **1.6.x group** because its payoff is scoring
+the scaled (ternary / larger-corpus) runs, not the reference-scale ones. **Gate**:
+on a corpus eval'd against itself, `--eval-corpus SAME` reproduces plain `--eval`
+bit-for-bit; a held-out split eval'd through the trained tokenizer is byte-exact and
+RNG-neutral; cross-arch; the no-flag run byte-identical (additive flag, no checkpoint
+format change). Logged as an X-series entry (the held-out AR-vs-data-scale number X019
+deferred).
+
 ## The 1.x architecture arc
 
 Past 1.0 the surface is **additive-only**, so each frontier experiment ships as
@@ -145,8 +166,9 @@ change at a time behind its own grad-check / bit-identity gate.
 > architecture arc, and **M15** the char-diffusion *training objective*
 > (`--objective diffusion`, v1.5.0) — the first objective departure — plus v1.5.1's
 > C4 data-ingestion tooling. Detail lives in [`CHANGELOG.md`](../../CHANGELOG.md),
-> ADRs 0007–0013, and [`experiments.md`](experiments.md) (X005–X016). **The plan
-> ahead is the data-ingestion & curation 1.5.x arc (the section above), then M16.**
+> ADRs 0007–0013, and [`experiments.md`](experiments.md) (X005–X019). **The
+> data-ingestion & curation 1.5.x arc (the section above) is complete; the plan ahead
+> is M16, into whose 1.6.x group the two open data items above fold.**
 
 ### M16 — Ternary (BitNet-style) training (v1.6.0) — E6
 
