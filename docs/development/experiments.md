@@ -875,3 +875,62 @@ layers, ~232 K params, 1500 steps). Metric: `--eval` bits/byte over each model's
    eval. Regeneration:
    `python3 scripts/c4_sample.py --curate --shards 12 --out data/c4-curated-24mb.txt --max-bytes 24000000`
    then `./build/attn11 --corpus data/c4-curated-24mb.txt [--preset] --bpe 256 --steps {600|1500} --eval`.
+
+## X020 — held-out (cross-corpus) eval: the own-corpus metric is already honest (v1.5.6) (2026-06-13)
+
+**Setup**: 1.5.6, the X019 deferred follow-on — the first run to use the new
+**`--eval-corpus PATH`** flag (re-encode a disjoint corpus through the loaded tokenizer,
+score bits/byte on it). Goal: quantify the **own → held-out generalization gap** X019
+flagged as unmeasurable, i.e. *is* own-corpus bits/byte inflated by memorization?
+Two **genuinely disjoint, same-distribution** slices of the X019 24 MB curated corpus
+(verified no shared documents — only a blank line in common):
+- **trainA** — first 4 000 000 B (`head -c`).
+- **heldB** — bytes [12 MB, 16 MB) (`tail -c +12000001 | head -c 4000000`); an 8 MB gap
+  from trainA guarantees disjoint docs, same C4-curated distribution.
+
+Two model sizes at X019's matched compute, BPE 256, seed 1337, x86_64: **default**
+(C=32, ctx 16, 3 layers, 52 768 params, 600 steps) and **preset** (C=64, ctx 64, 4
+layers, 232 320 params, 1500 steps). Metric: bits/byte on trainA (`--eval`, own) vs
+heldB (`--eval-corpus`, held-out).
+
+**Result** (bits/byte, lower = better):
+
+| model | own (trainA) | held-out (heldB) | **gen. gap** |
+|-------|--------------|------------------|--------------|
+| default (≈53 K) | **3.30599** | **3.33000** | +0.024 (**+0.73%**) |
+| preset (≈232 K) | **2.73826** | **2.77305** | +0.035 (**+1.27%**) |
+
+- capacity (default → preset): **−17.2%** own, **−16.7%** held-out — the X019 capacity
+  lever persists unchanged on held-out text (it is not a memorization artifact).
+- preset own-corpus **2.738** ≈ X019's 24 MB-curated preset **2.741** (trainA is a 4 MB
+  slice of that same 24 MB pool) — an independent cross-run consistency check.
+
+**Takeaways**:
+1. **The own → held-out gap is tiny (< 1.3%) at both scales** — the headline, and a
+   mild *surprise*. The hypothesis going in was that a bigger model would *memorize*
+   its 4 MB slice and so show a *larger* own→held gap; instead BOTH gaps are within
+   ~1% and the preset's is only marginally bigger (1.27% vs 0.73%). The reason is
+   compute, not capacity: at 600/1500 steps × batch 16 over ~2 M tokens the models see
+   well under one epoch (X016's "~8% of an epoch in 600 steps"), so there is almost
+   nothing to memorize — own and held-out are both essentially *first-pass* estimates.
+2. **This RETROACTIVELY VALIDATES the X016–X019 own-corpus numbers.** The worry X019
+   logged — "bits/byte-on-own-corpus understates data's value / could be inflated by
+   fitting the training set" — does **not** bite at this scale: own-corpus bits/byte is
+   a trustworthy, near-unbiased generalization proxy here (it tracks held-out to within
+   ~1%). The metric the whole 1.5.x data arc reported was honest all along; X020 is the
+   evidence, not an assumption.
+3. **The X019 "more clean data → held-out win" hypothesis is NOT yet testable — and X020
+   says why.** That claim needs a *different* experiment: train one model on 4 MB and
+   another on 24 MB, then eval BOTH on a third corpus disjoint from both. X020 instead
+   measures the own→held gap for a *single* training set, so it can't show the data-
+   volume win — but it shows the *precondition* for one (a memorization gap to convert)
+   is absent at this scale. The data-volume generalization win, like the capacity
+   crossover, lives at **M16+** where a bigger model can actually overfit a small corpus.
+   That comparison is now unblocked by `--eval-corpus`; logged as the **X021** follow-on.
+4. **Honest bottom line**: the new flag works (byte + BPE, AR + diffusion, RNG-neutral,
+   bit-reproducible across the in-session and `--gen-only --load` paths), and its first
+   result is a *reassuring null*: at attn11's scale own-corpus bits/byte already measures
+   generalization. Regeneration:
+   `head -c 4000000 data/c4-curated-24mb.txt > data/c4-24-trainA.txt`,
+   `tail -c +12000001 data/c4-curated-24mb.txt | head -c 4000000 > data/c4-24-heldB.txt`,
+   then `./build/attn11 --corpus data/c4-24-trainA.txt [--preset] --bpe 256 --steps {600|1500} --eval --eval-corpus data/c4-24-heldB.txt`.

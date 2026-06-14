@@ -31,6 +31,10 @@
 #   attn11 --eval                   after training/save: one deterministic pass
 #                                   over the corpus, prints CE/token and
 #                                   bits-per-byte (tokenizer-comparable)
+#   attn11 --eval-corpus PATH       held-out eval: re-encode a DISJOINT corpus
+#                                   through the loaded tokenizer and score
+#                                   bits/byte on it (the generalization metric;
+#                                   no vocab-order check; combines with --eval)
 #   attn11 --help, -h               show usage and exit
 #   attn11 --version                print the version and exit
 #
@@ -88,7 +92,7 @@ fn _atoi(s): i64 {
 }
 
 # Kept in sync with the VERSION file (CI's docs job gates the match).
-fn CFG_VERSION(): i64 { return "1.5.5"; }
+fn CFG_VERSION(): i64 { return "1.5.6"; }
 
 fn usage(): i64 {
     puts("attn11 — a from-scratch GPT-style transformer, trained, in Cyrius\n");
@@ -112,6 +116,7 @@ fn usage(): i64 {
     puts("  --expert-topk K active experts per token (default 2; 1..N)\n");
     puts("  --bpe K         learn K BPE merges first (1..512; byte-level is the default)\n");
     puts("  --eval          print CE/token + bits-per-byte after training/save\n");
+    puts("  --eval-corpus P held-out eval on a disjoint corpus via the loaded tokenizer\n");
     puts("  --objective O   training objective: ar (default) or diffusion (masked, bidirectional)\n");
     puts("  --decode-steps N   diffusion decode iterations (default = ctx)\n");
     puts("  --decode-schedule S  diffusion unmask schedule: cosine (default) or linear\n");
@@ -147,7 +152,7 @@ fn main(): i64 {
     var cfg_attn_every = 0;                          # M14 rung c: MHA every K-th layer (0 = uniform)
     var cfg_hybrid = 0;                              # set post-parse if the per-layer kinds are mixed
     var lkinds[1024];                                # per-layer mixer kinds (128 i64 = max --layers)
-    var use_bpe = 0; var bpe_k = 0; var do_eval = 0;
+    var use_bpe = 0; var bpe_k = 0; var do_eval = 0; var eval_corpus_path = 0;
     var cfg_objective = 0;                           # M15: 0 = AR (default), 1 = masked diffusion
     var cfg_decode_steps = 0;                        # diffusion decode iterations (0 = default, resolved post-parse)
     var cfg_decode_sched = 0;                        # diffusion decode schedule: 0 = cosine (default), 1 = linear
@@ -188,6 +193,7 @@ fn main(): i64 {
         elif (streq(a, "--expert-topk") == 1) { i = i + 1; cfg_expert_topk = _atoi(_av(i, a)); }
         elif (streq(a, "--bpe") == 1) { use_bpe = 1; i = i + 1; bpe_k = _atoi(_av(i, a)); }
         elif (streq(a, "--eval") == 1) { do_eval = 1; }
+        elif (streq(a, "--eval-corpus") == 1) { i = i + 1; eval_corpus_path = _av(i, a); }
         elif (streq(a, "--objective") == 1) {
             i = i + 1; var ob = _av(i, a);
             if (streq(ob, "ar") == 1) { cfg_objective = 0; }
@@ -488,6 +494,32 @@ fn main(): i64 {
                 puts("  route-entropy "); f_print(moe_entropy(), 4);
                 _putc(10);
             }
+        }
+    }
+
+    # ---- held-out eval (X019 follow-on; after own-corpus eval so both print) ----
+    # The generalization metric: score the model on a DISJOINT corpus re-encoded
+    # through the loaded tokenizer (no vocab-order check). Independent of --eval —
+    # works alone or alongside it, and under --gen-only --load (score a saved
+    # model on unseen text).
+    if (eval_corpus_path != 0) {
+        if (g_objective == 1) {
+            puts("held-out eval (diffusion denoising; ELBO upper bound; corpus ");
+            puts(eval_corpus_path); puts("):\n");
+        }
+        var hr = eval_corpus_held(eval_corpus_path);
+        if (hr < 0) {
+            # an explicitly-requested eval that can't run is an error (mirrors
+            # --save): a script `attn11 ... --eval-corpus held.txt` must detect a
+            # missing/empty/too-short held-out file, not silently exit 0.
+            puts("attn11: held-out eval failed (code "); fmt_int(hr); puts(")\n"); rc = 1;
+        } elif (g_objective != 1) {
+            puts("held-out eval (corpus "); puts(eval_corpus_path); puts("): tokens ");
+            fmt_int(g_eval_tokens);
+            puts("  bytes "); fmt_int(g_eval_bytes);
+            puts("  ce/token "); f_print(f64_div(g_eval_nats, f64_from(g_eval_tokens)), 5);
+            puts("  bits/byte "); f_print(eval_bpb(), 5);
+            _putc(10);
         }
     }
 

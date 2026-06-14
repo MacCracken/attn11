@@ -2929,6 +2929,47 @@ fn test_token_packing(): i64 {
     return 0;
 }
 
+# Held-out eval core (X019 follow-on): eval_corpus_buf re-encodes an in-memory
+# buffer through the LOADED tokenizer, swaps it in as the corpus, evals, restores.
+# Pinned invariant: fed the training corpus's OWN raw bytes it must reproduce
+# eval_corpus() BIT-FOR-BIT (same bytes + same tokenizer => same id stream => same
+# nats/bytes) — the same idempotent re-encode the checkpoint loader relies on —
+# for byte-level AND BPE, and a too-short buffer is rejected (not a crash).
+# RNG-neutral (eval sets g_training = 0), so it is registered dead-last and leaves
+# the shared stream intact.
+fn test_eval_held(): i64 {
+    g_data_w = 1;
+    var V = build_corpus();
+    model_init(V, 8, 4, 2, 2, 1, 0, f64_from(0), 19);
+    train(4, 4, 2, _lrc(3, 1000), _lrc(3, 10000), 2, f64_from(1), 1000000000);
+    var rng0 = _rng_state;
+    var n1 = eval_corpus();
+    var nats1 = g_eval_nats; var byt1 = g_eval_bytes;
+    var dl = g_datalen; var dat = g_data;
+    var nh = eval_corpus_buf(g_text, g_textlen);
+    assert(nh == n1, "held-out of own bytes: same token count as eval_corpus");
+    assert(g_eval_nats == nats1, "held-out of own bytes: nats bit-identical (byte-level)");
+    assert(g_eval_bytes == byt1, "held-out of own bytes: byte count identical (byte-level)");
+    assert((g_datalen == dl) && (g_data == dat), "held-out restores g_data/g_datalen");
+    assert(_rng_state == rng0, "held-out eval is RNG-neutral");
+
+    # BPE: the idempotent merge-replay must reproduce the merged-stream eval too
+    g_data_w = 1;
+    var Vb = bpe_learn(8);
+    model_init(Vb, 8, 4, 2, 2, 1, 0, f64_from(0), 19);
+    var nb = eval_corpus();
+    var natsb = g_eval_nats; var bytb = g_eval_bytes;
+    var nhb = eval_corpus_buf(g_text, g_textlen);
+    assert(nhb == nb, "held-out (bpe) of own bytes: same token count");
+    assert(g_eval_nats == natsb, "held-out (bpe) of own bytes: nats bit-identical");
+    assert(g_eval_bytes == bytb, "held-out (bpe) of own bytes: byte count identical");
+
+    # a buffer shorter than ctx+1 is rejected cleanly, never indexed out of bounds
+    assert(eval_corpus_buf(g_text, 4) == (0 - 1), "held-out rejects a too-short corpus");
+    g_data_w = 1;
+    return 0;
+}
+
 fn main(): i64 {
     alloc_init();
     rng_seed(123);
@@ -3023,6 +3064,10 @@ fn main(): i64 {
     # RNG-neutral, so dead-last is safe and keeps the diffusion group's stream intact
     test_group("token packing (1.5.3)");
     test_token_packing();
+    # RNG-neutral (g_training = 0 during eval), so dead-last keeps every earlier
+    # test's shared-stream position byte-for-byte unchanged (X019 follow-on).
+    test_group("held-out eval (1.5.x)");
+    test_eval_held();
     return assert_summary();
 }
 

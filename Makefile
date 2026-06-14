@@ -52,7 +52,10 @@ smoke: build
 	done; \
 	./build/attn11 --preset --attn-kind ssm --attn-every 2 --gen-only >/dev/null 2>&1; \
 	if [ $$? -ne 0 ]; then echo "smoke: a valid mha/ssm hybrid failed to build"; exit 1; fi; \
-	echo "smoke: ok (hostile --layers/--attn-every rejected; valid hybrid builds)"
+	./build/attn11 --gen-only --eval-corpus /nonexistent/attn11-smoke >/dev/null 2>&1; rc=$$?; \
+	if [ $$rc -ge 128 ]; then echo "smoke: CRASH (signal $$((rc-128))) on missing --eval-corpus file"; exit 1; fi; \
+	if [ $$rc -eq 0 ]; then echo "smoke: missing --eval-corpus file should set a non-zero exit"; exit 1; fi; \
+	echo "smoke: ok (hostile --layers/--attn-every rejected; valid hybrid builds; held-out eval errors cleanly)"
 
 clean:
 	rm -rf build/

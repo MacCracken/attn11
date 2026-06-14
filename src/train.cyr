@@ -608,6 +608,62 @@ fn eval_diffusion_grid(): i64 {
     return 0;
 }
 
+# ---- held-out (cross-corpus) eval (X019 follow-on) --------------------------
+# Score the model on a DISJOINT corpus: re-encode `path` through the CURRENTLY
+# LOADED tokenizer — the same g_char2id / BPE merges — and run the active
+# objective's eval over it. This is the apples-to-apples generalization metric
+# X019 called for: bits/byte-on-own-corpus penalizes a higher-entropy training
+# set in absolute terms, so it can't show "more clean data -> better
+# generalization"; a held-out pass can.
+#
+# Unlike --load+--corpus there is NO vocab-order check — the held-out file need
+# not reproduce the training vocab; it is merely re-tokenized through whatever
+# tokenizer the model already carries. Bytes absent from a byte-level vocab map
+# to id 0 (tok_encode's OOV fallback); BPE simply replays its merges. The packed
+# token width (g_data_w) is the one already set for the loaded corpus, so byte
+# (u8) and BPE (u16) models both round-trip without rewidening.
+#
+# g_data / g_datalen are swapped to the held-out stream for the pass and restored
+# before returning; the g_eval_* result globals persist for the caller to print
+# (the AR path) or are consumed by the grid's own output (the diffusion path).
+# RNG-neutral (g_training = 0 inside the eval), so a held-out eval never perturbs
+# subsequent sampling. Returns eval tokens (> 0), or negative on a read error
+# (secure_read_file's code), an empty file (-3), an alloc failure (-4), or a
+# corpus shorter than ctx+1 (-1).
+# Core: encode an in-memory `len`-byte buffer through the loaded tokenizer, swap
+# it in as the corpus, run the active objective's eval, restore. Split from the
+# file path so a test can drive it directly (no fixture file). Invariant the test
+# pins: fed the training corpus's OWN raw bytes, this must reproduce eval_corpus()
+# bit-for-bit (the same idempotent re-encode the checkpoint loader relies on).
+fn eval_corpus_buf(text, len): i64 {
+    if (len < 1) { return 0 - 3; }
+    # encode through the loaded tokenizer; output count <= byte count, so the
+    # packed buffer sized at one id-width per input byte never overflows.
+    var enc = alloc(len * g_data_w);
+    if (enc == 0) { return 0 - 4; }
+    var ntok = tok_encode(text, len, enc, g_data_w);
+    if (ntok < g_T + 1) { return 0 - 1; }
+    var sv_data = g_data; var sv_len = g_datalen;
+    g_data = enc; g_datalen = ntok;
+    var rc = 0;
+    if (g_objective == 1) {
+        eval_diffusion_grid();         # prints its grid + ELBO bound over the held-out stream
+        rc = g_eval_tokens;
+    } else {
+        rc = eval_corpus();
+    }
+    g_data = sv_data; g_datalen = sv_len;
+    return rc;
+}
+
+fn eval_corpus_held(path): i64 {
+    var buf = alloc(MAX_CORPUS_BYTES());
+    if (buf == 0) { return 0 - 4; }
+    var len = secure_read_file(path, buf, MAX_CORPUS_BYTES());
+    if (len < 0) { return len; }
+    return eval_corpus_buf(buf, len);
+}
+
 # ---- generation ------------------------------------------------------------
 # Sample from one logits row with temperature (temp is an f64 bit pattern).
 # temp == 0 means greedy (argmax).

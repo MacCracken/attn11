@@ -5,7 +5,31 @@
 
 ## Version
 
-**1.5.5** — *Hardening / audit / security pass* (P(-1); **closes the data-ingestion
+**1.5.6** — *Held-out (cross-corpus) eval* (X020; the deferred X019 follow-on). A new
+**`--eval-corpus PATH`** flag scores the model on a **disjoint** corpus: re-encode the
+file through the **loaded tokenizer** (same byte vocab / BPE merges, no vocab-order
+check) and run the active objective's eval — AR `eval_corpus` (CE/token + bits/byte) or
+the diffusion denoising grid + ELBO bound. The generalization metric X019 flagged as
+missing: bits/byte-on-own-corpus understates data's value in absolute terms; a held-out
+pass measures it directly. The flag swaps the encoded held-out stream in for the eval
+and restores `g_data`/`g_datalen`; **RNG-neutral** (eval sets `g_training = 0`);
+combines with `--eval` (own then held-out both print); works under `--gen-only --load`
+(score a saved checkpoint on unseen text). Unknown bytes → id 0; BPE replays merges (the
+loader's idempotent re-encode). A failed held-out eval (missing/empty/too-short file)
+sets a **non-zero exit** (mirrors `--save`); a hostile path **never crashes** (new
+`make smoke` case). New `test_eval_held` pins the invariant — held-out of the OWN bytes
+reproduces `eval_corpus()` **bit-for-bit** (byte + BPE) and rejects a too-short buffer:
+**977 → 986** checks, green x86_64 **and** aarch64/qemu. The no-flag/default run is
+**byte-identical** to 1.5.5 (verified). First cross-corpus generalization numbers (X020,
+[`experiments.md`](experiments.md)): the own → held-out gap is **tiny (< 1.3%)** at both
+scales (default 3.306 → 3.330; preset 2.738 → 2.773) — sub-epoch training barely
+memorizes, so own-corpus bits/byte is a near-unbiased generalization proxy, retroactively
+**validating the X016–X019 own-corpus numbers**; the data-volume "more data → held-out
+win" comparison (train-4MB vs train-24MB, eval a third disjoint set) is now unblocked as
+the X021 follow-on (lands at M16+ where a model can overfit a small corpus).
+`make release` exit 0.
+
+(1.5.5 — *Hardening / audit / security pass* (P(-1); **closes the data-ingestion
 & curation 1.5.x arc**). A security/correctness audit of the 1.5.x surface — the
 packed `g_data` store + raised 64 MB cap (1.5.3), the `c4_sample.py` curation script
 ingesting untrusted shards (1.5.1/2/4), and the char-diffusion path (1.5.0) — via an
@@ -19,7 +43,7 @@ extraction unchanged, a 12 MB bomb completes (no OOM), and re-curation byte-iden
 to before (X016/X017/X019 reproducibility preserved). The fix is **Python-side; the
 Cyrius binary is byte-identical** (CFG_VERSION bump only) — **977** checks unchanged.
 Audit at [`../audit/2026-06-13-1.5.x-hardening-audit.md`](../audit/2026-06-13-1.5.x-hardening-audit.md)
-(the ninth; GO, 0 blockers). `make release` exit 0.
+(the ninth; GO, 0 blockers). `make release` exit 0.)
 (1.5.4 — *Curation at scale* (X019; the data-ingestion & curation 1.5.x arc,
 step 3). The first run on 1.5.3's raised ceiling: curate a **24 MB / 12-shard** C4-en
 corpus (`c4_sample.py --curate --shards 12`, 6× the old 4 MB cap, impossible before

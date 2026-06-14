@@ -4,6 +4,40 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.5.6] - 2026-06-13
+
+**Held-out (cross-corpus) eval — the X019 generalization follow-on.** A new
+`--eval-corpus PATH` flag scores the model on a **disjoint** corpus: re-encode the
+file through the **currently loaded tokenizer** (the same byte vocab / BPE merges,
+no vocab-order check) and run the active objective's eval over it. This is the
+apples-to-apples generalization metric X019 called for — bits/byte-on-own-corpus
+penalizes a higher-entropy training set in absolute terms, so it can't show "more
+clean data → better generalization"; a held-out pass can. Additive and surgical:
+the no-flag/default run is **byte-identical** to 1.5.5; no new backward op, so the
+grad-check count is structurally unchanged (the new test adds eval-only assertions).
+
+### Added
+- **`--eval-corpus PATH`** (`src/main.cyr`, `src/train.cyr`). Re-encodes a disjoint
+  corpus through the loaded tokenizer into a packed buffer at the active token width
+  (`g_data_w`: u8 byte-level / u16 BPE), temporarily swaps it in as the corpus, runs
+  the objective-appropriate eval (AR `eval_corpus` → CE/token + bits/byte; diffusion
+  → the masked-CE denoising grid + ELBO bound), and restores `g_data`/`g_datalen`.
+  RNG-neutral (eval sets `g_training = 0`), so it never perturbs subsequent sampling.
+  Combines with `--eval` (own-corpus then held-out both print) and works under
+  `--gen-only --load` (score a saved checkpoint on unseen text). Unknown bytes (absent
+  from a byte-level vocab) map to id 0; BPE simply replays its merges — the same
+  idempotent re-encode the checkpoint loader already relies on. An explicitly-requested
+  held-out eval that can't run (missing/empty/too-short file) sets a **non-zero exit**
+  (mirrors `--save`), so a script can detect it; a hostile/missing path **never
+  crashes** (new `make smoke` case).
+- **`test_eval_held`** (`tests/attn11.tcyr`, registered dead-last — RNG-neutral, so the
+  earlier tests' shared-stream positions are byte-for-byte unchanged). Pins the core
+  invariant: fed the training corpus's **own** raw bytes, the held-out path reproduces
+  `eval_corpus()` **bit-for-bit** (same bytes + same tokenizer ⇒ same id stream ⇒ same
+  nats/bytes) for byte-level **and** BPE, restores `g_data`/`g_datalen`, and rejects a
+  too-short buffer (−1) without indexing out of bounds. **977 → 986** checks, green on
+  x86_64 **and** aarch64/qemu.
+
 ## [1.5.5] - 2026-06-13
 
 **Hardening / audit / security pass (P(-1)) — closes the data-ingestion & curation

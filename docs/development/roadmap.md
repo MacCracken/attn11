@@ -13,7 +13,7 @@
 
 ## Where we are
 
-Current: **v1.5.5**. The v1.0 surface is frozen and additive-only
+Current: **v1.5.6**. The v1.0 surface is frozen and additive-only
 ([`STABILITY.md`](../STABILITY.md)); the reusable numeric core lives in
 **[rosnet](https://github.com/MacCracken/rosnet)** + **[tyche](https://github.com/MacCracken/tyche)**
 (v1.1.0). The 1.x architecture arc through M14 has shipped (the attention/KV, FFN-
@@ -23,7 +23,9 @@ is now COMPLETE** — v1.5.1 the C4 tooling (X016), v1.5.2 the quality-curating 
 (X017), v1.5.3 the token-packing unlock (X018 — u8/u16 `g_data`, the 4 MB → 64 MB cap),
 v1.5.4 curation at scale (X019 — a 24 MB/12-shard corpus; the diversity penalty halves
 with capacity), **v1.5.5 the hardening/audit pass (the ninth audit — GO, one
-`c4_sample.py` gzip-bomb fix) closing the arc**.
+`c4_sample.py` gzip-bomb fix) closing the arc**, and **v1.5.6 the held-out eval
+follow-on** (the deferred `--eval-corpus` flag from X019 — score a disjoint corpus
+through the loaded tokenizer; the generalization metric, run as X020).
 **Next up is M16 (ternary / BitNet-style training, E6).** For *what* shipped,
 see [`CHANGELOG.md`](../../CHANGELOG.md)
 (release narrative), [`experiments.md`](experiments.md) (the X-series), and
@@ -114,7 +116,27 @@ re-curation byte-identical). The Cyrius binary is unchanged (Python-side fix). R
 [`../audit/2026-06-13-1.5.x-hardening-audit.md`](../audit/2026-06-13-1.5.x-hardening-audit.md).
 **Gate met**: audit filed, finding fixed + regression-verified, `make release` green —
 the 1.5.x arc is closed. Deferred follow-on noted by X019: a held-out
-**`--eval-corpus FILE`** flag (the clean way to score data's generalization value).
+**`--eval-corpus FILE`** flag (the clean way to score data's generalization value) —
+**✅ shipped in 1.5.6 (X020)** below.
+
+### 1.5.6 — Held-out (cross-corpus) eval — ✅ shipped (X020)
+
+The deferred X019 follow-on: a **`--eval-corpus PATH`** flag that scores the model on a
+**disjoint** corpus, re-encoding it through the loaded tokenizer (same byte vocab / BPE
+merges, no vocab-order check) and running the active objective's eval. The
+generalization metric X019 flagged as missing: bits/byte-on-own-corpus understates
+data's value in absolute terms; a held-out pass measures it directly. Additive and
+surgical — the no-flag run stays **byte-identical** to 1.5.5; RNG-neutral; combines with
+`--eval` and works under `--gen-only --load`; failures (missing/empty/too-short file)
+set a non-zero exit (mirrors `--save`) and never crash. New `test_eval_held` pins the
+core invariant (held-out of the OWN bytes reproduces `eval_corpus()` bit-for-bit, byte
++ BPE): **977 → 986** checks, green x86_64 + aarch64/qemu; lint + fuzz + `make smoke`
+(new held-out case) green. Run as **X020** (the first attn11 cross-corpus generalization
+numbers — see [`experiments.md`](experiments.md)): the own → held-out gap is **< 1.3%**
+at both scales, so sub-epoch training barely memorizes and own-corpus bits/byte is
+already a near-unbiased generalization proxy (validating X016–X019). The data-volume
+held-out win (train-4MB vs train-24MB, eval a third disjoint set) is the **X021**
+follow-on, landing at M16+ where a model can actually overfit a small corpus.
 
 ### Streaming token-shard ingestion — 1.6.x (with M16)
 
