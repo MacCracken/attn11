@@ -13,7 +13,7 @@
 
 ## Where we are
 
-Current: **v1.6.0**. The v1.0 surface is frozen and additive-only
+Current: **v1.6.1**. The v1.0 surface is frozen and additive-only
 ([`STABILITY.md`](../STABILITY.md)); the reusable numeric core lives in
 **[rosnet](https://github.com/MacCracken/rosnet)** + **[tyche](https://github.com/MacCracken/tyche)**
 (v1.1.0). The 1.x architecture arc through M14 has shipped (the attention/KV, FFN-
@@ -22,11 +22,13 @@ v1.5.0) is the first objective departure, the **data-ingestion & curation 1.5.x 
 is COMPLETE** (v1.5.1 the C4 tooling X016 → v1.5.2 the quality-curating sampler X017 →
 v1.5.3 the token-packing unlock X018 → v1.5.4 curation at scale X019 → v1.5.5 the
 hardening/audit pass → v1.5.6 the held-out `--eval-corpus` follow-on X020), and **M16
-(ternary / BitNet-style training, E6) has now shipped its first increment as v1.6.0** —
-`--ternary` weights in {−1,0,+1} (absmean scale) with a straight-through estimator,
-grad-checked, default run byte-identical, checkpoint v8 (run as **X022**). The 1.6.x
-group's remaining work (the i64-add ternary matmul + bench, streaming ingestion, the
-X021 data-volume held-out win) is below. For *what* shipped,
+(ternary / BitNet-style training, E6) is COMPLETE** — `--ternary` weights in {−1,0,+1}
+(absmean scale) with a straight-through estimator, grad-checked, default run byte-identical,
+checkpoint v8 (v1.6.0, X022), then the **i64-add ternary matmul + bench** closing the M16
+gate (v1.6.1, X023 — the collapse is exact + grad-checked but ~2.4–3× slower than wide-SIMD
+f64 at this scale, an honest negative; the default forward keeps the SIMD-f64 path). The
+1.6.x group's remaining work (streaming ingestion, the X021 data-volume held-out win) is
+below. For *what* shipped,
 see [`CHANGELOG.md`](../../CHANGELOG.md)
 (release narrative), [`experiments.md`](experiments.md) (the X-series), and
 [`state.md`](state.md) (the
@@ -210,11 +212,18 @@ aarch64/qemu. Accuracy vs f64 logged as X022 (ternary lowers capacity → worse
 bits/byte at reference scale, as expected — the deliverable is "it learns + is
 grad-checked", not a win at this scale).
 
-**Increment 2 — the i64-add matmul + bench (1.6.x follow-on).** `x·W_eff = γ·(x·t)`,
-`t∈{−1,0,+1}`, collapses the multiply to integer add / subtract / skip — the
-**i64-add matmul benched against the SIMD-f64 path** (the remaining M16 gate; the
-perf realization, as 1.2.1 realized MLA's cache after 1.2.0's correctness landing).
-Increment 1 reuses the f64 `linear_fwd` for correctness first.
+**Increment 2 — ✅ shipped (v1.6.1, X023, the i64-add matmul + bench; closes the M16
+gate).** `x·W_eff = γ·(x·t)`, `t∈{−1,0,+1}`, collapses the multiply to add/subtract/skip
+plus one γ-scale per output. Two reference kernels `ternary_matmul_fwd`/`ternary_matmul_dx`
+(`ops.cyr`), grad-checked (forward + `dx` pinned against the SIMD-f64 `W_eff` path at
+maxrel 0, `dx` FD'd; **1010 → 1014** checks) and **benched head-to-head**. Honest result
+(X023): the collapse is **~3× slower** (matmul) / **~2.4× slower** (end-to-end) than the
+SIMD-f64 path on x86_64 — `f64v_fmadd` is 4-wide while the collapse is scalar add/sub/skip,
+so the integer-add win needs activation quantization and/or non-FMA hardware (the orthogonal
+1.58-bit *memory* win is real, unmeasured here). The default ternary forward **keeps the
+SIMD-f64 path**; the collapse ships as the grad-checked + benched reference kernel (wired
+into no run — ternary *and* default runs byte-identical to 1.6.0). The remaining ternary
+fast-follows (mla/ssm/lin/MoE/rope/diffusion) and activation quantization are additive.
 
 > **The 1.6.x group also folds in two data items** defined in the data-ingestion
 > section above: **streaming token-shard ingestion** (the RAM-independent large-corpus
@@ -327,12 +336,13 @@ The remaining order is **value ÷ risk** and re-orderable (the axes are
 orthogonal). The **data-ingestion & curation 1.5.x arc** is **complete** (1.5.2
 quality-curating sampler ✓ → 1.5.3 token-packing ✓ → 1.5.4 curation at scale ✓ →
 1.5.5 hardening/audit ✓, which closed the arc) — cheap, high-ROW infra that improved the data the *existing*
-models see and lifted the corpus ceiling, before any new model-scale work. Next is the
-*precision* departure — **ternary training (M16, E6)** — into whose **1.6.x group**
-two data items fold: **streaming token-shard** ingestion (the RAM-independent
-large-corpus path) and the **data-volume held-out win (X021)** (the X019/X020
-follow-on), both of which only pay off once a scaled model can absorb / overfit a
-corpus. **RL (M17, E9)** is last
+models see and lifted the corpus ceiling, before any new model-scale work. The
+*precision* departure — **ternary training (M16, E6)** — is **complete** (v1.6.0 the
+grad-checked STE X022 → v1.6.1 the i64-add matmul + bench X023, closing the gate). Its
+**1.6.x group** still folds in two data items: **streaming token-shard** ingestion (the
+RAM-independent large-corpus path) and the **data-volume held-out win (X021)** (the
+X019/X020 follow-on), both of which only pay off once a scaled model can absorb / overfit
+a corpus. **RL (M17, E9)** is next (and last in the milestone chain)
 because it is an objective layer over a finished trunk, and the GPU *compute* backend
 (M18, E-infra) is sequenced TBD (it unblocks the B4 GPU benchmark).
 The E-series is informed by the

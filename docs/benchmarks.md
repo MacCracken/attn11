@@ -324,3 +324,35 @@ is causal/AR-only), so it re-runs an uncached full-window forward each unmask ro
 — the cost of parallel, any-order generation. The +32 params are the single learned
 `[MASK]` embedding. Quality vs AR at this scale is X015 (a scale-limited negative
 result, not a perf one).
+
+## The i64-add ternary matmul (1.6.1, M16 increment 2)
+
+The BitNet realization of `--ternary`: since `W_eff = γ·t` with `t ∈ {−1, 0, +1}`,
+`x·W_eff = γ·(x·t)` — the contracted-dim multiply **collapses to add / subtract / skip**,
+leaving one γ-scale per output element (M·N multiplies vs the dense M·K·N). The reference
+kernels `ternary_matmul_fwd`/`ternary_matmul_dx` (`ops.cyr`) are benched head-to-head
+against the 1.6.0 SIMD-f64 path (quantize to `W_eff`, then rosnet's 4-wide `f64v_fmadd`
+`linear_fwd`) at the MLP shape **T×C×F = 16×32×128**, x86_64, 2000 iters/cell:
+
+| surface                        | SIMD-f64 (`W_eff`) | i64-add collapse | i64-add ÷ SIMD-f64 |
+|--------------------------------|--------------------|------------------|--------------------|
+| matmul only                    | **60.5 µs**        | 181.5 µs         | **~3.0×** (slower)  |
+| end-to-end (quant + matmul)    | **94.2 µs**        | 225.0 µs         | **~2.4×** (slower)  |
+
+**An honest negative.** The collapse is *exact* — it reproduces the `W_eff` matmul to
+rounding (grad-checked at maxrel 0, X023) — and it still loses, because `f64v_fmadd`
+retires **4** fused multiply-adds per instruction while the collapse is **scalar**
+add/sub/skip (one element per op, plus a branch). The wide-SIMD f64 multiply is already
+cheaper per element than a scalar add; the ~31% zero-skip on Gaussian `W` doesn't recover
+the gap. The end-to-end ratio is milder (2.4× vs 3.0×) because the collapse's setup
+(`ternary_signs`) skips the per-element γ·t multiply `ternary_quant` pays to build `W_eff`.
+
+The integer-add advantage BitNet targets needs one of: **activation quantization** (int8
+absmax acts → a literal *integer* matmul, not f64 add — a heavier follow-on, ADR 0014) or
+**hardware where mul ≫ add / without wide FMA**. Modern x86 with 4-wide f64 FMA + f64
+activations is precisely where it can't win. The orthogonal **memory** win (1.58
+bits/weight vs 64) is real and unmeasured by this kernel. So the **default ternary forward
+keeps the SIMD-f64 path**; the collapse ships as the grad-checked + benched reference
+kernel only (wired into no run — ternary *and* default runs stay byte-identical to 1.6.0).
+Regenerate with `cyrius build tests/attn11.bcyr build/bench && ./build/bench` (the
+`ternary i64-add` / `SIMD-f64` rows + `(x100)` ratios).

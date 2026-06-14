@@ -5,7 +5,29 @@
 
 ## Version
 
-**1.6.0** — *Ternary (BitNet-style) training, M16 increment 1* (E6; ADR 0014, X022). A
+**1.6.1** — *i64-add ternary matmul + bench, M16 increment 2* (E6; ADR 0014, X023;
+**closes the M16 gate**). The BitNet realization of `--ternary`: `x·W_eff = γ·(x·t)`,
+`t ∈ {−1, 0, +1}`, collapses the contracted-dim multiply to **add / subtract / skip** with
+one γ-scale per output (M·N multiplies vs the dense M·K·N). Two attn11-local reference
+kernels `ternary_matmul_fwd`/`ternary_matmul_dx` (`ops.cyr`; `ternary_signs` fills the i64
+signs + returns γ = absmean) implement it, grad-checked by `test_ternary_matmul` — the
+forward and `dx` **pinned against the SIMD-f64 `W_eff` path at maxrel 0** (exact to
+rounding), `dx` FD'd at 1e-5, `signs·γ == W_eff` value-exact (`dW` is the unchanged STE
+pass-through pinned in `test_ternary_quant`): **1010 → 1014** checks, green x86_64 **and**
+aarch64/qemu. Benched **head-to-head** vs the 1.6.0 SIMD-f64 path (X023,
+[`experiments.md`](experiments.md)) at T×C×F = 16×32×128: the collapse is **~3.0× slower**
+(matmul, 60.5 → 181.5 µs) / **~2.4× slower** (end-to-end with quant, 94.2 → 225.0 µs) —
+`f64v_fmadd` retires 4 fused multiply-adds per instruction while the collapse is scalar
+add/sub/skip, so the wide-SIMD f64 multiply is already cheaper per element than a scalar
+add (the ~31% zero-skip on Gaussian `W` doesn't recover it). An **honest negative**: the
+integer-add win needs **activation quantization** (int8 acts → a literal integer matmul,
+the scoped-out heavier follow-on) and/or non-FMA hardware; the orthogonal **memory** win
+(1.58 bits/weight) is real and unmeasured by this kernel. So the **default ternary forward
+keeps the SIMD-f64 path**; the collapse ships as the grad-checked + benched reference
+kernel, wired into no run — **ternary *and* default runs stay byte-identical to 1.6.0**
+(default, preset, BPE verified). lint + fuzz + `make smoke` green; `make release` exit 0.
+
+(1.6.0 — *Ternary (BitNet-style) training, M16 increment 1* (E6; ADR 0014, X022). A
 new **`--ternary`** flag trains with weights quantized to **{−1, 0, +1}**: each quantized
 weight matrix becomes `W_eff = γ·clamp(round(W/γ),−1,+1)` (γ = absmean) in the forward,
 while the **master weights stay f64** (fake-quant). The backward is a **straight-through
@@ -29,8 +51,8 @@ run, [`experiments.md`](experiments.md)): at reference scale ternary is **compet
 with f64** (default config, 2000 steps: f64 **0.254** bits/byte — bit-for-bit X015 — vs
 ternary **0.228**; the ~1.58-bit constraint regularizes a memorizable tiny corpus) — "it
 learns + is grad-checked", not a general win. The **i64-add ternary matmul + bench vs the
-SIMD-f64 path** (the remaining M16 gate) is the increment-2 follow-on; increment 1 reuses
-the f64 `linear_fwd` for correctness first. `make release` exit 0.
+SIMD-f64 path** (the remaining M16 gate) was the increment-2 follow-on, shipped in 1.6.1
+(X023); increment 1 reuses the f64 `linear_fwd` for correctness first. `make release` exit 0.)
 
 (1.5.6 — *Held-out (cross-corpus) eval* (X020; the deferred X019 follow-on). A new
 **`--eval-corpus PATH`** flag scores the model on a **disjoint** corpus: re-encode the
@@ -404,6 +426,14 @@ deterministic resume. 0.2.0: stacked layers, grad clipping, LR schedule.)
   bidirectional — diffusion denoises the whole window each round, no KV cache). +32
   params (the mask_emb) over dense's 39 488. Quality at this scale: X015 (AR's exact
   0.254 bits/byte vs diffusion's 3.79 ELBO bound).
+- **i64-add ternary matmul** (1.6.1, X023, the M16 increment-2 gate): the BitNet
+  collapse `x·W_eff = γ·(x·t)` (add/sub/skip + one γ-scale) benched head-to-head vs
+  the SIMD-f64 `W_eff` path at T×C×F = 16×32×128 — **~3.0× slower** matmul-only (60.5 →
+  181.5 µs) / **~2.4× slower** end-to-end with quant (94.2 → 225.0 µs). An honest
+  negative: `f64v_fmadd` is 4-wide while the collapse is scalar, so the integer-add win
+  needs activation quantization and/or non-FMA hardware (the memory win, 1.58 bits/weight,
+  is orthogonal). The default ternary forward keeps the SIMD-f64 path; the collapse is the
+  grad-checked + benched reference kernel only.
 - **Canonical mixer/hybrid snapshot (1.4.6, X014):** one bench run cross-compares
   every mixer (step / cached-decode / cache bytes / params) — linear ≈ MHA, SSM
   ~1.58× the step, MoE ~1.95× at top-2; the **padded hybrid is memory-only** (its
@@ -547,8 +577,17 @@ checkpoint vs Linux at fixed CPU — `scripts/agnos-smoke.sh`):
   Quantizes the MHA Q/K/V/O + dense MLP only; scope MHA + dense + uniform + AR +
   learned-abs (gated at the CLI + a `model_init_full` backstop). Checkpoint v8 (slot
   [23]; `-48`/`-49` reject a hostile image). Grad-checked where defined + STE `dW` pinned
-  bit-exact (`test_ternary_quant`/`test_model_ternary`/`test_ckpt_ternary`, X022). The
-  i64-add matmul + bench is the increment-2 follow-on. A no-flag run is byte-identical.
+  bit-exact (`test_ternary_quant`/`test_model_ternary`/`test_ckpt_ternary`, X022). A
+  no-flag run is byte-identical.
+- **i64-add ternary matmul** (1.6.1, ADR 0014, E6, **closes the M16 gate**): the BitNet
+  collapse `x·W_eff = γ·(x·t)`, `t∈{−1,0,+1}` — add/sub/skip + one γ-scale per output.
+  Reference kernels `ternary_signs`/`ternary_matmul_fwd`/`ternary_matmul_dx` (`ops.cyr`),
+  grad-checked (`test_ternary_matmul`: forward + `dx` pinned against the SIMD-f64 `W_eff`
+  path at maxrel 0, `dx` FD'd) and benched head-to-head (X023). Honest result: **~2.4–3×
+  slower** than the SIMD-f64 path on x86_64 (4-wide `f64v_fmadd` beats the scalar collapse;
+  the integer-add win needs activation quant / non-FMA hardware). The default ternary
+  forward keeps the SIMD-f64 path — the collapse is wired into no run, so ternary *and*
+  default runs stay byte-identical to 1.6.0.
 - CLI: `--corpus --stdin --load --save --steps --gen-only --preset --heads
   --kv-heads --layers --attn-kind --latent-dim --attn-every --pos-kind --rope-dim
   --experts --expert-topk --bpe --eval --eval-corpus --objective --decode-steps
@@ -607,7 +646,10 @@ constant `nh·hd²` state instead of a T-growing K/V.
   load-balance aux (`moe_aux_fwd`/`moe_aux_dr`/`moe_aux_bwd`); plus the **M16
   ternary** quantizer (1.6.0) `ternary_quant` (absmean-scaled `{−1,0,+1}`) and the
   quantizing wrappers `qlinear_fwd`/`qlinear_bwd` over rosnet's linear (passthrough
-  when `g_ternary == 0`; STE backward — `dx` through `W_eff`, `dW` pass-through)
+  when `g_ternary == 0`; STE backward — `dx` through `W_eff`, `dW` pass-through); plus
+  the **M16 increment-2** i64-add reference kernels (1.6.1) `ternary_signs` (i64 signs +
+  γ) / `ternary_matmul_fwd` / `ternary_matmul_dx` (the BitNet collapse `γ·(x·t)`,
+  add/sub/skip — grad-checked + benched vs the SIMD-f64 path, X023; wired into no run)
 - `attn.cyr` — the shared attention core `attn_core_fwd`/`attn_core_bwd` (causal
   scaled-dot-product softmax/PV), wrapped by `attn_fwd`/`attn_bwd` (MHA/GQA
   projections) and `attn_mla_fwd`/`attn_mla_bwd` (MLA low-rank latent down/up

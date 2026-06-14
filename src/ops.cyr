@@ -698,3 +698,114 @@ fn qlinear_bwd(x, W, dy, dx, dW, db, M, K, N): i64 {
     ternary_quant(W, g_qscratch, K, N);
     return linear_bwd(x, g_qscratch, dy, dx, dW, db, M, K, N);
 }
+
+# ---------------------------------------------------------------------------
+# M16 increment 2 — the i64-add ternary matmul (E6, ADR 0014)
+# ---------------------------------------------------------------------------
+# The BitNet realization: x·W_eff = γ·(x·t) with t ∈ {−1, 0, +1}, so the inner
+# product collapses to add / subtract / SKIP — the only multiply left is ONE
+# γ-scale per output element (M·N multiplies vs the dense M·K·N). These are the
+# REFERENCE kernels for the collapse: grad-checked (`test_ternary_matmul`, the
+# forward + dx pinned against the SIMD-f64 W_eff path, dx FD'd) and benched
+# head-to-head vs that path (`tests/attn11.bcyr`). Activations stay f64 (ADR 0014
+# scope), so the adds are f64_add/f64_sub branched on an i64 sign — a literal
+# integer-add matmul additionally needs activation quantization (the heavier
+# follow-on). The default ternary forward keeps the SIMD-f64 W_eff path; whether
+# to wire this in is the bench's call (it is the perf realization, not an assumed
+# win). dW is the unchanged STE pass-through (xᵀ·dy, never reads t), so only the
+# forward and dx are collapsible.
+
+# Fill t(K,N) with the ternary signs of W (−1 / 0 / +1 as i64) and RETURN γ
+# (= absmean(W), the f64 bit pattern). γ·t reproduces ternary_quant's W_eff
+# bit-for-bit (same absmean, same round/clamp); a zero matrix yields all-zero
+# signs and γ == +0.0.
+fn ternary_signs(W, t, K, N): i64 {
+    var n = K * N;
+    var s = f64_from(0);
+    var i = 0;
+    while (i < n) { s = f64_add(s, f64_abs(load64(W + i * 8))); i = i + 1; }
+    var gamma = f64_div(s, f64_from(n));
+    if (gamma == f64_from(0)) {                      # all-zero matrix: signs == 0
+        i = 0; while (i < n) { store64(t + i * 8, 0); i = i + 1; }
+        return gamma;
+    }
+    var one = f64_from(1);
+    var neg1 = f64_from(0 - 1);
+    i = 0;
+    while (i < n) {
+        var r = f64_round(f64_div(load64(W + i * 8), gamma));   # nearest integer
+        if (f64_gt(r, one) == 1) { r = one; }
+        if (f64_lt(r, neg1) == 1) { r = neg1; }
+        var sgn = 0;
+        if (f64_gt(r, f64_from(0)) == 1) { sgn = 1; }
+        if (f64_lt(r, f64_from(0)) == 1) { sgn = 0 - 1; }
+        store64(t + i * 8, sgn);
+        i = i + 1;
+    }
+    return gamma;
+}
+
+# y(M,N) = b + γ·(x·t): accumulate the contracted dim as add / subtract / skip
+# (NO per-element multiply), then one γ-scale (and bias) per output. The (m,k,n)
+# AXPY order mirrors linear_fwd; b == 0 means no bias.
+fn ternary_matmul_fwd(x, t, gamma, b, y, M, K, N): i64 {
+    var m = 0;
+    while (m < M) {
+        var yrow = y + m * N * 8;
+        var n = 0;
+        while (n < N) { store64(yrow + n * 8, f64_from(0)); n = n + 1; }
+        var k = 0;
+        while (k < K) {
+            var xmk = load64(x + (m * K + k) * 8);
+            var trow = t + k * N * 8;
+            n = 0;
+            while (n < N) {
+                var tkn = load64(trow + n * 8);
+                if (tkn != 0) {
+                    if (tkn == 1) { store64(yrow + n * 8, f64_add(load64(yrow + n * 8), xmk)); }
+                    else { store64(yrow + n * 8, f64_sub(load64(yrow + n * 8), xmk)); }
+                }
+                n = n + 1;
+            }
+            k = k + 1;
+        }
+        n = 0;
+        while (n < N) {
+            var v = f64_mul(gamma, load64(yrow + n * 8));
+            if (b != 0) { v = f64_add(v, load64(b + n * 8)); }
+            store64(yrow + n * 8, v);
+            n = n + 1;
+        }
+        m = m + 1;
+    }
+    return 0;
+}
+
+# dx(M,K) = γ·(dy · tᵀ): the same add / subtract / skip collapse over the output
+# dim, one γ-scale per dx element. The STE weight gradient dW = xᵀ·dy is the
+# unchanged linear_bwd pass-through (it never reads t), so it is not recomputed
+# here — only this dx path benefits from the collapse.
+fn ternary_matmul_dx(t, gamma, dy, dx, M, K, N): i64 {
+    var m = 0;
+    while (m < M) {
+        var dyrow = dy + m * N * 8;
+        var k = 0;
+        while (k < K) {
+            var trow = t + k * N * 8;
+            var acc = f64_from(0);
+            var n = 0;
+            while (n < N) {
+                var tkn = load64(trow + n * 8);
+                if (tkn != 0) {
+                    if (tkn == 1) { acc = f64_add(acc, load64(dyrow + n * 8)); }
+                    else { acc = f64_sub(acc, load64(dyrow + n * 8)); }
+                }
+                n = n + 1;
+            }
+            store64(dx + (m * K + k) * 8, f64_mul(gamma, acc));
+            k = k + 1;
+        }
+        m = m + 1;
+    }
+    return 0;
+}

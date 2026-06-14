@@ -980,3 +980,45 @@ the default path byte-identical.)
    (`x·W_eff = γ·(x·t)`, the multiply collapsing to add/subtract/skip) **benched against
    the SIMD-f64 path** is the M16 increment-2 follow-on (the remaining gate). Regeneration:
    `./build/attn11 --steps 2000 --eval` (f64) and `./build/attn11 --ternary --steps 2000 --eval`.
+
+## X023 — the i64-add ternary matmul vs the SIMD-f64 path (M16 increment 2, v1.6.1) (2026-06-14)
+
+**Setup**: 1.6.1, the M16 increment-2 gate (the X022 takeaway-3 follow-on). The BitNet
+realization: `x·W_eff = γ·(x·t)`, `t ∈ {−1, 0, +1}`, so the contracted dim collapses to
+**add / subtract / skip** with **one** γ-scale per output (M·N multiplies vs the dense
+M·K·N). Two reference kernels (`ternary_matmul_fwd`, `ternary_matmul_dx` in `ops.cyr`)
+implement the collapse and are grad-checked (`test_ternary_matmul`: the forward and `dx`
+pinned against the SIMD-f64 `W_eff` path at maxrel **0**, `dx` FD'd at 1e-5; 1010 → 1014
+checks). They are benched **head-to-head** against the 1.6.0 SIMD-f64 path
+(`ternary_quant` → rosnet `linear_fwd`, 4-wide `f64v_fmadd`) at the MLP shape
+**T×C×F = 16×32×128**, x86_64, 2000 iters/cell.
+
+| surface | SIMD-f64 (W_eff) | i64-add collapse | i64-add ÷ SIMD-f64 |
+|---------|------------------|------------------|--------------------|
+| matmul only | **60.5 µs** | 181.5 µs | **2.95–3.00×** (slower) |
+| end-to-end (quant + matmul) | **94.2 µs** | 225.0 µs | **2.38–2.39×** (slower) |
+
+**Takeaways**:
+1. **The collapse is exact and grad-checked, and at this scale/hardware it LOSES — an
+   honest negative.** `γ·(x·t)` reproduces the `W_eff` matmul bit-for-bit-to-rounding
+   (maxrel 0 on the forward + `dx` pins), so it is a *correct* ternary matmul. But on
+   x86_64 it is **~3× slower** (matmul) / **~2.4× slower** (end-to-end) than the SIMD-f64
+   path — `f64v_fmadd` does **4** fused multiply-adds per instruction, while the collapse
+   is **scalar** add/sub/skip (one element per op, plus a branch). The SIMD multiply is
+   already cheaper per-element than a scalar add; the ~31% zero-skip on Gaussian `W`
+   doesn't recover the gap (branch cost).
+2. **Why the BitNet win is absent here, and where it lives.** The integer-add advantage
+   needs one of: (a) **activation quantization** (int8 absmax acts → a literal *integer*
+   matmul, not f64 add — the heavier follow-on this reference deliberately scopes out,
+   ADR 0014), and/or (b) **hardware where mul ≫ add or without wide FMA** (the collapse
+   trades one expensive mul for one cheap add). Modern x86 with 4-wide f64 FMA + f64
+   activations is exactly the regime where the collapse can't win. The **memory** win
+   (1.58 bits/weight vs 64) is real and orthogonal — it is not what this kernel measures.
+3. **Decision: the default ternary forward keeps the SIMD-f64 `W_eff` path** (the faster
+   one). The collapse ships as the **grad-checked + benched reference kernel** + this
+   honest finding — so the gate is met ("build it + bench it vs SIMD-f64") and **ternary
+   runs stay byte-identical to 1.6.0** (the kernel is additive, wired into no run). This
+   mirrors the project's standing pattern of honest negatives (X004 rejected M9 levers,
+   X015 diffusion-below-uniform at tiny scale). Regeneration: `cyrius build
+   tests/attn11.bcyr build/bench && ./build/bench` (the `ternary i64-add` / `SIMD-f64`
+   rows, `(x100)` ratios).

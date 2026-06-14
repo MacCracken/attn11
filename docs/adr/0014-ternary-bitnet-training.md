@@ -88,10 +88,20 @@ load-bearing choices:
   grad-checked", not a win at this scale). One extra scratch allocation (`C·F`)
   under ternary.
 - **Neutral**: the **i64-add ternary matmul kernel** (`x·W_eff = γ·(x·t)`, the
-  multiply collapsing to add/subtract/skip) **benched against the SIMD-f64 path** is
-  increment 2 (a 1.6.x follow-on — the perf realization, as 1.2.1 realized MLA's
-  cache after 1.2.0's correctness landing). MLA/SSM/lin/MoE/RoPE/diffusion ternary
-  are clean additive fast-follows.
+  multiply collapsing to add/subtract/skip) shipped as **increment 2 (v1.6.1, X023)** —
+  two reference kernels `ternary_matmul_fwd`/`ternary_matmul_dx` in `ops.cyr`,
+  grad-checked (the forward + `dx` pinned against the SIMD-f64 `W_eff` path at maxrel 0,
+  `dx` FD'd) and **benched head-to-head**. The honest result: on x86_64 the collapse is
+  **~3× slower** (matmul) / **~2.4× slower** (end-to-end) than the SIMD-f64 path, because
+  `f64v_fmadd` retires 4 fused multiply-adds per instruction while the collapse is scalar
+  add/subtract/skip — the wide-SIMD f64 multiply is already cheaper per element than a
+  scalar add. The integer-add advantage needs **activation quantization** (int8 absmax
+  acts → a literal integer matmul; the heavier follow-on scoped out below) and/or hardware
+  without wide FMA; the orthogonal **memory** win (1.58 bits/weight) is real and unmeasured
+  by this kernel. So the default ternary forward **keeps the SIMD-f64 path** and the
+  collapse ships as the grad-checked + benched reference kernel (wired into no run; ternary
+  runs stay byte-identical to 1.6.0). MLA/SSM/lin/MoE/RoPE/diffusion ternary remain clean
+  additive fast-follows.
 
 ## Alternatives considered
 

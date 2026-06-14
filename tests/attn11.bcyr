@@ -43,6 +43,31 @@ fn main(): i64 {
     var e = now_ns();
     _report("linear_fwd TxCxF ", e - s, NL1);
 
+    # ---- TERNARY i64-add matmul (M16 increment 2, E6): the BitNet collapse
+    # x·W_eff = γ·(x·t), t∈{−1,0,+1}, benched HEAD-TO-HEAD against the SIMD-f64
+    # W_eff path (the 1.6.0 ternary forward) at the SAME T×C×F shape. Two surfaces:
+    #   matmul-only  — linear_fwd(W_eff)         vs ternary_matmul_fwd(signs)
+    #   end-to-end   — quant + linear_fwd        vs signs + ternary_matmul_fwd
+    # The end-to-end is the decision-relevant number (which path the forward should
+    # use). f64v_fmadd is 4-wide; the collapse is scalar add/sub/skip — see X023.
+    var tsig = t_alloc(C * F); var Weff = t_alloc(C * F);
+    var gam = ternary_signs(W, tsig, C, F);          # γ + i64 signs of W
+    ternary_quant(W, Weff, C, F);                     # the 1.6.0 W_eff
+    s = now_ns(); i = 0; while (i < NL1) { linear_fwd(x, Weff, bvec, y, T, C, F); i = i + 1; } e = now_ns();
+    var sf_mm = (e - s) / NL1;
+    _report("  ternary SIMD-f64 mm ", e - s, NL1);
+    s = now_ns(); i = 0; while (i < NL1) { ternary_matmul_fwd(x, tsig, gam, bvec, y, T, C, F); i = i + 1; } e = now_ns();
+    var ia_mm = (e - s) / NL1;
+    _report("  ternary i64-add  mm ", e - s, NL1);
+    puts("  i64-add / SIMD-f64 matmul (x100): "); fmt_int(ia_mm * 100 / sf_mm); _putc(10);
+    s = now_ns(); i = 0; while (i < NL1) { ternary_quant(W, Weff, C, F); linear_fwd(x, Weff, bvec, y, T, C, F); i = i + 1; } e = now_ns();
+    var sf_e2e = (e - s) / NL1;
+    _report("  ternary SIMD-f64 e2e", e - s, NL1);
+    s = now_ns(); i = 0; while (i < NL1) { ternary_signs(W, tsig, C, F); ternary_matmul_fwd(x, tsig, gam, bvec, y, T, C, F); i = i + 1; } e = now_ns();
+    var ia_e2e = (e - s) / NL1;
+    _report("  ternary i64-add  e2e", e - s, NL1);
+    puts("  i64-add / SIMD-f64 end-to-end (x100): "); fmt_int(ia_e2e * 100 / sf_e2e); _putc(10);
+
     # ---- forward / backward / full step ----
     var N = 200;
     s = now_ns(); i = 0; while (i < N) { model_forward(); i = i + 1; } e = now_ns();

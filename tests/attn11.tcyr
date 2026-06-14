@@ -3106,6 +3106,64 @@ fn test_ckpt_ternary(): i64 {
     return 0;
 }
 
+# M16 increment 2: the i64-add ternary matmul kernel (E6, ADR 0014). x·W_eff =
+# γ·(x·t), t∈{−1,0,+1} — the multiply collapses to add/subtract/skip plus ONE
+# γ-scale per output. Triangulated: (a) the collapse forward equals the SIMD-f64
+# W_eff matmul (same math, different rounding), (b) the collapse dx equals the
+# W_eff dx, and (c) dx FD-checks through the collapse forward. dW is the unchanged
+# STE pass-through already pinned in test_ternary_quant.
+fn tmm_loss(x, t, gamma, b, y, dy, M, K, N): i64 {
+    ternary_matmul_fwd(x, t, gamma, b, y, M, K, N); return dotsum(dy, y, M * N);
+}
+fn test_ternary_matmul(): i64 {
+    var M = 3; var K = 4; var N = 5;
+    var x = t_alloc(M * K); var W = t_alloc(K * N); var b = t_alloc(N);
+    var y = t_alloc(M * N); var yr = t_alloc(M * N); var dy = t_alloc(M * N);
+    t_randn(x, M * K, f64_from(1)); t_randn(W, K * N, f64_from(1));
+    t_randn(b, N, f64_from(1)); t_randn(dy, M * N, f64_from(1));
+    var t = t_alloc(K * N); var Weff = t_alloc(K * N);
+    var gamma = ternary_signs(W, t, K, N);
+    ternary_quant(W, Weff, K, N);
+    # γ·t reproduces W_eff (same absmean + round/clamp as the wrapper). Value-exact,
+    # not bit-pattern: a weight whose round gives −0.0 yields W_eff = γ·(−0.0) = −0.0,
+    # which the sign-bucket treats as the +0.0 zero — equal in value, not in bits.
+    var bitok = 1; var i = 0;
+    while (i < K * N) {
+        var ti = load64(t + i * 8); var ev = f64_from(0);
+        if (ti == 1) { ev = gamma; }
+        if (ti == (0 - 1)) { ev = f64_mul(gamma, f64_from(0 - 1)); }
+        if (f64_abs(f64_sub(load64(Weff + i * 8), ev)) != f64_from(0)) { bitok = 0; }
+        i = i + 1;
+    }
+    assert(bitok == 1, "ternary signs * gamma == W_eff (value-exact)");
+    # (a) collapse forward == SIMD-f64 W_eff matmul. The two sides are INDEPENDENT
+    # implementations — ternary_matmul_fwd (scalar add/sub/skip, γ factored out) vs
+    # rosnet linear_fwd (4-wide f64v_fmadd over an independently-built W_eff) — so this
+    # is a real cross-check, not a tautology. They agree to maxrel 0 here only because
+    # γ·(Σx·t) and Σx·(γ·t) coincide to sub-ULP at this small shape; (c)'s FD remains the
+    # independent gradient oracle regardless.
+    ternary_matmul_fwd(x, t, gamma, b, y, M, K, N);
+    linear_fwd(x, Weff, b, yr, M, K, N);
+    check("ternary-matmul fwd == W_eff", y, yr, M * N, 1000000);
+    # (b) collapse dx == SIMD-f64 W_eff dx — again two independent paths (an FD-free pin)
+    var dx = t_alloc(M * K); var dxr = t_alloc(M * K);
+    var dWr = t_alloc(K * N); var dbr = t_alloc(N);
+    ternary_matmul_dx(t, gamma, dy, dx, M, K, N);
+    linear_bwd(x, Weff, dy, dxr, dWr, dbr, M, K, N);
+    check("ternary-matmul dx == W_eff dx", dx, dxr, M * K, 1000000);
+    # (c) dx FD through the collapse forward (smooth in x — the real grad-check)
+    var eps = _eps(); var te = f64_mul(f64_from(2), eps);
+    var ndx = t_alloc(M * K); i = 0;
+    while (i < M * K) {
+        var o = load64(x + i * 8);
+        store64(x + i * 8, f64_add(o, eps)); var lp = tmm_loss(x, t, gamma, b, y, dy, M, K, N);
+        store64(x + i * 8, f64_sub(o, eps)); var lm = tmm_loss(x, t, gamma, b, y, dy, M, K, N);
+        store64(x + i * 8, o); store64(ndx + i * 8, f64_div(f64_sub(lp, lm), te)); i = i + 1;
+    }
+    check("ternary-matmul dx (FD)", dx, ndx, M * K, 100000);
+    return 0;
+}
+
 fn main(): i64 {
     alloc_init();
     rng_seed(123);
@@ -3211,6 +3269,7 @@ fn main(): i64 {
     test_ternary_quant();
     test_model_ternary();
     test_ckpt_ternary();
+    test_ternary_matmul();
     return assert_summary();
 }
 

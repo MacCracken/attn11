@@ -4,6 +4,51 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.6.1] - 2026-06-14
+
+**M16 — the i64-add ternary matmul + bench, increment 2 (E6); closes the M16 gate.**
+The BitNet realization of `--ternary`: `x·W_eff = γ·(x·t)`, `t ∈ {−1, 0, +1}`, collapses
+the contracted-dim multiply to **add / subtract / skip** with one γ-scale per output
+(M·N multiplies vs the dense M·K·N). Two attn11-local reference kernels
+`ternary_matmul_fwd` / `ternary_matmul_dx` (in `ops.cyr`) implement the collapse and are
+**grad-checked** (`test_ternary_matmul`: the forward and `dx` both pinned against the
+SIMD-f64 `W_eff` path at **maxrel 0** — exact to rounding — and `dx` FD-checked at 1e-5;
+`dW` is the unchanged STE pass-through already pinned in `test_ternary_quant`), then
+**benched head-to-head** against the 1.6.0 SIMD-f64 path. **Honest result (X023):** on
+x86_64 the collapse is **~3.0× slower** (matmul) / **~2.4× slower** (end-to-end) than the
+SIMD-f64 path — `f64v_fmadd` does 4 fused multiply-adds per instruction while the collapse
+is scalar add/sub/skip, so the wide-SIMD f64 multiply is already cheaper per element than
+a scalar add (the integer-add win needs **activation quantization** and/or hardware
+without wide FMA — the documented heavier follow-on, ADR 0014). So the **default ternary
+forward keeps the SIMD-f64 path**; the collapse ships as the grad-checked + benched
+reference kernel, wired into no run — **ternary *and* default runs stay byte-identical to
+1.6.0** (default, preset, BPE all verified). **1010 → 1014** checks, green x86_64 **and**
+aarch64/qemu; lint + fuzz + `make smoke` green. See ADR 0014 (updated consequence) and X023.
+
+### Added
+- **`ternary_signs` / `ternary_matmul_fwd` / `ternary_matmul_dx`** (`src/ops.cyr`).
+  `ternary_signs(W, t, K, N)` fills `t` with the i64 signs (−1/0/+1) of `W` and returns
+  `γ = absmean(W)` (γ·t reproduces `ternary_quant`'s `W_eff` value-for-value);
+  `ternary_matmul_fwd` computes `y = b + γ·(x·t)` with the contracted dim as add/sub/skip;
+  `ternary_matmul_dx` computes `dx = γ·(dy·tᵀ)` the same way. Reference kernels — the
+  default ternary forward (`qlinear_fwd`/`qlinear_bwd`) is unchanged, so no run's numerics
+  move.
+- **`test_ternary_matmul`** (`tests/attn11.tcyr`, registered dead-last after the other
+  ternary tests — the shared-RNG-stream discipline). Pins `signs·γ == W_eff` (value-exact),
+  the collapse forward == SIMD-f64 `W_eff` forward, the collapse `dx` == `W_eff` `dx`, and
+  FD-checks `dx` through the collapse. **+4 assertions (1010 → 1014).**
+- **Ternary matmul bench** (`tests/attn11.bcyr`). Head-to-head at T×C×F = 16×32×128:
+  SIMD-f64 vs i64-add, matmul-only and end-to-end (quant + matmul), with the `(x100)`
+  ratio printed.
+
+### Notes
+- **X023** (the increment-2 bench): the honest negative above — the collapse is exact and
+  grad-checked but ~2.4–3× slower than wide-SIMD f64 at this scale/hardware; the integer-add
+  advantage lives at activation-quantized / non-FMA regimes (and the orthogonal *memory*
+  win, 1.58 bits/weight). See `experiments.md`.
+- ADR 0014's "Neutral" consequence is updated: increment 2 is shipped as a benched
+  reference kernel with the measured result, not an assumed speedup.
+
 ## [1.6.0] - 2026-06-14
 
 **M16 — ternary (BitNet-style) training, increment 1 (E6).** `--ternary` trains with
