@@ -5,7 +5,22 @@
 
 ## Version
 
-**1.5.4** — *Curation at scale* (X019; the data-ingestion & curation 1.5.x arc,
+**1.5.5** — *Hardening / audit / security pass* (P(-1); **closes the data-ingestion
+& curation 1.5.x arc**). A security/correctness audit of the 1.5.x surface — the
+packed `g_data` store + raised 64 MB cap (1.5.3), the `c4_sample.py` curation script
+ingesting untrusted shards (1.5.1/2/4), and the char-diffusion path (1.5.0) — via an
+adversarial multi-agent review: five read-only dimensions, each medium+ finding
+adversarially verified (refute-by-default) against the committed code. **One**
+confirmed finding, fixed; four dimensions clean. Finding: a **gzip-bomb / unbounded
+line buffer** in `c4_sample.py` (`for line in gz` materializes a whole line → a
+no-newline runaway member OOMs); fixed with a bounded `iter_lines()` (1 MB chunks,
+8 MB per-line cap, drop+resync, `oversized=N` reported) — regression-verified normal
+extraction unchanged, a 12 MB bomb completes (no OOM), and re-curation byte-identical
+to before (X016/X017/X019 reproducibility preserved). The fix is **Python-side; the
+Cyrius binary is byte-identical** (CFG_VERSION bump only) — **977** checks unchanged.
+Audit at [`../audit/2026-06-13-1.5.x-hardening-audit.md`](../audit/2026-06-13-1.5.x-hardening-audit.md)
+(the ninth; GO, 0 blockers). `make release` exit 0.
+(1.5.4 — *Curation at scale* (X019; the data-ingestion & curation 1.5.x arc,
 step 3). The first run on 1.5.3's raised ceiling: curate a **24 MB / 12-shard** C4-en
 corpus (`c4_sample.py --curate --shards 12`, 6× the old 4 MB cap, impossible before
 the packed store) and run the scaled data+capacity experiment vs the 4 MB curated
@@ -22,7 +37,7 @@ experiment only — binary unchanged** (CFG_VERSION bump; **977** checks unchang
 Honest caveat: bits/byte-on-own-corpus understates data's generalization value; a
 held-out **`--eval-corpus`** flag is the clean follow-on (deferred, additive). Recipe
 + grid in [`../examples/c4-english.md`](../examples/c4-english.md).
-(1.5.3 — *Token-packing unlock* (X018; the data-ingestion & curation 1.5.x arc,
+1.5.3 — *Token-packing unlock* (X018; the data-ingestion & curation 1.5.x arc,
 step 2). The corpus token stream `g_data` was one **i64 per token (8 B)**; 1.5.3
 stores it **packed** — `u8` for byte-level (vocab ≤ 256), `u16` for BPE (vocab ≤ 768)
 — removing the 8×/4× bloat and raising `MAX_CORPUS_BYTES` **4 MB → 64 MB** (the u16
@@ -741,19 +756,20 @@ the FFN-density axis `--experts N --expert-topk K`, **two non-softmax mixers**
 `--attn-every K` (any mix of the four), and the **training-objective axis**
 `--objective {ar, diffusion}`. **M12, M13, M14, and M15 are all complete.**
 
-**Next — the data-ingestion & curation 1.5.x arc, then M16.** M12–M15 shipped: the
+**Next — M16 (the data-ingestion & curation 1.5.x arc is CLOSED).** M12–M15 shipped: the
 architecture arc (MLA/RoPE, MoE, the mixer family + hybrid) closed at 1.4.6, then
 M15 (1.5.0) the first *training-objective* departure (char-diffusion; X015 — AR wins
 at this tiny scale, the super-data-learner advantage is a scale phenomenon), then
-v1.5.1 the C4 data-ingestion tooling (X016). The **1.5.x data arc** (per [`roadmap.md`](roadmap.md)):
-**1.5.2** quality-curating sampler **shipped** (X017 — the prose-quality filter cut
+v1.5.1 the C4 data-ingestion tooling (X016). The **1.5.x data arc** (per [`roadmap.md`](roadmap.md))
+**is complete**: **1.5.2** quality-curating sampler (X017 — the prose-quality filter cut
 bits/byte 5.9%; multi-shard diversity is a scale lever); **1.5.3** token-packing unlock
-**shipped** (X018 — u8/u16 `g_data` vs i64; removed the 8×/4× bloat, raised
+(X018 — u8/u16 `g_data` vs i64; removed the 8×/4× bloat, raised
 `MAX_CORPUS_BYTES` 4 MB → 64 MB; default run byte-identical); **1.5.4** curation at
-scale **shipped** (X019 — a 24 MB/12-shard curated corpus, 6× the old cap; the
+scale (X019 — a 24 MB/12-shard curated corpus, 6× the old cap; the
 diversity/volume penalty halves with capacity, +5.4%→+2.8%, so more clean data starts
-paying off at scale; binary unchanged); next is **1.5.5** hardening/audit/security
-pass (P(-1)) closing the arc. Then **M16** ternary
+paying off at scale; binary unchanged); **1.5.5** hardening/audit/security pass (P(-1),
+the ninth audit — GO, the one finding a `c4_sample.py` gzip-bomb OOM, fixed; binary
+unchanged) **closing the arc**. Then **M16** ternary
 (BitNet-style) training (E6), into whose 1.6.x group **streaming token-shard
 ingestion** folds (RAM-independent large corpora — it pays off once a scaled model
 can absorb the data); **M17** RL (E9) last. Open diffusion fast-follows:

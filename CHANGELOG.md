@@ -4,6 +4,57 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.5.5] - 2026-06-13
+
+**Hardening / audit / security pass (P(-1)) — closes the data-ingestion & curation
+1.5.x arc.** A security/correctness audit of the surface the 1.5.x arc added: the
+packed `g_data` token store + raised 64 MB cap (1.5.3), the `c4_sample.py` curation
+script ingesting untrusted shards (1.5.1/1.5.2/1.5.4), and the char-diffusion path
+(1.5.0). Adversarial multi-agent review — five read-only dimensions, each medium+
+finding adversarially verified against the committed code. **One** confirmed finding,
+fixed; four dimensions clean. The Cyrius binary is **unchanged** (the fix is
+Python-side; CFG_VERSION bump only) — **977** checks unchanged.
+
+### Fixed
+- **Gzip-bomb / unbounded line buffering in `scripts/c4_sample.py`** (the one confirmed
+  finding; medium). The script ingests untrusted gzipped JSON-lines shards and iterated
+  them with `for line in gz:`, which materializes a whole line before yielding — a
+  malformed/MITM'd member with a giant no-newline run (DEFLATE ~1000:1) decompresses to
+  hundreds of MB in memory (**OOM**), and the `--max-bytes` guard runs only *after* the
+  line is buffered. Fix: a bounded `iter_lines()` reading fixed 1 MB chunks, splitting
+  on `\n` locally, **dropping** any runaway line over an 8 MB cap (real C4 docs are a
+  few KB) and resyncing at the next newline — memory capped at ~chunk+max_line, the drop
+  count reported (`oversized=N`), a valid doc after a bomb still recovered. Regression-
+  verified: normal extraction unchanged (`oversized=0`); a 12 MB bomb completes (exit 0,
+  no OOM, `oversized=1`); **re-curating the 4 MB sample is byte-identical to before**
+  (well-formed shards yield identical text → X016/X017/X019 reproducibility preserved).
+
+### Audit
+- **`docs/audit/2026-06-13-1.5.x-hardening-audit.md`** (the ninth audit). Verdict
+  **GO**, 0 residual blockers. Four dimensions returned zero findings with explicit
+  coverage: the **packed store** (no integer overflow, no OOB, width-decision sound,
+  alloc-fail handled, re-encode buffer sizing correct), the **corpus loaders + 64 MB
+  cap** (clean over-cap rejection, every allocation under the 256 MB `ALLOC_MAX`), the
+  **diffusion path** (in-bounds indexing, masked-CE div-by-zero guarded three ways, v7
+  hostile-load rejects, NaN guard), and **checkpoint back-compat / memory** (packing is
+  in-RAM only — format unchanged, v1–v7 load; the cap raise is a pure relaxation; the
+  one-time u8→u16 widen is bounded). One finding refuted (the `--max-bytes`
+  one-document overshoot — a documented streaming-stop semantic, binary hard-bounds
+  ingestion regardless); two low advisories accepted (dedup sets bounded by
+  `--max-bytes`; `--out` is expected dev-CLI behavior).
+
+### Verified
+- Cleanliness baseline + post-cut: `cyrius build` OK, lint 0 warnings, **977** grad-
+  checks green on x86_64 AND aarch64/qemu; fuzz green; `make smoke` green; `make
+  release` exit 0. Benchmark baseline captured (default step ~3.58 ms) — binary
+  byte-identical across the cut, so no perf regression.
+
+### Noted (deferred follow-on)
+- A held-out **`--eval-corpus FILE`** flag (eval on a disjoint corpus through the
+  loaded tokenizer) remains the clean way to score data's *generalization* value
+  (X019's own-corpus-metric caveat) — a small additive feature for a future point
+  release, out of this hardening pass's scope.
+
 ## [1.5.4] - 2026-06-13
 
 **Curation at scale** (data-ingestion & curation 1.5.x arc, step 3; X019). The first

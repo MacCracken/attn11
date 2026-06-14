@@ -13,17 +13,18 @@
 
 ## Where we are
 
-Current: **v1.5.4**. The v1.0 surface is frozen and additive-only
+Current: **v1.5.5**. The v1.0 surface is frozen and additive-only
 ([`STABILITY.md`](../STABILITY.md)); the reusable numeric core lives in
 **[rosnet](https://github.com/MacCracken/rosnet)** + **[tyche](https://github.com/MacCracken/tyche)**
 (v1.1.0). The 1.x architecture arc through M14 has shipped (the attention/KV, FFN-
 density, and sequence-mixer axes), **M15** (the char-diffusion *training objective*,
-v1.5.0) is the first objective departure, and the data-ingestion 1.5.x arc is under
-way — v1.5.1 the C4 tooling (X016), v1.5.2 the quality-curating sampler (X017),
-v1.5.3 the token-packing unlock (X018 — u8/u16 `g_data`, the 4 MB → 64 MB cap),
-**v1.5.4 curation at scale (X019 — a 24 MB/12-shard corpus; the diversity penalty
-halves with capacity)**.
-**Next up is 1.5.5 (hardening/audit, closes the arc), then M16.** For *what* shipped,
+v1.5.0) is the first objective departure, and the **data-ingestion & curation 1.5.x arc
+is now COMPLETE** — v1.5.1 the C4 tooling (X016), v1.5.2 the quality-curating sampler
+(X017), v1.5.3 the token-packing unlock (X018 — u8/u16 `g_data`, the 4 MB → 64 MB cap),
+v1.5.4 curation at scale (X019 — a 24 MB/12-shard corpus; the diversity penalty halves
+with capacity), **v1.5.5 the hardening/audit pass (the ninth audit — GO, one
+`c4_sample.py` gzip-bomb fix) closing the arc**.
+**Next up is M16 (ternary / BitNet-style training, E6).** For *what* shipped,
 see [`CHANGELOG.md`](../../CHANGELOG.md)
 (release narrative), [`experiments.md`](experiments.md) (the X-series), and
 [`state.md`](state.md) (the
@@ -97,15 +98,23 @@ data's *generalization* value — a held-out **`--eval-corpus FILE`** flag (re-e
 disjoint corpus through the loaded tokenizer) is the clean way to score it, a small
 additive follow-on deferred to keep 1.5.4 binary-unchanged.
 
-### 1.5.5 — Hardening / audit / security pass (P(-1))
+### 1.5.5 — Hardening / audit / security pass (P(-1)) — ✅ shipped (closes the arc)
 
-The standard pre-minor hardening (CLAUDE.md P(-1)): cleanliness, a benchmark
-baseline, deep review, and a **security audit** of the surface the 1.5.x arc added —
-the raised corpus cap and the packed-store bounds (1.5.3), the curation scripts'
-input handling (1.5.2/1.5.4), and the diffusion path (1.5.0). Findings →
-tests/benchmarks; report filed in [`../audit/`](../audit/). **Gate**: audit filed,
-findings fixed + regression-tested, `make release` green — closes the 1.5.x arc
-before 1.6.0.
+The standard pre-minor hardening (CLAUDE.md P(-1)): cleanliness, a benchmark baseline,
+and a **security audit** of the surface the 1.5.x arc added — the raised corpus cap +
+packed-store bounds (1.5.3), the curation script's untrusted-input handling
+(1.5.1/1.5.2/1.5.4), and the diffusion path (1.5.0). Adversarial multi-agent review
+(the ninth audit): five read-only dimensions, each medium+ finding adversarially
+verified. **Verdict GO, 0 blockers**; four dimensions clean, **one** confirmed finding
+fixed — a **gzip-bomb / unbounded line buffer** in `c4_sample.py` (`for line in gz`
+materialized a whole line, so a no-newline runaway shard member OOMs), fixed with a
+bounded `iter_lines()` (chunked read, 8 MB per-line cap, drop+resync) and
+regression-verified (normal extraction unchanged, a 12 MB bomb completes with no OOM,
+re-curation byte-identical). The Cyrius binary is unchanged (Python-side fix). Report:
+[`../audit/2026-06-13-1.5.x-hardening-audit.md`](../audit/2026-06-13-1.5.x-hardening-audit.md).
+**Gate met**: audit filed, finding fixed + regression-verified, `make release` green —
+the 1.5.x arc is closed. Deferred follow-on noted by X019: a held-out
+**`--eval-corpus FILE`** flag (the clean way to score data's generalization value).
 
 ### Streaming token-shard ingestion — 1.6.x (with M16)
 
@@ -253,10 +262,10 @@ gets reported, no dropped or cherry-picked rows (the "no silent caps" discipline
 ## Sequencing intent
 
 The remaining order is **value ÷ risk** and re-orderable (the axes are
-orthogonal). The **data-ingestion & curation 1.5.x arc** is nearly done (1.5.2
+orthogonal). The **data-ingestion & curation 1.5.x arc** is **complete** (1.5.2
 quality-curating sampler ✓ → 1.5.3 token-packing ✓ → 1.5.4 curation at scale ✓ →
-**1.5.5 hardening/audit**, which closes the arc) — cheap, high-ROW infra that improves the data the *existing*
-models see and lifts the corpus ceiling, before any new model-scale work. Then the
+1.5.5 hardening/audit ✓, which closed the arc) — cheap, high-ROW infra that improved the data the *existing*
+models see and lifted the corpus ceiling, before any new model-scale work. Next is the
 *precision* departure — **ternary training (M16, E6)** — into whose **1.6.x group**
 the **streaming token-shard** ingestion folds (the RAM-independent large-corpus path,
 which only pays off once a scaled model can absorb it). **RL (M17, E9)** is last

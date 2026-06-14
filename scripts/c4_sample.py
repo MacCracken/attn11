@@ -96,6 +96,42 @@ def open_src(url):
     return urllib.request.urlopen(req), True     # follows the HF -> CDN redirect
 
 
+def iter_lines(gz, oversized, max_line=8 * 1024 * 1024, chunk_size=1 << 20):
+    """Yield newline-delimited decompressed lines, BOUNDING any single line to
+    max_line bytes. The C4 shards are untrusted external data; a plain
+    `for line in gz` materializes a whole line before yielding, so a malformed or
+    MITM'd gzip member with a giant no-newline run (highly compressible, ~1000:1)
+    would buffer hundreds of MB into one object — an OOM / gzip-bomb (1.5.5 audit).
+    We instead read fixed `chunk_size` blocks and split locally; a runaway
+    no-newline line is dropped (oversized[0] += 1) and resynced at the next
+    newline, capping memory at ~chunk_size + max_line. Real C4 docs are a few KB,
+    so a >8 MB single line is never a legitimate record. For well-formed shards the
+    yielded text (and thus every keep/dedup decision) is byte-identical to the old
+    iteration, so sampled corpora reproduce bit-for-bit."""
+    buf = b""
+    dropping = False
+    while True:
+        chunk = gz.read(chunk_size)
+        if not chunk:
+            break
+        buf += chunk
+        if b"\n" in buf:
+            parts = buf.split(b"\n")
+            buf = parts.pop()            # last element is the incomplete tail
+            for ln in parts:
+                if dropping:             # tail end of a dropped runaway line
+                    dropping = False     # resync: skip it, resume normal yielding
+                    continue
+                yield ln
+        if len(buf) > max_line:          # runaway line with no newline -> drop it
+            if not dropping:
+                oversized[0] += 1
+            buf = b""
+            dropping = True
+    if buf and not dropping and len(buf) <= max_line:
+        yield buf
+
+
 def main():
     ap = argparse.ArgumentParser(description="Sample (optionally curate) English text from C4 (en).")
     ap.add_argument("--out", default="data/c4-en-sample.txt")
@@ -112,6 +148,7 @@ def main():
 
     written = scanned = kept = dup = lowq = 0
     failed = 0
+    ov = [0]                       # oversized (no-newline runaway) lines dropped
     seen_full = set()
     seen_pre = set()
     out = open(args.out, "wb")
@@ -145,7 +182,7 @@ def main():
             shard_written = 0
             try:
                 gz = gzip.GzipFile(fileobj=src)
-                for line in gz:
+                for line in iter_lines(gz, ov):
                     if shard_written >= budget or written >= args.max_bytes:
                         break
                     try:
@@ -188,9 +225,9 @@ def main():
     finally:
         out.close()
     sys.stderr.write(
-        "c4_sample: wrote %d bytes -> %s (%s; shards=%d failed=%d scanned=%d kept=%d dup=%d lowq=%d)\n"
+        "c4_sample: wrote %d bytes -> %s (%s; shards=%d failed=%d scanned=%d kept=%d dup=%d lowq=%d oversized=%d)\n"
         % (written, args.out, "curated" if args.curate else "raw",
-           nshards, failed, scanned, kept, dup, lowq))
+           nshards, failed, scanned, kept, dup, lowq, ov[0]))
 
 
 if __name__ == "__main__":
