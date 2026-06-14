@@ -45,15 +45,31 @@ fn CKPT_MAGIC(): i64 { return 0x4154544E31317631; }   # "ATTN11v1" (file family)
 # The version the CURRENT model serializes as: v6 carries the M14 rung-c per-layer
 # mixer array (a hybrid); a uniform model writes v5 — byte-identical to pre-1.4.3,
 # so every existing v5 round-trip and the fuzz harness are unchanged.
-fn CKPT_VER(): i64 { if (g_objective == 1) { return 7; } if (g_layer_kind != 0) { return 6; } return 5; }
+# v8 (M16, ternary/BitNet): one more fixed field, g_ternary, at slot [23] (with
+# objective at [22], both written). A ternary model is uniform AR MHA dense, so
+# it carries NO per-layer region. AR / diffusion / hybrid models still write
+# v5/v6/v7 byte-identical (ver < 8 => no [23]). Ternary and diffusion are mutually
+# exclusive (the v1.6.0 scope), so a v8 image always has objective == 0.
+fn CKPT_VER(): i64 {
+    if (g_ternary == 1) { return 8; }
+    if (g_objective == 1) { return 7; }
+    if (g_layer_kind != 0) { return 6; }
+    return 5;
+}
 fn CKPT_HDR(): i64 { return 22; }                     # v5/v6 fixed header i64 fields
 # v7 (M15, char-diffusion): one extra fixed field, the training objective, at slot
 # [22]; the vocab base shifts to 23. Diffusion is uniform (no hybrid), so a v7
 # image carries NO per-layer region. A uniform AR model still writes v5 and a
 # hybrid AR model v6 — both byte-identical to before M15.
 fn CKPT_HDR_V7(): i64 { return 23; }
-# The fixed-header size the CURRENT model serializes with (23 iff diffusion).
-fn _ckpt_hdr_cur(): i64 { if (g_objective == 1) { return CKPT_HDR_V7(); } return CKPT_HDR(); }
+# v8 (M16, ternary): 24 fixed fields — objective at [22], g_ternary at [23].
+fn CKPT_HDR_V8(): i64 { return 24; }
+# The fixed-header size the CURRENT model serializes with (24 ternary / 23 diffusion).
+fn _ckpt_hdr_cur(): i64 {
+    if (g_ternary == 1) { return CKPT_HDR_V8(); }
+    if (g_objective == 1) { return CKPT_HDR_V7(); }
+    return CKPT_HDR();
+}
 # per-layer mixer region (v6, ADR 0011): NL i64 kinds appended after the fixed
 # header, before the vocab. 0 (no region) for a uniform model (v5 and earlier).
 fn _ckpt_pl(): i64 { if (g_layer_kind != 0) { return g_NL; } return 0; }
@@ -144,10 +160,14 @@ fn ckpt_serialize(buf): i64 {
     # M13 MoE descriptor (E8) — defaults to the dense MLP (1 expert, top-1)
     store64(buf + 20 * 8, g_num_experts);
     store64(buf + 21 * 8, g_expert_topk);
-    # M15 v7: the training-objective descriptor at slot [22] — written ONLY for a
-    # diffusion image (g_objective == 1). A v5/v6 image writes nothing here, so
-    # [22] stays the per-layer/vocab base and AR checkpoints are byte-identical.
-    if (g_objective == 1) { store64(buf + 22 * 8, g_objective); }
+    # M15 v7 / M16 v8: the objective descriptor at slot [22] is written for any
+    # image whose version has the field (v7 diffusion OR v8 ternary). A v5/v6 image
+    # writes nothing here, so [22] stays the per-layer/vocab base and AR checkpoints
+    # are byte-identical. A v8 ternary image is AR, so it writes objective == 0.
+    if (CKPT_VER() >= 7) { store64(buf + 22 * 8, g_objective); }
+    # M16 v8: the ternary flag at slot [23] — only for a ternary image (g_ternary
+    # == 1). v5/v6/v7 write nothing here, so they stay byte-identical.
+    if (CKPT_VER() >= 8) { store64(buf + 23 * 8, g_ternary); }
     # M14 rung-c per-layer mixer kinds (v6) — only present when a hybrid; appended
     # after the (version-correct) fixed header. A v7 diffusion image is uniform, so
     # pl == 0 here.
@@ -176,7 +196,7 @@ fn ckpt_load_buf(buf, len): i64 {
     if (len < CKPT_HDR_V1() * 8) { return 0 - 1; }
     if (load64(buf + 0 * 8) != CKPT_MAGIC()) { return 0 - 2; }
     var ver = load64(buf + 1 * 8);
-    if ((ver < 1) || (ver > 7)) { return 0 - 3; }   # versions 1..7 accepted (v7 = M15 char-diffusion)
+    if ((ver < 1) || (ver > 8)) { return 0 - 3; }   # versions 1..8 (v7 = diffusion, v8 = M16 ternary)
     var hdr = CKPT_HDR_V1();
     if (ver == 2) { hdr = CKPT_HDR_V2(); }
     if (ver == 3) { hdr = CKPT_HDR_V3(); }
@@ -184,6 +204,7 @@ fn ckpt_load_buf(buf, len): i64 {
     if (ver == 5) { hdr = CKPT_HDR(); }
     if (ver == 6) { hdr = CKPT_HDR(); }   # v6: 22 fixed fields + the NL per-layer region (added as pl below)
     if (ver == 7) { hdr = CKPT_HDR_V7(); }   # v7: 23 fixed fields (objective at [22]); uniform, so no per-layer region
+    if (ver == 8) { hdr = CKPT_HDR_V8(); }   # v8: 24 fixed fields (objective [22] + ternary [23]); uniform AR
     if (len < hdr * 8) { return 0 - 1; }
     var V = load64(buf + 2 * 8);
     var C = load64(buf + 3 * 8);
@@ -312,6 +333,17 @@ fn ckpt_load_buf(buf, len): i64 {
     if (objective == 1) {
         if ((attn_kind != 0) || (pos_kind != 0) || (num_experts != 1)) { return 0 - 47; }
     }
+    # M16 ternary descriptor (v8). v1..v7 carry no field and synthesize 0 (off). A
+    # ternary image is uniform AR MHA dense (the v1.6.0 scope; v8 carries no
+    # per-layer region, so it is uniform by construction) — validated BEFORE
+    # allocation; a hostile v8 violating it is rejected (-49). The master weights
+    # stay f64, so np / the weight blob are unaffected by this flag.
+    var ternary = 0;
+    if (ver >= 8) { ternary = load64(buf + 23 * 8); }
+    if ((ternary != 0) && (ternary != 1)) { return 0 - 48; }
+    if (ternary == 1) {
+        if ((attn_kind != 0) || (pos_kind != 0) || (num_experts != 1) || (objective != 0)) { return 0 - 49; }
+    }
     # M14 per-layer hybrid (v6, ADR 0011; rung c+d). v1..v5 carry no per-layer
     # region and run uniform (the descriptor's attn_kind everywhere), so they cannot
     # hit -46. The NL kinds sit at [CKPT_HDR() .. CKPT_HDR()+NL); bound the read
@@ -401,6 +433,11 @@ fn ckpt_load_buf(buf, len): i64 {
     # hybrid from the in-buffer kinds (already _hybrid_kinds_ok-validated above);
     # uniform models take the plain path. The kinds pointer is the in-buffer region.
     var was_bpe = g_bpe_on;
+    # M16: install the ternary mode BEFORE model construction — model_init_full
+    # reads g_ternary to size g_qscratch and run its backstop. Set unconditionally
+    # (0 for a non-ternary image) so a prior ternary load in the same process can't
+    # leak into this one.
+    g_ternary = ternary;
     if (pl > 0) {
         model_init_full(V, C, T, nh, nkv, NL, bias, drop, 1, attn_kind, d_c, pos_kind, d_rope,
                         num_experts, topk, buf + CKPT_HDR() * 8, 0);
@@ -459,6 +496,7 @@ fn ckpt_load_buf(buf, len): i64 {
     g_num_experts = num_experts;
     g_expert_topk = topk;
     g_objective = objective;   # M15 (model_init_full already set it + g_bidir; kept explicit)
+    g_ternary = ternary;       # M16 (set before construction above; kept explicit)
     return 0;
 }
 

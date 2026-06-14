@@ -13,20 +13,20 @@
 
 ## Where we are
 
-Current: **v1.5.6**. The v1.0 surface is frozen and additive-only
+Current: **v1.6.0**. The v1.0 surface is frozen and additive-only
 ([`STABILITY.md`](../STABILITY.md)); the reusable numeric core lives in
 **[rosnet](https://github.com/MacCracken/rosnet)** + **[tyche](https://github.com/MacCracken/tyche)**
 (v1.1.0). The 1.x architecture arc through M14 has shipped (the attention/KV, FFN-
 density, and sequence-mixer axes), **M15** (the char-diffusion *training objective*,
-v1.5.0) is the first objective departure, and the **data-ingestion & curation 1.5.x arc
-is now COMPLETE** — v1.5.1 the C4 tooling (X016), v1.5.2 the quality-curating sampler
-(X017), v1.5.3 the token-packing unlock (X018 — u8/u16 `g_data`, the 4 MB → 64 MB cap),
-v1.5.4 curation at scale (X019 — a 24 MB/12-shard corpus; the diversity penalty halves
-with capacity), **v1.5.5 the hardening/audit pass (the ninth audit — GO, one
-`c4_sample.py` gzip-bomb fix) closing the arc**, and **v1.5.6 the held-out eval
-follow-on** (the deferred `--eval-corpus` flag from X019 — score a disjoint corpus
-through the loaded tokenizer; the generalization metric, run as X020).
-**Next up is M16 (ternary / BitNet-style training, E6).** For *what* shipped,
+v1.5.0) is the first objective departure, the **data-ingestion & curation 1.5.x arc
+is COMPLETE** (v1.5.1 the C4 tooling X016 → v1.5.2 the quality-curating sampler X017 →
+v1.5.3 the token-packing unlock X018 → v1.5.4 curation at scale X019 → v1.5.5 the
+hardening/audit pass → v1.5.6 the held-out `--eval-corpus` follow-on X020), and **M16
+(ternary / BitNet-style training, E6) has now shipped its first increment as v1.6.0** —
+`--ternary` weights in {−1,0,+1} (absmean scale) with a straight-through estimator,
+grad-checked, default run byte-identical, checkpoint v8 (run as **X022**). The 1.6.x
+group's remaining work (the i64-add ternary matmul + bench, streaming ingestion, the
+X021 data-volume held-out win) is below. For *what* shipped,
 see [`CHANGELOG.md`](../../CHANGELOG.md)
 (release narrative), [`experiments.md`](experiments.md) (the X-series), and
 [`state.md`](state.md) (the
@@ -149,26 +149,26 @@ is big enough to keep absorbing data (a model-scale precondition); it pairs with
 byte-identical sampling vs the in-memory path on a small corpus; a GB-scale corpus
 trains within bounded RAM; cross-arch.
 
-### Held-out cross-corpus eval — `--eval-corpus FILE` — 1.6.x
+### Data-volume held-out win (X021) — 1.6.x (with M16)
 
-The clean way to score **data's generalization value**, the open follow-on from X019
-(v1.5.4): today `--eval` only measures bits/byte over the model's OWN training corpus,
-which penalizes a larger/more-diverse corpus's higher intrinsic entropy in ABSOLUTE
-terms — so it understated whether "more clean data" actually helps (X019's stated
-caveat; the +2.8% own-corpus penalty for the preset on 24 MB would very plausibly flip
-to a generalization win on a held-out set). A small additive **`--eval-corpus FILE`**
-flag evaluates a trained model on a **disjoint** corpus: re-encode FILE through the
-**loaded/trained tokenizer** (reusing `tok_encode`, no `corpus_set` vocab re-derive, so
-NO vocab-order match check — the blocker that makes `--load --corpus` reject a held-out
-file today) into the packed `g_data`, then run the existing `eval_corpus` /
-`eval_diffusion` pass. It pairs with `c4_sample.py` emitting a held-out split (e.g. a
-distinct shard range). Sequenced into the **1.6.x group** because its payoff is scoring
-the scaled (ternary / larger-corpus) runs, not the reference-scale ones. **Gate**:
-on a corpus eval'd against itself, `--eval-corpus SAME` reproduces plain `--eval`
-bit-for-bit; a held-out split eval'd through the trained tokenizer is byte-exact and
-RNG-neutral; cross-arch; the no-flag run byte-identical (additive flag, no checkpoint
-format change). Logged as an X-series entry (the held-out AR-vs-data-scale number X019
-deferred).
+The open experiment from X020 (v1.5.6), the one the `--eval-corpus` flag was built to
+run. X020 found the own→held-out gap **tiny (< 1.3%)** at reference scale — sub-epoch
+training barely memorizes, so own-corpus bits/byte is already a near-unbiased
+generalization proxy *there*. The number X019 actually wanted is the one that needs a
+model big enough to **overfit** a small corpus (what M16's added capacity / a longer
+budget unlocks): train two models — one on the **4 MB** curated corpus, one on the
+**24 MB / 12-shard** corpus (X019) — then score **both** on a **THIRD disjoint
+held-out set** via `--eval-corpus`. The hypothesis X019 flagged: the **+2.8%
+own-corpus penalty** the larger/more-diverse corpus paid (preset, 24 MB) should **flip
+to a held-out generalization win** once the model can overfit the small corpus —
+directly measuring "more clean data → better generalization", the data value
+bits/byte-on-own-corpus understates in ABSOLUTE terms. No new binary surface (it rides
+the shipped `--eval-corpus` flag + `c4_sample.py`'s shard-range splits); it is sequenced
+into the **1.6.x group with M16** because the result only appears at a capacity/budget
+that overfits 4 MB, not at reference scale. **Gate**: train-4MB vs train-24MB, both
+scored on the same third disjoint set, RNG-neutral + cross-arch reproducible; a clear
+held-out delta reported (an honest win *or* a documented null — no dropped cells).
+Logged as **X021** (the held-out AR-vs-data-scale number X019/X020 deferred).
 
 ## The 1.x architecture arc
 
@@ -196,14 +196,32 @@ change at a time behind its own grad-check / bit-identity gate.
 
 **Weights in {−1, 0, +1}** with a straight-through estimator — the precision
 ladder's algorithmic endpoint, and a *natural fit* for an everything-is-i64
-language: ternary matmul collapses to integer adds. **Gate**: the STE backward
-documented + grad-checked where defined; accuracy vs the f64 baseline; the
-i64-add matmul benched against the SIMD-f64 path.
+language: ternary matmul collapses to integer adds.
 
-> **The 1.6.x group also folds in streaming token-shard ingestion** (defined in the
-> data-ingestion section above) — the RAM-independent large-corpus path that pays off
-> once a scaled (ternary or larger) model can keep absorbing data. Sequencing within
-> the group is TBD.
+**Increment 1 — ✅ shipped (v1.6.0, X022, ADR 0014).** `--ternary`: each quantized
+weight matrix becomes `W_eff = γ·clamp(round(W/γ),−1,+1)` (γ = absmean), master
+weights stay f64, the STE backward is the `dx`-through-`W_eff` + `dW` pass-through
+that rosnet's `linear_bwd` gives for free (it never reads `W` for `dW`). Scope: MHA
++ dense MLP + uniform + AR + learned-abs (the other axes are documented fast-follows).
+Grad-checked **where defined** (`dx` FD at 1e-5; the STE `dW` pinned bit-exact;
+full-model smooth-param FD), checkpoint **v8** (slot [23], `-48`/`-49` rejects),
+default/preset/BPE runs **byte-identical**, **986 → 1010** checks green x86_64 +
+aarch64/qemu. Accuracy vs f64 logged as X022 (ternary lowers capacity → worse
+bits/byte at reference scale, as expected — the deliverable is "it learns + is
+grad-checked", not a win at this scale).
+
+**Increment 2 — the i64-add matmul + bench (1.6.x follow-on).** `x·W_eff = γ·(x·t)`,
+`t∈{−1,0,+1}`, collapses the multiply to integer add / subtract / skip — the
+**i64-add matmul benched against the SIMD-f64 path** (the remaining M16 gate; the
+perf realization, as 1.2.1 realized MLA's cache after 1.2.0's correctness landing).
+Increment 1 reuses the f64 `linear_fwd` for correctness first.
+
+> **The 1.6.x group also folds in two data items** defined in the data-ingestion
+> section above: **streaming token-shard ingestion** (the RAM-independent large-corpus
+> path that pays off once a scaled ternary/larger model can keep absorbing data) and
+> the **data-volume held-out win (X021)** (train-4MB vs train-24MB scored on a third
+> disjoint set — the X019/X020 follow-on that needs a model able to overfit the small
+> corpus). Both ride M16's added capacity; sequencing within the group is TBD.
 
 ### M17 — Reinforcement learning (v1.7.0) — E9
 
@@ -311,8 +329,10 @@ quality-curating sampler ✓ → 1.5.3 token-packing ✓ → 1.5.4 curation at s
 1.5.5 hardening/audit ✓, which closed the arc) — cheap, high-ROW infra that improved the data the *existing*
 models see and lifted the corpus ceiling, before any new model-scale work. Next is the
 *precision* departure — **ternary training (M16, E6)** — into whose **1.6.x group**
-the **streaming token-shard** ingestion folds (the RAM-independent large-corpus path,
-which only pays off once a scaled model can absorb it). **RL (M17, E9)** is last
+two data items fold: **streaming token-shard** ingestion (the RAM-independent
+large-corpus path) and the **data-volume held-out win (X021)** (the X019/X020
+follow-on), both of which only pay off once a scaled model can absorb / overfit a
+corpus. **RL (M17, E9)** is last
 because it is an objective layer over a finished trunk, and the GPU *compute* backend
 (M18, E-infra) is sequenced TBD (it unblocks the B4 GPU benchmark).
 The E-series is informed by the

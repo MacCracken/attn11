@@ -554,6 +554,18 @@ fn model_init_full(V, C, T, nh, nkv, NL, attn_bias, dropout, seed,
             sys_exit(1);
         }
     }
+    # M16 ternary backstop (E6, ADR 0014). g_ternary is a global set by main()
+    # (gated at the CLI) or the checkpoint loader (validated, -49). v1.6.0 scope:
+    # mha (kind 0) + learned-abs (pos 0) + dense (1 expert) + uniform (no hybrid)
+    # + AR (objective 0). The other axes are documented fast-follows. This is the
+    # defense-in-depth gate (the primary gates run before model_init).
+    if (g_ternary == 1) {
+        if ((attn_kind != 0) || (pos_kind != 0) || (num_experts != 1)
+            || (hybrid_kinds != 0) || (objective != 0)) {
+            puts("attn11: model_init: ternary requires mha + learned-abs + dense + uniform + ar\n");
+            sys_exit(1);
+        }
+    }
     g_V = V; g_C = C; g_T = T; g_nh = nh; g_nkv = nkv; g_NL = NL; g_F = 4 * C;
     g_attn_bias = attn_bias; g_dropout = dropout; g_training = 1; g_step = 0;
     # architecture descriptor (ADR 0007). g_attn_kind/g_latent_dim/g_pos_kind/
@@ -610,6 +622,13 @@ fn model_init_full(V, C, T, nh, nkv, NL, attn_bias, dropout, seed,
     g_grads = t_alloc(g_NP);
     g_adam_m = t_alloc(g_NP);
     g_adam_v = t_alloc(g_NP);
+    # M16 (E6): a scratch buffer holding the quantized W_eff of the active matmul.
+    # Sized to the largest quantized matrix — C*F (the MLP Wfc/Wproj, F = 4C) >=
+    # C*C (the attention Q/K/V/O) — and reused sequentially (only one quantized
+    # matmul is live at a time). Allocated ONLY under ternary (g_qscratch stays 0
+    # otherwise, and qlinear_* is then a pure passthrough — default byte-identical).
+    g_qscratch = 0;
+    if (g_ternary == 1) { g_qscratch = t_alloc(g_C * g_F); }
 
     # initialise weights
     rng_seed(seed);
@@ -1181,9 +1200,9 @@ fn model_forward(): i64 {
                 moe_aux_fwd(La(LA_mlogits, L), La(LA_msel, L), g_aux_alpha, g_moe_sc, T, g_num_experts, g_expert_topk));
         } else {
             var fc = La(LA_fc, L); var gg = La(LA_g, L);
-            linear_fwd(b, PL(L, _o_Wfc()), PL(L, _o_bfc()), fc, T, C, F);
+            qlinear_fwd(b, PL(L, _o_Wfc()), PL(L, _o_bfc()), fc, T, C, F);
             gelu_fwd(fc, gg, T * F);
-            linear_fwd(gg, PL(L, _o_Wproj()), PL(L, _o_bproj()), A_mlp, T, F, C);
+            qlinear_fwd(gg, PL(L, _o_Wproj()), PL(L, _o_bproj()), A_mlp, T, F, C);
         }
         # residual dropout on the MLP branch
         dropout_gen_mask(La(LA_dmask_mlp, L), TC, g_dropout, g_training);
@@ -1250,9 +1269,9 @@ fn model_fwd_row(tok, pos): i64 {
                     La(LA_mlogits, L), La(LA_msel, L), La(LA_mgate, L), La(LA_mefc, L), La(LA_megg, L),
                     g_moe_sc, 1, C, F, g_num_experts, g_expert_topk);
         } else {
-            linear_fwd(R_b, PL(L, _o_Wfc()), PL(L, _o_bfc()), R_fc, 1, C, F);
+            qlinear_fwd(R_b, PL(L, _o_Wfc()), PL(L, _o_bfc()), R_fc, 1, C, F);
             gelu_fwd(R_fc, R_g, F);
-            linear_fwd(R_g, PL(L, _o_Wproj()), PL(L, _o_bproj()), R_mlp, 1, F, C);
+            qlinear_fwd(R_g, PL(L, _o_Wproj()), PL(L, _o_bproj()), R_mlp, 1, F, C);
         }
         c = 0;
         while (c < C) {
@@ -1292,9 +1311,9 @@ fn model_eval_window(n): i64 {
                     g_moe_sc, n, C, F, g_num_experts, g_expert_topk);
         } else {
             var fc = La(LA_fc, L); var gg = La(LA_g, L);
-            linear_fwd(b, PL(L, _o_Wfc()), PL(L, _o_bfc()), fc, n, C, F);
+            qlinear_fwd(b, PL(L, _o_Wfc()), PL(L, _o_bfc()), fc, n, C, F);
             gelu_fwd(fc, gg, n * F);
-            linear_fwd(gg, PL(L, _o_Wproj()), PL(L, _o_bproj()), A_mlp, n, F, C);
+            qlinear_fwd(gg, PL(L, _o_Wproj()), PL(L, _o_bproj()), A_mlp, n, F, C);
         }
         var xout = La(LA_resid, L + 1);
         i = 0;
@@ -1339,9 +1358,9 @@ fn model_backward(): i64 {
             moe_aux_bwd(La(LA_mlogits, L), La(LA_msel, L), g_aux_alpha, La(LA_b, L), PL(L, _o_Wgate()),
                         D_b, GL(L, _o_Wgate()), g_moe_dlaux, g_moe_sc, T, C, g_num_experts, g_expert_topk);
         } else {
-            linear_bwd(La(LA_g, L), PL(L, _o_Wproj()), D_drop, D_g, GL(L, _o_Wproj()), GL(L, _o_bproj()), T, F, C);
+            qlinear_bwd(La(LA_g, L), PL(L, _o_Wproj()), D_drop, D_g, GL(L, _o_Wproj()), GL(L, _o_bproj()), T, F, C);
             gelu_bwd(La(LA_fc, L), D_g, D_fc, T * F);
-            linear_bwd(La(LA_b, L), PL(L, _o_Wfc()), D_fc, D_b, GL(L, _o_Wfc()), GL(L, _o_bfc()), T, C, F);
+            qlinear_bwd(La(LA_b, L), PL(L, _o_Wfc()), D_fc, D_b, GL(L, _o_Wfc()), GL(L, _o_bfc()), T, C, F);
         }
         ln_bwd(xmid, PL(L, _o_ln2g()), D_b, La(LA_m2, L), La(LA_r2, L), D_tmp,
                GL(L, _o_ln2g()), GL(L, _o_ln2b()), T, C);

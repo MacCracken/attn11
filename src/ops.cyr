@@ -637,3 +637,64 @@ fn moe_aux_bwd(logits, sel, alpha, x, Wg, dx, dWg, dlaux, sc, T, C, N, K): i64 {
     }
     return 0;
 }
+
+# ===========================================================================
+# M16 — ternary (BitNet b1.58) weight quantization (E6, ADR 0014)
+# ===========================================================================
+# Master weights stay f64 (g_params / Adam moments are unchanged). In the
+# forward, each quantized weight matrix W(K,N) is replaced by W_eff = gamma * t:
+#   gamma = absmean(W) = (sum |W_ij|) / (K*N)            # fixed row-major sum
+#   t_ij  = clamp(round(W_ij / gamma), -1, +1)  in {-1, 0, +1}
+# so W_eff in {-gamma, 0, +gamma}. Backward is a STRAIGHT-THROUGH ESTIMATOR:
+# dx flows through the FIXED W_eff (a normal linear backward), and dW = x^T dy
+# is passed straight to the master weight — linear_bwd computes dW WITHOUT
+# reading W, so round/clip act as identity for the weight gradient (the STE).
+# g_ternary == 0 is an exact passthrough to linear_fwd/linear_bwd, so a non-
+# ternary (default) run is BYTE-IDENTICAL. Scope (v1.6.0): mha + dense + uniform
+# + AR + learned-abs (gated by the CLI + the model_init/loader backstops);
+# mla/ssm/lin/moe/rope/diffusion ternary are documented fast-follows.
+var g_ternary = 0;     # 1 = BitNet-style ternary weights (set by main / loader)
+var g_qscratch = 0;    # holds W_eff for the active matmul (>= max quantized K*N)
+
+# Quantize W(K,N) -> out = gamma * clamp(round(W/gamma), -1, +1). A zero matrix
+# (gamma == 0, the +0.0 bit pattern) quantizes to all zeros (no divide). The
+# abs-sum and round are pure f64 builtins (bit-reproducible cross-arch).
+fn ternary_quant(W, out, K, N): i64 {
+    var n = K * N;
+    var s = f64_from(0);
+    var i = 0;
+    while (i < n) { s = f64_add(s, f64_abs(load64(W + i * 8))); i = i + 1; }
+    var gamma = f64_div(s, f64_from(n));
+    if (gamma == f64_from(0)) {                      # all-zero matrix: t == 0
+        i = 0; while (i < n) { store64(out + i * 8, f64_from(0)); i = i + 1; }
+        return 0;
+    }
+    var one = f64_from(1);
+    var neg1 = f64_from(0 - 1);
+    i = 0;
+    while (i < n) {
+        var t = f64_round(f64_div(load64(W + i * 8), gamma));   # nearest integer
+        if (f64_gt(t, one) == 1) { t = one; }
+        if (f64_lt(t, neg1) == 1) { t = neg1; }
+        store64(out + i * 8, f64_mul(gamma, t));
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Quantizing wrappers around rosnet's linear_fwd/linear_bwd. With g_ternary == 0
+# they are exact passthroughs (byte-identical default run). With ternary on, W is
+# quantized into g_qscratch and the matmul/backward run against W_eff. dx uses
+# W_eff (the true forward weight); dW = x^T dy is the STE pass-through (linear_bwd
+# never reads W when accumulating dW). The same master W is quantized in both the
+# fwd and bwd of a step (Adam updates only after backward), so W_eff is consistent.
+fn qlinear_fwd(x, W, b, y, M, K, N): i64 {
+    if (g_ternary == 0) { return linear_fwd(x, W, b, y, M, K, N); }
+    ternary_quant(W, g_qscratch, K, N);
+    return linear_fwd(x, g_qscratch, b, y, M, K, N);
+}
+fn qlinear_bwd(x, W, dy, dx, dW, db, M, K, N): i64 {
+    if (g_ternary == 0) { return linear_bwd(x, W, dy, dx, dW, db, M, K, N); }
+    ternary_quant(W, g_qscratch, K, N);
+    return linear_bwd(x, g_qscratch, dy, dx, dW, db, M, K, N);
+}

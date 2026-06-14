@@ -5,7 +5,34 @@
 
 ## Version
 
-**1.5.6** — *Held-out (cross-corpus) eval* (X020; the deferred X019 follow-on). A new
+**1.6.0** — *Ternary (BitNet-style) training, M16 increment 1* (E6; ADR 0014, X022). A
+new **`--ternary`** flag trains with weights quantized to **{−1, 0, +1}**: each quantized
+weight matrix becomes `W_eff = γ·clamp(round(W/γ),−1,+1)` (γ = absmean) in the forward,
+while the **master weights stay f64** (fake-quant). The backward is a **straight-through
+estimator** that needs no new gradient math — `dx` flows through the fixed `W_eff` (a
+normal linear backward) and `dW = xᵀ·dy` is the pass-through (rosnet's `linear_bwd`
+computes `dW` without reading `W`). Two attn11-local wrappers `qlinear_fwd`/`qlinear_bwd`
+(in `ops.cyr`, since `lib/rosnet.cyr` is vendored) quantize into a pre-allocated scratch
+`g_qscratch`; with `g_ternary == 0` they are exact passthroughs, so the **default run is
+byte-identical** (default, preset, BPE all verified bit-for-bit). Scope (v1.6.0): **MHA +
+dense MLP + uniform + AR + learned-abs** (mla/ssm/lin/MoE/rope/diffusion ternary are
+documented fast-follows), gated at the CLI with a `model_init_full` backstop. **Checkpoint
+v8** adds `g_ternary` at slot [23] (objective at [22]; a v8 image is AR); non-ternary AR
+still writes v5, hybrid v6, diffusion v7 — byte-identical; `-48`/`-49` reject a hostile
+v8 before allocation; the weight blob is unchanged (master f64). Grad-checked **where
+defined** — `test_ternary_quant` FDs the `dx` path (1e-5) + the full-precision bias and
+**pins the STE `dW` bit-exact** (a naive FD of `dW` through the piecewise-constant
+quantizer is meaningless); `test_model_ternary` FDs the smooth params end-to-end;
+`test_ckpt_ternary` round-trips v8: **986 → 1010** checks, green x86_64 **and**
+aarch64/qemu; lint + fuzz + `make smoke` (new ternary cases) green. X022 (the accuracy
+run, [`experiments.md`](experiments.md)): at reference scale ternary is **competitive
+with f64** (default config, 2000 steps: f64 **0.254** bits/byte — bit-for-bit X015 — vs
+ternary **0.228**; the ~1.58-bit constraint regularizes a memorizable tiny corpus) — "it
+learns + is grad-checked", not a general win. The **i64-add ternary matmul + bench vs the
+SIMD-f64 path** (the remaining M16 gate) is the increment-2 follow-on; increment 1 reuses
+the f64 `linear_fwd` for correctness first. `make release` exit 0.
+
+(1.5.6 — *Held-out (cross-corpus) eval* (X020; the deferred X019 follow-on). A new
 **`--eval-corpus PATH`** flag scores the model on a **disjoint** corpus: re-encode the
 file through the **loaded tokenizer** (same byte vocab / BPE merges, no vocab-order
 check) and run the active objective's eval — AR `eval_corpus` (CE/token + bits/byte) or
@@ -27,7 +54,7 @@ memorizes, so own-corpus bits/byte is a near-unbiased generalization proxy, retr
 **validating the X016–X019 own-corpus numbers**; the data-volume "more data → held-out
 win" comparison (train-4MB vs train-24MB, eval a third disjoint set) is now unblocked as
 the X021 follow-on (lands at M16+ where a model can overfit a small corpus).
-`make release` exit 0.
+`make release` exit 0.)
 
 (1.5.5 — *Hardening / audit / security pass* (P(-1); **closes the data-ingestion
 & curation 1.5.x arc**). A security/correctness audit of the 1.5.x surface — the
@@ -511,13 +538,26 @@ checkpoint vs Linux at fixed CPU — `scripts/agnos-smoke.sh`):
   t~U(0,1), ≥1-mask floor); `eval_diffusion` reports denoising bits/byte at a mask
   grid + the ELBO bound. MHA + learned-abs + dense + uniform only. Checkpoint v7;
   grad-checked per-op + full-model (X015). A no-flag run is byte-identical.
+- **Ternary (BitNet-style) training** (1.6.0, `--ternary`, ADR 0014, E6): weights
+  quantized to **{−1, 0, +1}** in the forward — `W_eff = γ·clamp(round(W/γ),−1,+1)`,
+  γ = absmean — with a **straight-through estimator** backward (`dx` through the fixed
+  `W_eff`; `dW = xᵀ·dy` pass-through). Master weights stay f64. Two `ops.cyr` wrappers
+  `qlinear_fwd`/`qlinear_bwd` (the vendored `lib/rosnet.cyr` is unmodified) quantize
+  into `g_qscratch`; `g_ternary == 0` is an exact passthrough (default byte-identical).
+  Quantizes the MHA Q/K/V/O + dense MLP only; scope MHA + dense + uniform + AR +
+  learned-abs (gated at the CLI + a `model_init_full` backstop). Checkpoint v8 (slot
+  [23]; `-48`/`-49` reject a hostile image). Grad-checked where defined + STE `dW` pinned
+  bit-exact (`test_ternary_quant`/`test_model_ternary`/`test_ckpt_ternary`, X022). The
+  i64-add matmul + bench is the increment-2 follow-on. A no-flag run is byte-identical.
 - CLI: `--corpus --stdin --load --save --steps --gen-only --preset --heads
   --kv-heads --layers --attn-kind --latent-dim --attn-every --pos-kind --rope-dim
-  --experts --expert-topk --bpe --eval --objective --decode-steps --decode-schedule`
+  --experts --expert-topk --bpe --eval --eval-corpus --objective --decode-steps
+  --decode-schedule --ternary`
   (`--attn-kind` takes `mha`/`mla`/`lin`/`ssm`; `--latent-dim` is the MLA latent /
   SSM state size; `--attn-every K` builds the per-layer hybrid over the `--attn-kind`
   base; `--objective diffusion` opts into masked diffusion, with `--decode-steps` /
-  `--decode-schedule {cosine,linear}` for its parallel decode)
+  `--decode-schedule {cosine,linear}` for its parallel decode; `--ternary` is M16
+  BitNet-style ternary weights on mha + dense + AR)
 
 Default run (`./build/attn11`, 3 layers): loss `~3.2 → ~0.13` over 2000 steps;
 sampled output reproduces real corpus phrases.
@@ -561,10 +601,13 @@ constant `nh·hd²` state instead of a T-growing K/V.
   lines); the f64-array helpers + dense matmul moved to **rosnet**, the PRNG to
   **tyche** (1.1.0 extraction)
 - `ops.cyr` — layernorm, GELU (tanh approx), softmax cross-entropy (forward +
-  backward); `linear_fwd`/`linear_bwd` now resolve from **rosnet**; plus the
+  backward); `linear_fwd`/`linear_bwd` now resolve from **rosnet**; the
   **MoE** router/combine (1.3.0) `moe_fwd`/`moe_bwd` (top-K pick + renormalized
   softmax + per-expert MLP, gradient to selected logits only) and the Switch
-  load-balance aux (`moe_aux_fwd`/`moe_aux_dr`/`moe_aux_bwd`)
+  load-balance aux (`moe_aux_fwd`/`moe_aux_dr`/`moe_aux_bwd`); plus the **M16
+  ternary** quantizer (1.6.0) `ternary_quant` (absmean-scaled `{−1,0,+1}`) and the
+  quantizing wrappers `qlinear_fwd`/`qlinear_bwd` over rosnet's linear (passthrough
+  when `g_ternary == 0`; STE backward — `dx` through `W_eff`, `dW` pass-through)
 - `attn.cyr` — the shared attention core `attn_core_fwd`/`attn_core_bwd` (causal
   scaled-dot-product softmax/PV), wrapped by `attn_fwd`/`attn_bwd` (MHA/GQA
   projections) and `attn_mla_fwd`/`attn_mla_bwd` (MLA low-rank latent down/up

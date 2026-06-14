@@ -934,3 +934,49 @@ heldB (`--eval-corpus`, held-out).
    `head -c 4000000 data/c4-curated-24mb.txt > data/c4-24-trainA.txt`,
    `tail -c +12000001 data/c4-curated-24mb.txt | head -c 4000000 > data/c4-24-heldB.txt`,
    then `./build/attn11 --corpus data/c4-24-trainA.txt [--preset] --bpe 256 --steps {600|1500} --eval --eval-corpus data/c4-24-heldB.txt`.
+
+> **X021 is reserved** for the data-volume held-out win (train-4MB vs train-24MB, eval a
+> third disjoint set) — the experiment X020 unblocked but which only pays off at M16+
+> scale (a model that can overfit a small corpus). It is sequenced into the 1.6.x group
+> (see [`roadmap.md`](roadmap.md)) and will fill this slot when run. X022 below (logged
+> first, chronologically) is the M16 ternary accuracy run.
+
+## X022 — ternary (BitNet) vs f64 at reference scale (M16, v1.6.0) (2026-06-14)
+
+**Setup**: 1.6.0, the first **precision-axis** comparison — same trunk, same compute,
+the only difference is `--ternary`. Default config (V=25, d_model 32, ctx 16, 4 heads,
+3 layers, dense, MHA, learned-abs), seed 1337, the embedded 190-byte corpus, **2000
+steps × batch 16**, `--eval` (exact next-token NLL → bits/byte). Ternary quantizes the
+MHA Q/K/V/O + dense-MLP weights to `W_eff = γ·clamp(round(W/γ),−1,+1)` (γ = absmean) in
+the forward, with an STE backward; the master weights stay f64. The "super data learner"
+regime: a tiny corpus seen for many epochs (matching X015's setup, so the f64 row is a
+direct cross-check).
+
+| weights | params | bits/byte |
+|---------|--------|-----------|
+| **f64** (baseline) | 39 488 | **0.254** |
+| **ternary** {−1,0,+1} | 39 488 (master f64) | **0.228** |
+
+(The f64 row reproduces X015's 0.254 **bit-for-bit** — the `--ternary` flag is additive,
+the default path byte-identical.)
+
+**Takeaways**:
+1. **Ternary trains, grad-checks, and is competitive at reference scale** — it even edges
+   f64 here (0.228 vs 0.254). Read honestly: on a tiny, memorizable corpus the ~1.58-bit
+   constraint acts as a mild **regularizer**, and at 39 K params both objectives converge
+   low; this is a "the grad-checked STE learns and is competitive," **NOT** a general
+   claim that ternary beats f64. BitNet's real advantage is the **memory + i64-add
+   compute** at large scale, which the reference scale can't show (and which increment 1
+   does not yet realize — see takeaway 3).
+2. **The STE is correct where it is defined.** The op-level grad-check (`test_ternary_quant`)
+   confirms the `dx` path through the fixed `W_eff` matches finite differences (1e-5) and
+   that the STE `dW` is the bit-exact pass-through (`dW = xᵀ·dy`, independent of the
+   quantizer — a naive FD of `dW` through the piecewise-constant quantizer is meaningless,
+   which is *why* an STE is used); the full-model check FDs the smooth params (embeddings,
+   LN, biases) through the quantized stack. 986 → 1010 checks, green x86_64 + aarch64/qemu.
+3. **This is correctness, not yet speed.** Increment 1 reuses the f64 `linear_fwd` (it
+   re-quantizes `W` into a scratch each matmul — redundant f64 work), so it shows the
+   *learning* is sound but realizes **no** throughput win. The **i64-add ternary matmul**
+   (`x·W_eff = γ·(x·t)`, the multiply collapsing to add/subtract/skip) **benched against
+   the SIMD-f64 path** is the M16 increment-2 follow-on (the remaining gate). Regeneration:
+   `./build/attn11 --steps 2000 --eval` (f64) and `./build/attn11 --ternary --steps 2000 --eval`.

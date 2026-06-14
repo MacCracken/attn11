@@ -2970,6 +2970,142 @@ fn test_eval_held(): i64 {
     return 0;
 }
 
+# ---- M16 ternary (BitNet b1.58) grad-checks (E6, ADR 0014) -----------------
+# The STE means the QUANTIZED weight gradient is deliberately NOT the finite
+# difference of the piecewise-constant quantized forward (round/clip are treated
+# as identity in backward). So we grad-check where the function IS differentiable
+# (the dx path through the fixed W_eff, and the full-precision biases), and PIN
+# the weight gradient by its STE definition (bit-exact pass-through) — mirroring
+# the existing exact-zero/exact-equality pins (rope dX, posemb off-path).
+fn qlin_loss(x, W, b, y, dy, M, K, N): i64 { qlinear_fwd(x, W, b, y, M, K, N); return dotsum(dy, y, M * N); }
+fn test_ternary_quant(): i64 {
+    var M = 3; var K = 4; var N = 5;
+    var x = t_alloc(M * K); var W = t_alloc(K * N); var b = t_alloc(N);
+    var y = t_alloc(M * N); var dy = t_alloc(M * N);
+    t_randn(x, M * K, f64_from(1)); t_randn(W, K * N, f64_from(1));
+    t_randn(b, N, f64_from(1)); t_randn(dy, M * N, f64_from(1));
+    var dx = t_alloc(M * K); var dW = t_alloc(K * N); var db = t_alloc(N);
+    # --- structural pins: gamma = absmean(W) > 0, W_eff in {-gamma, 0, +gamma} ---
+    var Weff = t_alloc(K * N);
+    ternary_quant(W, Weff, K, N);
+    var s = f64_from(0); var i = 0;
+    while (i < K * N) { s = f64_add(s, f64_abs(load64(W + i * 8))); i = i + 1; }
+    var gamma = f64_div(s, f64_from(K * N));
+    assert(f64_gt(gamma, f64_from(0)) == 1, "ternary gamma (absmean) > 0");
+    # |W_eff| is gamma or 0 — sign-agnostic so a -0.0 (round of a small negative)
+    # counts as the zero bucket. The value set is {-gamma, 0, +gamma}.
+    var ok = 1; i = 0;
+    while (i < K * N) {
+        var av = f64_abs(load64(Weff + i * 8));
+        if ((av != gamma) && (av != f64_from(0))) { ok = 0; }
+        i = i + 1;
+    }
+    assert(ok == 1, "ternary |W_eff| in {gamma, 0}");
+    # --- ternary ON: the quantizing wrappers ---
+    g_ternary = 1; g_qscratch = t_alloc(K * N);
+    qlinear_fwd(x, W, b, y, M, K, N);
+    qlinear_bwd(x, W, dy, dx, dW, db, M, K, N);
+    var eps = _eps(); var te = f64_mul(f64_from(2), eps);
+    # dx FD-check: the quantized forward is SMOOTH in x (W_eff is fixed as x varies),
+    # so dx through W_eff matches central differences — the real grad-check.
+    var ndx = t_alloc(M * K); i = 0;
+    while (i < M * K) {
+        var o = load64(x + i * 8);
+        store64(x + i * 8, f64_add(o, eps)); var lp = qlin_loss(x, W, b, y, dy, M, K, N);
+        store64(x + i * 8, f64_sub(o, eps)); var lm = qlin_loss(x, W, b, y, dy, M, K, N);
+        store64(x + i * 8, o); store64(ndx + i * 8, f64_div(f64_sub(lp, lm), te)); i = i + 1;
+    }
+    check("ternary dx (FD through W_eff)", dx, ndx, M * K, 100000);
+    # db FD-check: the bias is full precision (qlinear passes it through unquantized).
+    var ndb = t_alloc(N); i = 0;
+    while (i < N) {
+        var o = load64(b + i * 8);
+        store64(b + i * 8, f64_add(o, eps)); var lp = qlin_loss(x, W, b, y, dy, M, K, N);
+        store64(b + i * 8, f64_sub(o, eps)); var lm = qlin_loss(x, W, b, y, dy, M, K, N);
+        store64(b + i * 8, o); store64(ndb + i * 8, f64_div(f64_sub(lp, lm), te)); i = i + 1;
+    }
+    check("ternary db (full precision)", db, ndb, N, 100000);
+    # dW STE pin: round/clip act as identity, so dW is EXACTLY linear_bwd's dW
+    # (which never reads W) — pinned bit-for-bit against a plain linear backward. A
+    # naive FD of dW through the quantized forward would be ~0 with spikes at the
+    # quantization steps, NOT the STE gradient — which is exactly why it is a pin.
+    g_ternary = 0;
+    var dxp = t_alloc(M * K); var dWp = t_alloc(K * N); var dbp = t_alloc(N);
+    linear_bwd(x, W, dy, dxp, dWp, dbp, M, K, N);
+    var bitok = 1; i = 0;
+    while (i < K * N) { if (load64(dW + i * 8) != load64(dWp + i * 8)) { bitok = 0; } i = i + 1; }
+    assert(bitok == 1, "ternary dW == STE pass-through (bit-exact)");
+    return 0;
+}
+
+# Full-model grad-check under ternary: the SMOOTH parameters (embeddings, final
+# LN, biases) are differentiable through the FIXED W_eff, so their gradients
+# FD-check normally — exercising the whole quantized fwd/bwd composition (the
+# quantized weight gradients are pinned in test_ternary_quant, not FD'd here).
+fn test_model_ternary(): i64 {
+    var V = 5; var C = 4; var T = 3; var nh = 2; var NL = 2;
+    g_ternary = 1;                                  # set BEFORE model_init (sizes g_qscratch)
+    model_init(V, C, T, nh, nh, NL, 1, f64_from(0), 1);   # mha + dense + uniform + AR
+    assert(g_ternary == 1, "ternary model active");
+    assert(g_qscratch != 0, "ternary qscratch allocated");
+    store64(A_tokens + 0, 1); store64(A_tokens + 8, 3); store64(A_tokens + 16, 0);
+    store64(A_targets + 0, 3); store64(A_targets + 8, 0); store64(A_targets + 16, 4);
+    model_forward(); model_zero_grads(); model_backward();
+    var n_tok = V * C;
+    var aTok = t_alloc(n_tok); t_copy(aTok, G_tokemb(), n_tok);
+    var aPos = t_alloc(T * C); t_copy(aPos, G_posemb(), T * C);
+    var aLnf = t_alloc(C); t_copy(aLnf, G_lnfg(), C);
+    var abo0 = t_alloc(C); t_copy(abo0, G_bo(0), C);
+    var nTok = t_alloc(n_tok); model_ng(P_tokemb(), nTok, n_tok);
+    var nPos = t_alloc(T * C); model_ng(P_posemb(), nPos, T * C);
+    var nLnf = t_alloc(C); model_ng(P_lnfg(), nLnf, C);
+    var nbo0 = t_alloc(C); model_ng(P_bo(0), nbo0, C);
+    check("ternary model dtokemb", aTok, nTok, n_tok, 10000);
+    check("ternary model dposemb", aPos, nPos, T * C, 10000);
+    check("ternary model dlnf_g", aLnf, nLnf, C, 10000);
+    check("ternary model L0 dbo", abo0, nbo0, C, 10000);
+    g_ternary = 0;                                  # restore (no later test expects ternary)
+    return 0;
+}
+
+# Ternary checkpoint round-trip (v8) + hostile rejections. A ternary model is
+# uniform AR MHA dense — it serializes as v8 (objective [22] + ternary [23]); a
+# non-ternary model still writes v5. The loader restores g_ternary and rejects a
+# hostile v8 (ternary out of {0,1} -> -48; ternary + a non-scope axis -> -49).
+fn test_ckpt_ternary(): i64 {
+    var V = build_corpus();
+    g_ternary = 0;
+    model_init(V, 8, 4, 2, 2, 1, 1, f64_from(0), 5);
+    assert(CKPT_VER() == 5, "non-ternary AR still serializes as v5 after M16");
+    g_ternary = 1;
+    model_init(V, 8, 4, 2, 2, 2, 1, f64_from(0), 33);            # ternary, NL=2
+    assert(g_ternary == 1, "ternary model built");
+    assert(CKPT_VER() == 8, "ternary serializes as v8");
+    var np = g_NP;
+    var snap = t_alloc(np); t_copy(snap, g_params, np);
+    var sz = ckpt_size();
+    var ck = alloc(sz); ckpt_serialize(ck);
+    assert(load64(ck + 1 * 8) == 8, "version field = 8");
+    assert(load64(ck + 22 * 8) == 0, "objective = AR recorded at [22]");
+    assert(load64(ck + 23 * 8) == 1, "ternary recorded at [23]");
+    g_ternary = 0;
+    model_init(V, 8, 4, 2, 2, 2, 1, f64_from(0), 61);            # scramble to non-ternary
+    assert(g_ternary == 0, "reset to non-ternary");
+    assert(ckpt_load_buf(ck, sz) == 0, "v8 ternary checkpoint loads");
+    assert(g_ternary == 1, "ternary restored");
+    assert(g_NP == np, "NP restored");
+    var mism = 0; var i = 0;
+    while (i < np) { if (load64(g_params + i * 8) != load64(snap + i * 8)) { mism = mism + 1; } i = i + 1; }
+    assert(mism == 0, "v8 params restored bit-for-bit");
+    var bad = alloc(sz);
+    t_copy(bad, ck, sz / 8); store64(bad + 23 * 8, 2);          # ternary out of {0,1}
+    assert(ckpt_load_buf(bad, sz) == (0 - 48), "ternary=2 rejected (-48)");
+    t_copy(bad, ck, sz / 8); store64(bad + 17 * 8, 1);          # ternary + rope (pos_kind=1)
+    assert(ckpt_load_buf(bad, sz) == (0 - 49), "ternary + rope rejected (-49)");
+    g_ternary = 0;
+    return 0;
+}
+
 fn main(): i64 {
     alloc_init();
     rng_seed(123);
@@ -3068,6 +3204,13 @@ fn main(): i64 {
     # test's shared-stream position byte-for-byte unchanged (X019 follow-on).
     test_group("held-out eval (1.5.x)");
     test_eval_held();
+    # M16 ternary (E6) — registered LAST. model_init reseeds the RNG, but the op
+    # test consumes the ambient stream, so dead-last keeps every earlier test's
+    # shared-stream position byte-for-byte unchanged (the X019/X015 discipline).
+    test_group("ternary / BitNet (M16)");
+    test_ternary_quant();
+    test_model_ternary();
+    test_ckpt_ternary();
     return assert_summary();
 }
 

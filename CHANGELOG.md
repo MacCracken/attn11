@@ -4,6 +4,57 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-06-14
+
+**M16 — ternary (BitNet-style) training, increment 1 (E6).** `--ternary` trains with
+weights quantized to **{−1, 0, +1}** (BitNet b1.58, arXiv:2402.17764): each quantized
+weight matrix `W` is replaced in the forward by `W_eff = γ·clamp(round(W/γ),−1,+1)`,
+`γ = absmean(W)`, while the **master weights stay f64** (fake-quant). The backward is a
+**straight-through estimator** that costs no new gradient math — `dx` flows through the
+fixed `W_eff` (a normal linear backward) and `dW = xᵀ·dy` is the pass-through, which
+rosnet's `linear_bwd` already computes without reading `W`. Scope for v1.6.0 is narrow —
+**MHA + dense MLP + uniform + AR + learned-abs** (the other axes are documented
+fast-follows) — so it lands one idea behind a tight grad-check, the way M15 diffusion
+did. The no-flag/default run is **byte-identical** to 1.5.5/1.5.6 (default, preset, and
+BPE runs all verified bit-for-bit). The **i64-add ternary matmul + a bench vs the
+SIMD-f64 path** (the remaining M16 gate) is deferred to increment 2 — increment 1 reuses
+the f64 `linear_fwd` for correctness first. See ADR 0014 and X022.
+
+### Added
+- **`--ternary`** (`src/main.cyr`, `src/ops.cyr`, `src/model.cyr`). Two attn11-local
+  wrappers `qlinear_fwd`/`qlinear_bwd` (in `ops.cyr`, since the vendored
+  `lib/rosnet.cyr` may not be modified) quantize `W` into a pre-allocated scratch
+  `g_qscratch` (sized `C·F`, reused sequentially) and run the matmul/backward against
+  `W_eff`; with `g_ternary == 0` they are exact passthroughs (byte-identical default).
+  Wired into the 16 MHA + dense-MLP call sites (train / cached-decode / eval). Gated to
+  mha + dense + uniform + AR + learned-abs at the CLI, with a `model_init_full` backstop.
+- **Checkpoint v8** (`src/persist.cyr`). One `g_ternary` field at slot [23] (objective at
+  [22], both written; a v8 image is AR). A ternary model writes v8; non-ternary AR still
+  writes v5, hybrid v6, diffusion v7 — all **byte-identical**. v≤7 synthesize
+  `ternary = 0`. Code `-48` rejects `ternary ∉ {0,1}`, `-49` a ternary image paired with
+  mla/lin/ssm/rope/MoE/diffusion (validated before any allocation). The weight blob is
+  unaffected — master weights serialize as f64 verbatim.
+- **`test_ternary_quant`, `test_model_ternary`, `test_ckpt_ternary`** (`tests/attn11.tcyr`,
+  registered dead-last — the shared-RNG-stream discipline). The op test FD-checks the
+  `dx` path (smooth in `x` through the fixed `W_eff`, 1e-5) and the full-precision bias,
+  pins `W_eff ∈ {−γ,0,+γ}` and `γ = absmean`, and pins the STE `dW` **bit-for-bit**
+  against a plain `linear_bwd` (its definition — a naive FD of `dW` through the
+  quantizer is meaningless). The full-model test FD-checks the smooth params (embeddings,
+  final LN, biases) end-to-end through the quantized stack. The ckpt test round-trips v8
+  and pins the `-48`/`-49` rejections. **986 → 1010** checks, green x86_64 **and**
+  aarch64/qemu.
+- **`make smoke`** gains ternary cases: hostile `--ternary --experts/--objective/--attn-kind`
+  reject cleanly, a valid `--ternary` run builds + trains.
+
+### Notes
+- **X022** (the ternary-vs-f64 accuracy run): at reference scale ternary is **competitive
+  with f64** (default config, 2000 steps: f64 **0.254** bits/byte — bit-for-bit X015 —
+  vs ternary **0.228**; the ~1.58-bit constraint acts as a regularizer on the memorizable
+  tiny corpus). Read honestly as "the grad-checked ternary trains and is competitive at
+  this scale", NOT a general win — BitNet's real advantage is the memory/compute of the
+  i64-add matmul at large scale (increment 2 + M16's scale work). See `experiments.md`.
+- ADR 0014 documents the STE design and why `dW` is pinned, not FD'd.
+
 ## [1.5.6] - 2026-06-13
 
 **Held-out (cross-corpus) eval — the X019 generalization follow-on.** A new

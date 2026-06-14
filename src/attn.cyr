@@ -306,15 +306,15 @@ fn attn_fwd(Wq, bq, Wk, bk, Wv, bv, Wo, bo, x, out, ar, T, C, nh, nkv, pos_kind)
     var Vc = _at_Vc(ar, T, C, Ckv);
     var Pc = _at_Pc(ar, T, C, Ckv);
     var concat = _at_concat(ar, T, C, nh, Ckv);
-    linear_fwd(x, Wq, bq, Qc, T, C, C);
-    linear_fwd(x, Wk, bk, Kc, T, C, Ckv);
-    linear_fwd(x, Wv, bv, Vc, T, C, Ckv);
+    qlinear_fwd(x, Wq, bq, Qc, T, C, C);
+    qlinear_fwd(x, Wk, bk, Kc, T, C, Ckv);
+    qlinear_fwd(x, Wv, bv, Vc, T, C, Ckv);
     if (pos_kind == 1) {                # coupled RoPE: rotate Q/K (not V) in place
         rope_apply_fwd(Qc, T, 0, C, nh);
         rope_apply_fwd(Kc, T, 0, Ckv, nkv);
     }
     attn_core_fwd(Qc, Kc, Vc, Pc, concat, T, C, nh, nkv);
-    linear_fwd(concat, Wo, bo, out, T, C, C);
+    qlinear_fwd(concat, Wo, bo, out, T, C, C);
     return 0;
 }
 
@@ -423,15 +423,15 @@ fn attn_core_fwd_row(q_row, Kc, Vc, prow, concat_row, pos, C, nh, nkv): i64 {
 fn attn_fwd_row(Wq, bq, Wk, bk, Wv, bv, Wo, bo, x_row, out_row,
                 Kc, Vc, prow, concat_row, q_row, pos, C, nh, nkv, pos_kind): i64 {
     var Ckv = nkv * (C / nh);
-    linear_fwd(x_row, Wq, bq, q_row, 1, C, C);
-    linear_fwd(x_row, Wk, bk, Kc + pos * Ckv * 8, 1, C, Ckv);
-    linear_fwd(x_row, Wv, bv, Vc + pos * Ckv * 8, 1, C, Ckv);
+    qlinear_fwd(x_row, Wq, bq, q_row, 1, C, C);
+    qlinear_fwd(x_row, Wk, bk, Kc + pos * Ckv * 8, 1, C, Ckv);
+    qlinear_fwd(x_row, Wv, bv, Vc + pos * Ckv * 8, 1, C, Ckv);
     if (pos_kind == 1) {                # coupled RoPE: rotate this row's Q and K
         rope_apply_fwd(q_row, 1, pos, C, nh);
         rope_apply_fwd(Kc + pos * Ckv * 8, 1, pos, Ckv, nkv);
     }
     attn_core_fwd_row(q_row, Kc, Vc, prow, concat_row, pos, C, nh, nkv);
-    linear_fwd(concat_row, Wo, bo, out_row, 1, C, C);
+    qlinear_fwd(concat_row, Wo, bo, out_row, 1, C, C);
     return 0;
 }
 
@@ -584,7 +584,7 @@ fn attn_bwd(Wq, Wk, Wv, Wo, x, dout, dx,
     var dxv = _at_dxv(ar, T, C, nh, Ckv);
     var dprow = _at_dprow(ar, T, C, nh, Ckv);
     # 1. out = concat @ Wo
-    linear_bwd(concat, Wo, dout, dconcat, dWo, dbo, T, C, C);
+    qlinear_bwd(concat, Wo, dout, dconcat, dWo, dbo, T, C, C);
     # 2-4. attention core: dconcat -> dQ, dK, dV (incl. softmax backward). Qc/Kc
     # in the arena are the ROTATED forward values (RoPE rewrote them in place), so
     # dQ/dK come out w.r.t. the rotated Q/K.
@@ -594,9 +594,9 @@ fn attn_bwd(Wq, Wk, Wv, Wo, x, dout, dx,
         rope_apply_bwd(dK, T, 0, Ckv, nkv);
     }
     # 5. back through Q=x@Wq, K=x@Wk, V=x@Wv; accumulate dx
-    linear_bwd(x, Wq, dQ, dxq, dWq, dbq, T, C, C);
-    linear_bwd(x, Wk, dK, dxk, dWk, dbk, T, C, Ckv);
-    linear_bwd(x, Wv, dV, dxv, dWv, dbv, T, C, Ckv);
+    qlinear_bwd(x, Wq, dQ, dxq, dWq, dbq, T, C, C);
+    qlinear_bwd(x, Wk, dK, dxk, dWk, dbk, T, C, Ckv);
+    qlinear_bwd(x, Wv, dV, dxv, dWv, dbv, T, C, Ckv);
     var idx = 0;
     while (idx < T * C) {
         store64(dx + idx * 8, f64_add(f64_add(load64(dxq + idx * 8), load64(dxk + idx * 8)),

@@ -45,17 +45,19 @@ aarch64:
 # any exit >= 128 here is a signal/crash and fails the gate.
 smoke: build
 	@echo "smoke: hostile CLI args must reject cleanly, never crash"
-	@for args in "--layers 100000 --attn-every 2" "--layers 129 --attn-every 2" "--layers 0 --attn-every 2"; do \
+	@for args in "--layers 100000 --attn-every 2" "--layers 129 --attn-every 2" "--layers 0 --attn-every 2" "--ternary --experts 4" "--ternary --objective diffusion" "--ternary --attn-kind ssm"; do \
 	  ./build/attn11 $$args --gen-only >/dev/null 2>&1; rc=$$?; \
 	  if [ $$rc -ge 128 ]; then echo "smoke: CRASH (signal $$((rc-128))) on: $$args"; exit 1; fi; \
 	  if [ $$rc -eq 0 ]; then echo "smoke: expected rejection but succeeded on: $$args"; exit 1; fi; \
 	done; \
 	./build/attn11 --preset --attn-kind ssm --attn-every 2 --gen-only >/dev/null 2>&1; \
 	if [ $$? -ne 0 ]; then echo "smoke: a valid mha/ssm hybrid failed to build"; exit 1; fi; \
+	./build/attn11 --ternary --steps 5 >/dev/null 2>&1; \
+	if [ $$? -ne 0 ]; then echo "smoke: a valid --ternary run failed"; exit 1; fi; \
 	./build/attn11 --gen-only --eval-corpus /nonexistent/attn11-smoke >/dev/null 2>&1; rc=$$?; \
 	if [ $$rc -ge 128 ]; then echo "smoke: CRASH (signal $$((rc-128))) on missing --eval-corpus file"; exit 1; fi; \
 	if [ $$rc -eq 0 ]; then echo "smoke: missing --eval-corpus file should set a non-zero exit"; exit 1; fi; \
-	echo "smoke: ok (hostile --layers/--attn-every rejected; valid hybrid builds; held-out eval errors cleanly)"
+	echo "smoke: ok (hostile --layers/--attn-every/--ternary rejected; valid hybrid + ternary build; held-out eval errors cleanly)"
 
 clean:
 	rm -rf build/
