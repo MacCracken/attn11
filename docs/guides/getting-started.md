@@ -35,12 +35,18 @@ attn11 --experts N           MoE: N experts per block (1 = dense; >1 enables top
 attn11 --expert-topk K       active experts per token (default 2; 1..N)
 attn11 --bpe K               learn K BPE merges first (1..512; default is byte-level)
 attn11 --eval                print CE/token + bits-per-byte after training/save
+attn11 --eval-corpus P       held-out eval on a disjoint corpus via the loaded tokenizer
+attn11 --objective O         training objective: ar (default) or diffusion (masked, bidirectional)
+attn11 --ternary             BitNet-style ternary weights {-1,0,+1} (mha + dense + ar; STE backward)
+attn11 --decode-steps N      diffusion decode iterations (default = ctx)
+attn11 --decode-schedule S   diffusion unmask schedule: cosine (default) or linear
 ```
 
 Config flags (`--preset`/`--heads`/`--kv-heads`/`--layers`/`--attn-kind`/
 `--latent-dim`/`--attn-every`/`--pos-kind`/`--rope-dim`/`--experts`/`--expert-topk`/
-`--bpe`) shape a **fresh** model; under `--load` the checkpoint's config and
-tokenizer win.
+`--objective`/`--ternary`/`--bpe`) shape a **fresh** model; under `--load` the
+checkpoint's config, objective, precision, and tokenizer win. (`--decode-steps`/
+`--decode-schedule` are runtime knobs for diffusion generation, not model shape.)
 Magnitude caps (enforced in `model_config_ok`, else a clean abort): d_model
 ≤ 4096, ctx ≤ 8192, `--layers` 1..128, vocab ≤ 768; `--heads` must divide
 d_model and `--kv-heads` must divide `--heads`. See
@@ -69,8 +75,10 @@ full K/V (1.2.1); the `lin` and `ssm` mixers cache a **constant-size** recurrent
 state (not a T-growing K/V); coupled/decoupled RoPE (`--pos-kind`, 1.2.2/1.2.3)
 rotate by position — all bit-identical cached-vs-uncached. Checkpoints from
 earlier formats (v1 ≤ 0.6.0, v2 = 0.7.0, v3 = 1.0/1.1, v4 = 1.2.x, v5 =
-1.3.0–1.4.2) all still load; saves write **v5** for a uniform model and **v6** for
-a per-layer hybrid (the per-layer mixer array) — see ADR 0006/0007/0008/0011/0012.
+1.3.0–1.4.2, v6 = 1.4.3–1.4.4, v7 = 1.5.0) all still load; saves write **v5** for a
+uniform AR model, **v6** for a per-layer hybrid (the per-layer mixer array), **v7**
+for a diffusion model (the `objective` field), and **v8** for a ternary model (the
+`ternary` flag) — see ADR 0006/0007/0008/0011/0012/0013/0014.
 
 ## Layout
 

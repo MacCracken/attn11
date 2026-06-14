@@ -10,7 +10,7 @@
 
 ## CLI flags (frozen, runtime)
 
-All 19 behavioral flags below are stable. A run with **no flags** trains on the
+All 24 behavioral flags below are stable. A run with **no flags** trains on the
 embedded corpus and samples; that behavior is frozen. (Flags added past 1.0 are
 additive — the post-1.0 rule: a no-flag run stays byte-identical regardless.)
 
@@ -35,6 +35,11 @@ additive — the post-1.0 rule: a no-flag run stays byte-identical regardless.)
 | `--expert-topk K` | active experts per token (default 2; `1..N`); needs `--experts > 1` (1.3.0) |
 | `--bpe K` | learn K BPE merges first (1..512; byte-level is the default) |
 | `--eval` | print CE/token + bits-per-byte after training/save |
+| `--eval-corpus PATH` | held-out eval: re-encode a disjoint corpus through the loaded tokenizer and score CE/bits-per-byte on it (1.5.6) |
+| `--objective O` | training objective: `ar` (default) or `diffusion` (masked, bidirectional — D3PM/MDLM; mha/dense/uniform/learned-abs) (1.5.0) |
+| `--decode-steps N` | diffusion decode iterations (default = ctx); only with `--objective diffusion` (1.5.0) |
+| `--decode-schedule S` | diffusion unmask schedule: `cosine` (default) or `linear`; only with `--objective diffusion` (1.5.0) |
+| `--ternary` | BitNet-style ternary weights `{−1,0,+1}` (mha + dense MLP + uniform + AR + learned-abs; STE backward; master weights stay f64) (1.6.0) |
 
 Plus `--help`/`-h` and `--version` (informational). The parser **rejects
 unknown arguments** and a value-flag given without a value — both exit non-zero
@@ -74,23 +79,27 @@ them requires a rebuild. Their *values* are the frozen defaults:
 ## Checkpoint format (frozen contract: load-compatibility)
 
 Native-endian i64 blob; records the tokenizer (since v3), the architecture
-descriptor (since v4), the MoE descriptor (since v5), and — for a per-layer hybrid
-— the per-layer mixer kinds (v6). **v1 (≤0.6.0), v2 (0.7.0), v3 (1.0/1.1), v4
-(1.2.x), and v5 (1.3.0–1.4.2) all still load** and always will — backward
-load-compatibility is part of the contract. The save format advances additively
-(the post-1.0 additive-only rule): a **uniform** model writes **v5** (the
-`attn_kind`/`pos_kind`/`latent_dim`/`rope_dim` descriptor, ADR 0007, +
-`num_experts`/`expert_topk`, ADR 0008); a **per-layer hybrid** writes **v6** (the
-NL per-layer mixer kinds, ADR 0011/0012). `attn_kind` ∈ {mha, mla (1.2.0), lin
-(1.4.0), ssm (1.4.2)}, the `pos_kind` RoPE variants (1.2.2/1.2.3), MoE
-(`num_experts`/`topk`, 1.3.0), and the v6 hybrid pattern are all accepted. A
+descriptor (since v4), the MoE descriptor (since v5), the per-layer mixer kinds (v6,
+hybrids), the diffusion `objective` (v7), and the `ternary` flag (v8). **v1 (≤0.6.0),
+v2 (0.7.0), v3 (1.0/1.1), v4 (1.2.x), v5 (1.3.0–1.4.2), v6 (1.4.3–1.4.4), and v7
+(1.5.0) all still load** and always will — backward load-compatibility is part of the
+contract. The save format advances additively (the post-1.0 additive-only rule): a
+**uniform AR** model writes **v5** (the `attn_kind`/`pos_kind`/`latent_dim`/`rope_dim`
+descriptor, ADR 0007, + `num_experts`/`expert_topk`, ADR 0008); a **per-layer hybrid**
+writes **v6** (the NL per-layer mixer kinds, ADR 0011/0012); a **diffusion** model
+writes **v7** (the `objective` field, ADR 0013); a **ternary** model writes **v8** (the
+`ternary` flag, ADR 0014). `attn_kind` ∈ {mha, mla (1.2.0), lin (1.4.0), ssm (1.4.2)},
+the `pos_kind` RoPE variants (1.2.2/1.2.3), MoE (`num_experts`/`topk`, 1.3.0), the v6
+hybrid pattern, the v7 objective, and the v8 ternary flag are all accepted. A
 default-descriptor v5 (`mha`/`learned`/dense) is a byte-identical resume of a v4.
 The *exact save version* is not itself frozen (it advances additively); what is
 frozen is that older images keep loading. Checkpoints are **not** portable across
 architectures (raw native-endian `f64`); that is by design (ADR 0004) and frozen.
 The hostile-input validation surface (codes documented in `src/persist.cyr`) is
 frozen in behavior, additive in new codes (`-40..-43` the v4 descriptor, `-44`/
-`-45` the v5 MoE descriptor, `-46` an invalid v6 per-layer kind).
+`-45` the v5 MoE descriptor, `-46` an invalid v6 per-layer kind, `-47` an invalid v7
+objective, `-48`/`-49` an invalid v8 ternary flag / a ternary image paired with a
+non-scope axis).
 
 ## Not part of the contract
 

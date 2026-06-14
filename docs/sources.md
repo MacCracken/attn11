@@ -190,6 +190,23 @@ Generative Image Transformers." *CVPR 2022.* arXiv:[2202.04200](https://arxiv.or
 a cosine schedule (attn11's greedy, lowest-index-tie-break, deterministic variant).
 Used in: `src/train.cyr` (`gen_diffusion`, `_diff_keep`). See ADR 0013.
 
+## Weight precision / quantization
+
+### Ternary (BitNet b1.58) weight quantization, fake-quant with a straight-through estimator (M16)
+**Ma, S., Wang, H., Ma, L., Wang, L., Wang, W., Huang, S., Dong, L., Wang, R., Xue, J.,
+Wei, F. (2024).** "The Era of 1-bit LLMs: All Large Language Models are in 1.58 Bits."
+arXiv:[2402.17764](https://arxiv.org/abs/2402.17764) — the BitNet b1.58 ternary
+weight scheme attn11 implements: each quantized weight matrix becomes
+`W_eff = γ·clamp(round(W/γ),−1,+1)` with `γ = absmean(W)`, weights in {−γ, 0, +γ}, and
+the ternary matmul collapsing to integer add / subtract / skip (the i64-add kernel
+benched in X023). **Bengio, Y., Léonard, N., Courville, A. (2013).** "Estimating or
+Propagating Gradients Through Stochastic Neurons for Conditional Computation."
+arXiv:[1308.3432](https://arxiv.org/abs/1308.3432) — the straight-through estimator:
+treat the non-differentiable round/clip as the identity in the backward, so the master
+(f64) weight receives `dW = xᵀ·dy` while the forward uses `W_eff`. Used in: `src/ops.cyr`
+(`ternary_quant` + the `qlinear_fwd`/`qlinear_bwd` wrappers; the i64-add reference kernels
+`ternary_signs`/`ternary_matmul_fwd`/`ternary_matmul_dx`). See ADR 0014, X022/X023.
+
 ## Tokenization
 
 ### Byte-pair encoding (BPE) for subword vocabularies

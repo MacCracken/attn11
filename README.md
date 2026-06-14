@@ -23,8 +23,12 @@ an embedded corpus, then samples from it:
   (gated-linear), ssm (selective-SSM)}` — or a per-layer **hybrid** (`--attn-every`)
   — and the FFN is a dense GELU MLP or a top-K **MoE** (`--experts N`)
 - **Head** — final `LayerNorm` + weight-tied LM head → softmax cross-entropy
+- **Objective** — autoregressive by default, or a masked **diffusion** LM
+  (`--objective diffusion`: bidirectional, confidence-ordered parallel decode)
+- **Precision** — full `f64`, or opt-in **ternary** `{−1, 0, +1}` weights
+  (`--ternary`, BitNet-style fake-quant with a straight-through estimator)
 - **Training** — hand-written backprop + **Adam**; loss printed as it descends
-- **Generation** — autoregressive sampling from the trained weights
+- **Generation** — autoregressive (or diffusion) sampling from the trained weights
 
 Correctness of the hand-derived gradients is gated by **finite-difference
 gradient checks** (see `tests/`), the standard tool for verifying backprop.
@@ -49,7 +53,9 @@ cyrius test                               # grad checks + smoke tests
 
 See [`docs/guides/getting-started.md`](docs/guides/getting-started.md) for the
 full CLI (`--corpus`, `--load`/`--save` checkpoints, `--preset`, `--bpe`, `--eval`,
-and the architecture axes `--attn-kind {mha,mla,lin,ssm}`, `--pos-kind
+`--eval-corpus` (held-out cross-corpus eval), the objective/precision axes
+`--objective {ar,diffusion}` (with `--decode-steps`/`--decode-schedule`) and
+`--ternary`, and the architecture axes `--attn-kind {mha,mla,lin,ssm}`, `--pos-kind
 {learned,rope,rope-decoupled}`, `--experts N` (MoE), `--attn-every K` (per-layer
 hybrid)) and [`docs/STABILITY.md`](docs/STABILITY.md) for the frozen surface.
 

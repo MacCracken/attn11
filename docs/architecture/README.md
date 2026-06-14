@@ -37,3 +37,11 @@ Not decisions (those live in [`../adr/`](../adr/)) and not guides (those live in
   binary-exponentiation to the integer position — computed directly from the
   position so the batch and cached-row paths stay bit-identical (note 003).
   **Affects**: `src/attn.cyr` (`rope_apply_*`, `_rope_unit_cossin`, `_rope_pow`).
+- [006 — The packed corpus token store](006-packed-token-store.md) — `g_data` is
+  the only corpus-sized buffer, so it alone is packed: one **u8** per token for
+  byte-level (vocab ≤ 256) or **u16** for BPE (vocab ≤ 768), set by the `g_data_w`
+  width global before the corpus load, via width-generic accessors (`gd_ld`/`gd_st`,
+  `_tw_ld`/`_tw_st`). Everything else (the `g_T`-sized batch buffers, the vocab-sized
+  BPE tables) stays i64 — the asymmetry is deliberate. This removed the 8×/4× bloat
+  and raised `MAX_CORPUS_BYTES` 4 MB → 64 MB. **Affects**: `src/train.cyr` (`g_data`,
+  `corpus_set`, `bpe_learn`, `tok_encode`, the window samplers). Shipped 1.5.3 (X018).

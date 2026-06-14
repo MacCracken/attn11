@@ -58,6 +58,6 @@ real-entropy corpus.
 ```
 
 Adds a 256-merge BPE tokenizer over the byte base vocab (ADR 0006); the
-checkpoint carries the tokenizer (format v3). At iso-compute, BPE reaches
+checkpoint carries the tokenizer (in the format since v3). At iso-compute, BPE reaches
 ~11–13 % lower bits-per-byte than byte-level on this corpus — see
 [X003](../development/experiments.md) for the controlled comparison.
