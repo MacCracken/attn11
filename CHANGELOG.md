@@ -4,6 +4,119 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.6.5] - 2026-06-14
+
+**X021 — the data-volume held-out win (experiment; binary unchanged).** The run X019
+wanted and X020 unblocked but couldn't reach: does training on MORE clean data generalize
+better to a THIRD disjoint held-out set? It only shows once the model **overfits** the
+small corpus (X020 found <1.3% own→held at sub-epoch — nothing to convert), so X021 forces
+that regime — a 256 KB train slice (many epochs) vs a disjoint 4 MB slice at matched
+compute (4000 steps, BPE 256, seed 1337), both scored on a third disjoint 512 KB slice of
+one curated 12 MB C4-en pool. Rides the shipped `--eval-corpus` + `c4_sample.py`; **no new
+binary surface** — the binary is byte-identical to 1.6.4 (CFG_VERSION bump only), and the
+new reproducible runner is `scripts/x021-heldout.sh`. **Result (held-out bits/byte):** at
+**preset** capacity, training on 4 MB beats 256 KB by **−14.2%** (2.383 vs 2.776) — the
+data-volume generalization win; at **default** (tiny) capacity it is a **tie** (−0.06%), so
+the win is a **capacity lever** (the X017/X019 thesis, now on held-out text). The overfit
+regime is reached and exposes the headline caveat: preset·256 KB has a **+40.4%** own→held
+gap (own 1.977 ≪ held 2.776) — on its own corpus it looks *better* than the 4 MB model
+(1.977 vs 2.366), but that is memorization; on held-out the 4 MB model wins decisively. So
+**own-corpus bits/byte inverts the truth above the overfit threshold** — exactly when a
+held-out metric earns its keep — while remaining trustworthy below it (validating X020's
+read of the 1.5.x numbers). Closes the data-ingestion story (X016→X021). Full write-up:
+[X021](docs/development/experiments.md).
+
+### Added
+- **`scripts/x021-heldout.sh`**: the reproducible X021 runner — curate a C4 pool, cut three
+  disjoint slices (byte-offset gaps), train {default, preset} × {small, large} at matched
+  compute, and report own vs held-out bits/byte + the own→held gap. Deterministic; the
+  slice sizes / step budget are env-overridable.
+
+### Changed
+- Nothing in the binary — `src/*.cyr` is unchanged except `CFG_VERSION` (the default run,
+  every checkpoint, and all 1045 grad-checks are byte-identical to 1.6.4).
+
+## [1.6.4] - 2026-06-14
+
+**BPE GB-scale shards (`--stream-encode`); the second 1.6.2 fast-follow.** The in-RAM
+`--encode-shard` path caps the corpus at 64 MB (it loads it whole), so BPE shards were
+limited to that. **`--corpus FILE --bpe K --encode-shard OUT --stream-encode`** now
+pre-encodes an arbitrarily large file to a BPE (u16) token-shard in **bounded RAM**
+(~the 64 MB learn budget, independent of total corpus size). Two passes over the file:
+(0) learn the byte vocab + K merges from a bounded prefix; (1) re-read the whole file in
+1 MB chunks, apply the tokenizer with `tok_encode`, and emit only the **stable** prefix
+of each chunk's ids while carrying the trailing raw bytes. The header's `ntokens` (not
+known until the end) is written as a placeholder and patched via `lseek` before the
+atomic rename. Byte-level `--stream-encode` works too (no merges → no carry).
+
+The hard part is **chunk-boundary exactness**: BPE merges cross chunk boundaries, so a
+naive chunked encode diverges from a whole-corpus encode. The fix rests on a property of
+greedy left-to-right BPE: a final token spans ≤ `BPE_MAX_TOKLEN` bytes, and a token
+ending ≥ `BPE_MAX_TOKLEN` from the right edge can never change as more bytes arrive (it
+cannot be absorbed into a boundary-crossing token, and greedy-LTR never re-pairs to its
+left). So carrying the trailing `2*BPE_MAX_TOKLEN` raw bytes — always re-encoded from a
+**true token boundary** — makes the chunked encode byte-identical to a single-buffer
+encode. Verified: `--stream-encode` produces a shard **byte-identical to in-RAM
+`--bpe K --encode-shard`** on the same corpus, across real 1 MB chunk boundaries (a
+2.6 MB BPE-128 corpus) and across hundreds of boundaries at a 7-byte forced chunk
+(`test_stream_bpe_encode`). The default run stays byte-identical to 1.6.3.
+**1039 → 1045** checks green x86_64 + aarch64/qemu; lint + fuzz + `make smoke` (new
+`--stream-encode` BPE round-trip + error cases) green.
+
+### Added
+- **`--stream-encode`** (`src/main.cyr`, `src/stream.cyr`): a one-shot mode that, with
+  `--corpus FILE` + `--encode-shard OUT` (+ optional `--bpe K`), streams a large corpus
+  into a token-shard in bounded RAM. Requires a seekable file (not `--stdin`); excludes
+  `--load` / `--stream-corpus`.
+- **`shard_stream_encode`** (`src/stream.cyr`): the bounded-RAM encoder — bounded-prefix
+  tokenizer learn, chunked `tok_encode` with a `2*BPE_MAX_TOKLEN` raw-byte carry, a
+  streaming shard writer with an `lseek` header patch for `ntokens`, and a crash-atomic
+  rename. `g_stream_enc_chunk` overrides the 1 MB chunk for tests; `_enc_write` loops
+  short writes.
+- **`test_stream_bpe_encode`** (`tests/attn11.tcyr`): the chunked encode (forced 7-byte
+  chunk, ~6 KB synthetic corpus) is byte-identical to the whole-corpus in-RAM encode, at
+  BPE and byte width. **+6 checks** (1039 → 1045), dead-last (RNG-neutral).
+- **Smoke** (`Makefile`): a `--stream-encode` BPE round-trip (encode → train from the
+  shard) plus the `--stream-encode` error cases (no `--encode-shard`, no `--corpus`,
+  with `--stdin`).
+
+## [1.6.3] - 2026-06-14
+
+**Resume-from-stream (`--load` + `--stream-corpus`); the first 1.6.2 fast-follow.**
+A checkpoint saved mid-stream can now be reloaded against the same token-shard to
+continue training — the shard supplies the corpus, the checkpoint supplies the
+weights / optimizer moments / step / RNG. Resume is **bit-for-bit deterministic**:
+`train(K)` streamed in one go equals `train(K1)` → checkpoint → `train(K)` streamed,
+verified at byte **and** BPE width (the streamed path touches no RNG, and the schedule
+horizon is held fixed, exactly like the in-memory resume). Because a streamed corpus
+holds the tokens on disk (`g_data == 0`) and never re-encodes, the loader requires the
+shard to carry the **EXACT** tokenizer the checkpoint trained with — kind, base size,
+merge count, every base-vocab byte, and every merge pair — not just the base vocab the
+in-memory resume path checks (which adapts via re-encode). This closes a real hole the
+naive check would miss: a BPE shard whose base vocab happens to match a byte checkpoint
+would otherwise load and then stream ids ≥ Vb straight past the byte model's embedding
+table; now both directions reject cleanly with `-15`. The in-memory resume path is
+unchanged (its grad-checks stay green), and the default run is byte-identical to 1.6.2.
+**1032 → 1039** checks green x86_64 + aarch64/qemu; lint + fuzz + `make smoke` (new
+resume-from-stream round-trip + vocab-mismatch cases) green.
+
+### Added
+- **`--load` + `--stream-corpus`** (resume-from-stream): supported in `src/main.cyr`
+  (the prior rejection is removed); the corpus streams from the shard while the
+  checkpoint restores the model.
+- **`test_resume_stream`** (`tests/attn11.tcyr`): `train(K)` streamed == `train(K1)` →
+  in-memory checkpoint round-trip → `train(K)` streamed, params bit-for-bit; plus the
+  tokenizer-mismatch rejection (`-15`). **+7 checks** (1032 → 1039), dead-last.
+- **Smoke** (`Makefile`): a valid `--stream-corpus --save` → `--stream-corpus --load`
+  resume round-trip, and a BPE-shard-against-byte-checkpoint mismatch reject.
+
+### Changed
+- `ckpt_load_buf` (`src/persist.cyr`): the corpus-vocab consistency check splits into
+  an in-memory branch (`g_data != 0`, base-vocab match, the existing re-encode path)
+  and a **streamed branch** (`g_stream != 0`, full-tokenizer identity: kind + Vb + K +
+  base vocab + all merge pairs, exempt from the `-39` retained-bytes requirement since
+  the shard reads directly). The in-memory branch is behaviorally identical to 1.6.2.
+
 ## [1.6.2] - 2026-06-14
 
 **Streaming token-shard ingestion (1.6.x group; the RAM-independent large-corpus

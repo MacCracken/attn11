@@ -5,7 +5,60 @@
 
 ## Version
 
-**1.6.2** — *Streaming token-shard ingestion* (1.6.x group; the RAM-independent
+**1.6.5** — *X021: the data-volume held-out win* (1.6.x group; experiment, **binary
+unchanged**). The run X019 wanted + X020 unblocked: does more clean data generalize better
+to a THIRD disjoint held-out set? It needs the **overfit** regime (X020 found <1.3%
+own→held at sub-epoch — nothing to convert), so X021 forces it — a 256 KB train slice (many
+epochs) vs a disjoint 4 MB slice at matched compute (4000 steps, BPE 256, seed 1337), both
+scored on a third disjoint 512 KB slice of a curated 12 MB C4 pool. Rides the shipped
+`--eval-corpus` + `c4_sample.py` (**no new binary surface**; `src/*.cyr` byte-identical to
+1.6.4 bar CFG_VERSION; the runner is `scripts/x021-heldout.sh`). **Result (held-out
+bits/byte):** at **preset** capacity, 4 MB beats 256 KB by **−14.2%** (2.383 vs 2.776) —
+the data-volume generalization win; at **default** (tiny) capacity a **tie** (−0.06%), so
+the win is a **capacity lever** (X017/X019 thesis, on held-out text). preset·256 KB
+overfits hard (**+40.4%** own→held gap; own 1.977 looks *better* than the 4 MB model's 2.366
+but it is memorization — on held-out the 4 MB model wins), so own-corpus bits/byte **inverts
+the truth above the overfit threshold** (and is trustworthy below it — validating X020).
+Closes the data story X016→X021. **1045** checks unchanged; `make release` exit 0. Full
+write-up: [X021](experiments.md).
+
+(**1.6.4** — *BPE GB-scale shards* (1.6.x group; the second 1.6.2 fast-follow). The
+in-RAM `--encode-shard` caps the corpus at 64 MB; **`--corpus FILE --bpe K --encode-shard
+OUT --stream-encode`** now pre-encodes an arbitrarily large file to a BPE (u16) shard in
+**bounded RAM** (~the 64 MB learn budget, independent of corpus size). Two passes:
+(0) learn the byte vocab + K merges from a bounded prefix; (1) re-read the file in 1 MB
+chunks, `tok_encode` each, emit the **stable** id prefix and carry the trailing
+`2*BPE_MAX_TOKLEN` raw bytes; `ntokens` is patched into the header via `lseek` before the
+atomic rename. **Chunk-boundary exactness**: a final BPE token spans ≤ `BPE_MAX_TOKLEN`
+and greedy-LTR BPE is prefix-stable except within one token of the edge, so a token ending
+≥ `BPE_MAX_TOKLEN` from the edge never changes as more bytes arrive — carrying the trailing
+2 tokens (re-encoded from a true boundary) makes the chunked encode byte-identical to a
+whole-corpus encode. Verified byte-identical to in-RAM `--bpe --encode-shard` across real
+1 MB boundaries (2.6 MB BPE-128) and a 7-byte forced chunk (`test_stream_bpe_encode`,
++6). Byte-level `--stream-encode` works too (no carry). New `shard_stream_encode` in
+`src/stream.cyr`; default run byte-identical to 1.6.3. **1039 → 1045** checks green
+x86_64 + aarch64/qemu; lint + fuzz + `make smoke` (stream-encode round-trip + errors)
+green; `make release` exit 0.)
+
+(**1.6.3** — *Resume-from-stream* (1.6.x group; the first 1.6.2 fast-follow). A
+checkpoint saved mid-stream reloads against the SAME token-shard to continue training —
+**`--load` + `--stream-corpus`** (the prior rejection is removed). The shard supplies
+the corpus, the checkpoint the weights/moments/step/RNG; resume is **bit-for-bit
+deterministic** (`train(K)` streamed == `train(K1)` → checkpoint → `train(K)` streamed,
+byte + BPE — streaming touches no RNG and the schedule horizon is held). Because a
+streamed corpus holds its tokens on disk (`g_data == 0`, no re-encode), the loader
+requires the shard to carry the **EXACT** tokenizer the checkpoint trained with — kind,
+Vb, K, every base-vocab byte, every merge pair — not just the base vocab the in-memory
+path checks (it adapts via re-encode). This closes a real hole: a BPE shard whose base
+vocab matches a byte checkpoint would otherwise stream ids ≥ Vb past the byte model's
+embedding table; both directions now reject with `-15`. In-memory resume is unchanged;
+default run byte-identical to 1.6.2. `ckpt_load_buf` splits the vocab check into an
+in-memory branch and a streamed (`g_stream != 0`) full-tokenizer-identity branch.
+`test_resume_stream` (+7), dead-last: **1032 → 1039** checks green x86_64 + aarch64/qemu;
+lint + fuzz + `make smoke` (resume-from-stream round-trip + vocab-mismatch) green;
+`make release` exit 0.)
+
+(**1.6.2** — *Streaming token-shard ingestion* (1.6.x group; the RAM-independent
 large-corpus path). Two new flags decouple corpus size from RAM. **`--encode-shard
 PATH`** pre-encodes the loaded corpus (byte or `--bpe`) to a self-describing
 **token-shard** — header + tokenizer (byte vocab + BPE merges, as a checkpoint
@@ -31,7 +84,7 @@ ssm-hybrid all verified). Streaming is Linux-only (`lseek`); agnos rejects `--st
 (-73). Resume-from-stream + BPE GB shards are documented fast-follows. **1014 → 1032**
 checks green x86_64 + aarch64/qemu; lint + fuzz + `make smoke` (new encode/stream + bad-shard
 cases) green; `make release` exit 0. New file `src/stream.cyr`; invariants in
-[`../architecture/007-streaming-token-shards.md`](../architecture/007-streaming-token-shards.md).
+[`../architecture/007-streaming-token-shards.md`](../architecture/007-streaming-token-shards.md).)
 
 (**1.6.1** — *i64-add ternary matmul + bench, M16 increment 2* (E6; ADR 0014, X023;
 **closes the M16 gate**). The BitNet realization of `--ternary`: `x·W_eff = γ·(x·t)`,
@@ -626,18 +679,33 @@ checkpoint vs Linux at fixed CPU — `scripts/agnos-smoke.sh`):
   aarch64/qemu). `scripts/c4_sample.py --emit-shard` is the GB-scale byte-level producer
   (byte-identical to `--encode-shard`). Hostile shards rejected before install (`-60..-73`;
   merge-DAG + file-size validated). Linux-only; mutually exclusive with `--corpus`/`--stdin`/
-  `--bpe`/`--load` (resume-from-stream is a fast-follow). `test_stream_ingest`, +18 checks;
-  no-flag run byte-identical. [`../architecture/007-streaming-token-shards.md`](../architecture/007-streaming-token-shards.md)
+  `--bpe`. `test_stream_ingest`, +18 checks; no-flag run byte-identical.
+  [`../architecture/007-streaming-token-shards.md`](../architecture/007-streaming-token-shards.md)
+- **Resume-from-stream** (1.6.3, `--load` + `--stream-corpus`): a checkpoint saved
+  mid-stream reloads against the same shard to continue — **bit-for-bit deterministic**
+  (byte + BPE). `ckpt_load_buf`'s vocab check has a streamed branch requiring the shard's
+  FULL tokenizer (kind + Vb + K + base vocab + merges) to match the checkpoint's, so a
+  mismatched shard rejects (`-15`) instead of streaming ids past the embedding table.
+  `test_resume_stream`, +7 checks; in-memory resume + the default run unchanged.
+- **BPE GB-scale shards** (1.6.4, `--stream-encode`): `--corpus FILE --bpe K
+  --encode-shard OUT --stream-encode` pre-encodes an arbitrarily large file to a BPE
+  (u16) shard in **bounded RAM** (`shard_stream_encode`): learn the tokenizer from a
+  bounded prefix, then chunked `tok_encode` with a `2*BPE_MAX_TOKLEN` raw-byte carry
+  (greedy-LTR BPE is prefix-stable except within one token of the edge → the chunked
+  encode is **byte-identical** to a whole-corpus encode). `ntokens` patched via `lseek`
+  before the atomic rename. Byte-level works too (no carry). `test_stream_bpe_encode`,
+  +6 checks; default run unchanged.
 - CLI: `--corpus --stdin --load --save --steps --gen-only --preset --heads
   --kv-heads --layers --attn-kind --latent-dim --attn-every --pos-kind --rope-dim
-  --experts --expert-topk --bpe --eval --eval-corpus --encode-shard --stream-corpus
-  --objective --decode-steps --decode-schedule --ternary`
+  --experts --expert-topk --bpe --eval --eval-corpus --encode-shard --stream-encode
+  --stream-corpus --objective --decode-steps --decode-schedule --ternary`
   (`--attn-kind` takes `mha`/`mla`/`lin`/`ssm`; `--latent-dim` is the MLA latent /
   SSM state size; `--attn-every K` builds the per-layer hybrid over the `--attn-kind`
   base; `--objective diffusion` opts into masked diffusion, with `--decode-steps` /
   `--decode-schedule {cosine,linear}` for its parallel decode; `--ternary` is M16
   BitNet-style ternary weights on mha + dense + AR; `--encode-shard` writes a token-shard
-  + exits, `--stream-corpus` trains from one in bounded RAM)
+  + exits, `--stream-encode` does so for a GB-scale file in bounded RAM, `--stream-corpus`
+  trains from one in bounded RAM; `--load` + `--stream-corpus` resumes from a stream)
 
 Default run (`./build/attn11`, 3 layers): loss `~3.2 → ~0.13` over 2000 steps;
 sampled output reproduces real corpus phrases.

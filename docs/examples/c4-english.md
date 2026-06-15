@@ -199,8 +199,13 @@ size (a GB shard trains in ~13 MB). Two ways to make a shard:
 # (b) GB-scale, straight from C4 in bounded RAM (byte-level), via the sampler:
 python3 scripts/c4_sample.py --curate --shards 64 --max-bytes 1000000000 \
         --out data/c4-1gb.txt --emit-shard data/c4-1gb.tsh
+# (c) GB-scale BPE shard in bounded RAM, via attn11 (1.6.4 --stream-encode):
+./build/attn11 --corpus data/c4-1gb.txt --bpe 256 --encode-shard data/c4-1gb-bpe.tsh --stream-encode
 # then train/eval from the shard — the tokens never load into RAM:
 ./build/attn11 --stream-corpus data/c4-24mb.tsh --preset --steps 2000 --eval
+# resume a streamed run later (1.6.3): the shard supplies the corpus, the checkpoint the model
+./build/attn11 --stream-corpus data/c4-24mb.tsh --preset --steps 1000 --save ck.bin
+./build/attn11 --stream-corpus data/c4-24mb.tsh --load ck.bin --preset --steps 2000 --eval
 ```
 
 The shard is **self-describing** (it carries its own tokenizer), so `--stream-corpus`
@@ -208,6 +213,7 @@ needs no other flags; it is mutually exclusive with `--corpus`/`--stdin`/`--bpe`
 A streamed run is **byte-identical** to the equivalent in-memory run (verified on x86_64
 and aarch64), and `c4_sample.py --emit-shard` produces a shard byte-identical to
 `attn11 --encode-shard` on the same text. BPE shards: use `attn11 --bpe K --encode-shard`
-(≤ 64 MB; whole-corpus merge statistics don't stream, so the sampler's GB path is
-byte-level). Format + invariants:
+(≤ 64 MB in RAM) or, for GB-scale, add `--stream-encode` (1.6.4 — bounded-RAM, exact
+across chunk boundaries). The sampler's `--emit-shard` is byte-level (whole-corpus merge
+statistics don't stream). Format + invariants:
 [`../architecture/007-streaming-token-shards.md`](../architecture/007-streaming-token-shards.md).

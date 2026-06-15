@@ -63,13 +63,21 @@ smoke: build
 	if [ $$? -ne 0 ]; then echo "smoke: --encode-shard failed on a valid corpus"; exit 1; fi; \
 	./build/attn11 --stream-corpus /tmp/attn11-smoke.tsh --steps 5 >/dev/null 2>&1; \
 	if [ $$? -ne 0 ]; then echo "smoke: a valid --stream-corpus run failed"; exit 1; fi; \
-	for sa in "--stream-corpus /nonexistent/attn11-smoke.tsh" "--stream-corpus /tmp/attn11-smoke-corpus.txt" "--stream-corpus /tmp/attn11-smoke.tsh --corpus /tmp/attn11-smoke-corpus.txt" "--stream-corpus /tmp/attn11-smoke.tsh --bpe 8"; do \
+	./build/attn11 --stream-corpus /tmp/attn11-smoke.tsh --steps 3 --save /tmp/attn11-smoke.ckpt >/dev/null 2>&1; \
+	if [ $$? -ne 0 ]; then echo "smoke: --stream-corpus + --save failed"; exit 1; fi; \
+	./build/attn11 --stream-corpus /tmp/attn11-smoke.tsh --load /tmp/attn11-smoke.ckpt --steps 6 >/dev/null 2>&1; \
+	if [ $$? -ne 0 ]; then echo "smoke: a valid resume-from-stream (--load + --stream-corpus) failed"; exit 1; fi; \
+	./build/attn11 --corpus /tmp/attn11-smoke-corpus.txt --bpe 8 --encode-shard /tmp/attn11-smoke-bpe.tsh --stream-encode >/dev/null 2>&1; \
+	if [ $$? -ne 0 ]; then echo "smoke: --stream-encode (bpe) failed on a valid corpus"; exit 1; fi; \
+	./build/attn11 --stream-corpus /tmp/attn11-smoke-bpe.tsh --steps 3 >/dev/null 2>&1; \
+	if [ $$? -ne 0 ]; then echo "smoke: training from a --stream-encode bpe shard failed"; exit 1; fi; \
+	for sa in "--stream-corpus /nonexistent/attn11-smoke.tsh" "--stream-corpus /tmp/attn11-smoke-corpus.txt" "--stream-corpus /tmp/attn11-smoke.tsh --corpus /tmp/attn11-smoke-corpus.txt" "--stream-corpus /tmp/attn11-smoke.tsh --bpe 8" "--stream-corpus /tmp/attn11-smoke-bpe.tsh --load /tmp/attn11-smoke.ckpt --steps 3" "--stream-encode --encode-shard /tmp/attn11-smoke-x.tsh" "--stream-encode --corpus /tmp/attn11-smoke-corpus.txt" "--stream-encode --stdin --corpus /tmp/attn11-smoke-corpus.txt --encode-shard /tmp/attn11-smoke-x.tsh"; do \
 	  ./build/attn11 $$sa --gen-only >/dev/null 2>&1; rc=$$?; \
 	  if [ $$rc -ge 128 ]; then echo "smoke: CRASH (signal $$((rc-128))) on: $$sa"; exit 1; fi; \
 	  if [ $$rc -eq 0 ]; then echo "smoke: expected rejection but succeeded on: $$sa"; exit 1; fi; \
 	done; \
-	rm -f /tmp/attn11-smoke-seed.txt /tmp/attn11-smoke-corpus.txt /tmp/attn11-smoke.tsh; \
-	echo "smoke: ok (hostile --layers/--attn-every/--ternary rejected; valid hybrid + ternary + stream; bad shard / held-out eval error cleanly)"
+	rm -f /tmp/attn11-smoke-seed.txt /tmp/attn11-smoke-corpus.txt /tmp/attn11-smoke.tsh /tmp/attn11-smoke-bpe.tsh /tmp/attn11-smoke.ckpt /tmp/attn11-smoke-x.tsh; \
+	echo "smoke: ok (hostile args rejected; valid hybrid + ternary + stream + resume-from-stream + stream-encode; bad shard / vocab-mismatch / held-out eval error cleanly)"
 
 clean:
 	rm -rf build/

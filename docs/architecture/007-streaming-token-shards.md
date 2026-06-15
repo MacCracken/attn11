@@ -108,9 +108,24 @@ Error codes are a distinct **`-60..-73`** range (the checkpoint loader uses `..-
   `eval_corpus_buf` disables streaming for the held-out pass (the held-out file is
   in RAM) and restores it.
 - **Mutually exclusive** with `--corpus`/`--stdin`/`--bpe` (the shard *is* the
-  corpus + tokenizer) and, for now, with `--load`.
-- **Linux-only** — `lseek`; the agnos target rejects `shard_open` (`-73`).
-- **Fast-follows** (documented, additive): resume-from-stream (`--load` +
-  `--stream-corpus`), and BPE GB-scale shards (whole-corpus merge statistics do not
-  stream, so the c4 emitter is byte-level; `attn11 --bpe --encode-shard` handles the
-  ≤ 64 MB BPE case).
+  corpus + tokenizer).
+- **Resume-from-stream** (`--load` + `--stream-corpus`, 1.6.3): supported. The shard
+  supplies the corpus, the checkpoint the model. `ckpt_load_buf` has a streamed branch
+  (`g_stream != 0`) that requires the shard's **full tokenizer** — kind, Vb, K, every
+  base-vocab byte, every merge pair — to match the checkpoint's (the streamed ids are
+  frozen, so unlike the in-memory path there is no re-encode to adapt them); a mismatch
+  rejects with `-15`. Resume is bit-for-bit deterministic (RNG is checkpointed, the
+  schedule horizon is held).
+- **Linux-only** — `lseek`; the agnos target rejects `shard_open` / `shard_stream_encode`
+  (`-73`).
+- **BPE GB-scale shards** (`--stream-encode`, 1.6.4): `shard_stream_encode` pre-encodes a
+  large corpus FILE to a shard in bounded RAM — learn the byte vocab + K merges from a
+  bounded prefix, then re-read the file in 1 MB chunks, `tok_encode` each, emit the stable
+  id prefix and carry the trailing `2*BPE_MAX_TOKLEN` raw bytes (`ntokens` patched into the
+  header via `lseek` before the atomic rename). The carry is exact because greedy-LTR BPE
+  is prefix-stable except within one token (`≤ BPE_MAX_TOKLEN`) of the right edge: a token
+  ending farther from the edge can never be absorbed into a boundary-crossing token. So the
+  chunked encode is byte-identical to a single-buffer `tok_encode` of the same bytes
+  through the same merges (`test_stream_bpe_encode` pins it at a 7-byte forced chunk). The
+  c4 emitter stays byte-level (merge-learning needs whole-corpus pair stats); this is the
+  BPE GB path.

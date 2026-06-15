@@ -8,8 +8,9 @@
 #   attn11 --stdin                  train on a corpus read from stdin
 #   attn11 --steps N                set total training steps (schedule horizon)
 #   attn11 --save PATH              write a checkpoint after training
-#   attn11 --load PATH              resume from a checkpoint (with --corpus to
-#                                   continue training; alone for --gen-only)
+#   attn11 --load PATH              resume from a checkpoint (with --corpus or
+#                                   --stream-corpus to continue training; alone for
+#                                   --gen-only)
 #   attn11 --gen-only               skip training, just sample from the model
 #   attn11 --preset                 ctx 64 / d_model 64 / 8 heads / 4 layers
 #                                   (the scale preset; default stays ctx 16)
@@ -37,6 +38,9 @@
 #                                   no vocab-order check; combines with --eval)
 #   attn11 --encode-shard PATH      pre-encode the corpus to a token-shard file
 #                                   (header + tokenizer + packed ids), then exit
+#   attn11 --stream-encode          with --corpus FILE + --encode-shard: encode a
+#                                   LARGE file (incl. --bpe) to a shard in bounded
+#                                   RAM (GB-scale; not capped at 64 MB), then exit
 #   attn11 --stream-corpus PATH     train/eval from a token-shard WITHOUT loading
 #                                   it into RAM (windows by offset; GB-scale path)
 #   attn11 --ternary                BitNet-style ternary weights {-1,0,+1} with a
@@ -100,7 +104,7 @@ fn _atoi(s): i64 {
 }
 
 # Kept in sync with the VERSION file (CI's docs job gates the match).
-fn CFG_VERSION(): i64 { return "1.6.2"; }
+fn CFG_VERSION(): i64 { return "1.6.5"; }
 
 fn usage(): i64 {
     puts("attn11 — a from-scratch GPT-style transformer, trained, in Cyrius\n");
@@ -109,7 +113,7 @@ fn usage(): i64 {
     puts("  --stdin         train on a corpus read from stdin\n");
     puts("  --steps N       total training steps (also the LR-schedule horizon)\n");
     puts("  --save PATH     write a crash-atomic checkpoint after training\n");
-    puts("  --load PATH     resume from a checkpoint (+ --corpus to continue training)\n");
+    puts("  --load PATH     resume from a checkpoint (+ --corpus or --stream-corpus to continue)\n");
     puts("  --gen-only      skip training, just sample\n");
     puts("  --preset        ctx 64 / d_model 64 / 8 heads / 4 layers\n");
     puts("  --heads N       attention heads (must divide d_model)\n");
@@ -126,6 +130,7 @@ fn usage(): i64 {
     puts("  --eval          print CE/token + bits-per-byte after training/save\n");
     puts("  --eval-corpus P held-out eval on a disjoint corpus via the loaded tokenizer\n");
     puts("  --encode-shard P pre-encode the corpus to a token-shard file, then exit\n");
+    puts("  --stream-encode  with --corpus FILE + --encode-shard: encode a large file (incl. --bpe) in bounded RAM\n");
     puts("  --stream-corpus P train/eval from a token-shard without loading it into RAM\n");
     puts("  --objective O   training objective: ar (default) or diffusion (masked, bidirectional)\n");
     puts("  --ternary       BitNet-style ternary weights {-1,0,+1} (mha + dense + ar; STE backward)\n");
@@ -165,6 +170,7 @@ fn main(): i64 {
     var lkinds[1024];                                # per-layer mixer kinds (128 i64 = max --layers)
     var use_bpe = 0; var bpe_k = 0; var do_eval = 0; var eval_corpus_path = 0;
     var encode_shard_path = 0; var stream_corpus_path = 0;   # 1.6.x token-shard streaming
+    var stream_encode = 0;                                   # 1.6.4: stream --encode-shard (GB-scale, incl. BPE)
     var cfg_objective = 0;                           # M15: 0 = AR (default), 1 = masked diffusion
     var cfg_decode_steps = 0;                        # diffusion decode iterations (0 = default, resolved post-parse)
     var cfg_decode_sched = 0;                        # diffusion decode schedule: 0 = cosine (default), 1 = linear
@@ -209,6 +215,7 @@ fn main(): i64 {
         elif (streq(a, "--eval-corpus") == 1) { i = i + 1; eval_corpus_path = _av(i, a); }
         elif (streq(a, "--encode-shard") == 1) { i = i + 1; encode_shard_path = _av(i, a); }
         elif (streq(a, "--stream-corpus") == 1) { i = i + 1; stream_corpus_path = _av(i, a); }
+        elif (streq(a, "--stream-encode") == 1) { stream_encode = 1; }
         elif (streq(a, "--objective") == 1) {
             i = i + 1; var ob = _av(i, a);
             if (streq(ob, "ar") == 1) { cfg_objective = 0; }
@@ -393,15 +400,14 @@ fn main(): i64 {
     }
     # Streaming token-shard ingestion (1.6.x). --stream-corpus is a self-contained
     # corpus + tokenizer (a pre-encoded shard), so it is mutually exclusive with
-    # the other corpus sources and with --load / --bpe (the shard carries its own
-    # tokenizer). Resume-from-stream (--load + --stream-corpus) is a fast-follow.
+    # the other corpus sources and with --bpe (the shard carries its own tokenizer).
+    # --load + --stream-corpus IS supported (resume-from-stream, 1.6.3): the shard
+    # supplies the corpus, the checkpoint the weights; the loader hard-rejects (-15)
+    # if the shard's vocab does not match the checkpoint's, so a successful resume
+    # is consistent.
     if (stream_corpus_path != 0) {
         if ((corpus_path != 0) || (use_stdin == 1)) {
             puts("attn11: --stream-corpus conflicts with --corpus/--stdin\n"); return 1;
-        }
-        if (load_path != 0) {
-            puts("attn11: --stream-corpus + --load unsupported (resume-from-stream is a fast-follow)\n");
-            return 1;
         }
         if (use_bpe == 1) {
             puts("attn11: --bpe conflicts with --stream-corpus (the shard carries its tokenizer)\n"); return 1;
@@ -414,6 +420,27 @@ fn main(): i64 {
     # one-shot pre-encode). It needs a corpus source and no checkpoint.
     if ((encode_shard_path != 0) && (load_path != 0)) {
         puts("attn11: --encode-shard cannot be combined with --load\n"); return 1;
+    }
+
+    # ---- streaming encode (1.6.4): pre-encode a large corpus FILE in bounded RAM ----
+    # --stream-encode turns --encode-shard into the GB-scale producer: it reads the
+    # --corpus FILE in chunks (never loading it whole), learns the tokenizer from a
+    # bounded prefix, and streams a shard — so a BPE shard can come from a corpus
+    # larger than the 64 MB in-RAM cap. One-shot: it writes the shard and exits.
+    if (stream_encode == 1) {
+        if (encode_shard_path == 0) { puts("attn11: --stream-encode requires --encode-shard PATH\n"); return 1; }
+        if (corpus_path == 0) { puts("attn11: --stream-encode requires --corpus FILE (the input)\n"); return 1; }
+        if (use_stdin == 1) { puts("attn11: --stream-encode reads a seekable file, not --stdin\n"); return 1; }
+        if (load_path != 0) { puts("attn11: --stream-encode cannot be combined with --load\n"); return 1; }
+        if (stream_corpus_path != 0) { puts("attn11: --stream-encode excludes --stream-corpus\n"); return 1; }
+        var lk = 0; if (use_bpe == 1) { lk = bpe_k; }
+        var sr = shard_stream_encode(corpus_path, encode_shard_path, lk);
+        if (sr < 0) { puts("attn11: stream-encode failed (code "); fmt_int(sr); puts(")\n"); return 1; }
+        puts("attn11: stream-encoded token-shard "); puts(encode_shard_path);
+        puts(" (tokens "); fmt_int(sr);
+        if (use_bpe == 1) { puts(", bpe merges "); fmt_int(g_bpe_nmerges); }
+        puts(")\n");
+        return 0;
     }
 
     # ---- corpus ----

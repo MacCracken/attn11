@@ -935,11 +935,66 @@ heldB (`--eval-corpus`, held-out).
    `tail -c +12000001 data/c4-curated-24mb.txt | head -c 4000000 > data/c4-24-heldB.txt`,
    then `./build/attn11 --corpus data/c4-24-trainA.txt [--preset] --bpe 256 --steps {600|1500} --eval --eval-corpus data/c4-24-heldB.txt`.
 
-> **X021 is reserved** for the data-volume held-out win (train-4MB vs train-24MB, eval a
-> third disjoint set) — the experiment X020 unblocked but which only pays off at M16+
-> scale (a model that can overfit a small corpus). It is sequenced into the 1.6.x group
-> (see [`roadmap.md`](roadmap.md)) and will fill this slot when run. X022 below (logged
-> first, chronologically) is the M16 ternary accuracy run.
+## X021 — data-volume held-out win: more clean data generalizes better, with capacity (v1.6.5) (2026-06-14)
+
+**Setup**: 1.6.5, the experiment X019 wanted and X020 unblocked but couldn't reach — the
+own→held gap was <1.3% at sub-epoch compute, so there was no memorization to convert. The
+data-volume win only shows once the model **overfits** the small corpus, so X021 forces
+that regime: a SMALL train slice trained for many epochs vs a LARGER disjoint slice at
+**matched compute**, both scored on a THIRD disjoint slice. Rides the shipped
+`--eval-corpus` + `c4_sample.py` — **no new binary surface** (the runner is
+[`scripts/x021-heldout.sh`](../../scripts/x021-heldout.sh); binary byte-identical to 1.6.4,
+CFG_VERSION bump only). Three disjoint, same-distribution slices of one curated 12 MB C4-en
+pool (byte-offset gaps guarantee disjoint documents, as in X020):
+- **trainS** — `[0, 256 KB)` (the overfit target).
+- **trainL** — `[1.25 MB, 5.25 MB)` (4 MB; 16× more, diverse data; a 1 MB gap from trainS).
+- **heldB** — the last 512 KB `[11.49 MB, 12 MB)` (disjoint from both).
+
+Both model sizes — **default** (≈51 K) and **preset** (≈229–233 K) — BPE 256, seed 1337,
+**4000 steps each** (matched compute; at preset that is ~30 epochs over trainS vs ~4 over
+trainL). The deviation from the roadmap's literal "4 MB vs 24 MB" is deliberate and
+honest: attn11's largest model (preset, frozen surface) cannot overfit 4 MB of *diverse*
+C4 even at many epochs (X020), so the hypothesis is untestable there; 256 KB *is*
+overfittable at preset capacity, which is where the data-volume effect is decidable. Same
+question, the scale at which attn11 can answer it. Metric: bits/byte (byte-normalized, so
+comparable across the two tokenizers — X003) on own (`--eval`) vs heldB (`--eval-corpus`).
+
+**Result** (bits/byte, lower = better):
+
+| cell | params | own (train) | held-out (heldB) | own→held gap |
+|------|--------|-------------|------------------|--------------|
+| default · trainS (256 KB) | 51 200 | 2.70859 | 2.86080 | **+5.6%** |
+| default · trainL (4 MB)   | 52 928 | 2.87577 | 2.85913 | −0.6% |
+| **preset · trainS (256 KB)** | 229 184 | **1.97732** | **2.77612** | **+40.4%** |
+| **preset · trainL (4 MB)**   | 232 640 | 2.36582 | **2.38319** | +0.7% |
+
+**Held-out (the headline), trainL vs trainS:** preset **2.38319 vs 2.77612 = −14.2%**
+(more data generalizes much better); default **2.85913 vs 2.86080 = −0.06%** (a tie).
+
+**Takeaways**:
+1. **More clean data → a decisive held-out win, AT CAPACITY.** The preset trained on 4 MB
+   beats the one trained on 256 KB by **−14.2% bits/byte on held-out text** — the
+   data-volume generalization win X019 hypothesized and X020 said needed the overfit
+   regime. The default (tiny) model is a **tie** (−0.06%): it lacks the capacity to exploit
+   the extra data. So the data-volume win is a **capacity lever** — the exact shape of the
+   X017 ("diversity is a scale lever") and X019 ("the penalty halves with capacity")
+   findings, now confirmed on *held-out* text.
+2. **The overfit regime — X020's missing precondition — is reached, and own-corpus
+   bits/byte INVERTS the truth there.** preset·trainS has a **+40.4%** own→held gap (own
+   1.977 ≪ held 2.776): it memorized the 256 KB slice. On its OWN corpus trainS (1.977)
+   looks far *better* than trainL (2.366) — but that is memorization, not skill: on
+   held-out, trainL (2.383) crushes trainS (2.776). This is precisely the failure mode
+   X019 flagged ("own-corpus understates data's value") and X020 couldn't exhibit (no
+   memorization at sub-epoch). The gap scales with capacity (default·trainS only +5.6%:
+   too small to memorize much), so own-corpus bits/byte is a trustworthy proxy ONLY below
+   the overfit threshold (validating X020's read of the 1.5.x numbers) and **misleading
+   above it** — exactly when a held-out metric earns its keep.
+3. **Closes the data story.** X016 (data ingestion) → X017 (quality > diversity at tiny
+   scale) → X018 (the packing ceiling) → X019 (capacity uses more data) → X020 (own is
+   honest sub-epoch) → **X021 (more data wins on held-out, at capacity, once overfitting
+   makes own dishonest).** The `--eval-corpus` flag (built in 1.5.6 for exactly this) is
+   the instrument. Reproduce: `scripts/x021-heldout.sh` (deterministic curation + seed;
+   RNG-neutral evals; cross-arch reproducible).
 
 ## X022 — ternary (BitNet) vs f64 at reference scale (M16, v1.6.0) (2026-06-14)
 

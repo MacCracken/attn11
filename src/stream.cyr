@@ -233,3 +233,156 @@ fn shard_open(path): i64 {
     g_stream_clen = 0;
     return V;
 }
+
+# ---- streaming encoder (--stream-encode; 1.6.4, BPE GB-scale shards) ---------
+# Encode a (possibly GB) corpus FILE into a token-shard in BOUNDED RAM. The in-RAM
+# --encode-shard path caps the corpus at MAX_CORPUS_BYTES (it loads it whole); this
+# path streams, so a BPE shard can be produced from an arbitrarily large input.
+#
+# Two passes over the file: (0) learn the byte vocab + (if learn_k>0) K BPE merges
+# from a BOUNDED prefix (<= MAX_CORPUS_BYTES; for a corpus that fits, prefix ==
+# whole, so the tokenizer is identical to the in-RAM reference); (1) re-read the
+# whole file in chunks, apply the learned tokenizer with tok_encode, and emit only
+# the STABLE prefix of each chunk's ids, carrying the trailing raw bytes.
+#
+# Chunk-boundary exactness: a final BPE token spans <= BPE_MAX_TOKLEN bytes, and
+# greedy left-to-right BPE is prefix-stable except within one token of the right
+# edge (a token ending >= BPE_MAX_TOKLEN from the edge can never change as more
+# bytes arrive — it cannot be absorbed into a boundary-crossing token, which would
+# exceed BPE_MAX_TOKLEN, and greedy-LTR never re-pairs to its left). So carrying
+# the trailing 2*BPE_MAX_TOKLEN raw bytes (always re-encoded from a TRUE token
+# boundary) makes the chunked encode byte-identical to a single-buffer encode of
+# the same bytes through the same merges — pinned by test_stream_bpe_encode at a
+# tiny forced chunk size. Byte-level (learn_k==0) has no merges, so no carry.
+fn STREAM_ENC_CHUNK(): i64 { return 1048576; }   # 1 MB raw bytes per read pass
+var g_stream_enc_chunk = 0;                       # 0 = STREAM_ENC_CHUNK(); >0 overrides (tests force tiny)
+fn _enc_chunk(): i64 { if (g_stream_enc_chunk > 0) { return g_stream_enc_chunk; } return STREAM_ENC_CHUNK(); }
+
+# loop-write `n` bytes of buf to fd; returns 0 or a negative error
+fn _enc_write(fd, buf, n): i64 {
+    var t = 0;
+    while (t < n) {
+        var w = file_write(fd, buf + t, n - t);
+        if (w <= 0) { return 0 - 1; }
+        t = t + w;
+    }
+    return 0;
+}
+
+fn shard_stream_encode(in_path, out_path, learn_k): i64 {
+    #ifdef CYRIUS_TARGET_AGNOS
+    return 0 - 73;     # streaming is Linux-only (no lseek in the frozen agnos ABI)
+    #endif
+    # --- pass 0: learn the tokenizer from a bounded prefix ---
+    var lbuf = alloc(MAX_CORPUS_BYTES());
+    if (lbuf == 0) { return 0 - 72; }
+    var ifd = file_open(in_path, _O_RDONLY() | _O_NOFOLLOW(), 0);
+    if (ifd < 0) { return ifd; }
+    var ln = 0;
+    while (ln < MAX_CORPUS_BYTES()) {
+        var r = file_read(ifd, lbuf + ln, MAX_CORPUS_BYTES() - ln);
+        if (r < 0) { file_close(ifd); return r; }
+        if (r == 0) { break; }
+        ln = ln + r;
+    }
+    if (ln < 1) { file_close(ifd); return 0 - 3; }
+    g_stream = 0;                       # the encode reads the in-RAM tokenizer, not a stream
+    g_data_w = 1;
+    var V = corpus_set(lbuf, ln);       # base vocab (first-appearance) from the prefix
+    if (V < 0) { file_close(ifd); return V; }
+    if (learn_k > 0) {
+        V = bpe_learn(learn_k);         # learn merges (widens to u16)
+        if (V < 0) { file_close(ifd); return V; }
+    }
+    var tok_kind = g_bpe_on;
+    var Vb = V; if (tok_kind == 1) { Vb = g_bpe_base; }
+    var K = g_bpe_nmerges;
+    var width = g_data_w;               # 1 byte / 2 bpe
+    var carry_cap = 0;
+    if (tok_kind == 1) { carry_cap = 2 * BPE_MAX_TOKLEN(); }   # byte-level needs no carry
+
+    # --- open <out>.tmp, write the header (ntok placeholder) + tokenizer blob ---
+    var plen = strlen(out_path);
+    var tmp = alloc(plen + 6);
+    if (tmp == 0) { file_close(ifd); return 0 - 72; }
+    var pi = 0;
+    while (pi < plen) { store8(tmp + pi, load8(out_path + pi)); pi = pi + 1; }
+    store8(tmp + plen, 46); store8(tmp + plen + 1, 116);        # '.t'
+    store8(tmp + plen + 2, 109); store8(tmp + plen + 3, 112);   # 'mp'
+    store8(tmp + plen + 4, 0);
+    var ofd = file_open(tmp, _O_WRONLY() | _O_CREAT() | _O_TRUNC() | _O_NOFOLLOW(), 420);
+    if (ofd < 0) { file_close(ifd); return ofd; }
+    var meta_n = (SHARD_HDR() + Vb + 2 * K) * 8;
+    var meta = alloc(meta_n);
+    if (meta == 0) { file_close(ofd); file_close(ifd); _unlink(tmp); return 0 - 72; }
+    store64(meta + 0 * 8, SHARD_MAGIC()); store64(meta + 1 * 8, 1);
+    store64(meta + 2 * 8, tok_kind); store64(meta + 3 * 8, Vb); store64(meta + 4 * 8, K);
+    store64(meta + 5 * 8, V); store64(meta + 6 * 8, width); store64(meta + 7 * 8, 0);   # ntok patched later
+    var mi = 0;
+    while (mi < Vb) { store64(meta + (SHARD_HDR() + mi) * 8, load64(g_vocab + mi * 8)); mi = mi + 1; }
+    mi = 0;
+    while (mi < 2 * K) { store64(meta + (SHARD_HDR() + Vb + mi) * 8, load64(g_merges + mi * 8)); mi = mi + 1; }
+    if (_enc_write(ofd, meta, meta_n) < 0) { file_close(ofd); file_close(ifd); _unlink(tmp); return 0 - 1; }
+
+    # --- pass 1: stream the whole file, emit stable ids, carry the unstable tail ---
+    if (file_seek(ifd, 0) < 0) { file_close(ofd); file_close(ifd); _unlink(tmp); return 0 - 2; }
+    var margin = 4 * BPE_MAX_TOKLEN();
+    var rawsz = _enc_chunk() + margin;
+    var raw = alloc(rawsz);
+    var ids = alloc(rawsz * width);
+    if ((raw == 0) || (ids == 0)) { file_close(ofd); file_close(ifd); _unlink(tmp); return 0 - 72; }
+    # carry_len after a trim is at most carry_cap + BPE_MAX_TOKLEN (the keep loop
+    # overshoots carry_cap by < one final token), i.e. <= 3*BPE_MAX_TOKLEN; the
+    # margin (4*BPE_MAX_TOKLEN) leaves slack so raw[carry_len + _enc_chunk()] never
+    # overflows. Below carry_cap the whole (sub-128-byte) buffer is carried.
+    var carry_len = 0;
+    var ntok = 0;
+    var done = 0;
+    while (done == 0) {
+        var rn = file_read(ifd, raw + carry_len, _enc_chunk());
+        if (rn < 0) { file_close(ofd); file_close(ifd); _unlink(tmp); return rn; }
+        var avail = carry_len + rn;
+        if (rn == 0) { done = 1; }
+        if (avail > 0) {
+            var m = tok_encode(raw, avail, ids, width);
+            var emit = m;
+            var keepbytes = 0;
+            if (done == 0) {
+                # keep the last >= carry_cap bytes (a whole number of tokens) as carry
+                var j = m;
+                while ((j > 0) && (keepbytes < carry_cap)) {
+                    j = j - 1;
+                    var id = _tw_ld(ids, j, width);
+                    var bl = 1; if (tok_kind == 1) { bl = load64(g_tok_len + id * 8); }
+                    keepbytes = keepbytes + bl;
+                }
+                emit = j;
+            }
+            if (emit > 0) {
+                if (_enc_write(ofd, ids, emit * width) < 0) {
+                    file_close(ofd); file_close(ifd); _unlink(tmp); return 0 - 1;
+                }
+                ntok = ntok + emit;
+            }
+            if (done == 0) {
+                # move the carry (last keepbytes raw bytes) to the front of raw
+                var cstart = avail - keepbytes;
+                var bi = 0;
+                while (bi < keepbytes) { store8(raw + bi, load8(raw + cstart + bi)); bi = bi + 1; }
+                carry_len = keepbytes;
+            }
+        }
+    }
+
+    # --- patch ntok in the header, durably commit, atomic rename ---
+    if (file_seek(ofd, 7 * 8) < 0) { file_close(ofd); file_close(ifd); _unlink(tmp); return 0 - 2; }
+    var nb[8];
+    store64(&nb, ntok);
+    if (_enc_write(ofd, &nb, 8) < 0) { file_close(ofd); file_close(ifd); _unlink(tmp); return 0 - 1; }
+    if (_fdatasync(ofd) < 0) { file_close(ofd); file_close(ifd); _unlink(tmp); return 0 - 2; }
+    file_close(ofd);
+    file_close(ifd);
+    var rr = _rename(tmp, out_path);
+    if (rr < 0) { _unlink(tmp); return rr; }
+    return ntok;
+}

@@ -419,6 +419,9 @@ fn ckpt_load_buf(buf, len): i64 {
     # (Compare the CORPUS vocab size g_corpus_vlen, not g_V — the latter is
     # the model's and is unset on the load-without-prior-init path.)
     if (g_data != 0) {
+        # In-memory resume: only the BASE vocab must match — the corpus is
+        # re-encoded through the CHECKPOINT's merges below (from retained raw
+        # bytes), so it adapts to whatever tokenizer the checkpoint carries.
         if (g_corpus_vlen != Vb) { return 0 - 15; }
         i = 0;
         while (i < Vb) {
@@ -428,6 +431,28 @@ fn ckpt_load_buf(buf, len): i64 {
         # a BPE resume re-encodes the corpus from its retained raw bytes;
         # corpus_set always retains them, so this is purely defensive
         if ((tok_kind == 1) && (g_text == 0)) { return 0 - 39; }
+    } elif (g_stream != 0) {
+        # Streamed resume (1.6.3, --load + --stream-corpus): the shard's pre-encoded
+        # ids are FROZEN on disk — there is NO re-encode — so the shard must carry
+        # the EXACT tokenizer the checkpoint trained with: kind, base size, merge
+        # count, every base-vocab byte, AND every merge pair. Otherwise a shard id
+        # would index the restored embeddings as a DIFFERENT token (e.g. a BPE shard
+        # whose base vocab happens to match a byte checkpoint would still stream ids
+        # >= Vb, past the byte model's embedding table). g_data is 0 here (tokens
+        # stay on disk), so g_text == 0 is expected — NOT the -39 missing-bytes error.
+        if (g_bpe_on != tok_kind) { return 0 - 15; }
+        if (g_corpus_vlen != Vb) { return 0 - 15; }
+        if (g_bpe_nmerges != K) { return 0 - 15; }
+        i = 0;
+        while (i < Vb) {
+            if (load64(g_vocab + i * 8) != load64(buf + (base + i) * 8)) { return 0 - 15; }
+            i = i + 1;
+        }
+        i = 0;
+        while (i < 2 * K) {
+            if (load64(g_merges + i * 8) != load64(buf + (base + Vb + i) * 8)) { return 0 - 15; }
+            i = i + 1;
+        }
     }
     # validated — build the model and restore state. v6 rebuilds the per-layer
     # hybrid from the in-buffer kinds (already _hybrid_kinds_ok-validated above);

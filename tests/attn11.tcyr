@@ -3254,6 +3254,109 @@ fn test_stream_ingest(): i64 {
     return 0;
 }
 
+# Resume-from-stream (1.6.3): a checkpoint saved mid-stream, reloaded against the
+# SAME shard, must continue BIT-FOR-BIT — train(K) continuous == train(K1) ->
+# checkpoint round-trip -> train(K), all streamed. Mirrors test_resume_determinism
+# but with the corpus on disk (g_data == 0, g_stream == 1): the loader verifies the
+# shard's full tokenizer against the checkpoint's (g_stream branch in ckpt_load_buf)
+# and resumes without re-encoding. Also pins the mismatch rejection (-15). Uses a
+# real /tmp shard; RNG-consuming + model_init-reseeding, so registered DEAD-LAST.
+fn test_resume_stream(): i64 {
+    g_stream = 0; g_data_w = 1;
+    var sp = "/tmp/attn11-resume-stream.tsh";
+    var V = build_corpus();
+    assert(shard_save_file(sp, V) == 0, "resume-stream: shard written");
+    assert(shard_open(sp) == V, "resume-stream: shard opened");
+    var C = 8; var T = 4; var nh = 2; var nkv = 2; var NL = 2;
+    var base = _lrc(3, 1000); var minl = _lrc(3, 10000); var clip = f64_from(1);
+    var K = 24; var K1 = 9; var B = 4; var warm = 5; var quiet = 1000000000;
+
+    # Path A: one continuous streamed run to K (horizon = K)
+    model_init(V, C, T, nh, nkv, NL, 0, f64_from(0), 7);
+    train(K, K, B, base, minl, warm, clip, quiet);
+    var npA = g_NP;
+    var snapA = t_alloc(npA); t_copy(snapA, g_params, npA);
+
+    # Path B: streamed to K1, in-memory checkpoint round-trip, then continue to K
+    model_init(V, C, T, nh, nkv, NL, 0, f64_from(0), 7);
+    train(K1, K, B, base, minl, warm, clip, quiet);
+    var sz = ckpt_size();
+    var buf = alloc(sz);
+    ckpt_serialize(buf);
+    model_init(V, C, T, nh, nkv, NL, 0, f64_from(0), 999);   # scramble to a different seed
+    var rc = ckpt_load_buf(buf, sz);                         # resume-from-stream (g_stream != 0)
+    train(K, K, B, base, minl, warm, clip, quiet);
+    var mism = 0; var i = 0;
+    while (i < g_NP) { if (load64(g_params + i * 8) != load64(snapA + i * 8)) { mism = mism + 1; } i = i + 1; }
+    assert(rc == 0, "resume-stream: ckpt_load_buf ok under streaming");
+    assert(g_NP == npA, "resume-stream: param count matches");
+    assert(g_step == K, "resume-stream: step counter reaches K");
+    assert(mism == 0, "resume-stream: reproduces params BIT-FOR-BIT");
+
+    # mismatch: flip the checkpoint's FIRST base-vocab byte (slot CKPT_HDR(); this
+    # uniform byte image is v5, no per-layer region) to a different valid 0..255
+    # value. np/size stay valid, so the streaming branch's vocab check fires (-15) —
+    # a shard whose tokenizer differs from the checkpoint's must not load.
+    var vorig = load64(buf + CKPT_HDR() * 8);
+    var valt = 0; if (vorig == 0) { valt = 1; }
+    store64(buf + CKPT_HDR() * 8, valt);
+    assert(ckpt_load_buf(buf, sz) == (0 - 15), "resume-stream: tokenizer mismatch rejected (-15)");
+
+    file_close(g_stream_fd); g_stream = 0;
+    _unlink(sp);
+    g_data_w = 1;
+    return 0;
+}
+
+# Streaming BPE encode (1.6.4): a shard produced by the chunked, carry-based
+# streaming encoder must be byte-identical to a whole-corpus in-RAM encode through
+# the same merges. Uses a ~6 KB synthetic corpus and a TINY forced chunk (7 bytes)
+# so the carry runs across hundreds of boundaries — the strongest exactness stress
+# for the "greedy-LTR BPE is prefix-stable except within one token of the edge"
+# property the carry relies on. RNG-neutral (no model/RNG); dead-last by convention.
+fn test_stream_bpe_encode(): i64 {
+    g_stream = 0; g_data_w = 1;
+    var cpath = "/tmp/attn11-se-in.txt";
+    var spath = "/tmp/attn11-se.tsh";
+    # a repetitive synthetic corpus (BPE finds real merges; repetition stresses the
+    # parity / boundary cases that naive chunking would get wrong)
+    var n = 6000;
+    var txt = alloc(n);
+    var src = "the quick brown fox jumps over the lazy dog and then runs away . ";
+    var sl = strlen(src);
+    var k = 0;
+    while (k < n) { store8(txt + k, load8(src + (k % sl))); k = k + 1; }
+    var V = corpus_set(txt, n);
+    var Vb = bpe_learn(24);
+    var nref = g_datalen;
+    var ref = t_alloc(nref);
+    var i = 0; while (i < nref) { store64(ref + i * 8, gd_ld(i)); i = i + 1; }
+    assert(secure_write_atomic(cpath, txt, n) == n, "se: wrote input file");
+    g_stream_enc_chunk = 7;                       # tiny chunk -> hundreds of carry boundaries
+    var nt = shard_stream_encode(cpath, spath, 24);
+    g_stream_enc_chunk = 0;
+    assert(nt == nref, "se: streamed token count == whole-corpus encode");
+    assert(shard_open(spath) == Vb, "se: streamed shard opens with the same vocab");
+    g_stream_cap = 5; g_stream_lo = 0 - 1; g_stream_clen = 0;
+    var bad = 0; i = 0;
+    while (i < nref) { if (gd_ld(i) != load64(ref + i * 8)) { bad = bad + 1; } i = i + 1; }
+    assert(bad == 0, "se: streamed BPE ids byte-identical to whole-corpus encode across chunks");
+    file_close(g_stream_fd); g_stream = 0; g_stream_cap = STREAM_CHUNK();
+    # byte-level streaming encode (no merges, no carry) is exact too
+    g_data_w = 1;
+    corpus_set(txt, n);
+    var nbyte = g_datalen;
+    g_stream_enc_chunk = 13;
+    var ntb = shard_stream_encode(cpath, spath, 0);
+    g_stream_enc_chunk = 0;
+    assert(ntb == nbyte, "se: byte-level streamed token count == corpus length");
+    assert(shard_open(spath) == V, "se: byte-level streamed shard vocab matches");
+    file_close(g_stream_fd); g_stream = 0;
+    _unlink(cpath); _unlink(spath);
+    g_data_w = 1;
+    return 0;
+}
+
 fn main(): i64 {
     alloc_init();
     rng_seed(123);
@@ -3365,6 +3468,10 @@ fn main(): i64 {
     # unchanged (the X019/X015 discipline).
     test_group("streaming token-shard (1.6.x)");
     test_stream_ingest();
+    # resume-from-stream (1.6.3) — also RNG-consuming + model_init-reseeding, dead-last.
+    test_resume_stream();
+    # streaming BPE encode (1.6.4) — RNG-neutral (tokenizer only), dead-last by convention.
+    test_stream_bpe_encode();
     return assert_summary();
 }
 

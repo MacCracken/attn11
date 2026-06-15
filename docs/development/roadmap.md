@@ -13,7 +13,7 @@
 
 ## Where we are
 
-Current: **v1.6.2**. The v1.0 surface is frozen and additive-only
+Current: **v1.6.5**. The v1.0 surface is frozen and additive-only
 ([`STABILITY.md`](../STABILITY.md)); the reusable numeric core lives in
 **[rosnet](https://github.com/MacCracken/rosnet)** + **[tyche](https://github.com/MacCracken/tyche)**
 (v1.1.0). The 1.x architecture arc through M14 has shipped (the attention/KV, FFN-
@@ -155,30 +155,30 @@ boundaries) on x86_64 **and** aarch64/qemu; RSS is flat ~13 MB as the corpus gro
 (bounded RAM, the GB precondition); the no-flag run is byte-identical; lint + fuzz
 (500 shard rounds) + `make smoke` green. New file `src/stream.cyr`,
 [`../architecture/007-streaming-token-shards.md`](../architecture/007-streaming-token-shards.md).
-**Fast-follows** (additive): resume-from-stream (`--load` + `--stream-corpus`) and BPE
-GB-scale shards (whole-corpus merge stats don't stream — the c4 emitter is byte-level;
-`attn11 --bpe --encode-shard` covers the ≤ 64 MB BPE case).
+**Fast-follows** (additive), both now shipped: resume-from-stream (`--load` +
+`--stream-corpus`) — **✅ v1.6.3** (bit-for-bit deterministic; the loader requires the
+shard's full tokenizer to match the checkpoint's, `-15` otherwise) — and BPE GB-scale
+shards (`--stream-encode`) — **✅ v1.6.4** (a bounded-RAM streaming encoder: learn merges
+on a bounded prefix, then chunked `tok_encode` with a `2*BPE_MAX_TOKLEN` raw-byte carry
+that makes the chunked encode byte-identical to a whole-corpus encode). The c4 emitter
+stays byte-level; `attn11 --stream-encode` is the BPE GB path.
 
-### Data-volume held-out win (X021) — 1.6.x (with M16)
+### Data-volume held-out win (X021) — ✅ shipped (v1.6.5)
 
-The open experiment from X020 (v1.5.6), the one the `--eval-corpus` flag was built to
-run. X020 found the own→held-out gap **tiny (< 1.3%)** at reference scale — sub-epoch
-training barely memorizes, so own-corpus bits/byte is already a near-unbiased
-generalization proxy *there*. The number X019 actually wanted is the one that needs a
-model big enough to **overfit** a small corpus (what M16's added capacity / a longer
-budget unlocks): train two models — one on the **4 MB** curated corpus, one on the
-**24 MB / 12-shard** corpus (X019) — then score **both** on a **THIRD disjoint
-held-out set** via `--eval-corpus`. The hypothesis X019 flagged: the **+2.8%
-own-corpus penalty** the larger/more-diverse corpus paid (preset, 24 MB) should **flip
-to a held-out generalization win** once the model can overfit the small corpus —
-directly measuring "more clean data → better generalization", the data value
-bits/byte-on-own-corpus understates in ABSOLUTE terms. No new binary surface (it rides
-the shipped `--eval-corpus` flag + `c4_sample.py`'s shard-range splits); it is sequenced
-into the **1.6.x group with M16** because the result only appears at a capacity/budget
-that overfits 4 MB, not at reference scale. **Gate**: train-4MB vs train-24MB, both
-scored on the same third disjoint set, RNG-neutral + cross-arch reproducible; a clear
-held-out delta reported (an honest win *or* a documented null — no dropped cells).
-Logged as **X021** (the held-out AR-vs-data-scale number X019/X020 deferred).
+The open experiment from X020, the one `--eval-corpus` was built to run. It needs the
+**overfit** regime X020 lacked (sub-epoch barely memorizes, so own≈held); X021 forces it
+with a small overfittable slice vs a larger disjoint one at matched compute, scored on a
+third disjoint slice (`scripts/x021-heldout.sh`; **no new binary surface** — rides the
+shipped `--eval-corpus` + `c4_sample.py`, binary byte-identical to 1.6.4). **Result (an
+honest win, not a null):** at **preset** capacity, training on **4 MB** beats **256 KB** by
+**−14.2% held-out bits/byte** (2.383 vs 2.776) — the data-volume generalization win X019
+hypothesized; at **default** (tiny) capacity a **tie** (−0.06%), so the win is a **capacity
+lever**. The overfit regime is reached (preset·256 KB own→held gap **+40.4%**), exposing
+that own-corpus bits/byte **inverts the truth above the overfit threshold** (own looks
+better while held-out is far worse) yet stays honest below it (validating X020). The scale
+deviates from the roadmap's literal 4 MB vs 24 MB — attn11's largest (preset) cannot
+overfit 4 MB of diverse C4, so 256 KB vs 4 MB is the scale where the question is decidable;
+documented in X021. **Closes the data-ingestion story (X016→X021).**
 
 ## The 1.x architecture arc
 
@@ -233,12 +233,12 @@ SIMD-f64 path**; the collapse ships as the grad-checked + benched reference kern
 into no run — ternary *and* default runs byte-identical to 1.6.0). The remaining ternary
 fast-follows (mla/ssm/lin/MoE/rope/diffusion) and activation quantization are additive.
 
-> **The 1.6.x group also folded in two data items** defined in the data-ingestion
-> section above: **streaming token-shard ingestion** (the RAM-independent large-corpus
-> path) — **✅ shipped in v1.6.2** (`--encode-shard` / `--stream-corpus`; see above) —
-> and the **data-volume held-out win (X021)** (train-4MB vs train-24MB scored on a third
-> disjoint set — the X019/X020 follow-on that needs a model able to overfit the small
-> corpus), still **open** because it needs a capacity/budget that overfits 4 MB.
+> **The 1.6.x group's two data items are both done:** **streaming token-shard ingestion**
+> — **✅ v1.6.2** (`--encode-shard` / `--stream-corpus`), with resume-from-stream (✅ v1.6.3)
+> and BPE GB-scale shards (✅ v1.6.4) as the fast-follows — and the **data-volume held-out
+> win (X021)** — **✅ v1.6.5** (an honest win: more clean data generalizes −14.2% better on
+> held-out at capacity; the overfit regime shows own-corpus bits/byte inverts above it).
+> **The 1.6.x group is complete; M16 and its group are closed. Next is M17 (RL).**
 
 ### M17 — Reinforcement learning (v1.7.0) — E9
 
@@ -347,11 +347,11 @@ quality-curating sampler ✓ → 1.5.3 token-packing ✓ → 1.5.4 curation at s
 models see and lifted the corpus ceiling, before any new model-scale work. The
 *precision* departure — **ternary training (M16, E6)** — is **complete** (v1.6.0 the
 grad-checked STE X022 → v1.6.1 the i64-add matmul + bench X023, closing the gate). Its
-**1.6.x group** shipped **streaming token-shard ingestion** (the RAM-independent
-large-corpus path, **v1.6.2** — `--encode-shard` / `--stream-corpus`); the one item
-still **open** is the **data-volume held-out win (X021)** (the X019/X020 follow-on),
-which only pays off once a scaled model can overfit a small corpus. **RL (M17, E9)** is
-next (and last in the milestone chain)
+**1.6.x group is now complete**: **streaming token-shard ingestion** (v1.6.2,
+`--encode-shard` / `--stream-corpus`) with resume-from-stream (v1.6.3) and BPE GB-scale
+shards (v1.6.4) as the fast-follows, and the **data-volume held-out win (X021, v1.6.5)** —
+an honest win (more clean data generalizes −14.2% better on held-out at capacity). With
+M16 + its group closed, **RL (M17, E9)** is next (and last in the milestone chain)
 because it is an objective layer over a finished trunk, and the GPU *compute* backend
 (M18, E-infra) is sequenced TBD (it unblocks the B4 GPU benchmark).
 The E-series is informed by the
