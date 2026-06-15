@@ -1,4 +1,4 @@
-.PHONY: check release lint test fuzz bench build aarch64 smoke clean
+.PHONY: check release lint test fuzz bench compete-bench build aarch64 smoke clean
 
 check: lint test            # the local CI gate (lint + x86 grad-checks)
 
@@ -28,6 +28,13 @@ fuzz:
 
 bench:
 	./scripts/bench-history.sh
+
+# Competitor benchmarks (B-series): attn11 vs external references + the zero-deps
+# story. Clones/builds competitors into a gitignored bench/ at recorded refs;
+# emits competitor-bench.csv. Local/release-machine (needs network + competitor
+# stacks), NOT a CI lane. See docs/benchmarks.md "Competitor benchmarks".
+compete-bench:
+	./scripts/compete-bench.sh
 
 build:
 	@mkdir -p build

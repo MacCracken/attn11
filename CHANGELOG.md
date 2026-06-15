@@ -4,6 +4,51 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.7.2] - 2026-06-14
+
+**Competitor benchmarks (the B-series, B0) + toolchain realign (cyrius 6.2.5 → 6.2.6).**
+The wrap-up cut before the GPU work pauses on the mabda 3.x Vulkan-f64 dependency. Two
+binary-neutral threads:
+
+1. **B-series B0 — the competitor-benchmark harness.** New `scripts/compete-bench.sh`
+   (+ `make compete-bench`) adds the axis the self-bench lacks: attn11 vs external
+   references (llm.c / nanoGPT / llama2.c / micrograd) on the training + decode surfaces,
+   plus the normalized **zero-deps** story. It clones + builds competitors at a **recorded
+   upstream commit** into a gitignored `bench/` (no vendoring), enforces the fairness rules
+   (matched config with the **param count asserted**, `taskset` + warmup, attn11
+   single-thread first, competitor thread/deps recorded), and — per the "no silent caps"
+   discipline — emits an **explicit status row** (built-only / skip + reason) for any
+   competitor it can't match/build/run, never a fabricated number. New
+   `competitor-bench.csv` (append-per-run, like `bench-history.csv`); the self-bench track
+   is untouched. **B3 (zero-deps) is complete + real**: attn11 ships as **one 372,896-byte
+   static ELF, `ldd` = "not a dynamic executable"** (no BLAS/libc/CUDA) vs every
+   competitor's runtime stack. The harness validated here by cloning + **building llm.c and
+   llama2.c** at recorded refs (`f1e2ace` / `350e04f`) + emitting attn11's real row
+   (~4 393 tok/s, 39 488 params); the **matched-config comparison runs (B1/B2) are
+   harness-ready but unpopulated** — they need each competitor's stack + GPT-2 data-prep on
+   a bench machine (this host has no PyTorch; nanoGPT skipped with a reason). **B4 (GPU)**
+   rides M18. Write-up: `docs/benchmarks.md` ("Competitor benchmarks").
+2. **Toolchain realign: cyrius pin 6.2.5 → 6.2.6** (cycc rolled forward again, faster than
+   the pin). `cyrius.cyml` bumped + `cyrius update` resynced the `lib/` snapshot + lock; the
+   default / RL / ternary runs are **byte-identical** to 1.7.1 (verified), grad-checks green
+   on the realigned snapshot.
+
+**1014 → unchanged: 1056** checks green x86_64 + aarch64/qemu (no new src tests — the B0
+harness is tooling/data/docs); lint + fuzz + `make smoke` green; `make release` exit 0.
+`src/*.cyr` unchanged except `CFG_VERSION`.
+
+### Added
+- **`scripts/compete-bench.sh`** + **`make compete-bench`** (B0 harness) and
+  **`competitor-bench.csv`** (the data track).
+- **`docs/benchmarks.md`** — "Competitor benchmarks (the B-series, 1.7.2)" section: the
+  fairness rules, the zero-deps table (B3), attn11's baseline, and the honest competitor
+  coverage (built vs harness-ready vs skip).
+- `.gitignore` += `bench/` (the gitignored competitor clone dir).
+
+### Changed
+- `cyrius.cyml` pin **6.2.5 → 6.2.6** + `cyrius.lock`/`lib/` resynced (`cyrius update`); no
+  source/behavior change beyond `CFG_VERSION`.
+
 ## [1.7.1] - 2026-06-14
 
 **Toolchain realignment (maintenance): cyrius pin 6.2.2 → 6.2.5.** The installed `cycc`

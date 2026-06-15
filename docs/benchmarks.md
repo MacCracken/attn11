@@ -356,3 +356,57 @@ keeps the SIMD-f64 path**; the collapse ships as the grad-checked + benched refe
 kernel only (wired into no run — ternary *and* default runs stay byte-identical to 1.6.0).
 Regenerate with `cyrius build tests/attn11.bcyr build/bench && ./build/bench` (the
 `ternary i64-add` / `SIMD-f64` rows + `(x100)` ratios).
+
+## Competitor benchmarks (the B-series, 1.7.2)
+
+The sections above are **self-referential** — attn11 vs its own history. The B-series
+adds the missing axis: attn11 vs external references, on two surfaces (training step,
+decode) and two stories — honest raw throughput **and** the normalized
+*throughput-at-zero-dependencies*. Harness: [`scripts/compete-bench.sh`](../scripts/compete-bench.sh)
+(B0); data: [`competitor-bench.csv`](../competitor-bench.csv) (append-per-run, like
+`bench-history.csv`). The self-bench `bench-history.sh` track is unchanged.
+
+**Fairness rules the harness enforces** (no cherry-picking): a competitor is accepted as
+a *comparison* only at a **matched config** (same vocab / `d_model` / layers / heads /
+ctx / batch, with the printed **param count asserted** to match attn11's `--preset`);
+one CPU (`taskset`), warmup + run-of-record; attn11's single-thread/SIMD baseline first,
+competitor thread counts (llm.c OpenMP, PyTorch MKL) recorded, never hidden; competitors
+clone+build at a **recorded upstream commit** into a gitignored `bench/` (no vendoring).
+A competitor that can't be matched/built/run gets an **explicit status row** (build-only
+/ skip + reason) — never a silent drop and never a fabricated number.
+
+**The zero-deps story (B3) — where attn11 is alone.** Measured here, real:
+
+| build | shippable artifact | shared-lib deps (`ldd`) | runtime deps |
+|-------|--------------------|-------------------------|--------------|
+| **attn11** (DCE, `--preset`-capable) | **one 372,896-byte static ELF** | **none** ("not a dynamic executable") | **none** — no BLAS / libc / CUDA |
+| llm.c (`train_gpt2`, CPU) | object + libc/libm/OpenMP | libc, libm, libgomp | OpenMP runtime |
+| llama2.c (`run`) | object + libc/libm | libc, libm | — |
+| nanoGPT | Python sources | — | CPython + PyTorch (+CUDA), GB-scale |
+| micrograd | Python sources | — | CPython |
+
+attn11 self-bench baseline (default config, x86_64): **~4 400 tok/s** training step,
+KV-cached decode **5 868 tok/s** (default) / 1 486 tok/s (preset) — see the sections above.
+
+**Competitor coverage as run (the honest current state).** B0 (the harness) is complete
+and validated — it clones + builds the C competitors here at recorded refs; the *matched
+comparison runs* (B1 training, B2 decode) need each competitor's stack + a tiny-config
+data-prep that a CI lane lacks, so they are produced on a **bench machine** by running
+the harness there. Latest local run:
+
+| competitor | ref | surface | status |
+|------------|-----|---------|--------|
+| **attn11** | (HEAD) | train | **ok — 4 393 tok/s, 39 488 params, 372,896 B static ELF, deps=none** |
+| llama2.c | `350e04f` | decode | built ✓; matched run pending (needs a model `.bin` + config map to `--preset`) |
+| llm.c | `f1e2ace` | train | built ✓; matched run pending (GPT-2 tokenizer/weights data-prep + tiny-config source edit) |
+| micrograd | `c911406` | train | built ✓; matched run N/A (an MLP, not a transformer — a from-scratch *floor* reference only) |
+| nanoGPT | — | train | skip (PyTorch not installed on this host) |
+
+So the **raw-throughput tables (B1/B2) are harness-ready, not yet populated**: faithful
+matched-config competitor numbers come from one `scripts/compete-bench.sh` run on a host
+with PyTorch + the GPT-2 data-prep installed (the harness asserts the param-count match
+before accepting each row). The **zero-deps story (B3) above is complete** — it needs no
+competitor run. **B4 (GPU)** rides the M18 1.8.x GPU backend.
+
+Reproduce: `scripts/compete-bench.sh` (records the upstream commit it builds; emits
+`competitor-bench.csv` + the table above).

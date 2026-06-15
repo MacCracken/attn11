@@ -39,3 +39,6 @@ Thumbs.db
 *.pem
 *.key
 __pycache__/
+
+# competitor clones for the B-series harness (scripts/compete-bench.sh)
+/bench/

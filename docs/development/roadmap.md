@@ -13,7 +13,7 @@
 
 ## Where we are
 
-Current: **v1.7.1**. The v1.0 surface is frozen and additive-only
+Current: **v1.7.2**. The v1.0 surface is frozen and additive-only
 ([`STABILITY.md`](../STABILITY.md)); the reusable numeric core lives in
 **[rosnet](https://github.com/MacCracken/rosnet)** + **[tyche](https://github.com/MacCracken/tyche)**
 (v1.1.0). **The full milestone chain M12–M17 is complete**, plus both data arcs:
@@ -417,20 +417,22 @@ for the native-AMD f64 route.
 - **B4 — GPU comparison** *(rides the M18 1.8.x arc)*. attn11-GPU vs nanoGPT-GPU vs
   llama2.c CUDA, same matched config, a `backend` column folded into the same tables.
 
-**Release framing — 1.7.2 ships B0–B3 (the CPU + zero-deps story); B4 waits for 1.8.x.**
-1.7.2 is the next concrete version: `scripts/compete-bench.sh` (B0) + the CPU training /
-decode tables (B1/B2) + the zero-deps normalized headline (B3) in `docs/benchmarks.md`,
-plus a new `competitor-bench.csv` (append-per-run, like `bench-history.csv`). It is
-binary-unchanged (tooling + data + docs; `CFG_VERSION` bump only). Practical reality from
-the recon: the harness clones + builds competitors at **pinned refs** into a gitignored
-`bench/` (no vendoring), which needs network + build toolchains (gcc/make for llm.c &
-llama2.c; CPython for micrograd; PyTorch-CPU for nanoGPT) — so the B-series runs
-**local/release-machine, not per-commit CI** (PyTorch is too heavy for the CI lane). Open
-items to pin before B1: the exact competitor commits/tags, the matched-config mapping for
-each (some lack CLI flags → small source edits), and a documented reference benchmark host.
-If a competitor build/run fails, emit an error row + continue (no dropped/silent cells —
-the "no silent caps" discipline). The matched config maps attn11's `--preset` to each
-competitor and asserts the printed param count matches before accepting a row.
+**Release framing — B0 + B3 shipped in v1.7.2; B1/B2 harness-ready; B4 waits for 1.8.x.**
+**v1.7.2 shipped** `scripts/compete-bench.sh` (B0) + `competitor-bench.csv` + the
+`docs/benchmarks.md` "Competitor benchmarks" section, binary-unchanged (tooling/data/docs).
+**Done now:** the harness (clones + builds competitors at a recorded upstream commit into a
+gitignored `bench/`, enforces matched-config + param-count assert + the skip-row "no silent
+caps" discipline) and **B3 — the zero-deps story** (attn11 = one 372,896-byte static ELF,
+zero shared-lib deps, vs every competitor's runtime stack). Validated by cloning + building
+llm.c + llama2.c at recorded refs + attn11's real self-row. **Still open (B1/B2, the
+matched-config competitor numbers):** they need each competitor's stack + a tiny-config
+data-prep that the dev box / CI lane lacks (no PyTorch; llm.c needs GPT-2 tokenizer/weights
++ a tiny-config source edit), so they are produced by **one harness run on a bench machine**
+with those stacks installed — the harness asserts the param-count match before accepting a
+row, and no number is fabricated meanwhile. Items to pin for that run: the exact competitor
+commits/tags (the harness currently records the resolved HEAD), the per-competitor
+matched-config mapping, and a documented reference benchmark host. **B4 (GPU)** rides the
+M18 1.8.x backend.
 
 **Gate**: reproducible (every competitor at a pinned ref; config-match asserted by
 param count; host/threads/date in every row) and *complete* — every config run

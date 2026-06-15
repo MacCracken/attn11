@@ -1,0 +1,6 @@
+competitor,ref,lang,surface,tokens_per_sec,params,threads,deps,static_bytes,status,host,date
+attn11,b9111ab,cyrius,train,4393,39488,1,none,372896,ok,Linux_7.0.11-arch1-1_x86_64,2026-06-15T02:38:20Z
+micrograd,c911406,python,train-floor,NA,NA,1,cpython,NA,built; matched-run-NA(MLP-not-transformer; reference floor only),Linux_7.0.11-arch1-1_x86_64,2026-06-15T02:38:20Z
+llama2.c,350e04f,c,decode,NA,NA,1,libc+libm,NA,built; matched-run-pending(needs a model .bin + config map to --preset),Linux_7.0.11-arch1-1_x86_64,2026-06-15T02:38:20Z
+llm.c,f1e2ace,c,train,NA,NA,OpenMP,libc+libm+OpenMP,NA,built; matched-run-pending(GPT-2 tokenizer/weights data-prep + tiny-config source edit),Linux_7.0.11-arch1-1_x86_64,2026-06-15T02:38:20Z
+nanoGPT,nostack,pytorch,train,NA,NA,MKL,pytorch(+cuda),NA,skip(PyTorch not installed on this host),Linux_7.0.11-arch1-1_x86_64,2026-06-15T02:38:20Z

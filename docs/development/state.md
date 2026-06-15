@@ -5,7 +5,22 @@
 
 ## Version
 
-**1.7.1** — *Toolchain realignment* (maintenance): cyrius pin **6.2.2 → 6.2.5**. The
+**1.7.2** — *Competitor benchmarks (B-series B0) + toolchain realign* (the wrap-up cut
+before the GPU pause on mabda 3.x). **B0 harness** `scripts/compete-bench.sh` (+ `make
+compete-bench`, `competitor-bench.csv`): attn11 vs llm.c/nanoGPT/llama2.c/micrograd on
+training + decode, enforcing the fairness rules (matched config + **param-count assert**,
+taskset/warmup, attn11 single-thread first, recorded upstream commit, gitignored `bench/`,
+explicit skip-rows — no fabricated numbers). **B3 zero-deps story is real + complete**:
+attn11 = **one 372,896-byte static ELF, no shared-lib deps** vs every competitor's runtime
+stack. Validated by cloning + building llm.c (`f1e2ace`) + llama2.c (`350e04f`) + attn11's
+real row (~4 393 tok/s, 39 488 params); **matched-config B1/B2 runs are harness-ready but
+unpopulated** (need competitor stacks + GPT-2 data-prep on a bench machine; nanoGPT skipped
+— no PyTorch here). B4 rides M18. **Toolchain**: cyrius pin **6.2.5 → 6.2.6** (`cyrius
+update` resync); default/RL/ternary runs **byte-identical** to 1.7.1. **1056** checks
+unchanged green x86_64 + aarch64/qemu; lint + fuzz + `make smoke` + `make release` exit 0.
+`src/*.cyr` unchanged except CFG_VERSION. Write-up: [`../benchmarks.md`](../benchmarks.md).
+
+(**1.7.1** — *Toolchain realignment* (maintenance): cyrius pin **6.2.2 → 6.2.5**. The
 installed cycc had moved ahead of the pin (local builds warned of toolchain drift); bumped
 `cyrius.cyml` and ran `cyrius update` to resync the `lib/` snapshot + `cyrius.lock`. `lib/`
 is gitignored (CI regenerates it from the pin), so the tracked diff is `cyrius.cyml` +
@@ -18,7 +33,7 @@ snapshot + lock moved together (the new-compiler/old-lib mismatch is the AGNOS
 `argc()==0` trap, and `syscalls_x86_64_agnos` is among the changed files), so the agnos
 target was rebuilt + the full gate re-run on the realigned snapshot. **1056** checks
 unchanged, green x86_64 + aarch64/qemu; lint + fuzz + `make smoke` + `--agnos` build +
-`make release` exit 0. `src/*.cyr` unchanged except CFG_VERSION.
+`make release` exit 0. `src/*.cyr` unchanged except CFG_VERSION.)
 
 (**1.7.0** — *M17: Reinforcement learning (REINFORCE)* (E9; ADR 0015, X024; the last
 milestone in the chain). `--objective rl` trains the policy toward a **reward** via
@@ -483,17 +498,16 @@ deterministic resume. 0.2.0: stacked layers, grad clipping, LR schedule.)
 
 ## Toolchain
 
-- **Cyrius pin**: `6.2.5` (in `cyrius.cyml [package].cyrius`) — bumped from
-  6.2.2 in 1.7.1 to realign with the installed cycc (`cyrius update` resynced the
-  gitignored `lib/` snapshot + `cyrius.lock`; tracked diff = `cyrius.cyml` +
-  `cyrius.lock`). The 6.2.5 lib snapshot differs from 6.2.2 ONLY in files attn11
-  does not use on its Linux path (networking/TLS `net`/`tls_native*`, threading
-  `thread*`, `chrono`, `syscalls_x86_64_agnos`); the core libs
-  (`rosnet`/`tyche`/`alloc`/`fmt`/`io`/`math`/`simd`/…) are unchanged, so all runs
-  (default/RL/etc.) are byte-identical to 1.7.0; 1056 checks green on both arches +
-  the agnos build, no drift warning. (1.3.0 moved the pin 6.2.1 → 6.2.2 with a
-  byte-identical snapshot; 1.2.4 moved 6.1.37 → 6.2.1.) The pin and snapshot must
-  always move together: cycc
+- **Cyrius pin**: `6.2.6` (in `cyrius.cyml [package].cyrius`) — bumped from 6.2.5
+  in 1.7.2 (and 6.2.2 → 6.2.5 in 1.7.1) to realign with the fast-rolling installed
+  cycc (`cyrius update` resyncs the gitignored `lib/` snapshot + `cyrius.lock`;
+  tracked diff = `cyrius.cyml` + `cyrius.lock`). Each realign's lib changes are in
+  files attn11 doesn't use on its Linux path (networking/TLS, threading, `chrono`,
+  `syscalls_x86_64_agnos`); the core libs (`rosnet`/`tyche`/`alloc`/`fmt`/`io`/
+  `math`/`simd`/…) are unchanged, so all runs (default/RL/ternary/etc.) stay
+  byte-identical across the bump (verified 1.7.1 + 1.7.2); 1056 checks green both
+  arches, no drift warning. (1.3.0 moved the pin 6.2.1 → 6.2.2; 1.2.4 moved
+  6.1.37 → 6.2.1.) The pin and snapshot must always move together: cycc
   6.1.32 fixed attn11's agnos argv-capture issue (r15-parked init rsp; the old
   `_agnos_init_rsp` global is gone) during M6, and a new-compiler/old-lib
   mismatch reproduces `argc()==0` under the kernel — the run gate caught it, so
