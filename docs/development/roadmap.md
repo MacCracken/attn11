@@ -16,23 +16,24 @@
 Current: **v1.7.1**. The v1.0 surface is frozen and additive-only
 ([`STABILITY.md`](../STABILITY.md)); the reusable numeric core lives in
 **[rosnet](https://github.com/MacCracken/rosnet)** + **[tyche](https://github.com/MacCracken/tyche)**
-(v1.1.0). The 1.x architecture arc through M14 has shipped (the attention/KV, FFN-
-density, and sequence-mixer axes), **M15** (the char-diffusion *training objective*,
-v1.5.0) is the first objective departure, the **data-ingestion & curation 1.5.x arc
-is COMPLETE** (v1.5.1 the C4 tooling X016 → v1.5.2 the quality-curating sampler X017 →
-v1.5.3 the token-packing unlock X018 → v1.5.4 curation at scale X019 → v1.5.5 the
-hardening/audit pass → v1.5.6 the held-out `--eval-corpus` follow-on X020), and **M16
-(ternary / BitNet-style training, E6) is COMPLETE** — `--ternary` weights in {−1,0,+1}
-(absmean scale) with a straight-through estimator, grad-checked, default run byte-identical,
-checkpoint v8 (v1.6.0, X022), then the **i64-add ternary matmul + bench** closing the M16
-gate (v1.6.1, X023 — the collapse is exact + grad-checked but ~2.4–3× slower than wide-SIMD
-f64 at this scale, an honest negative; the default forward keeps the SIMD-f64 path). The
-1.6.x group's remaining work (streaming ingestion, the X021 data-volume held-out win) is
-below. For *what* shipped,
-see [`CHANGELOG.md`](../../CHANGELOG.md)
+(v1.1.0). **The full milestone chain M12–M17 is complete**, plus both data arcs:
+the architecture axes (M12 attention/KV + RoPE, M13 MoE, M14 the `lin`/`ssm` mixers +
+`--attn-every` hybrids), **M15** char-diffusion (the first objective departure), the
+**data-ingestion & curation 1.5.x arc** (X016→X020), **M16** ternary/BitNet (v1.6.0–1.6.1),
+the **1.6.x streaming/data group** (v1.6.2 token-shard streaming + v1.6.3 resume-from-stream
++ v1.6.4 BPE GB shards + v1.6.5 the X021 data-volume held-out win), **M17** REINFORCE
+(v1.7.0, X024), and the v1.7.1 toolchain realign (cyrius 6.2.5). The frontier experiments
+E1–E9 have all graduated. For *what* shipped, see [`CHANGELOG.md`](../../CHANGELOG.md)
 (release narrative), [`experiments.md`](experiments.md) (the X-series), and
-[`state.md`](state.md) (the
-live snapshot — current flags, counts, perf). This file is the plan ahead only.
+[`state.md`](state.md) (the live snapshot — flags, counts, perf).
+
+**The plan ahead is two infra tracks** (no new training science; both scoped from the
+2026-06-14 mabda recon): **v1.7.2 — the B-series competitor benchmarks** (B0–B3, the honest
+CPU + zero-deps story; the next cut, no GPU dependency), then the **v1.8.x mini-arc — the
+M18 GPU compute backend** on **mabda** (1.8.0 plumbing + matmul → 1.8.1 forward → 1.8.2
+backward + Adam), which is **f32 on the GPU vs the CPU f64 reference** (mabda/WGSL has no
+f64) and unblocks B4 (the GPU competitor row). Detail on both is below. This file is the
+plan ahead only.
 
 ## Versioning
 
@@ -259,21 +260,103 @@ bits/byte 0.24 → ~13, naive reward hacking). ADR 0015; runner `scripts/m17-rl.
 **PPO/GRPO + richer rewards (valid text, length/format targets)** are the documented
 heavier follow-on — REINFORCE earns the question, not yet the heavier machinery.
 
-### M18 — GPU backend (sequencing TBD) — E-infra
+### M18 — GPU compute backend (the 1.8.x mini-arc) — E-infra
 
-**Moved in from Out-of-scope per the user (2026-06-13).** A GPU *compute* backend
-for the same hand-derived forward/backward — an execution target, not a new
-dependency. The sovereign path: the f64 tensor ops (matmul, attention, LM head,
-Adam) dispatch to the **[mabda](https://github.com/MacCracken/mabda)** GPU
-foundation (already vendored in `lib/mabda.cyr`) with **ai-hwaccel** for device
-detection — **no cuBLAS / cuDNN / autodiff**; the "everything-is-i64, hand-derived,
-grad-checked" invariant is device-independent. The CPU scalar/SIMD path stays the
-reference and the bit-exact oracle: every GPU kernel is gated by matching the CPU
-result to f64 tolerance (the finite-difference discipline, one level up), and the
-no-flag run stays CPU + byte-identical. **Gate**: each GPU op validated against the
-CPU reference within tolerance. Sequencing is TBD relative to M15–M17 (the user
-reads it as "a few updates away"); no version pinned yet. **This milestone unblocks
-benchmark phase B4 (the GPU competitor comparison).**
+**Moved in from Out-of-scope per the user (2026-06-13); scoped from a mabda recon
+(2026-06-14).** A GPU *compute* backend for the same hand-derived forward/backward —
+an execution target, not a new dependency. The f64 tensor ops dispatch to the
+**[mabda](https://github.com/MacCracken/mabda)** GPU foundation (v3.0.1, vendored in
+the resolved `lib/mabda.cyr`) — **no cuBLAS / cuDNN / autodiff**; the
+"everything-is-i64, hand-derived, grad-checked" invariant is device-independent. The
+CPU scalar/SIMD path stays the reference oracle and the byte-identical no-flag default;
+the GPU rides behind a `--gpu` flag. Sequenced as a **1.8.x mini-arc** (per the user)
+because it is several independently-gateable increments.
+
+**Library boundary — the ML kernels do NOT live in mabda (user, 2026-06-14).** mabda is
+the GPU *foundation* (device / buffers / compute-pipeline / dispatch — a graphics +
+generic-compute primitive layer); putting GEMM / attention / softmax / Adam kernels in it
+would contaminate its purpose. Tensor math is **rosnet's** domain (the CPU numeric core).
+So the GPU tensor ops are **rosnet's GPU backend, layered ON mabda's primitives** — the GPU
+sibling of rosnet's SIMD path, with the GPU-vs-CPU oracle living next to the f64 CPU
+reference it validates. `lib/` is vendored (unmodifiable here), so the kernels are **built
+attn11-local first** (`src/gpu*.cyr`, consuming `lib/mabda.cyr`), then **extracted** to
+rosnet's GPU backend once proven — the same path the CPU core took to rosnet at 1.1.0.
+**mabda is consumed, never modified** (its own roadmap carries only device-layer work — see
+the mabda 3.x dependency below). See [ADR 0016](../adr/0016-gpu-backend-layered-on-mabda.md)
+(the boundary + precision-tier + locked f32→f64 sequencing).
+
+**What the recon established (what mabda gives us, and what we must build):**
+- **mabda provides the primitives**, not the math: synchronous headless device/context
+  init (`gpu_context_*`), buffer create / upload / synchronous readback
+  (`gpu_buffer_*`, 256 MB cap), and a compute pipeline — WGSL source → shader module →
+  bind-group layout → pipeline → `compute_dispatch` (workgroup dims), with shader /
+  pipeline / bind-group caches and a ping-pong buffer. The portable **wgpu** backend
+  (Vulkan/Metal/DX12) works today; the **native-AMD** (DRM/PM4) backend's compute
+  dispatch is deferred upstream (a later increment / M19). **No matmul / BLAS / softmax
+  / attention kernels are vendored** — every kernel is hand-written **WGSL** (the
+  shading language; not SPIR-V, not a Cyrius DSL).
+- **PRECISION — the f32 wall is WebGPU's, not AMD's (research, 2026-06-14).**
+  - **Portable wgpu/WGSL = f32 only.** WGSL has no f64 (gpuweb #2805, deferred Milestone
+    4+); mabda ships f64↔f32 boundary converters. On the portable path attn11 downcasts
+    f64→f32, gated by an **f32-tolerance** dual-precision test (GPU-f32 op vs CPU-f64 op,
+    ~1e-3..1e-5) **plus** a statistical gate (loss descends / never NaNs) — the one new
+    discipline. (attn11 is f64 everywhere, CPU grad-checked at maxrel 1e-5.)
+  - **f64 IS reachable on AMD** — preserving the f64 oracle — two ways: **(a)
+    Vulkan-compute + SPIR-V** (Vulkan's `shaderFloat64`; wgpu exposes it as the
+    `SHADER_F64` feature — native-Vulkan only, driver-gated, ~16–64× slower than f32, and
+    naga may not validate f64 → possibly raw SPIR-V); **(b) native AMD CDNA MFMA**
+    (Instinct MI100/200/300: full-rate FP64, **1:1 FP64:FP32 matrix** via `V_MFMA_F64`).
+    Consumer Radeon (RDNA) is FP64-throttled (~1:16–1:32) → f64 perf pays only on
+    datacenter parts.
+  - **Cross-repo dependency — on mabda's roadmap now (v3.2, 3.x).** The Vulkan-compute f64
+    path is a mabda **device-layer** capability (not ML), added to mabda's v3.2 plan
+    (2026-06-14); attn11's f64-on-GPU oracle rides it. The fully-sovereign full-rate route
+    (native GFX9+ PM4 + `V_MFMA_F64`) is mabda's heavier native follow-on.
+- **Clean seam.** Matmul is ~80% of FLOPs and funnels through `qlinear_fwd/bwd`
+  (`ops.cyr`) over rosnet `linear_fwd/bwd` — one hook for the dominant op. The rest:
+  `attn_core_fwd/bwd`, `head_fwd/bwd`, `ln_fwd/bwd`, `gelu_fwd/bwd`, `softmax_xent`,
+  `model_adam_step`.
+- **Honest-scale caveat (set expectations now).** attn11 is *tiny* — default ≈59 K /
+  preset ≈285 K params, ~0.5 MB of state per step. Host↔device transfer + kernel-launch
+  latency will dominate at this scale, so M18's deliverable is **the sovereign GPU path
+  working + validated**, NOT a speed win at reference scale (a win needs a much larger
+  model). This is the same honest-negative footing as ternary X023 — "build it + validate
+  it + measure it straight," logged as an X-entry — not a claimed speedup.
+
+**Sovereign references (study, don't link).** All MIT/Apache, usable as kernel-design + ISA
+references with no ROCm runtime and no vendor-BLAS link: **Composable Kernel / CK Tile**
+(MIT — FMHA / GEMM / LayerNorm / RMSNorm / softmax examples + the tiling / global↔LDS↔register
+pipeline; supports fp64), **rocBLAS** (MIT GEMM), the free **AMD ISA PDFs** (RDNA 1–4 /
+CDNA 1–4), and the **LLVM AMDGPU backend** (Apache-2.0 — assembles GFX9+ ISA via
+clang/llvm-mc). **Risk flag:** the documented low-level submit path is amdkfd/HSA AQL, but
+mabda's native backend uses raw **PM4-over-graphics-DRM** (libdrm_amdgpu CS), which is
+under-documented (Mesa/RADV + AMD PAL headers are the next references) — the real unknown
+for the native-AMD f64 route.
+
+**The 1.8.x mini-arc (each increment: a `--gpu` op set, validated vs the CPU reference + byte-identical no-flag, cross-arch where a GPU exists / clean CPU fallback where not):**
+- **1.8.0 — GPU foundation + the matmul kernel (portable f32 path).** Wire mabda into
+  attn11: lazy device init behind `--gpu`, the f64↔f32 host conversion layer, buffer
+  up/readback, and the first WGSL kernel — `linear_fwd` at the `qlinear_fwd` seam.
+  **Gate**: GPU matmul matches CPU `linear_fwd` within f32 tolerance (new dual-precision
+  test); no GPU present ⇒ clean fallback/skip; the no-flag CPU run byte-identical. Stands
+  up the rosnet-GPU layer + the validation harness on the working wgpu backend; every
+  later op reuses the pattern.
+- **1.8.1 — the rest of the forward on GPU.** WGSL kernels for `attn_core_fwd`,
+  `head_fwd`, `ln_fwd`, `gelu_fwd`, `softmax` — a full `--gpu` forward, each op
+  f32-validated against its CPU f64 reference.
+- **1.8.2 — backward + Adam on GPU; the honest perf X-entry.** `linear_bwd`,
+  `attn_core_bwd`, `head_bwd`, `ln_bwd`, `gelu_bwd`, `model_adam_step` — a full `--gpu`
+  training step. Then the straight GPU-vs-CPU comparison (default / preset / a larger
+  config) with the transfer-cost caveat, logged as an X-entry (expected: a wash or loss
+  at reference scale, a win only at scale — the documented honest result).
+- **f64 track (later 1.8.x / M19 — gated on mabda 3.x's Vulkan-f64 capability):** re-run
+  the op set on the **Vulkan-compute + SPIR-V f64** path to **restore the f64 oracle**
+  (the tighter gate); then native-AMD CDNA `V_MFMA_F64` for full-rate f64 once mabda's
+  native compute dispatch + the PM4-over-DRM gap resolve. This is where attn11's f64
+  identity returns to the GPU; on CDNA it can also become a genuine speed win.
+- **Follow-ons (additive, not gating the arc):** MoE / ternary / RoPE GPU kernels;
+  pipelined host↔device transfer. **The arc unblocks benchmark phase B4** (the GPU
+  competitor comparison).
 
 ## Competitor benchmarking (B-series)
 
@@ -331,8 +414,23 @@ benchmark phase B4 (the GPU competitor comparison).**
   generate.
 - **B3 — the normalized story.** Add the zero-deps / shippable-bytes / single-ELF
   context columns + write the headline framing into `docs/benchmarks.md`.
-- **B4 — GPU comparison** *(rides M18)*. attn11-GPU vs nanoGPT-GPU vs llama2.c
-  CUDA, same matched config, a `backend` column folded into the same tables.
+- **B4 — GPU comparison** *(rides the M18 1.8.x arc)*. attn11-GPU vs nanoGPT-GPU vs
+  llama2.c CUDA, same matched config, a `backend` column folded into the same tables.
+
+**Release framing — 1.7.2 ships B0–B3 (the CPU + zero-deps story); B4 waits for 1.8.x.**
+1.7.2 is the next concrete version: `scripts/compete-bench.sh` (B0) + the CPU training /
+decode tables (B1/B2) + the zero-deps normalized headline (B3) in `docs/benchmarks.md`,
+plus a new `competitor-bench.csv` (append-per-run, like `bench-history.csv`). It is
+binary-unchanged (tooling + data + docs; `CFG_VERSION` bump only). Practical reality from
+the recon: the harness clones + builds competitors at **pinned refs** into a gitignored
+`bench/` (no vendoring), which needs network + build toolchains (gcc/make for llm.c &
+llama2.c; CPython for micrograd; PyTorch-CPU for nanoGPT) — so the B-series runs
+**local/release-machine, not per-commit CI** (PyTorch is too heavy for the CI lane). Open
+items to pin before B1: the exact competitor commits/tags, the matched-config mapping for
+each (some lack CLI flags → small source edits), and a documented reference benchmark host.
+If a competitor build/run fails, emit an error row + continue (no dropped/silent cells —
+the "no silent caps" discipline). The matched config maps attn11's `--preset` to each
+competitor and asserts the printed param count matches before accepting a row.
 
 **Gate**: reproducible (every competitor at a pinned ref; config-match asserted by
 param count; host/threads/date in every row) and *complete* — every config run
@@ -353,11 +451,19 @@ shards (v1.6.4) as the fast-follows, and the **data-volume held-out win (X021, v
 an honest win (more clean data generalizes −14.2% better on held-out at capacity). With
 M16 + its group closed, **RL (M17, E9, v1.7.0)** — the last milestone in the chain —
 **shipped** (REINFORCE as reward-weighted softmax-CE; the policy moves toward the reward,
-X024). **The full M12–M17 milestone chain is now complete.** What remains is the GPU
-*compute* backend (**M18, E-infra**, sequencing TBD — it unblocks the B4 GPU benchmark)
-and the competitor-benchmarking **B-series** (a continuous measurement track); both are
-infra, not new training science. The architecture / objective / precision / RL frontier
-experiments (E1–E9) have all graduated.
+X024). **The full M12–M17 milestone chain is now complete** — the architecture / objective
+/ precision / RL frontier experiments (E1–E9) have all graduated. **The forward path is now
+two infra tracks, both scoped (mabda recon, 2026-06-14):**
+1. **v1.7.2 — the B-series competitor benchmarks (B0–B3)**: the honest CPU throughput +
+   zero-deps story vs llm.c / nanoGPT / llama2.c / micrograd; binary-unchanged tooling,
+   run local/release-machine (not CI). The natural next cut (no GPU dependency).
+2. **v1.8.x — the M18 GPU compute backend (mini-arc)**: 1.8.0 plumbing + matmul → 1.8.1
+   full forward → 1.8.2 backward + Adam + the honest perf X-entry, on the **mabda** wgpu
+   path. The recon's defining finding reshapes the gate: mabda/WGSL is **f32-only**, so the
+   GPU runs f32 against the CPU f64 reference and the milestone validates at **f32
+   tolerance** (not the f64-exact oracle of M12–M17). It unblocks **B4** (the GPU competitor
+   row). At attn11's tiny scale this is "the sovereign GPU path works + is validated," not a
+   speed claim (an honest negative until model scale grows).
 The E-series is informed by the
 June-2026 frontier survey (`ai-ml-frontier-2026-expanded.docx`, repo root) —
 data quality > volume, the KV cache as the central inference object, SSM/attention
