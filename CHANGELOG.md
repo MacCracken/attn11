@@ -4,6 +4,55 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.7.0] - 2026-06-14
+
+**M17 — Reinforcement learning (REINFORCE), E9; the last milestone in the chain.**
+`--objective rl` trains the policy toward a *reward* instead of a corpus, via on-policy
+**REINFORCE** (Williams 1992): each step samples `batch` rollouts from the current policy
+(temperature 1), scores each with a deterministic reward, and weights its log-prob
+gradient by the advantage `(R − b)` (`b` = an EMA of past mean rewards). The key
+simplification — and why RL is a *small* milestone — is that for a softmax policy
+`∇log π(a) = −∇CE(a)`, so the policy gradient IS the existing softmax-CE backward over the
+sampled rollout **scaled by `(R − b)`**: no new forward, no new backward op, no autodiff.
+The model stays a plain AR transformer and an RL-trained image is a **normal v5 checkpoint**
+(no format bump). The reward is a simple in-process function: the count of a target char
+(`--rl-target C`, default space) per rollout. **Gate met (X024):** the policy moves
+decisively toward the reward — target-char frequency rises **9–19% (SFT) → ~99.7% (RL)**
+across common/rare/space targets — at the cost of the SFT→RL alignment tax (corpus
+bits/byte 0.24 → ~13, honest reward hacking from the naive count reward). The advantage
+scale is gated on `g_rl`, so AR and diffusion training are untouched and the no-flag run is
+**byte-identical** to 1.6.5. **1045 → 1056** checks green x86_64 + aarch64/qemu; lint +
+fuzz + `make smoke` (valid `--objective rl` + error cases) green. See
+[ADR 0015](docs/adr/0015-reinforcement-learning.md), [X024](docs/development/experiments.md),
+and `docs/sources.md` (Williams 1992). PPO/GRPO + richer rewards are the documented
+follow-on.
+
+### Added
+- **`--objective rl`** (`src/main.cyr`, `src/train.cyr`, `src/model.cyr`): REINFORCE
+  policy-gradient training over the plain AR model. **`--rl-target C`** sets the reward
+  target char (default space).
+- **`rl_train` / `rl_rollout` / `rl_reward` / `rl_prompt` / `rl_eval`** (`src/train.cyr`):
+  the RL training loop (rollout → reward → advantage → reward-weighted backward → EMA
+  baseline), the on-policy rollout sampler (lays a sampled sequence out as AR
+  `A_tokens`/`A_targets`), the count reward, the random-corpus-token prompt, and a
+  rollout-frequency report (the X024 metric, run after `--save`).
+- **`g_rl` / `g_reinforce_scale`** (`src/model.cyr`): the advantage scale on the seeded
+  logit gradient `D_logits` in `model_backward` (gated on `g_rl`).
+- **`test_rl_op` / `test_rl_rollout`** (`tests/attn11.tcyr`): the RL backward grad-checked
+  three ways (RL grad == advantage × AR grad to rounding; FD vs the numeric gradient of
+  `advantage × CE`; sign-flip + zero-advantage limits), plus the rollout layout /
+  reward / prompt structural checks. **+11 checks** (1045 → 1056), dead-last.
+- **`scripts/m17-rl.sh`**: the reproducible X024 runner (SFT vs RL per target char).
+- **[ADR 0015](docs/adr/0015-reinforcement-learning.md)** and a Williams-1992 citation in
+  `docs/sources.md`. **Smoke**: valid `--objective rl` (+ `--rl-target`) runs and the
+  `--rl-target`-without-`--objective rl` / bad-objective rejections.
+
+### Changed
+- `model_backward` (`src/model.cyr`) scales `D_logits` by `g_reinforce_scale` when
+  `g_rl != 0` (the policy-gradient term); the AR/diffusion paths (`g_rl == 0`) are
+  untouched and byte-identical. The `--objective` flag now accepts `rl` alongside
+  `ar`/`diffusion`.
+
 ## [1.6.5] - 2026-06-14
 
 **X021 — the data-volume held-out win (experiment; binary unchanged).** The run X019

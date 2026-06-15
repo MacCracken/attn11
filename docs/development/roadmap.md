@@ -13,7 +13,7 @@
 
 ## Where we are
 
-Current: **v1.6.5**. The v1.0 surface is frozen and additive-only
+Current: **v1.7.0**. The v1.0 surface is frozen and additive-only
 ([`STABILITY.md`](../STABILITY.md)); the reusable numeric core lives in
 **[rosnet](https://github.com/MacCracken/rosnet)** + **[tyche](https://github.com/MacCracken/tyche)**
 (v1.1.0). The 1.x architecture arc through M14 has shipped (the attention/KV, FFN-
@@ -240,24 +240,24 @@ fast-follows (mla/ssm/lin/MoE/rope/diffusion) and activation quantization are ad
 > held-out at capacity; the overfit regime shows own-corpus bits/byte inverts above it).
 > **The 1.6.x group is complete; M16 and its group are closed. Next is M17 (RL).**
 
-### M17 — Reinforcement learning (v1.7.0) — E9
+### M17 — Reinforcement learning (REINFORCE) — ✅ shipped (v1.7.0)
 
-**Last in the chain, by design.** RL is an orthogonal *training-objective* layer,
-not an architecture: it runs on whatever trunk exists (any `--attn-kind` /
-mixer / precision), so it graduates after the architecture families are in place
-and can fine-tune the best of them. The reference target is **policy gradient
-(REINFORCE)** at char scale: sample a rollout from the current policy, score it
-with a deterministic reward function, and weight the log-prob gradient by
-`(R − b)` (advantage, `b` a moving-average baseline). The gradient
-`∇ log π(a)·(R − b)` **reuses the existing softmax-CE backward** reweighted per
-token — so the hand-derived backward is a small, grad-checkable delta over the
-supervised path, exactly attn11's wheelhouse. Reward is a simple in-process
-function at this scale (e.g. "is the sample valid-Cyrius / matches a target
-pattern / hits a length target"), not a learned reward model. **Gate**: the
-reward-weighted backward grad-checked against finite differences; a documented
-RL-vs-SFT comparison (does the policy move toward the reward) logged as an
-X-series entry. PPO/GRPO (clipped ratio, group baselines) noted as a heavier
-follow-on only if REINFORCE earns it.
+**Last in the milestone chain, by design** — an orthogonal *training-objective* layer
+over the finished AR trunk. `--objective rl`: on-policy **REINFORCE** (Williams 1992) —
+sample rollouts from the policy (temperature 1), score each with a deterministic reward
+(count of `--rl-target C` per rollout), weight the log-prob gradient by the advantage
+`(R − b)` (`b` = EMA baseline). The realization that made it a *small* milestone:
+`∇log π(a) = −∇CE(a)`, so the policy gradient is the **existing softmax-CE backward over
+the sampled rollout scaled by `(R − b)`** — no new forward, no new backward op, no
+checkpoint bump (the model stays plain AR; an RL image is a normal v5). The scale is
+injected at `D_logits` in `model_backward`, gated on `g_rl` (AR/diffusion + the no-flag
+run byte-identical). **Gate met** (X024, an honest win): grad-checked three ways
+(`test_rl_op`: RL grad == advantage × AR grad at maxrel 0; FD vs `advantage × CE`; sign +
+zero limits) + the RL-vs-SFT comparison — the policy moves decisively toward the reward
+(target-char freq 9–19% → ~99.7%) with the documented SFT→RL alignment tax (corpus
+bits/byte 0.24 → ~13, naive reward hacking). ADR 0015; runner `scripts/m17-rl.sh`.
+**PPO/GRPO + richer rewards (valid text, length/format targets)** are the documented
+heavier follow-on — REINFORCE earns the question, not yet the heavier machinery.
 
 ### M18 — GPU backend (sequencing TBD) — E-infra
 
@@ -351,9 +351,13 @@ grad-checked STE X022 → v1.6.1 the i64-add matmul + bench X023, closing the ga
 `--encode-shard` / `--stream-corpus`) with resume-from-stream (v1.6.3) and BPE GB-scale
 shards (v1.6.4) as the fast-follows, and the **data-volume held-out win (X021, v1.6.5)** —
 an honest win (more clean data generalizes −14.2% better on held-out at capacity). With
-M16 + its group closed, **RL (M17, E9)** is next (and last in the milestone chain)
-because it is an objective layer over a finished trunk, and the GPU *compute* backend
-(M18, E-infra) is sequenced TBD (it unblocks the B4 GPU benchmark).
+M16 + its group closed, **RL (M17, E9, v1.7.0)** — the last milestone in the chain —
+**shipped** (REINFORCE as reward-weighted softmax-CE; the policy moves toward the reward,
+X024). **The full M12–M17 milestone chain is now complete.** What remains is the GPU
+*compute* backend (**M18, E-infra**, sequencing TBD — it unblocks the B4 GPU benchmark)
+and the competitor-benchmarking **B-series** (a continuous measurement track); both are
+infra, not new training science. The architecture / objective / precision / RL frontier
+experiments (E1–E9) have all graduated.
 The E-series is informed by the
 June-2026 frontier survey (`ai-ml-frontier-2026-expanded.docx`, repo root) —
 data quality > volume, the KV cache as the central inference object, SSM/attention

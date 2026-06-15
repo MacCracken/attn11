@@ -46,6 +46,10 @@
 #   attn11 --ternary                BitNet-style ternary weights {-1,0,+1} with a
 #                                   straight-through estimator (mha + dense + AR;
 #                                   master weights stay f64, fake-quant matmul)
+#   attn11 --objective rl           REINFORCE policy-gradient training (model stays
+#                                   AR; reward-weighted softmax-CE over rollouts)
+#   attn11 --rl-target C            REINFORCE reward = count of char C per rollout
+#                                   (default space; needs --objective rl)
 #   attn11 --help, -h               show usage and exit
 #   attn11 --version                print the version and exit
 #
@@ -104,7 +108,7 @@ fn _atoi(s): i64 {
 }
 
 # Kept in sync with the VERSION file (CI's docs job gates the match).
-fn CFG_VERSION(): i64 { return "1.6.5"; }
+fn CFG_VERSION(): i64 { return "1.7.0"; }
 
 fn usage(): i64 {
     puts("attn11 — a from-scratch GPT-style transformer, trained, in Cyrius\n");
@@ -132,7 +136,8 @@ fn usage(): i64 {
     puts("  --encode-shard P pre-encode the corpus to a token-shard file, then exit\n");
     puts("  --stream-encode  with --corpus FILE + --encode-shard: encode a large file (incl. --bpe) in bounded RAM\n");
     puts("  --stream-corpus P train/eval from a token-shard without loading it into RAM\n");
-    puts("  --objective O   training objective: ar (default) or diffusion (masked, bidirectional)\n");
+    puts("  --objective O   training objective: ar (default), diffusion (masked, bidirectional), or rl (REINFORCE)\n");
+    puts("  --rl-target C   REINFORCE reward = count of char C per rollout (default space; needs --objective rl)\n");
     puts("  --ternary       BitNet-style ternary weights {-1,0,+1} (mha + dense + ar; STE backward)\n");
     puts("  --decode-steps N   diffusion decode iterations (default = ctx)\n");
     puts("  --decode-schedule S  diffusion unmask schedule: cosine (default) or linear\n");
@@ -175,6 +180,9 @@ fn main(): i64 {
     var cfg_decode_steps = 0;                        # diffusion decode iterations (0 = default, resolved post-parse)
     var cfg_decode_sched = 0;                        # diffusion decode schedule: 0 = cosine (default), 1 = linear
     var cfg_ternary = 0;                             # M16 (E6): 1 = BitNet-style ternary weights
+    var cfg_rl = 0;                                  # M17 (E9): 1 = REINFORCE policy-gradient training
+    var cfg_rl_target = 32;                          # reward-target byte (default space); -> token id post-load
+    var rl_target_set = 0;                           # 1 if --rl-target was given (for the guard)
     var i = 1;
     while (i < argc()) {
         var a = argv(i);
@@ -220,7 +228,13 @@ fn main(): i64 {
             i = i + 1; var ob = _av(i, a);
             if (streq(ob, "ar") == 1) { cfg_objective = 0; }
             elif (streq(ob, "diffusion") == 1) { cfg_objective = 1; }
-            else { puts("attn11: --objective must be ar or diffusion\n"); return 1; }
+            elif (streq(ob, "rl") == 1) { cfg_rl = 1; }   # M17: REINFORCE (model stays AR)
+            else { puts("attn11: --objective must be ar, diffusion, or rl\n"); return 1; }
+        }
+        elif (streq(a, "--rl-target") == 1) {
+            i = i + 1; var rt = _av(i, a);
+            cfg_rl_target = load8(rt);                # the reward-target char's byte value
+            rl_target_set = 1;
         }
         elif (streq(a, "--ternary") == 1) { cfg_ternary = 1; }
         elif (streq(a, "--decode-steps") == 1) { i = i + 1; cfg_decode_steps = _atoi(_av(i, a)); }
@@ -371,6 +385,22 @@ fn main(): i64 {
     if ((cfg_decode_steps != 0) && (cfg_objective != 1) && (load_path == 0)) {
         puts("attn11: --decode-steps / --decode-schedule require --objective diffusion\n");
         return 1;
+    }
+    # M17 RL (E9, ADR 0015). REINFORCE is a TRAINING method over a plain AR model: it
+    # composes with the mixer/precision/position axes (the forward is unchanged) and
+    # bumps no checkpoint format — only --rl-target is RL-specific. --decode-* already
+    # require diffusion above, so they cannot pair with rl, and --objective sets exactly
+    # one of ar/diffusion/rl (rl + diffusion impossible by construction). EXCEPTION: MoE
+    # (--experts > 1) adds a load-balance AUX-loss gradient seeded OUTSIDE D_logits, so
+    # the (R-b) scale (which only touches D_logits) would miss it — the RL gradient would
+    # be wrong. So RL requires a dense MLP; the MoE-RL combination (scale or drop the aux
+    # under RL) is a documented fast-follow. The g_num_experts backstop after model_init
+    # below also catches a MoE checkpoint loaded under --objective rl.
+    if ((rl_target_set == 1) && (cfg_rl == 0)) {
+        puts("attn11: --rl-target requires --objective rl\n"); return 1;
+    }
+    if ((cfg_rl == 1) && (cfg_num_experts != 1) && (load_path == 0)) {
+        puts("attn11: --objective rl requires a dense MLP (--experts 1; MoE-RL is a fast-follow)\n"); return 1;
     }
     # M16 ternary (E6, ADR 0014). v1.6.0 scope: MHA + dense MLP + uniform + AR +
     # learned-abs (the other axes are documented fast-follows). Surface a clear CLI
@@ -547,6 +577,7 @@ fn main(): i64 {
     }
     if (g_objective == 1) { puts(" objective=diffusion(bidir)"); }
     if (g_ternary == 1) { puts(" weights=ternary{-1,0,+1}"); }
+    if (cfg_rl == 1) { puts(" objective=rl(reinforce)"); }
     puts(" params="); fmt_int(g_NP); _putc(10);
     puts("  tokenizer=");
     if (g_bpe_on == 1) { puts("bpe(merges="); fmt_int(g_bpe_nmerges); puts(")"); }
@@ -554,10 +585,27 @@ fn main(): i64 {
     puts(" corpus tokens="); fmt_int(g_datalen); _putc(10);
     _putc(10);
 
+    # ---- M17: resolve the RL reward target (byte -> token id, through the loaded
+    # tokenizer) before training. The rollout reward counts this token. ----
+    if (cfg_rl == 1) {
+        # backstop: a MoE model (fresh or loaded) routes a load-balance aux gradient
+        # outside D_logits, which the (R-b) scale would miss — reject before training.
+        if (g_num_experts != 1) {
+            puts("attn11: --objective rl requires a dense MLP (--experts 1; MoE-RL is a fast-follow)\n"); return 1;
+        }
+        var tid = load64(g_char2id + cfg_rl_target * 8);
+        if (tid < 0) { puts("attn11: --rl-target char not in the corpus vocabulary\n"); return 1; }
+        g_rl_target = tid;
+    }
+
     # ---- train ----
     if (gen_only == 0) {
         if (((g_stream == 0) && (g_data == 0)) || (g_datalen < g_T + 1)) {
             puts("attn11: no/short corpus (need >= ctx+1 bytes); skipping training\n");
+        } elif (cfg_rl == 1) {
+            # M17 REINFORCE: on-policy rollouts, reward-weighted softmax-CE gradient
+            puts("training (REINFORCE; reward = count of target token per rollout):\n");
+            rl_train(steps, steps, CFG_BATCH(), CFG_LR(), CFG_MINLR(), CFG_WARMUP(), CFG_CLIP(), CFG_LOG());
         } else {
             puts("training:\n");
             train(steps, steps, CFG_BATCH(), CFG_LR(), CFG_MINLR(), CFG_WARMUP(), CFG_CLIP(), CFG_LOG());
@@ -573,6 +621,15 @@ fn main(): i64 {
         var sv = ckpt_save_file(save_path);
         if (sv < 0) { puts("attn11: checkpoint save failed (code "); fmt_int(sv); puts(")\n"); rc = 1; }
         else { puts("attn11: saved checkpoint ("); fmt_int(ckpt_size()); puts(" bytes)\n"); }
+    }
+
+    # ---- RL reward report (after save, so the checkpoint is RNG-clean: rl_eval
+    # draws the PRNG to sample rollouts) ----
+    if ((cfg_rl == 1) && (g_step > 0)) {
+        var mr = rl_eval(64);
+        var pct = f64_mul(f64_div(mr, f64_from(g_T)), f64_from(100));
+        puts("rl: mean reward "); f_print(mr, 4);
+        puts(" over 64 rollouts (target token freq "); f_print(pct, 2); puts("%)\n");
     }
 
     # ---- eval (after save, so the checkpoint is identical with or without) ----

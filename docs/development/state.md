@@ -5,7 +5,27 @@
 
 ## Version
 
-**1.6.5** — *X021: the data-volume held-out win* (1.6.x group; experiment, **binary
+**1.7.0** — *M17: Reinforcement learning (REINFORCE)* (E9; ADR 0015, X024; the last
+milestone in the chain). `--objective rl` trains the policy toward a **reward** via
+on-policy REINFORCE (Williams 1992): sample `batch` rollouts at temperature 1, score each
+with a deterministic reward, weight its log-prob gradient by the advantage `(R − b)`
+(`b` = EMA of past mean rewards). Because `∇log π(a) = −∇CE(a)` for a softmax policy, the
+policy gradient **IS the existing softmax-CE backward over the sampled rollout scaled by
+`(R − b)`** — no new forward, no new backward op, no autodiff, no checkpoint bump (the
+model stays plain AR; an RL image is a normal v5). The scale is injected at `D_logits` in
+`model_backward`, gated on `g_rl` (so AR/diffusion are untouched and the no-flag run is
+**byte-identical**). Reward = count of a target char (`--rl-target C`, default space) per
+rollout. New `g_rl`/`g_reinforce_scale` (model.cyr) + `rl_train`/`rl_rollout`/`rl_reward`/
+`rl_prompt`/`rl_eval` (train.cyr) + `--objective rl`/`--rl-target` (main.cyr). Grad-checked
+three ways (`test_rl_op`: RL grad == advantage × AR grad at maxrel 0, FD vs `advantage × CE`
+at 1e-5, sign-flip + zero-advantage) + rollout structural (`test_rl_rollout`): **1045 →
+1056** checks green x86_64 + aarch64/qemu. **Gate met (X024):** the policy moves decisively
+toward the reward — target-char freq **9–19% (SFT) → ~99.7% (RL)** — with the honest SFT→RL
+alignment tax (corpus bits/byte 0.24 → ~13; naive count reward = reward hacking; PPO/GRPO +
+richer rewards are the documented follow-on). lint + fuzz + `make smoke` (valid `--objective
+rl` + errors) green; `make release` exit 0. ADR 0015; runner `scripts/m17-rl.sh`.
+
+(**1.6.5** — *X021: the data-volume held-out win* (1.6.x group; experiment, **binary
 unchanged**). The run X019 wanted + X020 unblocked: does more clean data generalize better
 to a THIRD disjoint held-out set? It needs the **overfit** regime (X020 found <1.3%
 own→held at sub-epoch — nothing to convert), so X021 forces it — a 256 KB train slice (many
@@ -20,7 +40,7 @@ overfits hard (**+40.4%** own→held gap; own 1.977 looks *better* than the 4 MB
 but it is memorization — on held-out the 4 MB model wins), so own-corpus bits/byte **inverts
 the truth above the overfit threshold** (and is trustworthy below it — validating X020).
 Closes the data story X016→X021. **1045** checks unchanged; `make release` exit 0. Full
-write-up: [X021](experiments.md).
+write-up: [X021](experiments.md).)
 
 (**1.6.4** — *BPE GB-scale shards* (1.6.x group; the second 1.6.2 fast-follow). The
 in-RAM `--encode-shard` caps the corpus at 64 MB; **`--corpus FILE --bpe K --encode-shard
@@ -695,17 +715,28 @@ checkpoint vs Linux at fixed CPU — `scripts/agnos-smoke.sh`):
   encode is **byte-identical** to a whole-corpus encode). `ntokens` patched via `lseek`
   before the atomic rename. Byte-level works too (no carry). `test_stream_bpe_encode`,
   +6 checks; default run unchanged.
+- **Reinforcement learning** (1.7.0, `--objective rl`, M17/E9, ADR 0015): on-policy
+  **REINFORCE** over the plain AR model — sample rollouts, reward = count of a target char
+  (`--rl-target C`, default space), weight the log-prob gradient by the advantage `(R − b)`
+  (`b` = EMA baseline). Since `∇log π(a) = −∇CE(a)`, the policy gradient is the existing
+  softmax-CE backward scaled by `(R − b)` — injected at `D_logits` in `model_backward`
+  (gated on `g_rl`, so AR/diffusion + the no-flag run stay byte-identical). No new
+  forward/backward/checkpoint (an RL image is a normal v5 AR checkpoint). `rl_train`/
+  `rl_rollout`/`rl_reward`/`rl_prompt`/`rl_eval` (train.cyr). Grad-checked 3 ways
+  (`test_rl_op`) + rollout structural (`test_rl_rollout`), +11 checks. X024: policy
+  target-char freq 9–19% → ~99.7% (gate met) with the honest SFT→RL alignment tax.
 - CLI: `--corpus --stdin --load --save --steps --gen-only --preset --heads
   --kv-heads --layers --attn-kind --latent-dim --attn-every --pos-kind --rope-dim
   --experts --expert-topk --bpe --eval --eval-corpus --encode-shard --stream-encode
-  --stream-corpus --objective --decode-steps --decode-schedule --ternary`
+  --stream-corpus --objective --decode-steps --decode-schedule --ternary --rl-target`
   (`--attn-kind` takes `mha`/`mla`/`lin`/`ssm`; `--latent-dim` is the MLA latent /
   SSM state size; `--attn-every K` builds the per-layer hybrid over the `--attn-kind`
-  base; `--objective diffusion` opts into masked diffusion, with `--decode-steps` /
-  `--decode-schedule {cosine,linear}` for its parallel decode; `--ternary` is M16
-  BitNet-style ternary weights on mha + dense + AR; `--encode-shard` writes a token-shard
-  + exits, `--stream-encode` does so for a GB-scale file in bounded RAM, `--stream-corpus`
-  trains from one in bounded RAM; `--load` + `--stream-corpus` resumes from a stream)
+  base; `--objective` takes `ar`/`diffusion`/`rl` — `diffusion` adds `--decode-steps` /
+  `--decode-schedule {cosine,linear}`, `rl` adds `--rl-target C` (REINFORCE reward char);
+  `--ternary` is M16 BitNet-style ternary weights on mha + dense + AR; `--encode-shard`
+  writes a token-shard + exits, `--stream-encode` does so for a GB-scale file in bounded
+  RAM, `--stream-corpus` trains from one in bounded RAM; `--load` + `--stream-corpus`
+  resumes from a stream)
 
 Default run (`./build/attn11`, 3 layers): loss `~3.2 → ~0.13` over 2000 steps;
 sampled output reproduces real corpus phrases.

@@ -94,6 +94,18 @@ var g_objective = 0;
 var g_bidir = 0;
 var g_nmask = 0;
 
+# ---- REINFORCE policy-gradient training (M17, E9; ADR 0015) ------------------
+# RL is a TRAINING method, not an architecture: the model stays a plain AR
+# transformer (g_objective == 0, causal, no mask_emb) and the checkpoint is a
+# normal AR image — only the training LOSS changes. The policy-gradient update is
+# ascent on E[R]: theta += alpha * (R - b) * grad log pi(a). Since
+# grad log pi(a) = -grad CE(a) for a softmax policy, the per-rollout gradient is
+# EXACTLY the existing softmax-CE backward over the SAMPLED rollout, scaled by the
+# advantage (R - b). g_rl gates that scale (so AR/diffusion training is untouched
+# and byte-identical); g_reinforce_scale carries (R - b) for the current rollout.
+var g_rl = 0;                       # 1 = REINFORCE training step active
+var g_reinforce_scale = 0;          # f64 (R - b) advantage for the current rollout
+
 # ---- packed parameter vectors ----------------------------------------------
 var g_params = 0;
 var g_grads = 0;
@@ -1336,6 +1348,11 @@ fn model_backward(): i64 {
     } else {
         softmax_xent_bwd(A_probs, A_targets, D_logits, T, V);
     }
+    # M17 REINFORCE: scale the seeded logit gradient by the advantage (R - b). The
+    # rest of the backward is LINEAR in D_logits, so this scales the whole gradient
+    # to (R - b) * grad CE = the policy-gradient term. Gated on g_rl, so AR /
+    # diffusion training never touches this and stays byte-identical.
+    if (g_rl != 0) { t_scale(D_logits, T * V, g_reinforce_scale); }
     head_bwd();                                   # -> D_f ; accum G_tokemb (head)
     # through final LN: D_f -> D_resid (= d resid[NL])
     ln_bwd(La(LA_resid, g_NL), P_lnfg(), D_f, A_meanf, A_rstdf, D_resid, G_lnfg(), G_lnfb(), T, C);

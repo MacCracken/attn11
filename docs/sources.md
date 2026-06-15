@@ -190,6 +190,17 @@ Generative Image Transformers." *CVPR 2022.* arXiv:[2202.04200](https://arxiv.or
 a cosine schedule (attn11's greedy, lowest-index-tie-break, deterministic variant).
 Used in: `src/train.cyr` (`gen_diffusion`, `_diff_keep`). See ADR 0013.
 
+### REINFORCE (policy-gradient reinforcement learning, M17)
+**Williams, R.J. (1992).** "Simple statistical gradient-following algorithms for
+connectionist reinforcement learning." *Machine Learning*, 8(3–4), 229–256.
+doi:[10.1007/BF00992696](https://doi.org/10.1007/BF00992696) — the score-function
+estimator `∇ E[R] = E[(R − b)·∇ log π(a)]` with a baseline `b` for variance
+reduction. attn11 realizes it as the reward-weighted softmax-CE backward over an
+on-policy rollout (since `∇ log π(a) = −∇ CE(a)`), with `b` an EMA of past mean
+rewards. Used in: `src/train.cyr` (`rl_train`, `rl_rollout`, `rl_reward`),
+`src/model.cyr` (the `g_rl` / `g_reinforce_scale` advantage scale in
+`model_backward`). See ADR 0015.
+
 ## Weight precision / quantization
 
 ### Ternary (BitNet b1.58) weight quantization, fake-quant with a straight-through estimator (M16)

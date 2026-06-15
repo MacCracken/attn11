@@ -1077,3 +1077,48 @@ checks). They are benched **head-to-head** against the 1.6.0 SIMD-f64 path
    X015 diffusion-below-uniform at tiny scale). Regeneration: `cyrius build
    tests/attn11.bcyr build/bench && ./build/bench` (the `ternary i64-add` / `SIMD-f64`
    rows, `(x100)` ratios).
+
+## X024 — REINFORCE vs SFT: the policy moves toward the reward (M17, v1.7.0) (2026-06-14)
+
+**Setup**: 1.7.0, the first **reinforcement-learning** run — `--objective rl` (REINFORCE,
+E9, ADR 0015). The M17 gate: *does the policy move toward a reward?* Train the SAME default
+model (C=32, ctx 16, 3 layers, 39 488 params, byte-level, seed 1337) two ways on one
+corpus and compare per reward-target char: the target's frequency in the policy's samples
+(measured identically for both via the in-binary rollout eval over 64 rollouts) and the
+corpus bits/byte (LM quality). **SFT** = the usual AR next-token CE. **RL** = on-policy
+REINFORCE: each step samples `batch` rollouts at temperature 1, scores each by the count of
+the target char, and weights its log-prob gradient by the advantage `(R − b)` (b = an EMA
+of past mean rewards). The policy-gradient *is* the softmax-CE backward over the sampled
+rollout scaled by `(R − b)` — no new backward math (grad-checked in `test_rl_op`). 400 steps
+each. Runner: [`scripts/m17-rl.sh`](../../scripts/m17-rl.sh) (no new binary surface beyond
+the M17 flags). SFT baseline corpus bits/byte **0.241**.
+
+**Result** (target frequency in policy samples; corpus bits/byte):
+
+| reward target | SFT freq | RL freq | SFT b/b | RL b/b |
+|---------------|----------|---------|---------|--------|
+| `'e'` (common)  | 9.76%  | **99.70%** | 0.241 | 13.749 |
+| `' '` (space)   | 18.75% | **99.70%** | 0.241 | 12.682 |
+| `'z'` (rare)    | 0.87%  | **99.80%** | 0.241 | 15.292 |
+
+**Takeaways**:
+1. **The policy moves decisively toward the reward — the M17 gate is met.** From any
+   starting frequency (rare `z` 0.9%, common `e` 9.8%, space 18.8%) REINFORCE drives the
+   target to **~99.7%** of sampled tokens. The reward-weighted softmax-CE gradient does
+   exactly what policy gradient promises: raise the probability of high-reward actions. The
+   SFT frequencies independently track the corpus's natural letter statistics (a sanity
+   check on the measurement: `e` ≈ 10%, space ≈ 19%, `z` ≈ 0.9%).
+2. **The SFT→RL alignment tax is real and visible.** Maximizing the naive count reward is
+   reward hacking — the policy collapses to emitting the target, so corpus bits/byte blows
+   up **0.241 → 12.7–15.3** (the LM is destroyed). The tax scales **inversely with target
+   rarity**: over-emitting rare `z` costs most (15.3) and the already-frequent space least
+   (12.7). This is the canonical RL-vs-SFT trade-off at char scale — RL optimizes the
+   reward it is given, not language modeling — and an honest caveat: a useful reward must
+   encode what you actually want (valid text, a length/format target), not a degenerate
+   count. PPO/GRPO + richer rewards are the documented heavier follow-on (ADR 0015).
+3. **RL is a tiny, grad-checkable delta — attn11's wheelhouse.** No new forward, no new
+   backward op, no checkpoint bump: the model stays a plain AR transformer and the RL image
+   is a normal v5 checkpoint. The only new gradient surface is one scalar `(R − b)` scale on
+   the seeded logit gradient, grad-checked three ways (`test_rl_op`: RL grad == advantage ×
+   AR grad to rounding; FD vs the numeric gradient of `advantage × CE`; sign-flip + zero
+   advantage). Reproduce: `scripts/m17-rl.sh [steps]` (deterministic; seed 1337; cross-arch).
