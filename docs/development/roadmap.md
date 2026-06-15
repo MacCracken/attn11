@@ -434,6 +434,13 @@ commits/tags (the harness currently records the resolved HEAD), the per-competit
 matched-config mapping, and a documented reference benchmark host. **B4 (GPU)** rides the
 M18 1.8.x backend.
 
+**Timing (decided 2026-06-14):** the B1/B2 competitor numbers are **deferred to a single
+pass on the fuller stack alongside B4** — i.e. stand up one reference bench host with the
+competitor CPU stacks (PyTorch, the GPT-2 data-prep) **and** a GPU once M18 lands, then run
+the harness once to fill B1/B2 (CPU) and B4 (GPU) together. A separate interim CPU-only run
+isn't worth the setup; the B0 harness + the param-count gate already lock the protocol, so
+the numbers are turnkey when the stack is in place.
+
 **Gate**: reproducible (every competitor at a pinned ref; config-match asserted by
 param count; host/threads/date in every row) and *complete* — every config run
 gets reported, no dropped or cherry-picked rows (the "no silent caps" discipline).
