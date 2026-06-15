@@ -4,6 +4,33 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.7.1] - 2026-06-14
+
+**Toolchain realignment (maintenance): cyrius pin 6.2.2 → 6.2.5.** The installed `cycc`
+had moved ahead of the pin (local builds warned "cyrius.cyml pins 6.2.2 but cycc is
+6.2.5 — toolchain drift"). Bumped the pin in `cyrius.cyml` and ran `cyrius update` to
+resync the vendored `lib/` snapshot + `cyrius.lock` to 6.2.5. `lib/` is gitignored (CI
+regenerates it from the pin via `cyrius deps`), so the tracked diff is **`cyrius.cyml` +
+`cyrius.lock`** only. The 6.2.5 snapshot does differ from 6.2.2 — but **only in files
+attn11 does not use on its Linux training/inference path**: networking / TLS
+(`net`, `tls_native*`, +6 new TLS files), threading (`thread`, `thread_local`,
+`thread_agnos`), `chrono`, and `syscalls_x86_64_agnos`. attn11's core libs are
+**unchanged** (`rosnet`, `tyche`, `alloc`, `fmt`, `string`, `io`, `math`, `simd`,
+`bounds`, …), so the binary and every run are **byte-identical** to 1.7.0 (verified:
+default / preset / BPE / diffusion / ternary / RL). The pin + snapshot + lock move
+together per the standing rule (a new-compiler / old-lib mismatch can reproduce the AGNOS
+`argc()==0` trap — and `syscalls_x86_64_agnos` is among the changed files), so the agnos
+target was rebuilt and the full gate re-run on the realigned snapshot. **1056** checks
+unchanged, green x86_64 **and** aarch64/qemu; lint + fuzz + `make smoke` green; `--agnos`
+build OK; `make release` exit 0. `src/*.cyr` is unchanged except `CFG_VERSION`.
+
+### Changed
+- `cyrius.cyml`: `[package].cyrius` pin **6.2.2 → 6.2.5** (the single source of truth; CI
+  and the release gate read it). `cyrius.lock` resynced via `cyrius update` to the 6.2.5
+  hashes; `lib/` (gitignored) regenerated from the new pin. The 6.2.5 lib diff touches
+  only networking/TLS/threading/chrono/agnos-syscall files — none on attn11's Linux path
+  — so the binary and all runs are byte-identical. No `src/` change beyond `CFG_VERSION`.
+
 ## [1.7.0] - 2026-06-14
 
 **M17 — Reinforcement learning (REINFORCE), E9; the last milestone in the chain.**

@@ -5,7 +5,22 @@
 
 ## Version
 
-**1.7.0** — *M17: Reinforcement learning (REINFORCE)* (E9; ADR 0015, X024; the last
+**1.7.1** — *Toolchain realignment* (maintenance): cyrius pin **6.2.2 → 6.2.5**. The
+installed cycc had moved ahead of the pin (local builds warned of toolchain drift); bumped
+`cyrius.cyml` and ran `cyrius update` to resync the `lib/` snapshot + `cyrius.lock`. `lib/`
+is gitignored (CI regenerates it from the pin), so the tracked diff is `cyrius.cyml` +
+`cyrius.lock` only. The 6.2.5 snapshot differs from 6.2.2 **only in files attn11 doesn't
+use on the Linux path** — networking/TLS (`net`, `tls_native*`), threading (`thread*`),
+`chrono`, `syscalls_x86_64_agnos`; the core libs (`rosnet`/`tyche`/`alloc`/`fmt`/`io`/
+`math`/`simd`/…) are **unchanged** — so the binary and all runs
+(default/preset/BPE/diffusion/ternary/RL) are **byte-identical** to 1.7.0 (verified). Pin +
+snapshot + lock moved together (the new-compiler/old-lib mismatch is the AGNOS
+`argc()==0` trap, and `syscalls_x86_64_agnos` is among the changed files), so the agnos
+target was rebuilt + the full gate re-run on the realigned snapshot. **1056** checks
+unchanged, green x86_64 + aarch64/qemu; lint + fuzz + `make smoke` + `--agnos` build +
+`make release` exit 0. `src/*.cyr` unchanged except CFG_VERSION.
+
+(**1.7.0** — *M17: Reinforcement learning (REINFORCE)* (E9; ADR 0015, X024; the last
 milestone in the chain). `--objective rl` trains the policy toward a **reward** via
 on-policy REINFORCE (Williams 1992): sample `batch` rollouts at temperature 1, score each
 with a deterministic reward, weight its log-prob gradient by the advantage `(R − b)`
@@ -23,7 +38,7 @@ at 1e-5, sign-flip + zero-advantage) + rollout structural (`test_rl_rollout`): *
 toward the reward — target-char freq **9–19% (SFT) → ~99.7% (RL)** — with the honest SFT→RL
 alignment tax (corpus bits/byte 0.24 → ~13; naive count reward = reward hacking; PPO/GRPO +
 richer rewards are the documented follow-on). lint + fuzz + `make smoke` (valid `--objective
-rl` + errors) green; `make release` exit 0. ADR 0015; runner `scripts/m17-rl.sh`.
+rl` + errors) green; `make release` exit 0. ADR 0015; runner `scripts/m17-rl.sh`.)
 
 (**1.6.5** — *X021: the data-volume held-out win* (1.6.x group; experiment, **binary
 unchanged**). The run X019 wanted + X020 unblocked: does more clean data generalize better
@@ -468,12 +483,17 @@ deterministic resume. 0.2.0: stacked layers, grad clipping, LR schedule.)
 
 ## Toolchain
 
-- **Cyrius pin**: `6.2.2` (in `cyrius.cyml [package].cyrius`) — bumped from
-  6.2.1 in 1.3.0 to realign with the installed cycc (`cyrius update` resynced the
-  `lib/` snapshot; it is byte-identical to the 6.2.1 snapshot — a clean patch
-  realign — so only `cyrius.cyml` moved in the working tree; 673 checks green on
-  both arches + the agnos build, no shadow/drift warnings). (1.2.4 had moved the
-  pin 6.1.37 → 6.2.1.) The pin and snapshot must always move together: cycc
+- **Cyrius pin**: `6.2.5` (in `cyrius.cyml [package].cyrius`) — bumped from
+  6.2.2 in 1.7.1 to realign with the installed cycc (`cyrius update` resynced the
+  gitignored `lib/` snapshot + `cyrius.lock`; tracked diff = `cyrius.cyml` +
+  `cyrius.lock`). The 6.2.5 lib snapshot differs from 6.2.2 ONLY in files attn11
+  does not use on its Linux path (networking/TLS `net`/`tls_native*`, threading
+  `thread*`, `chrono`, `syscalls_x86_64_agnos`); the core libs
+  (`rosnet`/`tyche`/`alloc`/`fmt`/`io`/`math`/`simd`/…) are unchanged, so all runs
+  (default/RL/etc.) are byte-identical to 1.7.0; 1056 checks green on both arches +
+  the agnos build, no drift warning. (1.3.0 moved the pin 6.2.1 → 6.2.2 with a
+  byte-identical snapshot; 1.2.4 moved 6.1.37 → 6.2.1.) The pin and snapshot must
+  always move together: cycc
   6.1.32 fixed attn11's agnos argv-capture issue (r15-parked init rsp; the old
   `_agnos_init_rsp` global is gone) during M6, and a new-compiler/old-lib
   mismatch reproduces `argc()==0` under the kernel — the run gate caught it, so
