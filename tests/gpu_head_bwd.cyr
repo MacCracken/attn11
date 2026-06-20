@@ -1,0 +1,95 @@
+# tests/gpu_head_bwd.cyr — M18 1.8.8 GPU LM-head-backward validation (BIT-EXACT, plain --gpu).
+#
+# Validates `gpu_head_bwd` (src/gpu.cyr) against an inline CPU replica identical to src/model.cyr
+# head_bwd: D_f[t,c]=Σ_v D_logits[t,v]·emb[v,c], gemb[v,c]+=Σ_t D_logits[t,v]·A_f[t,c]. The CPU
+# head_bwd is PURE-SCALAR sequential (unlike the SIMD-tree forward head), so the GPU's sequential
+# tiles match it BIT-FOR-BIT → it rides plain --gpu, keeping the checkpoint byte-identical. Tests
+# the >byte-vocab (V%16==0) path bit-exact + the byte-vocab (V%16≠0) CPU fallback. Engagement
+# proven. Device-dependent → SKIPS cleanly (exit 0) where no AMD f64 GPU.
+#
+# Build:  cyrius build tests/gpu_head_bwd.cyr build/gpu_head_bwd && ./build/gpu_head_bwd
+# Exit:   0 = bit-exact (or cleanly skipped); 1 = any bit difference / unexpected fallback.
+
+include "lib/mabda.cyr"
+include "src/gpu.cyr"
+
+fn print_cstr(s): i64 { syscall(1, 1, s, strlen(s)); return 0; }
+fn print_i64(n): i64 { var b[32]; memset(&b, 0, 32); var l = fmt_int_buf(n, &b); syscall(1, 1, &b, l); return 0; }
+
+fn frand(i, seed): i64 {
+    var x = ((i * 2654435761) + (seed * 40503)) % 1000; if (x < 0) { x = x + 1000; }
+    return f64_div(f64_from(x - 500), f64_from(100));
+}
+
+# CPU reference — identical to src/model.cyr head_bwd.
+fn cpu_head_bwd(D_logits, emb, A_f, D_f, gemb, T, V, C): i64 {
+    var t = 0;
+    while (t < T) {
+        var c = 0;
+        while (c < C) {
+            var acc = f64_from(0); var v = 0;
+            while (v < V) { acc = f64_add(acc, f64_mul(load64(D_logits + (t*V+v)*8), load64(emb + (v*C+c)*8))); v = v + 1; }
+            store64(D_f + (t*C+c)*8, acc);
+            c = c + 1;
+        }
+        t = t + 1;
+    }
+    var v2 = 0;
+    while (v2 < V) {
+        var c = 0;
+        while (c < C) {
+            var acc = f64_from(0); var tt = 0;
+            while (tt < T) { acc = f64_add(acc, f64_mul(load64(D_logits + (tt*V+v2)*8), load64(A_f + (tt*C+c)*8))); tt = tt + 1; }
+            var gi = gemb + (v2*C+c)*8;
+            store64(gi, f64_add(load64(gi), acc));
+            c = c + 1;
+        }
+        v2 = v2 + 1;
+    }
+    return 0;
+}
+
+fn run_shape(T, V, C, want_gpu): i64 {
+    var Dl = alloc(T*V*8); var emb = alloc(V*C*8); var Af = alloc(T*C*8);
+    var Dfr = alloc(T*C*8); var Dfg = alloc(T*C*8);
+    var gr = alloc(V*C*8); var gg = alloc(V*C*8);
+    var i = 0; while (i < T*V) { store64(Dl + i*8, frand(i, 1)); i = i + 1; }
+    i = 0; while (i < V*C) { store64(emb + i*8, frand(i, 2)); i = i + 1; }
+    i = 0; while (i < T*C) { store64(Af + i*8, frand(i, 3)); i = i + 1; }
+    i = 0; while (i < V*C) { var p = frand(i, 5); store64(gr + i*8, p); store64(gg + i*8, p); i = i + 1; }  # gemb += seed
+    cpu_head_bwd(Dl, emb, Af, Dfr, gr, T, V, C);
+    var rc = gpu_head_bwd(Dl, emb, Af, Dfg, gg, T, V, C);
+    print_cstr("  T="); print_i64(T); print_cstr(" V="); print_i64(V); print_cstr(" C="); print_i64(C); print_cstr(": ");
+    if (want_gpu == 0) {
+        if (rc == 0) { print_cstr("UNEXPECTED on-device (V%16≠0 should fall back)\n"); return 0; }
+        print_cstr("CPU fallback (correct)\n"); return 1;
+    }
+    if (rc != 0) { print_cstr("GPU FALLBACK (rc="); print_i64(rc); print_cstr(") — expected on-device\n"); return 0; }
+    var df = 0; var gf = 0; i = 0;
+    while (i < T*C) { if (load64(Dfg + i*8) != load64(Dfr + i*8)) { df = df + 1; } i = i + 1; }
+    i = 0; while (i < V*C) { if (load64(gg + i*8) != load64(gr + i*8)) { gf = gf + 1; } i = i + 1; }
+    if ((df == 0) && (gf == 0)) { print_cstr("BIT-EXACT (D_f "); print_i64(T*C); print_cstr(", gemb "); print_i64(V*C); print_cstr(")\n"); return 1; }
+    print_cstr("BIT DIFF (D_f "); print_i64(df); print_cstr(", gemb "); print_i64(gf); print_cstr(")\n");
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    print_cstr("attn11 GPU LM-head-backward validation (M18 1.8.8) — gpu_head_bwd vs head_bwd, BIT-EXACT\n");
+    if (_gpu_init() == 0) {
+        print_cstr("no native AMD GPU — SKIPPED (CPU oracle unaffected; build verified)\n");
+        return 0;
+    }
+    print_cstr("native AMD f64 GPU online — validating bit-exactness + the byte-vocab fallback:\n");
+    var ok = 1;
+    if (run_shape(64, 256, 64, 1) == 0) { ok = 0; }     # preset BPE-256
+    if (run_shape(64, 768, 64, 1) == 0) { ok = 0; }     # max BPE vocab
+    if (run_shape(16, 25, 32, 0) == 0) { ok = 0; }      # default byte vocab (V%16≠0) → CPU fallback
+    print_cstr("GPU head-bwd ops dispatched on-device: "); print_i64(gpu_headbwd_count()); print_cstr("\n");
+    if (ok == 0) { print_cstr("\nFAIL: GPU head_bwd diverged from the CPU oracle\n"); return 1; }
+    print_cstr("\nOK — gpu_head_bwd BIT-EXACT to head_bwd (V%16==0); clean CPU fallback otherwise\n");
+    return 0;
+}
+
+var exit_code = main();
+sys_exit(exit_code);

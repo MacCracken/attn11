@@ -962,6 +962,13 @@ fn head_fwd(): i64 { return head_fwd_n(g_T); }
 fn head_bwd(): i64 {
     var T = g_T; var C = g_C; var V = g_V;
     var emb = P_tokemb(); var gemb = G_tokemb();
+#ifndef CYRIUS_TARGET_AGNOS
+    # GPU LM-head backward (BIT-EXACT: pure-scalar CPU ref → sequential GPU AXPY matches) → keeps
+    # the --gpu checkpoint byte-identical. Plain g_gpu gate; CPU fallback (byte vocab V%16≠0, etc.).
+    if (g_gpu == 1) {
+        if (gpu_head_bwd(D_logits, emb, A_f, D_f, gemb, T, V, C) == 0) { return 0; }
+    }
+#endif
     var t = 0;
     while (t < T) {
         var c = 0;

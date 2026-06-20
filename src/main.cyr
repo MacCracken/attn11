@@ -131,7 +131,7 @@ fn _atoi(s): i64 {
 }
 
 # Kept in sync with the VERSION file (CI's docs job gates the match).
-fn CFG_VERSION(): i64 { return "1.8.7"; }
+fn CFG_VERSION(): i64 { return "1.8.8"; }
 
 fn usage(): i64 {
     puts("attn11 — a from-scratch GPT-style transformer, trained, in Cyrius\n");
@@ -753,10 +753,11 @@ fn main(): i64 {
     if (g_gpu == 1) {
         if ((gpu_mm_count() > 0) || (gpu_ln_count() > 0) || (gpu_gelu_count() > 0) ||
             (gpu_head_count() > 0) || (gpu_attn_count() > 0) || (gpu_adam_count() > 0) ||
-            (gpu_linbwd_count() > 0)) {
+            (gpu_linbwd_count() > 0) || (gpu_headbwd_count() > 0)) {
             puts("GPU: dispatched "); fmt_int(gpu_mm_count()); puts(" matmuls + ");
             fmt_int(gpu_ln_count()); puts(" layernorms");
             if (gpu_adam_count() > 0) { puts(" + "); fmt_int(gpu_adam_count()); puts(" adam steps"); }
+            if (gpu_headbwd_count() > 0) { puts(" + "); fmt_int(gpu_headbwd_count()); puts(" head-bwd"); }
             puts(" (bit-exact)");
             if (gpu_gelu_count() > 0) { puts(" + "); fmt_int(gpu_gelu_count()); puts(" gelus"); }
             if (gpu_head_count() > 0) { puts(" + "); fmt_int(gpu_head_count()); puts(" heads"); }

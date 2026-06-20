@@ -65,6 +65,7 @@ var _gpu_head_count = 0; # forward LM-head matmuls actually dispatched on-device
 var _gpu_attn_count = 0; # fused attention cores actually dispatched on-device (tolerance)
 var _gpu_adam_count = 0; # Adam optimizer steps actually dispatched on-device (bit-exact)
 var _gpu_linbwd_count = 0; # linear backward ops actually dispatched on-device (tolerance)
+var _gpu_headbwd_count = 0; # LM-head backward ops actually dispatched on-device (bit-exact)
 
 # Counts of forward ops run on the GPU (vs CPU fallback). >0 proves the device ran.
 fn gpu_mm_count(): i64 { return _gpu_mm_count; }
@@ -74,6 +75,7 @@ fn gpu_head_count(): i64 { return _gpu_head_count; }
 fn gpu_attn_count(): i64 { return _gpu_attn_count; }
 fn gpu_adam_count(): i64 { return _gpu_adam_count; }
 fn gpu_linbwd_count(): i64 { return _gpu_linbwd_count; }
+fn gpu_headbwd_count(): i64 { return _gpu_headbwd_count; }
 
 # SPIR-V word emitters. op<wc> writes one <wc>-word instruction (word0 = (wc<<16)|op)
 # and returns the next byte offset. One instruction per source line → readable + ≤120c.
@@ -1117,6 +1119,67 @@ fn gpu_linear_bwd(x, W, dy, dx, dW, db, M, K, N): i64 {
         }
     }
     _gpu_linbwd_count = _gpu_linbwd_count + 1;
+    return 0;
+}
+
+# ===========================================================================
+# 1.8.8 — LM-head backward on GPU, BIT-EXACT (the tied-embedding gradients). The CPU head_bwd is
+# pure-scalar sequential (NOT the SIMD-tree forward head), so sequential GPU reductions match it
+# bit-for-bit → plain --gpu, keeps byte-identity. Both phases reuse proven tiles:
+#   D_f[t,c]    = Σ_v D_logits[t,v]·emb[v,c]   → _gpu_build_tile (K=V, N=C, grid T·C, zero-init)
+#   gemb[v,c]  += Σ_t D_logits[t,v]·A_f[t,c]   → _gpu_build_tile_dw (K=V, N=C, grid V·C, RMW onto gemb)
+# ===========================================================================
+
+# GPU LM-head backward: D_f(T,C) + gemb(V,C) from D_logits(T,V), emb(V,C), A_f(T,C). Returns 0 =
+# ran, -1 = use CPU. BIT-EXACT → gated by g_gpu. Buffers reused per phase (D_logits→x both phases).
+fn gpu_head_bwd(D_logits, emb, A_f, D_f, gemb, T, V, C): i64 {
+    if (_gpu_init() == 0) { return 0 - 1; }
+    var TK = GPU_TK();
+    if (V <= 0) { return 0 - 1; }
+    if ((V % TK) != 0) { return 0 - 1; }            # D_f tiles over V (byte vocab V=25 → CPU)
+    if ((T % TK) != 0) { return 0 - 1; }            # gemb tiles over T
+    if ((T * C) > MABDA_MAX_DISPATCH_DIM) { return 0 - 1; }
+    if ((V * C) > MABDA_MAX_DISPATCH_DIM) { return 0 - 1; }
+    var tv = T * V; var vc = V * C; var tc = T * C;
+    if ((tv * 8) > GPU_BO_MAX()) { return 0 - 1; }
+    if ((vc * 8) > GPU_BO_MAX()) { return 0 - 1; }
+    if ((tc * 8) > GPU_BO_MAX()) { return 0 - 1; }
+    # ---- D_f = D_logits·emb (forward tile, K=V N=C, grid T·C, RMW from 0) ----
+    var i = 0;
+    while (i < tv) { store64(_gpu_xm + i*8, load64(D_logits + i*8)); i = i + 1; }
+    i = 0; while (i < vc) { store64(_gpu_wm + i*8, load64(emb + i*8)); i = i + 1; }
+    i = 0; while (i < tc) { store64(_gpu_ym + i*8, f64_from(0)); i = i + 1; }
+    var k0 = 0;
+    while (k0 < V) {
+        var sh = _gpu_get_tile(V, C, k0);
+        if (sh == 0) { return 0 - 1; }
+        var bp[56]; store64(&bp+0, 3);
+        store64(&bp+8, _gpu_xh); store64(&bp+16, _GPU_XVA());
+        store64(&bp+24, _gpu_wh); store64(&bp+32, _GPU_WVA());
+        store64(&bp+40, _gpu_yh); store64(&bp+48, _GPU_YVA());
+        if (gpu_compute_dispatch(_gpu_ctx, sh, tc, 1, 1, &bp) != 0) { return 0 - 1; }
+        k0 = k0 + TK;
+    }
+    i = 0; while (i < tc) { store64(D_f + i*8, load64(_gpu_ym + i*8)); i = i + 1; }
+    # ---- gemb += D_logitsᵀ·A_f (tile_dw, K=V N=C, grid V·C). CPU head_bwd does gemb = seed +
+    # (Σ_t from 0), NOT RMW-from-seed (unlike linear_bwd's dW) — so compute the PURE Σ (zero-init)
+    # then host-add onto the caller's gemb, matching the CPU's f64_add order bit-for-bit.
+    i = 0; while (i < tv) { store64(_gpu_xm + i*8, load64(D_logits + i*8)); i = i + 1; }
+    i = 0; while (i < tc) { store64(_gpu_wm + i*8, load64(A_f + i*8)); i = i + 1; }
+    i = 0; while (i < vc) { store64(_gpu_ym + i*8, f64_from(0)); i = i + 1; }
+    var m0 = 0;
+    while (m0 < T) {
+        var sh2 = _gpu_get_tile_dw(V, C, m0);
+        if (sh2 == 0) { return 0 - 1; }
+        var bp2[56]; store64(&bp2+0, 3);
+        store64(&bp2+8, _gpu_xh); store64(&bp2+16, _GPU_XVA());
+        store64(&bp2+24, _gpu_wh); store64(&bp2+32, _GPU_WVA());
+        store64(&bp2+40, _gpu_yh); store64(&bp2+48, _GPU_YVA());
+        if (gpu_compute_dispatch(_gpu_ctx, sh2, vc, 1, 1, &bp2) != 0) { return 0 - 1; }
+        m0 = m0 + TK;
+    }
+    i = 0; while (i < vc) { store64(gemb + i*8, f64_add(load64(gemb + i*8), load64(_gpu_ym + i*8))); i = i + 1; }
+    _gpu_headbwd_count = _gpu_headbwd_count + 1;
     return 0;
 }
 

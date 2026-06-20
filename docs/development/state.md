@@ -5,7 +5,27 @@
 
 ## Version
 
-**1.8.7** — *M18 1.8.7: linear backward on the GPU — the highest-FLOP backward op + the shared
+**1.8.8** — *M18 1.8.8: LM-head backward on the GPU — BIT-EXACT, the second bit-exact gradient op*
+(E-infra; ADR 0016, X036). Adds **`gpu_head_bwd`** at the `head_bwd` seam (tied-embedding
+gradients): **D_f = D_logits·emb** (reuses the forward tile `_gpu_build_tile`, K=V N=C) + **gemb +=
+D_logitsᵀ·A_f** (reuses `_gpu_build_tile_dw`, K=V N=C). The CPU `head_bwd` is pure-scalar sequential
+(unlike the SIMD-tree forward head), so the GPU's sequential tiles match **bit-for-bit** → plain
+**`--gpu`**, keeps byte-identity. **Bug the bit-exact test caught (the lesson):** dW (1.8.7) and gemb
+are both `+=` accumulators but their CPU fns accumulate differently — `linear_bwd` is RMW-from-seed
+(interleaved), `head_bwd` is **seed + pure-Σ** (`acc=Σ` from 0, then `gemb += acc`); float add is
+non-associative, so reusing the RMW path for gemb gave a 68% mismatch. Fix: gemb does **zero-init →
+pure Σ → host `f64_add` onto the caller's gemb**. Rule: the RMW-vs-host-add choice must match EACH
+CPU op's own order. **Engagement:** D_f tiles V → V%16==0 (byte vocab + `--bpe 256` → CPU fallback;
+`--bpe 7` V=32 → on-device). **Validation (X036):** `tests/gpu_head_bwd.cyr` (`make gpu-test`) D_f +
+gemb **0 bit-diff** at V∈{256,768} + V%16≠0 fallback check; byte-identity proven both default
+(head_bwd CPU) AND `--bpe 7 --gpu` (head_bwd on-device, 96 dispatches). **Gate:** 1056 grad-checks
+x86_64 **and** aarch64/qemu; agnos main+tcyr; lint (0 warn); fuzz; smoke; 9-test gpu suite re-passes.
+`gpu_head_bwd` in `src/gpu.cyr`; hook in `src/model.cyr` (head_bwd); new `tests/gpu_head_bwd.cyr`.
+**Next (1.8.9):** `ln_bwd` (BIT-EXACT — sequential reductions + sqrt/div; 4-pass, dgamma/dbeta
+serialized-per-row). cyrius pin stays **6.2.29** (installed cycc 6.2.31, benign drift); pin
+`mabda = 3.4.1`. `src/*.cyr` unchanged except the additive GPU wiring + CFG_VERSION.
+
+(**1.8.7** — *M18 1.8.7: linear backward on the GPU — the highest-FLOP backward op + the shared
 matmul-bwd infra* (E-infra; ADR 0016, X035). Adds **`gpu_linear_bwd`** at the `qlinear_bwd` seam
 (dense + ternary): **dx = dy·Wᵀ** (reuses `_gpu_build_tile_t`, contract N → TOLERANCE ~1e-13,
 sequential vs CPU 4-lane-tree), **dW += xᵀ·dy** (NEW `_gpu_build_tile_dw`, contract M, RMW onto the
@@ -23,7 +43,7 @@ grad-checks x86_64 **and** aarch64/qemu; agnos main+tcyr; lint (0 warn); fuzz; s
 `tests/gpu_linear_bwd.cyr`. **Next (1.8.8):** `head_bwd` (BIT-EXACT — pure-scalar CPU ref →
 sequential GPU AXPY matches; reuses tile_dw + the RMW protocol). cyrius pin stays **6.2.29**
 (installed cycc 6.2.31, benign drift); pin `mabda = 3.4.1`. `src/*.cyr` unchanged except the
-additive GPU wiring + CFG_VERSION.
+additive GPU wiring + CFG_VERSION.)
 
 (**1.8.6** — *M18 1.8.6: GELU backward on the GPU — TOLERANCE, the second backward-arc op*
 (E-infra; ADR 0016, X034). Adds **`gpu_gelu_bwd`** at the `gelu_bwd` seam: `dx = dy·gelu'(x)`

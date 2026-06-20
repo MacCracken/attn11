@@ -4,6 +4,40 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.8.8] - 2026-06-20
+
+**M18 1.8.8: LM-head backward on the GPU — BIT-EXACT, the second bit-exact gradient op (E-infra;
+ADR 0016, X036).** Adds **`gpu_head_bwd`** at the `head_bwd` seam — the tied-embedding gradients:
+- **D_f[t,c] = Σ_v D_logits[t,v]·emb[v,c]** (contract V) — reuses the **forward matmul tile**
+  `_gpu_build_tile` (K=V, N=C, grid T·C, RMW from 0).
+- **gemb[v,c] += Σ_t D_logits[t,v]·A_f[t,c]** (contract T) — reuses **`_gpu_build_tile_dw`** (K=V,
+  N=C, grid V·C) from 1.8.7.
+
+The CPU `head_bwd` is **pure-scalar sequential** (unlike the SIMD-tree forward head), so the GPU's
+sequential tiles match it **bit-for-bit** → head_bwd rides **plain `--gpu`** and keeps the
+checkpoint byte-identical (the second bit-exact *gradient* op, after the bit-exact ops Adam/ln).
+
+**The accumulation-order bug the bit-exact test caught (the lesson).** dW (1.8.7) and gemb (here)
+are both `+=` accumulators, but their CPU functions accumulate in **different orders**:
+`linear_bwd` does `dW[k,n] += term` *interleaved inside the m-loop* (RMW-from-seed), while
+`head_bwd` does `acc = Σ_t` *from 0* then `gemb += acc` (**seed + pure-Σ**). Float add is
+non-associative, so `(seed+t0)+t1+…` ≠ `seed+(t0+t1+…)` — reusing 1.8.7's upload-seed+RMW path for
+gemb gave a 68% bit-mismatch. Fix: gemb does **zero-init → pure Σ on device → host `f64_add` onto
+the caller's gemb**, matching the CPU's order exactly. (D_f overwrites, no accumulator issue.)
+So the RMW-onto-seed vs zero-then-host-add choice must follow *each CPU op's own* order.
+
+**Engagement gate.** D_f tiles over V, so V%16==0 is required; the default byte vocab (V≈25) and
+`--bpe 256` (base+256) don't qualify → clean CPU fallback. A `--bpe 7` run (V=32) engages it
+on-device. T%16 (gemb) and the V·C/T·C ≤ 65535 grid bounds also gate; else CPU.
+
+**Validation (X036).** New `tests/gpu_head_bwd.cyr` (`make gpu-test`): `gpu_head_bwd` vs a
+`head_bwd` replica, **bit-exact** (0 diff in D_f *and* gemb, with a nonzero-seeded gemb) at V∈{256,
+768}, plus the V%16≠0 CPU-fallback check. Full **9-test** gpu suite re-passes. Byte-identity proven
+two ways: default `--gpu` (head_bwd CPU fallback) AND `--bpe 7 --gpu` (head_bwd **on-device**, 96
+dispatches) — both 40/30-step checkpoints byte-identical to no-flag. Full gate green: 1056
+grad-checks (x86_64 + aarch64/qemu — CPU path unchanged), agnos main+tcyr, lint (0 warn), fuzz,
+smoke. cyrius pin stays **6.2.29**; `mabda = 3.4.1`.
+
 ## [1.8.7] - 2026-06-20
 
 **M18 1.8.7: linear backward on the GPU — the highest-FLOP backward op + the shared matmul-bwd

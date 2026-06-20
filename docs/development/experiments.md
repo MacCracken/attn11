@@ -1565,3 +1565,29 @@ row width over the contracted m (x +K, dy +N) and write index k·N+n; consts %16
 — the head's transposed-tile, same shape as dy·Wᵀ. Gates: N%16 (dx tiles N), M%16 (dW tiles M),
 grids ≤65535. Reproduce: `make gpu-test`. Next: 1.8.8 head_bwd (BIT-EXACT — pure-scalar CPU ref →
 sequential GPU AXPY matches; reuses tile_dw + the RMW protocol). Detail: ADR 0016; roadmap M18.
+
+## X036 — M18 1.8.8: LM-head backward on GPU, BIT-EXACT (the accumulation-order lesson) (M18, v1.8.8, 2026-06-20)
+
+**Result.** `gpu_head_bwd` (src/gpu.cyr) at the `head_bwd` seam runs the tied-embedding gradients on
+the native-AMD f64 path: D_f[t,c]=Σ_v D_logits[t,v]·emb[v,c] (reuses the forward tile `_gpu_build_tile`,
+K=V N=C) + gemb[v,c]+=Σ_t D_logits[t,v]·A_f[t,c] (reuses `_gpu_build_tile_dw`, K=V N=C). The CPU
+head_bwd is pure-scalar sequential (unlike the SIMD-tree forward head), so the GPU's sequential tiles
+match BIT-FOR-BIT → plain `--gpu`, byte-identical. `tests/gpu_head_bwd.cyr` (`make gpu-test`): D_f +
+gemb **0 bit-diff** at V∈{256,768} (nonzero-seeded gemb) + the V%16≠0 CPU-fallback check. Byte-identity
+proven end-to-end: `--bpe 7 --gpu` (V=32) engages head-bwd on-device (96 dispatches) and the checkpoint
+is byte-identical to no-flag.
+
+**The bug the bit-exact test caught (THE lesson).** dW (1.8.7) and gemb (here) are both `+=`
+accumulators, but the two CPU functions accumulate in DIFFERENT orders: `linear_bwd` does
+`dW += term` interleaved in the m-loop (**RMW-from-seed**), while `head_bwd` does `acc = Σ_t` from 0
+then `gemb += acc` (**seed + pure-Σ**). Float add is non-associative — `(seed+t0)+t1+…` ≠
+`seed+(t0+t1+…)` — so reusing 1.8.7's upload-seed+RMW path for gemb gave a **68% bit-mismatch**. Fix:
+gemb does **zero-init → pure Σ on device → host `f64_add` onto the caller's gemb**. **Rule: the
+RMW-onto-seed vs zero-then-host-add choice must match EACH CPU op's own accumulation order — don't
+assume the previous op's pattern carries over.** (D_f overwrites → no accumulator issue, was exact
+from the start.)
+
+**Engagement gate.** D_f tiles over V → V%16==0 required (byte vocab V≈25 and `--bpe 256` → CPU
+fallback; `--bpe 7` V=32 → on-device). T%16 (gemb) + V·C/T·C ≤ 65535 also gate. Reproduce:
+`make gpu-test`; `./build/attn11 --bpe 7 --gpu --steps 30 --save g.ckpt` vs no-flag + `cmp`. Next:
+1.8.9 ln_bwd (BIT-EXACT, 4-pass, dgamma/dbeta serialized-per-row). Detail: ADR 0016; roadmap M18.

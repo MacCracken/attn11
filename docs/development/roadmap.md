@@ -13,9 +13,10 @@
 
 ## Where we are
 
-Current: **v1.8.7** — **M18 in progress**: `--gpu` runs **matmul** (1.8.0) **+ layernorm** (1.8.1)
-**+ the Adam optimizer step** (1.8.5, X033) bit-exact (a `--gpu` checkpoint is byte-identical to the
-CPU's — now incl. optimizer state); **`--gpu-tc`** adds **GELU** (1.8.2) + the **LM head** (1.8.3) +
+Current: **v1.8.8** — **M18 in progress**: `--gpu` runs **matmul** (1.8.0) **+ layernorm** (1.8.1)
+**+ the Adam optimizer step** (1.8.5, X033) **+ the LM-head backward** (1.8.8, X036 — bit-exact, the
+2nd bit-exact gradient op) bit-exact (a `--gpu` checkpoint is byte-identical to the CPU's — incl.
+optimizer state); **`--gpu-tc`** adds **GELU** (1.8.2) + the **LM head** (1.8.3) +
 the **full fused attention core** (1.8.4, X031) **+ GELU backward** (1.8.6, X034) **+ linear
 backward** (1.8.7, X035 — dx/dW/db; dW+db bit-identical, dx tolerance) at a *tolerance* (transcendental / SIMD-tree-order —
 a separate gate keeps plain `--gpu` byte-identical). The **entire forward** runs on-device, and
@@ -460,9 +461,11 @@ for the native-AMD f64 route.
     Σ_m onto it → **bit-identical** to the CPU `+=`, since a host-side `V0+Σ` re-add would break the
     add order); dx via `_gpu_build_tile_t` (tolerance); db on host (bit-identical). Measured: dx
     ~1e-13, dW + db **0 error**. Whole op rides `--gpu-tc` (dx forces tolerance). `tests/gpu_linear_bwd.cyr`.
-  - **1.8.8 — `head_bwd` (BIT-EXACT, plain --gpu).** The CPU head_bwd is pure-scalar sequential →
-    a sequential GPU AXPY matches bit-for-bit (unlike the SIMD-tree forward head). First bit-exact
-    *gradient* op; keeps byte-identity. Reuses the 1.8.7 matmul-bwd kernels + the gemb RMW.
+  - **1.8.8 — `head_bwd` (BIT-EXACT, plain --gpu) — ✅ SHIPPED (X036).** D_f via the forward tile
+    `_gpu_build_tile` (K=V N=C), gemb via `_gpu_build_tile_dw`. CPU head_bwd is pure-scalar sequential
+    → bit-for-bit; first bit-exact *gradient* op, keeps byte-identity. **Lesson:** gemb's CPU order is
+    seed + pure-Σ (NOT RMW-from-seed like dW) → needs zero-init + host-add; the bit-exact test caught
+    the 68% mismatch from reusing dW's RMW path. Engages for V%16==0 (`--bpe 7` V=32). `tests/gpu_head_bwd.cyr`.
   - **1.8.9 — `ln_bwd` (BIT-EXACT, plain --gpu).** Sequential reductions + sqrt/div → bit-exact;
     4 passes, dgamma/dbeta accumulated **serialized per-row** (race-free + matches CPU order).
   - **1.8.10 — `attn_core_bwd` (TOLERANCE, --gpu-tc) → the full `--gpu-tc` step on-device.** The
