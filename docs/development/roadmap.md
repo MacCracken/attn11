@@ -35,6 +35,21 @@ backward + Adam), which is **f32 on the GPU vs the CPU f64 reference** (mabda/WG
 f64) and unblocks B4 (the GPU competitor row). Detail on both is below. This file is the
 plan ahead only.
 
+> **Beyond attn11's own tracks — the ecosystem ML-paradigm map.** The wider
+> sovereign-ML horizon (the *other* generative paradigms that come online as
+> their own references, with attn11 kept scoped to the Transformer) is mapped in
+> agnosticos [`docs/development/planning/generative-paradigms.md`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/planning/generative-paradigms.md)
+> — the GPT-lineage type references (Autoregressive/recurrence, Pre-Trained/import+LoRA,
+> Generative/diffusion) + the *Beyond* watch (Griffin, Titans) + a **Further
+> Horizons** research-watch. **Standouts most adjacent to attn11's proven core:**
+> **BitNet / integer-native** (the lane attn11 *pioneered* at M16 ternary — the
+> i64 thesis in the weights); **VAR** (next-scale image gen *reusing attn11's exact
+> i64-token transformer* + a VQ tokenizer); **retrieval / capability-via-data**
+> (grow knowledge by editing a datastore, no weight change); and the **trust /
+> verification spine** (symbolic-proof + sparse-autoencoder interpretability +
+> conformal abstention — "AI you can trust to touch the OS"). All research-watch,
+> demand-gated; names deferred per 2026-06-08.
+
 ## Versioning
 
 `VERSION` is the single source of truth (`cyrius.cyml` derives it via
