@@ -4,6 +4,37 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.8.9] - 2026-06-20
+
+**M18 1.8.9: layernorm backward on the GPU — BIT-EXACT, the most complex bit-exact op (E-infra;
+ADR 0016, X037).** Adds **`gpu_ln_bwd`** at the `ln_bwd` seam: dx + dgamma/dbeta from the saved
+mean/rstd. Since rstd is a precomputed **input**, the kernels use only sequential mul/add/sub
+reductions (no transcendental, no SIMD tree) → they match the CPU **bit-for-bit** → plain `--gpu`,
+keeps byte-identity. Three passes (no GLSL preamble; tile TK=8):
+- **P1 row-reduce** — `Mpack[m]=Σ_i dxhat`, `Mpack[M+m]=Σ_i dxhat·xhat` (grid M, j-tiled over C;
+  the two row-scalars packed into one buffer at `[m]` and `[M+m]`; host ×invC). seed+pure-Σ.
+- **P3 dx** — `dx = rstd·(dxhat − mdxhat − xhat·mdxhat_xhat)` (grid M·C, elementwise).
+- **P2 dgamma/dbeta** — `dgamma[i]+=Σ_m dy·xhat`, `dbeta[i]+=Σ_m dy` (grid C, j-tiled over M,
+  RMW-from-seed — CPU's interleaved `+=` order). Run order **1→3→2** so the 7-BO pool juggles
+  (dx→β after P1, then dgamma→γ / dbeta→y reuse).
+
+**The `CMP_ERR_FLAT_NONVGPR` (−78) bug + the VGPR-taint fix (the lesson).** P1/P2 first failed to
+compile: gfx9 rejects a memory load whose address is **uniform** (an SGPR), and P1's `gamma[c]` /
+P2's `mean[m]`,`rstd[m]` are indexed by the *loop* variable (the contracted dim), which is a
+compile-time constant per dispatch — uniform across the grid, unlike every prior kernel where
+every index is thread-derived (a VGPR). Fix: **taint the uniform index with a VGPR-zero** —
+`vz = gid − gid` (a runtime ISub of the thread id with itself → a VGPR 0 the compiler won't
+const-fold), then `idx = loop_const + vz` materializes into a VGPR. (Now recorded as a reusable
+rule for any GPU reduction that indexes a buffer purely by the contracted dim.)
+
+**Validation (X037).** New `tests/gpu_ln_bwd.cyr` (`make gpu-test`): `gpu_ln_bwd` vs a `ln_bwd`
+replica, **bit-exact** (0 diff in dx, dgamma, *and* dbeta, with nonzero-seeded dgamma/dbeta) at
+(M,C) ∈ {(16,32),(64,64),(16,64)}. Full **10-test** gpu suite re-passes. Plain `--gpu` 40-step
+checkpoint byte-identical to no-flag — now with **4480 ln-bwd ops on-device** (default M16·C32 are
+%8). Full gate green: 1056 grad-checks (x86_64 + aarch64/qemu — CPU path unchanged), agnos
+main+tcyr, lint (0 warn), fuzz, smoke. With ln_bwd, **only `attn_core_bwd` remains** before the
+full training step runs end-to-end on the GPU. cyrius pin stays **6.2.29**; `mabda = 3.4.1`.
+
 ## [1.8.8] - 2026-06-20
 
 **M18 1.8.8: LM-head backward on the GPU — BIT-EXACT, the second bit-exact gradient op (E-infra;

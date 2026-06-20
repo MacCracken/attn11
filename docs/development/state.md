@@ -5,7 +5,26 @@
 
 ## Version
 
-**1.8.8** — *M18 1.8.8: LM-head backward on the GPU — BIT-EXACT, the second bit-exact gradient op*
+**1.8.9** — *M18 1.8.9: layernorm backward on the GPU — BIT-EXACT, the most complex bit-exact op*
+(E-infra; ADR 0016, X037). Adds **`gpu_ln_bwd`** at the `ln_bwd` seam: dx + dgamma/dbeta from the
+saved mean/rstd. rstd is a precomputed input → only sequential mul/add/sub (no transcendental, no
+SIMD tree) → bit-for-bit → plain **`--gpu`**, byte-identical. 3 passes (no GLSL; TK=8), run **1→3→2**
+to juggle the 7-BO pool: P1 row-reduce (mdxhat, mdxhat_xhat packed in one buffer, seed+pure-Σ, host
+×invC) → P3 dx (elementwise) → P2 dgamma/dbeta (column-reduce, RMW-from-seed). **Bug + lesson
+(`CMP_ERR_FLAT_NONVGPR` −78):** gfx9 rejects a load with a UNIFORM address; P1's `gamma[c]` and P2's
+`mean/rstd[m]` are indexed by the LOOP (contracted) dim → uniform across the grid. Fix: **taint the
+index with a VGPR-zero** `vz = gid − gid` (won't const-fold) → `loop_const + vz` materializes a VGPR
+address. Rule: any reduction indexing a buffer purely by the contracted dim needs the gid−gid taint.
+**Validation (X037):** `tests/gpu_ln_bwd.cyr` (`make gpu-test`) dx + dgamma + dbeta **0 bit-diff** at
+(M,C)∈{(16,32),(64,64),(16,64)} (nonzero-seeded); plain `--gpu` 40-step checkpoint byte-identical
+with **4480 ln-bwd ops on-device**. **Gate:** 1056 grad-checks x86_64 **and** aarch64/qemu; agnos
+main+tcyr; lint (0 warn); fuzz; smoke; 10-test gpu suite re-passes. `gpu_ln_bwd` + 3 kernels in
+`src/gpu.cyr`; hook in `src/ops.cyr` (ln_bwd); new `tests/gpu_ln_bwd.cyr`. **Next (1.8.10):**
+`attn_core_bwd` (the hardest — softmax-Jacobian cancellation, dV/dK write-collision gather) → the
+**full training step end-to-end on GPU**. cyrius pin stays **6.2.29** (installed cycc 6.2.31, benign
+drift); pin `mabda = 3.4.1`. `src/*.cyr` unchanged except the additive GPU wiring + CFG_VERSION.
+
+(**1.8.8** — *M18 1.8.8: LM-head backward on the GPU — BIT-EXACT, the second bit-exact gradient op*
 (E-infra; ADR 0016, X036). Adds **`gpu_head_bwd`** at the `head_bwd` seam (tied-embedding
 gradients): **D_f = D_logits·emb** (reuses the forward tile `_gpu_build_tile`, K=V N=C) + **gemb +=
 D_logitsᵀ·A_f** (reuses `_gpu_build_tile_dw`, K=V N=C). The CPU `head_bwd` is pure-scalar sequential
@@ -23,7 +42,7 @@ x86_64 **and** aarch64/qemu; agnos main+tcyr; lint (0 warn); fuzz; smoke; 9-test
 `gpu_head_bwd` in `src/gpu.cyr`; hook in `src/model.cyr` (head_bwd); new `tests/gpu_head_bwd.cyr`.
 **Next (1.8.9):** `ln_bwd` (BIT-EXACT — sequential reductions + sqrt/div; 4-pass, dgamma/dbeta
 serialized-per-row). cyrius pin stays **6.2.29** (installed cycc 6.2.31, benign drift); pin
-`mabda = 3.4.1`. `src/*.cyr` unchanged except the additive GPU wiring + CFG_VERSION.
+`mabda = 3.4.1`. `src/*.cyr` unchanged except the additive GPU wiring + CFG_VERSION.)
 
 (**1.8.7** — *M18 1.8.7: linear backward on the GPU — the highest-FLOP backward op + the shared
 matmul-bwd infra* (E-infra; ADR 0016, X035). Adds **`gpu_linear_bwd`** at the `qlinear_bwd` seam

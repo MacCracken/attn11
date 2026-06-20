@@ -37,6 +37,8 @@ no-flag run, *including the optimizer state*):
 - **the LM-head backward** (`head_bwd`) — the tied-embedding gradients (D_f + gemb); the CPU
   head_bwd is pure-scalar sequential so the GPU tiles match bit-for-bit — 1.8.8 (engages when the
   vocab is a multiple of 16, e.g. `--bpe 7`; else CPU fallback).
+- **the layernorm backward** (`ln_bwd`) — dx + dgamma/dbeta from the saved mean/rstd; rstd is a
+  precomputed input so the reductions are sequential (no transcendental) → bit-exact — 1.8.9.
 
 **`--gpu-tc`** (implies `--gpu`) additionally runs **GELU** (1.8.2), the **LM head** (1.8.3,
 `logits = f · tokembᵀ`), and the **full fused attention core** (1.8.4 — QK scores + the causal
@@ -52,9 +54,9 @@ passes** — scores (`nh·T·T`) → rowmax → exp+sum → PV — because a sin
 kernel exceeds the 256-id compile cap; it covers **causal MHA** (`nkv==nh`, `g_bidir==0`).
 
 What stays on CPU: **GQA / bidirectional (diffusion) attention** (fall back to the CPU core) and
-the rest of the **backward pass** (`ln_bwd`/`attn_core_bwd` — the 1.8.9+ arc; as of 1.8.8
-`gelu_bwd` + `linear_bwd` run on `--gpu-tc`, `head_bwd` (bit-exact) + the Adam *step* on `--gpu`).
-Each op self-falls-back to CPU if the device is absent, the contraction
+**`attn_core_bwd`** (the 1.8.10 increment — the last op before a full training step runs on the
+GPU). As of 1.8.9, `gelu_bwd` + `linear_bwd` run on `--gpu-tc`, and `head_bwd` + `ln_bwd` (bit-exact)
++ the Adam *step* on `--gpu`. Each op self-falls-back to CPU if the device is absent, the contraction
 dimension isn't a multiple of `GPU_TK` (16) / the tile `TK` (4), or a buffer/dispatch limit is
 exceeded — all of attn11's default/preset shapes (matmul K ∈ {32,64,128,256}; ln C ∈ {32,64};
 GELU any width; head C ∈ {32,64}; attention T ∈ {16,64}) run on-device.
@@ -67,7 +69,7 @@ make gpu-test     # build + run tests/gpu_matmul.cyr
 
 This builds + runs the GPU validation suite — `tests/gpu_matmul.cyr` (matmul) and
 `tests/gpu_ln.cyr` (layernorm) + `tests/gpu_adam.cyr` (the Adam step) + `tests/gpu_head_bwd.cyr`
-(the LM-head backward) bit-exact, plus
+(LM-head backward) + `tests/gpu_ln_bwd.cyr` (layernorm backward) bit-exact, plus
 `tests/gpu_gelu.cyr`, `tests/gpu_head.cyr`, `tests/gpu_attn.cyr` (the fused attention core),
 `tests/gpu_gelu_bwd.cyr` (GELU backward), and `tests/gpu_linear_bwd.cyr` (linear backward —
 dx tolerance, dW/db bit-exact) at tolerance — validating each against its CPU

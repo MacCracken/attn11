@@ -1,0 +1,107 @@
+# tests/gpu_ln_bwd.cyr — M18 1.8.9 GPU layernorm-backward validation (BIT-EXACT, plain --gpu).
+#
+# Validates `gpu_ln_bwd` (src/gpu.cyr) against an inline CPU replica identical to src/ops.cyr ln_bwd
+# (dx + dgamma/dbeta from saved mean/rstd). rstd is a precomputed INPUT, so the kernels use only
+# sequential mul/add/sub reductions (no transcendental, no SIMD tree) → the GPU matches the CPU
+# BIT-FOR-BIT → plain --gpu, byte-identical. dgamma/dbeta are += accumulators, seeded NONZERO to
+# exercise the RMW. Engagement proven. Device-dependent → SKIPS cleanly (exit 0) where no AMD GPU.
+#
+# Build:  cyrius build tests/gpu_ln_bwd.cyr build/gpu_ln_bwd && ./build/gpu_ln_bwd
+# Exit:   0 = bit-exact (or cleanly skipped); 1 = any bit difference / fallback.
+
+include "lib/mabda.cyr"
+include "src/gpu.cyr"
+
+fn print_cstr(s): i64 { syscall(1, 1, s, strlen(s)); return 0; }
+fn print_i64(n): i64 { var b[32]; memset(&b, 0, 32); var l = fmt_int_buf(n, &b); syscall(1, 1, &b, l); return 0; }
+
+fn frand(i, seed): i64 {
+    var x = ((i * 2654435761) + (seed * 40503)) % 1000; if (x < 0) { x = x + 1000; }
+    return f64_div(f64_from(x - 500), f64_from(100));
+}
+
+# CPU reference — identical to src/ops.cyr ln_bwd.
+fn cpu_ln_bwd(x, gamma, dy, mean, rstd, dx, dgamma, dbeta, M, C): i64 {
+    var invC = f64_div(f64_from(1), f64_from(C));
+    var m = 0;
+    while (m < M) {
+        var row = x + m*C*8; var mu = load64(mean + m*8); var rs = load64(rstd + m*8);
+        var mdxhat = f64_from(0); var mdxhat_xhat = f64_from(0); var i = 0;
+        while (i < C) {
+            var xhat = f64_mul(f64_sub(load64(row + i*8), mu), rs);
+            var dxhat = f64_mul(load64(dy + (m*C+i)*8), load64(gamma + i*8));
+            mdxhat = f64_add(mdxhat, dxhat);
+            mdxhat_xhat = f64_add(mdxhat_xhat, f64_mul(dxhat, xhat));
+            var g_i = dgamma + i*8;
+            store64(g_i, f64_add(load64(g_i), f64_mul(load64(dy + (m*C+i)*8), xhat)));
+            var b_i = dbeta + i*8;
+            store64(b_i, f64_add(load64(b_i), load64(dy + (m*C+i)*8)));
+            i = i + 1;
+        }
+        mdxhat = f64_mul(mdxhat, invC); mdxhat_xhat = f64_mul(mdxhat_xhat, invC); i = 0;
+        while (i < C) {
+            var xhat = f64_mul(f64_sub(load64(row + i*8), mu), rs);
+            var dxhat = f64_mul(load64(dy + (m*C+i)*8), load64(gamma + i*8));
+            var inner = f64_sub(f64_sub(dxhat, mdxhat), f64_mul(xhat, mdxhat_xhat));
+            store64(dx + (m*C+i)*8, f64_mul(rs, inner));
+            i = i + 1;
+        }
+        m = m + 1;
+    }
+    return 0;
+}
+
+fn run_shape(M, C): i64 {
+    var x = alloc(M*C*8); var gamma = alloc(C*8); var dy = alloc(M*C*8);
+    var mean = alloc(M*8); var rstd = alloc(M*8);
+    var dxr = alloc(M*C*8); var dgr = alloc(C*8); var dbr = alloc(C*8);
+    var dxg = alloc(M*C*8); var dgg = alloc(C*8); var dbg = alloc(C*8);
+    var i = 0; while (i < M*C) { store64(x + i*8, frand(i, 1)); store64(dy + i*8, frand(i, 3)); i = i + 1; }
+    i = 0; while (i < C) { store64(gamma + i*8, frand(i, 2)); i = i + 1; }
+    # mean/rstd as the forward ln would produce them (any consistent values; same for CPU+GPU)
+    i = 0;
+    while (i < M) {
+        var mu = f64_from(0); var c = 0;
+        while (c < C) { mu = f64_add(mu, load64(x + (i*C+c)*8)); c = c + 1; }
+        mu = f64_div(mu, f64_from(C));
+        var vv = f64_from(0); c = 0;
+        while (c < C) { var d = f64_sub(load64(x + (i*C+c)*8), mu); vv = f64_add(vv, f64_mul(d, d)); c = c + 1; }
+        vv = f64_div(vv, f64_from(C));
+        var eps = f64_div(f64_from(1), f64_from(100000));
+        store64(mean + i*8, mu); store64(rstd + i*8, f64_div(f64_from(1), f64_sqrt(f64_add(vv, eps))));
+        i = i + 1;
+    }
+    # dgamma/dbeta are += accumulators — seed NONZERO (same for CPU + GPU)
+    i = 0; while (i < C) { var p = frand(i, 5); store64(dgr + i*8, p); store64(dgg + i*8, p); var q = frand(i, 7); store64(dbr + i*8, q); store64(dbg + i*8, q); i = i + 1; }
+    cpu_ln_bwd(x, gamma, dy, mean, rstd, dxr, dgr, dbr, M, C);
+    var rc = gpu_ln_bwd(x, gamma, dy, mean, rstd, dxg, dgg, dbg, M, C);
+    print_cstr("  M="); print_i64(M); print_cstr(" C="); print_i64(C); print_cstr(": ");
+    if (rc != 0) { print_cstr("GPU FALLBACK (rc="); print_i64(rc); print_cstr(")\n"); return 0; }
+    var xf = 0; var gf = 0; var bf = 0; i = 0;
+    while (i < M*C) { if (load64(dxg + i*8) != load64(dxr + i*8)) { xf = xf + 1; } i = i + 1; }
+    i = 0; while (i < C) { if (load64(dgg + i*8) != load64(dgr + i*8)) { gf = gf + 1; } if (load64(dbg + i*8) != load64(dbr + i*8)) { bf = bf + 1; } i = i + 1; }
+    if ((xf == 0) && (gf == 0) && (bf == 0)) { print_cstr("BIT-EXACT (dx "); print_i64(M*C); print_cstr(", dgamma+dbeta "); print_i64(2*C); print_cstr(")\n"); return 1; }
+    print_cstr("BIT DIFF (dx "); print_i64(xf); print_cstr(", dgamma "); print_i64(gf); print_cstr(", dbeta "); print_i64(bf); print_cstr(")\n");
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    print_cstr("attn11 GPU layernorm-backward validation (M18 1.8.9) — gpu_ln_bwd vs ln_bwd, BIT-EXACT\n");
+    if (_gpu_init() == 0) {
+        print_cstr("no native AMD GPU — SKIPPED (CPU oracle unaffected; build verified)\n");
+        return 0;
+    }
+    print_cstr("native AMD f64 GPU online — validating bit-exactness across attn11's ln shapes:\n");
+    var ok = 1;
+    if (run_shape(16, 32) == 0) { ok = 0; }     # default
+    if (run_shape(64, 64) == 0) { ok = 0; }     # preset
+    if (run_shape(16, 64) == 0) { ok = 0; }     # mixed
+    print_cstr("GPU ln-bwd ops dispatched on-device: "); print_i64(gpu_lnbwd_count()); print_cstr("\n");
+    if (ok == 0) { print_cstr("\nFAIL: GPU ln_bwd diverged from the CPU oracle\n"); return 1; }
+    print_cstr("\nOK — gpu_ln_bwd BIT-EXACT to ln_bwd across all attn11 shapes\n");
+    return 0;
+}
+
+var exit_code = main();
+sys_exit(exit_code);

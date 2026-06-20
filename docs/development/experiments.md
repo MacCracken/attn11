@@ -1591,3 +1591,30 @@ from the start.)
 fallback; `--bpe 7` V=32 → on-device). T%16 (gemb) + V·C/T·C ≤ 65535 also gate. Reproduce:
 `make gpu-test`; `./build/attn11 --bpe 7 --gpu --steps 30 --save g.ckpt` vs no-flag + `cmp`. Next:
 1.8.9 ln_bwd (BIT-EXACT, 4-pass, dgamma/dbeta serialized-per-row). Detail: ADR 0016; roadmap M18.
+
+## X037 — M18 1.8.9: layernorm backward on GPU, BIT-EXACT (the FLAT_NONVGPR / VGPR-taint lesson) (M18, v1.8.9, 2026-06-20)
+
+**Result.** `gpu_ln_bwd` (src/gpu.cyr) at the `ln_bwd` seam runs dx + dgamma/dbeta on the native-AMD
+f64 path. rstd is a precomputed INPUT, so the kernels use only sequential mul/add/sub reductions (no
+transcendental, no SIMD tree) → bit-for-bit vs the CPU → plain `--gpu`, byte-identical. 3 passes
+(tile TK=8): P1 row-reduce (Mpack[m]=Σ_i dxhat, Mpack[M+m]=Σ_i dxhat·xhat — the 2 row-scalars packed
+in one buffer; host ×invC), P3 dx (elementwise), P2 dgamma/dbeta (column-reduce, RMW-from-seed). Run
+1→3→2 to juggle the 7-BO pool. `tests/gpu_ln_bwd.cyr` (`make gpu-test`): dx + dgamma + dbeta **0
+bit-diff** at (M,C)∈{(16,32),(64,64),(16,64)} (nonzero-seeded dgamma/dbeta). Plain `--gpu` default
+runs 4480 ln-bwd ops on-device, byte-identical. The most complex bit-exact backward.
+
+**THE bug + lesson (CMP_ERR_FLAT_NONVGPR = −78).** P1/P2 first failed to compile: gfx9 rejects a
+memory load whose address is UNIFORM (an SGPR). P1's `gamma[c]` and P2's `mean[m]`/`rstd[m]` are
+indexed by the LOOP variable (the contracted dim) — a compile-time constant per dispatch, hence
+uniform across the grid (unlike every prior kernel, where indices are thread-derived → VGPR). Fix:
+**taint the uniform index with a VGPR-zero** — `vz = gid − gid` (runtime ISub of the thread id with
+itself → a VGPR 0 the compiler won't const-fold, since neither operand is a const), then
+`idx = loop_const + vz` materializes the address into a VGPR. **Rule: any GPU reduction that indexes
+a buffer PURELY by the contracted dim (not the thread) needs the `gid−gid` VGPR-taint on that index.**
+P3 (dx) was fine from the start — it derives m,i from idx (UDiv/ISub) so all its indices are VGPR.
+
+**Bit-exactness orders (consistent with X035/X036): mdxhat is seed+pure-Σ (host ×invC after a
+zero-init Σ); dgamma/dbeta are RMW-from-seed (CPU's interleaved `+=` in the m-loop).** Both verified
+0-diff. Reproduce: `make gpu-test`; `./build/attn11 --gpu --steps 40 --save g.ckpt` vs no-flag + cmp.
+With ln_bwd, only attn_core_bwd remains for the full step on GPU. Next: 1.8.10 attn_core_bwd (the
+hardest — softmax-Jacobian cancellation, dV/dK write-collision gather). Detail: ADR 0016; roadmap M18.

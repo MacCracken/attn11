@@ -13,10 +13,10 @@
 
 ## Where we are
 
-Current: **v1.8.8** — **M18 in progress**: `--gpu` runs **matmul** (1.8.0) **+ layernorm** (1.8.1)
-**+ the Adam optimizer step** (1.8.5, X033) **+ the LM-head backward** (1.8.8, X036 — bit-exact, the
-2nd bit-exact gradient op) bit-exact (a `--gpu` checkpoint is byte-identical to the CPU's — incl.
-optimizer state); **`--gpu-tc`** adds **GELU** (1.8.2) + the **LM head** (1.8.3) +
+Current: **v1.8.9** — **M18 in progress**: `--gpu` runs **matmul** (1.8.0) **+ layernorm** (1.8.1)
+**+ Adam** (1.8.5) **+ the LM-head backward** (1.8.8) **+ the layernorm backward** (1.8.9, X037) all
+bit-exact (a `--gpu` checkpoint is byte-identical to the CPU's — incl. optimizer state + most
+gradients); **`--gpu-tc`** adds **GELU** (1.8.2) + the **LM head** (1.8.3) +
 the **full fused attention core** (1.8.4, X031) **+ GELU backward** (1.8.6, X034) **+ linear
 backward** (1.8.7, X035 — dx/dW/db; dW+db bit-identical, dx tolerance) at a *tolerance* (transcendental / SIMD-tree-order —
 a separate gate keeps plain `--gpu` byte-identical). The **entire forward** runs on-device, and
@@ -466,8 +466,11 @@ for the native-AMD f64 route.
     → bit-for-bit; first bit-exact *gradient* op, keeps byte-identity. **Lesson:** gemb's CPU order is
     seed + pure-Σ (NOT RMW-from-seed like dW) → needs zero-init + host-add; the bit-exact test caught
     the 68% mismatch from reusing dW's RMW path. Engages for V%16==0 (`--bpe 7` V=32). `tests/gpu_head_bwd.cyr`.
-  - **1.8.9 — `ln_bwd` (BIT-EXACT, plain --gpu).** Sequential reductions + sqrt/div → bit-exact;
-    4 passes, dgamma/dbeta accumulated **serialized per-row** (race-free + matches CPU order).
+  - **1.8.9 — `ln_bwd` (BIT-EXACT, plain --gpu) — ✅ SHIPPED (X037).** rstd is a precomputed input →
+    only sequential mul/add/sub → bit-exact. 3 passes (P1 row-reduce → mdxhat/mdxhat_xhat packed; P3
+    dx; P2 dgamma/dbeta column-reduce RMW), run 1→3→2 to juggle the 7-BO pool. **Lesson:** loop-indexed
+    (uniform) loads (gamma[c], mean/rstd[m]) hit `CMP_ERR_FLAT_NONVGPR` → taint the index with a
+    VGPR-zero `gid−gid`. dx+dgamma+dbeta 0-diff; default `--gpu` runs 4480 ln-bwd on-device. `tests/gpu_ln_bwd.cyr`.
   - **1.8.10 — `attn_core_bwd` (TOLERANCE, --gpu-tc) → the full `--gpu-tc` step on-device.** The
     hardest, landed last: dP/dotPdP + the softmax-Jacobian `dscore = P·(dP − dotPdP)` (catastrophic
     cancellation → grad-check band ~1e-12, not 1e-13), and the **dV/dK write-collision re-grid**
