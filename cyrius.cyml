@@ -13,23 +13,16 @@ test = "src/test.cyr"
 output = "build/attn11"
 
 [deps]
-stdlib = ["string", "fmt", "alloc", "io", "vec", "str", "syscalls", "assert", "bench", "math", "ganita", "args"]
+stdlib = ["string", "fmt", "alloc", "io", "vec", "str", "syscalls", "assert", "bench", "math", "ganita", "args", "hashmap", "tagged", "fnptr", "mmap", "dynlib", "sakshi", "thread", "sankoch"]
 
-# M18 (v1.8.x GPU arc) — READY TO LAND. Held out of the DEFAULT binary only to keep it
-# lean; NOT blocked. Verified 2026-06-19 on cyrius 6.2.29 + mabda 3.4.1 (X026):
-#   ✓ The real gate is CLEARED — mabda 3.4.1 renamed its colliding constants to
-#     `MABDA_F64_HALF`/`MABDA_F64_TWO`, so the `math` stdlib keeps sole ownership of
-#     `F64_HALF`/`F64_TWO`. `include "lib/mabda.cyr"` now builds clean and the
-#     no-`--gpu` CPU path is byte-identical (finite loss, no NaN). Collision retired.
-#   ✓ GPU proven online — `gpu_probe` (src/gpu.cyr) brings up the native-AMD Cezanne
-#     f64 SPIR-V device, launcher-free + pure-Cyrius (X025).
-#   • Transient cost, NOT a gate — cyrius has no `dep-module-call` yet, so including
-#     mabda amalgamates its ~1 MB dist (binary 373,504 → 1,338,344 B measured) even when
-#     `--gpu` is unused. `dep-module-call` is slated for the 6.2.x line and slims this
-#     back with ZERO attn11 change — it gates binary SIZE, not M18.
-# To land: uncomment [deps.mabda] (tag 3.4.1) below, append mabda's stdlib needs to the
-# list above — "hashmap", "tagged", "fnptr", "mmap", "dynlib", "sakshi", "thread",
-# "sankoch" — and add `include "lib/mabda.cyr"` in src/main.cyr (src/gpu.cyr is staged).
+# M18 (v1.8.x GPU arc) — LANDED in v1.8.0 (X027). mabda 3.4.1 is consumed by
+# src/gpu.cyr (`include "lib/mabda.cyr"` in src/main.cyr + the test/fuzz/bench
+# harnesses); the 8 stdlib needs above (hashmap/tagged/fnptr/mmap/dynlib/sakshi/
+# thread/sankoch) are mabda's. The `--gpu` forward matmul runs on the native-AMD
+# f64 SPIR-V path, BIT-EXACT vs the CPU oracle (a --gpu run reproduces the no-flag
+# run byte-for-byte). The ~1 MB dist amalgamation (binary ~373 KB → ~1.34 MB) is a
+# transient binary-SIZE cost — cyrius lacks `dep-module-call` (slated for 6.2.x,
+# slims back with ZERO attn11 change) — NOT a gate; binary size never gated M18.
 
 # Extracted at the v1 freeze: the tensor storage / BLAS-1 / matmul (+ gradient)
 # layer -> rosnet; the deterministic statistical PRNG -> tyche. attn11 now
@@ -50,10 +43,11 @@ modules = ["dist/rosnet.cyr"]
 # compute path (proven bit-exact on Cezanne, X025), launcher-free + pure-Cyrius, so
 # the binary stays static/no-libc. The tensor kernels are attn11/rosnet's, layered
 # ON mabda's primitives (ADR 0016) — mabda is consumed, never modified.
-# READY (mabda 3.4.1 verified, X026) — uncomment to land M18; held back only for binary
-# leanness pending cyrius dep-module-call (a transient SIZE cost, not a gate; see [deps]).
-# [deps.mabda]
-# git = "https://github.com/MacCracken/mabda"
-# tag = "3.4.1"
-# modules = ["dist/mabda.cyr"]
+# LANDED for M18 (v1.8.x GPU arc): mabda 3.4.1, the collision-fixed release (X026). The
+# ~1 MB dist amalgamation is a transient binary-SIZE cost (cyrius lacks dep-module-call;
+# slated for 6.2.x, slims back with zero attn11 change) — NOT a gate on the GPU work.
+[deps.mabda]
+git = "https://github.com/MacCracken/mabda"
+tag = "3.4.1"
+modules = ["dist/mabda.cyr"]
 ---

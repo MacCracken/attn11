@@ -1243,3 +1243,51 @@ approach is chosen — un-stage now and accept the interim 1.3 MB binary, or wai
 `dep-module-call`. This supersedes X025's "pin `mabda = 3.3.0`": the correct pin is **3.4.1**
 (the collision-fixed release). Reproduce: isolated worktree, mabda tag 3.4.1, cyrius 6.2.29,
 `CYRIUS_DCE=1 cyrius build src/main.cyr` with/without the mabda include; sizes above are exact.
+
+## X027 — M18 1.8.0: the `--gpu` forward matmul, bit-exact on-device (M18, v1.8.0, 2026-06-20)
+
+**Question.** X026 proved the device comes up from attn11's host context. The milestone
+question: can attn11 run a real **forward matmul on the GPU**, and does it match the CPU
+oracle closely enough to ship? The roadmap framed 1.8.0 as the *portable f32* path validated
+at f32 tolerance; this entry reports what actually shipped — the **native-AMD f64** path, and
+at a far stronger tolerance.
+
+**Method.** Land the GPU backend on `main` (un-stage mabda 3.4.1, `include "lib/mabda.cyr"`),
+write `src/gpu.cyr` (`gpu_matmul_fwd`) and hook it at `qlinear_fwd` behind `--gpu`. Two
+properties had to be discovered empirically on the dev Cezanne (gfx90c) before the kernel
+shape was fixed, each proven with a throwaway spike then the committed harness:
+(1) `gfx9_compile` rejects `OpLoopMerge`/`OpPhi` (straight-line only), and (2) mabda's public
+native-compile path caps a module at **256 ids** (`NATIVE_SHADER_CAP_IDS`). Both force the
+final design: an **unrolled** dot product, **host-tiled** over `k` (a bounded `GPU_TK=16`-term
+read-modify-write kernel; host pre-fills `y` with the bias and loops `k0` in `ceil(K/16)`
+serialized dispatches). Validate `gpu_matmul_fwd` vs rosnet `linear_fwd` across attn11's real
+shapes (`tests/gpu_matmul.cyr`), and run a full `--gpu` training step end-to-end vs CPU.
+
+**Result.**
+- **Bit-exact, not merely f32-tolerant.** Across every attn11 shape — default
+  16×32×{32,128}, MLP-down 16×128×32, preset 64×{64,256}, single-row decode 1×32×32 —
+  `gpu_matmul_fwd` matches `linear_fwd` **byte-for-byte** (the GPU's scalar `V_MUL_F64`+
+  `V_ADD_F64` in the same k-order as `linear_fwd`'s `f64v_fmadd` rounds identically). The
+  roadmap's f32-tolerance gate is met at the *strongest* possible tolerance.
+- **Engagement proven, not assumed.** `gpu_matmul_fwd` returns 0 only after a real
+  dispatch+readback; the test fails on a non-zero (silent-fallback) return. The K=24
+  (not a `GPU_TK` multiple) case correctly falls back to CPU. A default 30-step `--gpu` run
+  dispatched **17,514** forward matmuls on-device.
+- **A `--gpu` run reproduces the CPU run.** A 30- and 40-step `--gpu` training run produced a
+  checkpoint **byte-identical** to the no-flag CPU run (forward on GPU is bit-exact →
+  identical loss → identical Adam trajectory). The CPU stays the oracle; the GPU is an
+  execution target with no numerical effect.
+- **No regression.** **1056** grad-checks green on x86_64 **and** aarch64/qemu (mabda
+  cross-compiles; the device is absent under qemu → the CPU fallback keeps the suite
+  byte-identical); lint clean; fuzz + `make smoke` green; the no-flag run is byte-identical to
+  the pre-M18 HEAD binary (proven by diffing checkpoints from a clean HEAD worktree build).
+
+**Takeaway.** M18 1.8.0 ships the **sovereign GPU forward matmul** — generated f64 SPIR-V,
+host-tiled to fit mabda's compile cap, bit-exact vs the CPU oracle, on the launcher-free
+native-AMD path. It is "the GPU path works + is validated," exactly the honest-scale
+deliverable the roadmap set (no speed claim at attn11's tiny scale — scalar VALU f64, no
+matrix core; per-call host↔device transfer + `ceil(K/16)` dispatches dominate). The same
+generated-SPIR-V + host-tiling pattern extends to the rest of the forward (1.8.1) and
+backward + Adam (1.8.2). Reproduce: `make gpu-test` on an AMD GFX9 box (skips cleanly
+elsewhere); `./build/attn11 --gpu --steps 40 --save g.ckpt` vs the same without `--gpu`,
+then `cmp` the checkpoints. Invariants: [`../architecture/008-gpu-matmul-spirv.md`](../architecture/008-gpu-matmul-spirv.md); ADR 0016.

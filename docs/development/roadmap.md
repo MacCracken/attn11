@@ -13,7 +13,9 @@
 
 ## Where we are
 
-Current: **v1.7.3**. The v1.0 surface is frozen and additive-only
+Current: **v1.8.0** — **M18 shipped**: the `--gpu` forward matmul runs on the native-AMD
+f64 SPIR-V path (mabda 3.4.1), bit-exact vs the CPU oracle (ADR 0016, X027; see the M18
+section below). The v1.0 surface is frozen and additive-only
 ([`STABILITY.md`](../STABILITY.md)); the reusable numeric core lives in
 **[rosnet](https://github.com/MacCracken/rosnet)** + **[tyche](https://github.com/MacCracken/tyche)**
 (v1.1.0). **The full milestone chain M12–M17 is complete**, plus both data arcs:
@@ -373,13 +375,20 @@ under-documented (Mesa/RADV + AMD PAL headers are the next references) — the r
 for the native-AMD f64 route.
 
 **The 1.8.x mini-arc (each increment: a `--gpu` op set, validated vs the CPU reference + byte-identical no-flag, cross-arch where a GPU exists / clean CPU fallback where not):**
-- **1.8.0 — GPU foundation + the matmul kernel (portable f32 path).** Wire mabda into
-  attn11: lazy device init behind `--gpu`, the f64↔f32 host conversion layer, buffer
-  up/readback, and the first WGSL kernel — `linear_fwd` at the `qlinear_fwd` seam.
-  **Gate**: GPU matmul matches CPU `linear_fwd` within f32 tolerance (new dual-precision
-  test); no GPU present ⇒ clean fallback/skip; the no-flag CPU run byte-identical. Stands
-  up the rosnet-GPU layer + the validation harness on the working wgpu backend; every
-  later op reuses the pattern.
+- **1.8.0 — GPU foundation + the matmul kernel — ✅ SHIPPED (X027; f64-native, not f32).**
+  Wired mabda 3.4.1 into attn11 (`src/gpu.cyr`): lazy native-AMD device init behind `--gpu`,
+  persistent GTT data buffers (CPU-visible on the Cezanne APU — upload/readback by pointer),
+  and the matmul kernel at the `qlinear_fwd` seam. **Inverted the recon's f32-first plan**
+  (ADR 0016): the portable wgpu path doesn't run compute here (`MABDA_WGPU_COMPUTE=0`) and
+  loses f64 + needs a C launcher, so the **native-AMD f64 SPIR-V** path shipped first — it
+  keeps bit-exact f64 + the single-static-ELF charter. The kernel is **generated SPIR-V**
+  (gfx9_compile takes straight-line only + caps at 256 ids → unrolled dot product,
+  **host-tiled** `GPU_TK=16` RMW over `k`). **Gate exceeded**: GPU matmul matches CPU
+  `linear_fwd` **bit-exact** (not just f32-tolerant); no GPU ⇒ clean per-shape CPU fallback;
+  the no-flag run is byte-identical and a `--gpu` run reproduces it byte-for-byte. Stood up
+  the attn11-local GPU layer (to be extracted to rosnet's GPU backend) + the validation
+  harness (`tests/gpu_matmul.cyr`, `make gpu-test`); every later op reuses the pattern. The
+  **portable f32 / WGSL path** for non-AMD GPUs is now a later increment, not the entry point.
 - **1.8.1 — the rest of the forward on GPU.** WGSL kernels for `attn_core_fwd`,
   `head_fwd`, `ln_fwd`, `gelu_fwd`, `softmax` — a full `--gpu` forward, each op
   f32-validated against its CPU f64 reference.

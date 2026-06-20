@@ -5,7 +5,40 @@
 
 ## Version
 
-**1.7.4** — *Toolchain realign (cyrius 6.2.27 → 6.2.29) + M18 GPU-arc unblock verified*
+**1.8.0** — *M18: the GPU compute backend — `--gpu` forward matmul on the native-AMD
+f64 SPIR-V path, bit-exact vs the CPU oracle* (E-infra; ADR 0016, X027). The first
+execution-target milestone. The hand-derived forward matmul now dispatches to the GPU
+behind **`--gpu`**, riding **mabda 3.4.1**'s in-tree SPIR-V→GFX9 f64 emitter
+(launcher-free, pure-Cyrius — bit-exact on the dev AMD Cezanne gfx90c). The CPU
+scalar/SIMD path stays the f64 **oracle** and the byte-identical no-flag default; a
+`--gpu` run **reproduces the no-flag run byte-for-byte** (the GPU matmul is bit-exact,
+not f32-tolerant). **Sequencing inverted** (ADR 0016): the native-AMD f64 path shipped
+*first* (portable wgpu doesn't run compute here + needs a C launcher + loses f64). The
+kernel is **generated SPIR-V** (`src/gpu.cyr`) — `gfx9_compile` takes straight-line only
+(no `OpLoopMerge`/`OpPhi`) and caps a module at 256 ids, so the dot product is **unrolled**
+and the contraction **host-tiled** (`GPU_TK=16`-term RMW kernel, host pre-fills `y` with
+bias, `ceil(K/16)` serialized dispatches; 1-D grid `M·N`, `idx=GlobalInvocationId.x`).
+Hooked at `qlinear_fwd` (QKV / O / MLP — ~80% of FLOPs); per-shape self-fallback to CPU
+(no device / `K`∤16 / over limits). Backward + the head + mixers stay CPU (1.8.2 / later).
+Validated by `tests/gpu_matmul.cyr` (`make gpu-test`, X027): `gpu_matmul_fwd` vs
+`linear_fwd` **bit-exact** across attn11's real shapes, engagement proven (non-zero return
+= failure), `K=24` CPU-fallback checked — a **separate** device-dependent harness (skips
+cleanly with no GPU, so the grad-check total stays environment-independent), **not** in the
+CI release gate. End-to-end: a `--gpu` 40-step run's checkpoint is byte-identical to CPU's.
+**1056** grad-checks unchanged green x86_64 **and** aarch64/qemu (mabda cross-compiles; no
+device under qemu → clean CPU fallback); lint clean; fuzz + `make smoke` green; no-flag run
+byte-identical to pre-M18 (proven vs the HEAD binary). New files `src/gpu.cyr` (the backend)
++ `tests/gpu_matmul.cyr`; invariants in
+[`../architecture/008-gpu-matmul-spirv.md`](../architecture/008-gpu-matmul-spirv.md).
+**Binary SIZE (a cost, never a gate):** `qlinear_fwd` now references `src/gpu.cyr`, so every
+binary that includes `ops.cyr` (main, test, fuzz, bench) carries mabda's ~1 MB dist —
+binary **373,504 → ~1,376,680 B** — until cyrius ships `dep-module-call` (slims back with
+zero attn11 change). mabda is **consumed, never modified**; pin **`mabda = 3.4.1`** (the
+collision-fixed release). The cyrius toolchain pin stays **6.2.29**; the installed cycc
+(6.2.30) warns of drift but builds + runs clean on both arches (the realign is separate
+maintenance). `src/*.cyr` unchanged except the additive GPU wiring + CFG_VERSION.
+
+(**1.7.4** — *Toolchain realign (cyrius 6.2.27 → 6.2.29) + M18 GPU-arc unblock verified*
 (maintenance + a milestone-status finding). The installed cycc rolled ahead of the pin (drift
 at 6.2.27 vs 6.2.29); bumped `cyrius.cyml` and resynced the gitignored `lib/` + `cyrius.lock`.
 The 6.2.27 → 6.2.29 stdlib snapshot differs in **only 5 files** — four off attn11's compile
@@ -25,7 +58,7 @@ cyrius `dep-module-call`, is **reclassified as a transient binary-size cost, not
 without it, including mabda amalgamates its ~1 MB dist (binary 373,504 → 1,338,344 B measured)
 even when `--gpu` is unused; it is slated for the 6.2.x line and slims back with **zero attn11
 change**. So M18 is **GO**; mabda stays staged in the default build only to keep it lean until
-the landing approach is chosen — binary unchanged this cut.
+the landing approach is chosen — binary unchanged this cut.)
 
 (**1.7.3** — *Toolchain realign + dependency bump* (maintenance). cyrius pin **6.2.6 →
 6.2.27** (installed cycc had rolled well ahead; local builds warned of drift) plus the first

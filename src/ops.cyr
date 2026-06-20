@@ -688,9 +688,18 @@ fn ternary_quant(W, out, K, N): i64 {
 # W_eff (the true forward weight); dW = x^T dy is the STE pass-through (linear_bwd
 # never reads W when accumulating dW). The same master W is quantized in both the
 # fwd and bwd of a step (Adam updates only after backward), so W_eff is consistent.
+# M18: with --gpu (g_gpu==1) the forward matmul dispatches to the GPU backend
+# (src/gpu.cyr), which is BIT-EXACT vs linear_fwd and self-falls-back to CPU for any
+# shape it can't take (no device, K not GPU_TK-tiled, over buffer/dispatch limits).
+# With g_gpu==0 (default) this is the unchanged CPU path — the no-flag run is
+# byte-identical.
 fn qlinear_fwd(x, W, b, y, M, K, N): i64 {
-    if (g_ternary == 0) { return linear_fwd(x, W, b, y, M, K, N); }
+    if (g_ternary == 0) {
+        if (g_gpu == 1) { if (gpu_matmul_fwd(x, W, b, y, M, K, N) == 0) { return 0; } }
+        return linear_fwd(x, W, b, y, M, K, N);
+    }
     ternary_quant(W, g_qscratch, K, N);
+    if (g_gpu == 1) { if (gpu_matmul_fwd(x, g_qscratch, b, y, M, K, N) == 0) { return 0; } }
     return linear_fwd(x, g_qscratch, b, y, M, K, N);
 }
 fn qlinear_bwd(x, W, dy, dx, dW, db, M, K, N): i64 {

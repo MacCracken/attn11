@@ -50,6 +50,9 @@
 #                                   AR; reward-weighted softmax-CE over rollouts)
 #   attn11 --rl-target C            REINFORCE reward = count of char C per rollout
 #                                   (default space; needs --objective rl)
+#   attn11 --gpu                    run the forward matmul on the GPU (M18; native-AMD
+#                                   f64 SPIR-V via mabda, bit-exact vs the CPU oracle;
+#                                   auto CPU fallback where no device / unsupported)
 #   attn11 --help, -h               show usage and exit
 #   attn11 --version                print the version and exit
 #
@@ -61,6 +64,8 @@
 
 include "lib/tyche.cyr"          # extracted PRNG (rng_*, _rng_state)
 include "lib/rosnet.cyr"         # extracted tensor/BLAS-1/matmul (+ gradient)
+include "lib/mabda.cyr"          # M18: GPU foundation (native-AMD f64 SPIR-V compute)
+include "src/gpu.cyr"            # M18: --gpu matmul backend on mabda (ADR 0016)
 include "src/tensor.cyr"
 include "src/fileio.cyr"
 include "src/ops.cyr"
@@ -108,7 +113,7 @@ fn _atoi(s): i64 {
 }
 
 # Kept in sync with the VERSION file (CI's docs job gates the match).
-fn CFG_VERSION(): i64 { return "1.7.4"; }
+fn CFG_VERSION(): i64 { return "1.8.0"; }
 
 fn usage(): i64 {
     puts("attn11 — a from-scratch GPT-style transformer, trained, in Cyrius\n");
@@ -141,6 +146,7 @@ fn usage(): i64 {
     puts("  --ternary       BitNet-style ternary weights {-1,0,+1} (mha + dense + ar; STE backward)\n");
     puts("  --decode-steps N   diffusion decode iterations (default = ctx)\n");
     puts("  --decode-schedule S  diffusion unmask schedule: cosine (default) or linear\n");
+    puts("  --gpu           run the forward matmul on the GPU (native-AMD f64; CPU stays the oracle + fallback)\n");
     puts("  --help, -h      show this help and exit\n");
     puts("  --version       print the version and exit\n");
     return 0;
@@ -194,6 +200,7 @@ fn main(): i64 {
         elif (streq(a, "--save") == 1) { i = i + 1; save_path = _av(i, a); }
         elif (streq(a, "--steps") == 1) { i = i + 1; steps = _atoi(_av(i, a)); }
         elif (streq(a, "--gen-only") == 1) { gen_only = 1; }
+        elif (streq(a, "--gpu") == 1) { g_gpu = 1; }
         elif (streq(a, "--preset") == 1) { cfg_c = 64; cfg_t = 64; cfg_nh = 8; cfg_nl = 4; }
         elif (streq(a, "--heads") == 1) { i = i + 1; cfg_nh = _atoi(_av(i, a)); }
         elif (streq(a, "--kv-heads") == 1) { i = i + 1; cfg_nkv = _atoi(_av(i, a)); }
@@ -247,6 +254,10 @@ fn main(): i64 {
         else { puts("attn11: unknown argument "); puts(a); _putc(10); usage(); return 1; }
         i = i + 1;
     }
+    # M18: report GPU status once when --gpu is requested (the matmul backend lazily
+    # brings the device up on first use; this is just a user-facing probe). A missing
+    # device is non-fatal — qlinear_fwd self-falls-back to the CPU oracle.
+    if (g_gpu == 1) { gpu_probe(); }
     if (cfg_nkv == 0) { cfg_nkv = cfg_nh; }
     # MLA uses full heads (the cache compression is the latent, not head-sharing);
     # force nkv = nh and default d_c to C/2 (~4x KV-cache cut vs MHA's 2*Ckv) when
@@ -710,6 +721,16 @@ fn main(): i64 {
         puts("\nsampled (temp 0.8):\n");
         var temp = f64_div(f64_from(8), f64_from(10));
         generate("a transformer ", 14, 120, temp);
+    }
+
+    # M18: report GPU engagement so a silent CPU fallback is never mistaken for a GPU run.
+    if (g_gpu == 1) {
+        if (gpu_mm_count() > 0) {
+            puts("GPU: dispatched "); fmt_int(gpu_mm_count());
+            puts(" forward matmuls on-device (CPU oracle bit-exact)\n");
+        } else {
+            puts("GPU: requested but no matmul ran on-device — CPU fallback was used throughout\n");
+        }
     }
 
     return rc;

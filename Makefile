@@ -1,4 +1,4 @@
-.PHONY: check release lint test fuzz bench compete-bench build aarch64 smoke clean
+.PHONY: check release lint test fuzz bench compete-bench gpu-test build aarch64 smoke clean
 
 check: lint test            # the local CI gate (lint + x86 grad-checks)
 
@@ -35,6 +35,14 @@ bench:
 # stacks), NOT a CI lane. See docs/benchmarks.md "Competitor benchmarks".
 compete-bench:
 	./scripts/compete-bench.sh
+
+# M18 GPU matmul validation (tests/gpu_matmul.cyr): gpu_matmul_fwd vs the linear_fwd
+# oracle, bit-exact, on attn11's real shapes. Environment-dependent (needs a native
+# AMD f64 GPU) so it is NOT in the release gate — it SKIPS cleanly (exit 0) where no
+# device exists, and is run on a GPU box. See docs/guides/gpu.md.
+gpu-test:
+	@mkdir -p build
+	cyrius build tests/gpu_matmul.cyr build/gpu_matmul && ./build/gpu_matmul
 
 build:
 	@mkdir -p build

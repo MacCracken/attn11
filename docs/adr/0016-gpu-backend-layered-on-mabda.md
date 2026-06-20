@@ -1,7 +1,37 @@
 # 0016 — GPU compute backend layered on mabda (not in it); precision-tiered f32→f64
 
-**Status**: Accepted — *amended 2026-06-19 (see Update)*
+**Status**: Accepted — *implemented in v1.8.0 (see 2026-06-20 Update); amended 2026-06-19*
 **Date**: 2026-06-14
+
+## Update (2026-06-20) — v1.8.0 shipped: native-AMD f64 FIRST (sequencing inverted)
+
+M18 1.8.0 landed (X027). Acting on the 2026-06-19 revision, **1.8.0 shipped the
+native-AMD f64 SPIR-V path FIRST**, not the portable f32 path Decision §3 originally
+locked — because on the dev Cezanne the f64 path is the one that keeps attn11's charter
+(bit-exact f64, launcher-free, single static ELF) while the portable wgpu path needs a C
+launcher *and* loses f64. What shipped:
+
+- `src/gpu.cyr` — `gpu_matmul_fwd` at the `qlinear_fwd` seam, behind `--gpu`. The CPU
+  `linear_fwd` stays the oracle + automatic fallback; the no-flag run is byte-identical
+  and a **`--gpu` run reproduces it byte-for-byte** (the GPU matmul is **bit-exact**, not
+  just f32-tolerant — the dual-precision gate Decision §2 anticipated is met at the
+  *strongest* tolerance).
+- **The kernel is generated, not authored in WGSL.** `gfx9_compile` accepts only
+  straight-line SPIR-V (no `OpLoopMerge`/`OpPhi`), and mabda's public native-compile path
+  caps a module at 256 ids — so the dot product is **unrolled** and the contraction is
+  **host-tiled** (a bounded `GPU_TK=16`-term read-modify-write kernel; the host loops `k0`
+  and pre-fills `y` with the bias). One thread per output, 1-D dispatch, `m=idx/N`,
+  `n=idx%N`. See [`../architecture/008-gpu-matmul-spirv.md`](../architecture/008-gpu-matmul-spirv.md).
+- **Validation** (`tests/gpu_matmul.cyr`, `make gpu-test`): `gpu_matmul_fwd` vs
+  `linear_fwd` bit-exact across attn11's real shapes; engagement proven (a non-zero
+  return = silent CPU fallback = test failure). Separate from the grad-check suite because
+  it is device-dependent (skips cleanly with no GPU, so the counted 1056-check total stays
+  environment-independent).
+
+Decision §3's f32→f64 ordering is therefore **inverted on AMD**: f64-native is the
+first-class path here; the portable f32 path (1.8.0's original framing) becomes the
+route for non-AMD GPUs and a later increment. The rest of the forward, then backward +
+Adam (1.8.1 / 1.8.2), extend the same generated-SPIR-V + host-tiling pattern.
 
 ## Update (2026-06-19) — f64 proven on-hardware; f64-track sequencing revised
 

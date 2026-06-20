@@ -4,6 +4,61 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.8.0] - 2026-06-20
+
+**M18: the GPU compute backend — `--gpu` forward matmul on the native-AMD f64 SPIR-V
+path, bit-exact vs the CPU oracle (E-infra; ADR 0016, X027).** The first execution-target
+milestone: attn11's hand-derived forward matmul now dispatches to the GPU behind `--gpu`,
+riding **mabda 3.4.1**'s in-tree SPIR-V→GFX9 f64 emitter (launcher-free, pure-Cyrius —
+proven bit-exact on the dev AMD Cezanne, X025/X026). The CPU scalar/SIMD path stays the
+f64 **reference oracle** and the byte-identical no-flag default; a `--gpu` run **reproduces
+the no-flag run byte-for-byte** (the GPU matmul is bit-exact, not merely f32-tolerant), so
+the milestone validates at the *strongest* possible tolerance.
+
+**Sequencing inverted (ADR 0016):** 1.8.0 was scoped as the *portable f32 wgpu* path, but
+that path doesn't run compute on this toolchain (`MABDA_WGPU_COMPUTE = 0`, the dispatch is a
+`GPU_ERR_OTHER` stub) **and** needs a C launcher + loses f64. The **native-AMD f64 path**
+keeps attn11's charter (bit-exact f64, launcher-free, single static ELF), so it shipped
+**first**; portable f32 becomes the route for non-AMD GPUs (a later increment).
+
+**The kernel is generated, not authored.** `gfx9_compile` accepts straight-line SPIR-V only
+(no `OpLoopMerge`/`OpPhi`) and mabda's public native-compile path caps a module at 256 ids —
+so `src/gpu.cyr` **generates** the SPIR-V word-by-word with the dot product **unrolled**, and
+**host-tiles** the contraction: a bounded `GPU_TK = 16`-term read-modify-write kernel, the
+host pre-filling `y` with the bias and looping `k0` in `ceil(K/16)` serialized dispatches (no
+race on `y`). One thread per output (1-D grid `M·N`, `idx = GlobalInvocationId.x`,
+`m = idx/N`, `n = idx%N`); incremental indexing (`xi += 1`, `wi += N`) so the kernel needs
+only `{0,1,K,N,k0,k0·N}`. Tile kernels are cached by `(K,N,k0)`. GTT buffers are CPU-visible
+(Cezanne unified memory: upload/readback by pointer, no copy), mapped at fixed VAs clear of
+mabda's reserved IB/fence/RT/texture regions. Invariants: [`docs/architecture/008-gpu-matmul-spirv.md`](docs/architecture/008-gpu-matmul-spirv.md).
+
+**Seam + scope.** Hooked at `qlinear_fwd` (`ops.cyr`) — the ~80%-of-FLOPs matmul (QKV / O /
+MLP up+down); with `g_gpu == 0` it is the unchanged CPU path (byte-identical). Per-shape
+self-fallback to CPU when: no device, `K` not a `GPU_TK` multiple, or over the buffer/dispatch
+limits. The tied-weight LM head and the attention-core / mixers stay CPU; backward
+(`qlinear_bwd`) stays CPU until 1.8.2. New `--gpu` flag (lazy device bring-up on first use) +
+a post-run engagement report (matmuls actually dispatched on-device, so a silent CPU fallback
+is never mistaken for a GPU run).
+
+**Validation (X027).** `tests/gpu_matmul.cyr` (`make gpu-test`): `gpu_matmul_fwd` vs
+`linear_fwd` **bit-exact** across attn11's real shapes (default 16×32×{32,128}, preset
+64×{64,256}, single-row decode) with engagement proven (a non-zero return = silent fallback =
+failure) and the `K=24` CPU-fallback path checked. It is a **separate** harness from the
+grad-check suite (device-dependent — it skips cleanly where no GPU exists, so the counted
+check total stays environment-independent) and is **not** in the CI release gate. End-to-end:
+a `--gpu` 40-step training run's checkpoint is **byte-identical** to the CPU run's; the GPU
+dispatched 17 514 forward matmuls in a default 30-step run.
+
+**Gate.** `--gpu` matmul bit-exact vs `linear_fwd` (X027); no-flag run byte-identical to
+pre-M18 (proven against the HEAD binary); **1056** grad-checks green on x86_64 **and**
+aarch64/qemu (mabda cross-compiles; the device is absent under qemu → clean CPU fallback);
+lint clean; fuzz + `make smoke` green. **Cost (not a gate):** `qlinear_fwd` now pulls in
+`lib/mabda.cyr`, so every binary that includes `ops.cyr` carries mabda's ~1 MB dist (binary
+~373 KB → ~1.34 MB) until cyrius ships `dep-module-call` (slims back with zero attn11 change).
+mabda is **consumed, never modified** (ADR 0016). Pin `mabda = 3.4.1` (the collision-fixed
+release). The cyrius toolchain pin stays **6.2.29**; the installed cycc (6.2.30) warns of
+drift but builds + runs clean on both arches (the pin realign is separate maintenance).
+
 ## [1.7.4] - 2026-06-19
 
 **Toolchain realign (cyrius 6.2.27 → 6.2.29) + M18 GPU-arc unblock verified (mabda 3.4.1).**

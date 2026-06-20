@@ -1,18 +1,296 @@
-# src/gpu.cyr — M18 (the v1.8.x GPU arc): the GPU compute foundation.
+# src/gpu.cyr — M18 (the v1.8.x GPU arc): the GPU compute backend.
 #
-# attn11's opt-in GPU sibling. Brings up mabda's NATIVE-AMD SPIR-V f64 compute
-# device (launcher-free, pure-Cyrius — proven bit-exact on AMD Cezanne, see the
-# X025 experiment) behind `--gpu`. The CPU scalar/SIMD path stays the f64 reference
-# and the byte-identical no-flag default; mabda is consumed, never modified
-# (ADR 0016). The tensor kernels are attn11/rosnet's, layered ON mabda's primitives
-# — landing attn11-local here first, extracted to rosnet's GPU backend once proven.
+# attn11's opt-in GPU sibling, behind `--gpu`. The CPU scalar/SIMD path stays the
+# f64 reference oracle and the byte-identical no-flag default; the GPU rides mabda's
+# NATIVE-AMD SPIR-V f64 compute path (launcher-free, pure-Cyrius — proven bit-exact
+# on AMD Cezanne, X025/X026). mabda is consumed, never modified (ADR 0016); the
+# tensor kernels are attn11/rosnet's, layered ON mabda's primitives — landing
+# attn11-local here first, extracted to rosnet's GPU backend once proven.
 #
-# 1.8.0 step 0: the device-bring-up smoke. Proves attn11 can open the native GPU
-# end-to-end before any kernel lands; every later op reuses this context path.
+# 1.8.0: the matmul kernel at the qlinear_fwd seam (~80% of FLOPs). A GPU forward
+# matmul y = b + x·W validated BIT-EXACT against rosnet's linear_fwd (it preserves
+# linear_fwd's exact k-order accumulation, so a `--gpu` run reproduces the CPU run).
+#
+# === the SPIR-V kernel ===
+# gfx9_compile (mabda's in-tree SPIR-V→GFX9 emitter) accepts STRAIGHT-LINE code only
+# — no OpLoopMerge / OpPhi (a back-edge breaks its forward linear-scan). So the dot
+# product is UNROLLED. mabda's public native compile path caps a module at 256 ids
+# (NATIVE_SHADER_CAP_IDS), which a full-K unroll blows past (id_bound ≈ 8·K). So we
+# HOST-TILE the contraction: a bounded GPU_TK-term kernel read-modify-writes y, and
+# the host loops k0 in steps of GPU_TK (serialized dispatches → no race on y). The
+# host pre-fills y with the bias; every tile then does acc = y[idx] + Σ x·W. One
+# thread per output element (1-D grid of M·N), idx = GlobalInvocationId.x,
+# m = idx/N, n = idx%N. Indices advance incrementally (xi += 1, wi += N), so the
+# kernel needs only the consts {0, 1, K, N, k0, k0·N}.
+
+# ---- config ----
+fn GPU_TK(): i64 { return 16; }              # k-tile unroll (id_bound ≈ 8·TK+34 < 256 cap)
+fn GPU_BO_MAX(): i64 { return 4194304; }     # 4 MB per data buffer (x / W / y)
+# Fixed GPU VAs for the three persistent data buffers. Chosen clear of mabda's
+# reserved native VAs — IB 0x..100200000, fence 0x..100600000, render targets
+# 0x..101000000 (16 MiB), textures 0x..180000000 (2 GiB) — with 16 MiB spacing
+# (each buffer ≤ 4 MiB).
+fn _GPU_XVA(): i64 { return 0xFFFF800110000000; }
+fn _GPU_WVA(): i64 { return 0xFFFF800111000000; }
+fn _GPU_YVA(): i64 { return 0xFFFF800112000000; }
+
+# ---- state ----
+var g_gpu = 0;            # 1 = --gpu requested (set by main); read by qlinear_fwd
+var _gpu_state = 0;       # 0 = untried, 1 = ready, 2 = unavailable (CPU fallback)
+var _gpu_ctx = 0;
+var _gpu_xh = 0; var _gpu_xm = 0;   # x BO handle + host map (GTT is CPU-visible)
+var _gpu_wh = 0; var _gpu_wm = 0;
+var _gpu_yh = 0; var _gpu_ym = 0;
+# shader cache (linear scan over a small set of distinct (K,N,k0) tile kernels)
+var _gpu_ck[1024];       # 128 packed keys
+var _gpu_cv[1024];       # 128 shader-module handles (or -1 = known compile-fail)
+var _gpu_cn = 0;
+var _gpu_mm_count = 0;   # forward matmuls actually dispatched on-device (engagement proof)
+
+# Count of forward matmuls run on the GPU (vs CPU fallback). >0 proves the device ran.
+fn gpu_mm_count(): i64 { return _gpu_mm_count; }
+
+# SPIR-V word emitters. op<wc> writes one <wc>-word instruction (word0 = (wc<<16)|op)
+# and returns the next byte offset. One instruction per source line → readable + ≤120c.
+fn _gpu_op2(buf, o, w0, p1): i64 { store32(buf + o, w0); store32(buf + o + 4, p1); return o + 8; }
+fn _gpu_op3(buf, o, w0, p1, p2): i64 {
+    store32(buf + o, w0); store32(buf + o + 4, p1); store32(buf + o + 8, p2); return o + 12;
+}
+fn _gpu_op4(buf, o, w0, p1, p2, p3): i64 {
+    store32(buf + o, w0); store32(buf + o + 4, p1); store32(buf + o + 8, p2); store32(buf + o + 12, p3);
+    return o + 16;
+}
+fn _gpu_op5(buf, o, w0, p1, p2, p3, p4): i64 {
+    store32(buf + o, w0); store32(buf + o + 4, p1); store32(buf + o + 8, p2);
+    store32(buf + o + 12, p3); store32(buf + o + 16, p4); return o + 20;
+}
+fn _gpu_op6(buf, o, w0, p1, p2, p3, p4, p5): i64 {
+    store32(buf + o, w0); store32(buf + o + 4, p1); store32(buf + o + 8, p2);
+    store32(buf + o + 12, p3); store32(buf + o + 16, p4); store32(buf + o + 20, p5); return o + 24;
+}
+
+# Generate the GPU_TK-tile RMW matmul kernel for (K, N, k0) into buf; return bytes.
+# Bindings: x=0, W=1, y=2. Consts %16=0 %17=1 %18=K %19=N %20=k0 %21=k0·N. Fn %22.
+fn _gpu_build_tile(buf, K, N, k0, TK): i64 {
+    var k0N = k0 * N;
+    var o = _gpu_op3(buf, 0, 0x07230203, 0x00010300, 0x00000000);   # magic / version 1.3 / gen
+    var bound_off = o;
+    o = _gpu_op2(buf, o, 0x00000000, 0x00000000);                   # id-bound (patched) + schema
+    o = _gpu_op2(buf, o, 0x00020011, 1);                            # Capability Shader
+    o = _gpu_op2(buf, o, 0x00020011, 10);                           # Capability Float64
+    o = _gpu_op3(buf, o, 0x0003000E, 0, 1);                         # MemoryModel Logical GLSL450
+    o = _gpu_op6(buf, o, 0x0006000F, 5, 22, 0x6E69616D, 0x00000000, 11);  # EntryPoint GLCompute %22 "main" %11
+    o = _gpu_op6(buf, o, 0x00060010, 22, 17, 1, 1, 1);             # ExecutionMode LocalSize 1 1 1
+    # decorations: gid BuiltIn GlobalInvocationId + 3 storage buffers (Binding/DescSet)
+    o = _gpu_op4(buf, o, 0x00040047, 11, 11, 28);                  # %11 BuiltIn GlobalInvocationId
+    o = _gpu_op4(buf, o, 0x00040047, 12, 33, 0);                   # %12 x Binding 0
+    o = _gpu_op4(buf, o, 0x00040047, 12, 34, 0);                   # %12 x DescriptorSet 0
+    o = _gpu_op4(buf, o, 0x00040047, 13, 33, 1);                   # %13 W Binding 1
+    o = _gpu_op4(buf, o, 0x00040047, 13, 34, 0);                   # %13 W DescriptorSet 0
+    o = _gpu_op4(buf, o, 0x00040047, 14, 33, 2);                   # %14 y Binding 2
+    o = _gpu_op4(buf, o, 0x00040047, 14, 34, 0);                   # %14 y DescriptorSet 0
+    # types / pointers / consts / variables
+    o = _gpu_op2(buf, o, 0x00020013, 1);                           # %1 void
+    o = _gpu_op3(buf, o, 0x00030021, 2, 1);                        # %2 fn void()
+    o = _gpu_op4(buf, o, 0x00040015, 3, 32, 0);                    # %3 uint
+    o = _gpu_op4(buf, o, 0x00040017, 4, 3, 3);                     # %4 uvec3
+    o = _gpu_op4(buf, o, 0x00040020, 5, 1, 4);                     # %5 ptr Input uvec3
+    o = _gpu_op3(buf, o, 0x00030016, 6, 64);                       # %6 double
+    o = _gpu_op3(buf, o, 0x0003001D, 7, 6);                        # %7 runtimearray double
+    o = _gpu_op3(buf, o, 0x0003001E, 8, 7);                        # %8 struct {array}
+    o = _gpu_op4(buf, o, 0x00040020, 9, 12, 8);                    # %9 ptr StorageBuffer struct
+    o = _gpu_op4(buf, o, 0x00040020, 10, 12, 6);                   # %10 ptr StorageBuffer double
+    o = _gpu_op4(buf, o, 0x0004002B, 3, 16, 0);                    # %16 = 0
+    o = _gpu_op4(buf, o, 0x0004002B, 3, 17, 1);                    # %17 = 1
+    o = _gpu_op4(buf, o, 0x0004002B, 3, 18, K);                    # %18 = K
+    o = _gpu_op4(buf, o, 0x0004002B, 3, 19, N);                    # %19 = N
+    o = _gpu_op4(buf, o, 0x0004002B, 3, 20, k0);                   # %20 = k0
+    o = _gpu_op4(buf, o, 0x0004002B, 3, 21, k0N);                  # %21 = k0·N
+    o = _gpu_op4(buf, o, 0x0004003B, 5, 11, 1);                    # %11 gid var Input
+    o = _gpu_op4(buf, o, 0x0004003B, 9, 12, 12);                   # %12 x var StorageBuffer
+    o = _gpu_op4(buf, o, 0x0004003B, 9, 13, 12);                   # %13 W var StorageBuffer
+    o = _gpu_op4(buf, o, 0x0004003B, 9, 14, 12);                   # %14 y var StorageBuffer
+    # function body
+    o = _gpu_op5(buf, o, 0x00050036, 1, 22, 0, 2);                 # %22 Function void() None
+    o = _gpu_op2(buf, o, 0x000200F8, 23);                         # %23 Label
+    o = _gpu_op4(buf, o, 0x0004003D, 4, 24, 11);                  # %24 = Load gid
+    o = _gpu_op5(buf, o, 0x00050051, 3, 25, 24, 0);              # %25 idx = gid.x
+    o = _gpu_op5(buf, o, 0x00050086, 3, 26, 25, 19);            # %26 m  = idx / N (UDiv)
+    o = _gpu_op5(buf, o, 0x00050089, 3, 27, 25, 19);            # %27 n  = idx % N (UMod)
+    o = _gpu_op5(buf, o, 0x00050084, 3, 28, 26, 18);            # %28 mK = m * K   (IMul)
+    o = _gpu_op5(buf, o, 0x00050080, 3, 29, 28, 20);            # %29 xi = mK + k0 (IAdd)
+    o = _gpu_op5(buf, o, 0x00050080, 3, 30, 27, 21);            # %30 wi = n + k0N (IAdd)
+    o = _gpu_op6(buf, o, 0x00060041, 10, 31, 14, 16, 25);      # %31 = &y[idx]
+    o = _gpu_op4(buf, o, 0x0004003D, 6, 32, 31);               # %32 acc = y[idx] (RMW base)
+    var xi = 29; var wi = 30; var acc = 32; var nid = 33;
+    var j = 0;
+    while (j < TK) {
+        var ax = nid; nid = nid + 1;
+        o = _gpu_op6(buf, o, 0x00060041, 10, ax, 12, 16, xi);     # &x[xi]
+        var vx = nid; nid = nid + 1;
+        o = _gpu_op4(buf, o, 0x0004003D, 6, vx, ax);             # x[xi]
+        var aw = nid; nid = nid + 1;
+        o = _gpu_op6(buf, o, 0x00060041, 10, aw, 13, 16, wi);     # &W[wi]
+        var vw = nid; nid = nid + 1;
+        o = _gpu_op4(buf, o, 0x0004003D, 6, vw, aw);             # W[wi]
+        var prod = nid; nid = nid + 1;
+        o = _gpu_op5(buf, o, 0x00050085, 6, prod, vx, vw);       # x*W (FMul)
+        var accn = nid; nid = nid + 1;
+        o = _gpu_op5(buf, o, 0x00050081, 6, accn, acc, prod);    # acc += prod (FAdd)
+        acc = accn;
+        if (j < TK - 1) {
+            var xin = nid; nid = nid + 1;
+            o = _gpu_op5(buf, o, 0x00050080, 3, xin, xi, 17);    # xi += 1
+            var win = nid; nid = nid + 1;
+            o = _gpu_op5(buf, o, 0x00050080, 3, win, wi, 19);    # wi += N
+            xi = xin; wi = win;
+        }
+        j = j + 1;
+    }
+    o = _gpu_op3(buf, o, 0x0003003E, 31, acc);   # Store y[idx] = acc
+    o = _gpu_op2(buf, o, 0x000100FD, 0x00010038);   # Return ; FunctionEnd (1-word ops packed)
+    store32(buf + bound_off, nid);   # id bound = next free id
+    return o;
+}
+
+# Pack (K, N, k0) into a cache key (each field < 2^20 for any attn11 shape).
+fn _gpu_pack(K, N, k0): i64 { return (K << 40) | (N << 20) | k0; }
+
+fn _gpu_cache_get(key): i64 {
+    var i = 0;
+    while (i < _gpu_cn) {
+        if (load64(&_gpu_ck + i * 8) == key) { return load64(&_gpu_cv + i * 8); }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn _gpu_cache_put(key, val): i64 {
+    if (_gpu_cn >= 128) { return 0; }   # cache full: skip (caller still uses the handle)
+    store64(&_gpu_ck + _gpu_cn * 8, key);
+    store64(&_gpu_cv + _gpu_cn * 8, val);
+    _gpu_cn = _gpu_cn + 1;
+    return 0;
+}
+
+# Get (compile+cache) the tile shader for (K, N, k0). 0 = unavailable (CPU fallback).
+fn _gpu_get_tile(K, N, k0): i64 {
+    var key = _gpu_pack(K, N, k0);
+    var c = _gpu_cache_get(key);
+    if (c == (0 - 1)) { return 0; }     # known compile-fail
+    if (c != 0) { return c; }
+    var spv[8192];
+    var nbytes = _gpu_build_tile(&spv, K, N, k0, GPU_TK());
+    var shmod = gpu_shader_module_create_spirv(_gpu_ctx, &spv, nbytes);
+    if (shmod == 0) { _gpu_cache_put(key, 0 - 1); return 0; }
+    _gpu_cache_put(key, shmod);
+    return shmod;
+}
+
+# Lazy device bring-up: open the native ctx + allocate/map the three persistent data
+# buffers once. 1 = ready, 0 = unavailable (clean CPU fallback, never fatal).
+# Release the three data BOs (the _gpu_init error-unwind paths once all are created).
+fn _gpu_free3(fd, xh, xm, wh, wm, yh, ym, sz): i64 {
+    native_bo_release_gtt(fd, xh, xm, sz);
+    native_bo_release_gtt(fd, wh, wm, sz);
+    native_bo_release_gtt(fd, yh, ym, sz);
+    return 0;
+}
+
+fn _gpu_init(): i64 {
+    if (_gpu_state == 1) { return 1; }
+    if (_gpu_state == 2) { return 0; }
+    var res = gpu_context_new_native();
+    if (is_err_result(res) == 1) { _gpu_state = 2; return 0; }
+    var ctx = payload(res);
+    var fd = native_ctx_fd(ctx);
+    var sz = GPU_BO_MAX();
+    var xb[16]; var wb[16]; var yb[16];
+    if (native_bo_create_gtt(fd, sz, &xb) != 0) { gpu_context_release(ctx); _gpu_state = 2; return 0; }
+    if (native_bo_create_gtt(fd, sz, &wb) != 0) {
+        native_bo_release_gtt(fd, load64(&xb + 0), load64(&xb + 8), sz);
+        gpu_context_release(ctx); _gpu_state = 2; return 0;
+    }
+    if (native_bo_create_gtt(fd, sz, &yb) != 0) {
+        native_bo_release_gtt(fd, load64(&xb + 0), load64(&xb + 8), sz);
+        native_bo_release_gtt(fd, load64(&wb + 0), load64(&wb + 8), sz);
+        gpu_context_release(ctx); _gpu_state = 2; return 0;
+    }
+    var xh = load64(&xb + 0); var xm = load64(&xb + 8);
+    var wh = load64(&wb + 0); var wm = load64(&wb + 8);
+    var yh = load64(&yb + 0); var ym = load64(&yb + 8);
+    if (native_gem_va_map(fd, xh, _GPU_XVA(), sz, _NATIVE_PERM_DATA) != 0) {
+        _gpu_free3(fd, xh, xm, wh, wm, yh, ym, sz);
+        gpu_context_release(ctx); _gpu_state = 2; return 0;
+    }
+    if (native_gem_va_map(fd, wh, _GPU_WVA(), sz, _NATIVE_PERM_DATA) != 0) {
+        native_gem_va_unmap(fd, xh, _GPU_XVA(), sz);
+        _gpu_free3(fd, xh, xm, wh, wm, yh, ym, sz);
+        gpu_context_release(ctx); _gpu_state = 2; return 0;
+    }
+    if (native_gem_va_map(fd, yh, _GPU_YVA(), sz, _NATIVE_PERM_DATA) != 0) {
+        native_gem_va_unmap(fd, xh, _GPU_XVA(), sz); native_gem_va_unmap(fd, wh, _GPU_WVA(), sz);
+        _gpu_free3(fd, xh, xm, wh, wm, yh, ym, sz);
+        gpu_context_release(ctx); _gpu_state = 2; return 0;
+    }
+    _gpu_ctx = ctx;
+    _gpu_xh = xh; _gpu_xm = xm; _gpu_wh = wh; _gpu_wm = wm; _gpu_yh = yh; _gpu_ym = ym;
+    _gpu_state = 1;
+    return 1;
+}
+
+# GPU forward matmul: y(M,N) = b(N) + x(M,K)·W(K,N), all row-major f64. Returns 0 on
+# success (y written), -1 = "cannot GPU this — use CPU". Bit-exact vs linear_fwd.
+fn gpu_matmul_fwd(x, W, b, y, M, K, N): i64 {
+    if (_gpu_init() == 0) { return 0 - 1; }
+    var TK = GPU_TK();
+    if (K <= 0) { return 0 - 1; }
+    if ((K % TK) != 0) { return 0 - 1; }                 # 1.8.0: K must tile by GPU_TK
+    if ((M * N) <= 0) { return 0 - 1; }
+    if ((M * N) > MABDA_MAX_DISPATCH_DIM) { return 0 - 1; }
+    if ((M * K * 8) > GPU_BO_MAX()) { return 0 - 1; }
+    if ((K * N * 8) > GPU_BO_MAX()) { return 0 - 1; }
+    if ((M * N * 8) > GPU_BO_MAX()) { return 0 - 1; }
+    # upload x, W to the host-visible GTT maps
+    var i = 0; var nx = M * K;
+    while (i < nx) { store64(_gpu_xm + i * 8, load64(x + i * 8)); i = i + 1; }
+    i = 0; var nw = K * N;
+    while (i < nw) { store64(_gpu_wm + i * 8, load64(W + i * 8)); i = i + 1; }
+    # pre-fill y with the bias (or 0) — every tile then accumulates onto it
+    var m = 0;
+    while (m < M) {
+        var nn = 0;
+        while (nn < N) {
+            var v = f64_from(0);
+            if (b != 0) { v = load64(b + nn * 8); }
+            store64(_gpu_ym + (m * N + nn) * 8, v);
+            nn = nn + 1;
+        }
+        m = m + 1;
+    }
+    # tiled dispatch (serialized — native_compute_dispatch waits, so no race on y)
+    var MN = M * N;
+    var k0 = 0;
+    while (k0 < K) {
+        var sh = _gpu_get_tile(K, N, k0);
+        if (sh == 0) { return 0 - 1; }   # compile cap hit → CPU (caller's y untouched)
+        var bp[56];
+        store64(&bp + 0, 3);
+        store64(&bp + 8, _gpu_xh);  store64(&bp + 16, _GPU_XVA());
+        store64(&bp + 24, _gpu_wh); store64(&bp + 32, _GPU_WVA());
+        store64(&bp + 40, _gpu_yh); store64(&bp + 48, _GPU_YVA());
+        if (gpu_compute_dispatch(_gpu_ctx, sh, MN, 1, 1, &bp) != 0) { return 0 - 1; }
+        k0 = k0 + TK;
+    }
+    # read y back from the GTT map
+    i = 0;
+    while (i < MN) { store64(y + i * 8, load64(_gpu_ym + i * 8)); i = i + 1; }
+    _gpu_mm_count = _gpu_mm_count + 1;
+    return 0;
+}
 
 # gpu_probe — bring the native GPU context up, report device + f64 capability, release.
-# Returns 0 = GPU online; 1 = no native device (clean fallback, never fatal — the CPU
-# f64 path is unaffected and stays the reference oracle).
+# Returns 0 = GPU online; 1 = no native device (clean fallback). Used by main's --gpu.
 fn gpu_probe(): i64 {
     var res = gpu_context_new_native();
     if (is_err_result(res) == 1) {
@@ -22,9 +300,9 @@ fn gpu_probe(): i64 {
     var ctx = payload(res);
     puts("GPU: native AMD compute device online (launcher-free, pure-Cyrius)\n");
     if (gpu_caps_native_shader_f64() == 1) {
-        puts("GPU: f64 SPIR-V compute supported — the f64 oracle can run on-device\n");
+        puts("GPU: f64 SPIR-V compute supported — matmul on-device (CPU stays the oracle)\n");
     } else {
-        puts("GPU: f64 SPIR-V compute UNSUPPORTED on this device\n");
+        puts("GPU: f64 SPIR-V compute UNSUPPORTED on this device — CPU fallback\n");
     }
     gpu_context_release(ctx);
     return 0;

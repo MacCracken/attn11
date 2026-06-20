@@ -1,0 +1,113 @@
+# tests/gpu_matmul.cyr — M18 1.8.0 GPU validation harness (the dual-precision test).
+#
+# Separate from the grad-check suite (tests/attn11.tcyr) BECAUSE it is
+# environment-dependent: it needs a native AMD f64 GPU. CI / qemu have none, so a
+# conditional check there would make the counted grad-check total non-deterministic.
+# This harness instead SKIPS cleanly (exit 0) when no device is present — build-
+# verified everywhere, run on a GPU box (the dev Cezanne).
+#
+# It validates the real backend `gpu_matmul_fwd` (src/gpu.cyr) against the CPU oracle
+# `linear_fwd` (rosnet) across attn11's actual matmul shapes. The gate is stronger
+# than the roadmap's "f32 tolerance": the native-AMD f64 path is BIT-EXACT, so we
+# assert byte-equality. A non-zero gpu_matmul_fwd return (silent CPU fallback) on a
+# GPU-eligible shape is a FAILURE — engagement is proven, not assumed.
+#
+# Build:  cyrius build tests/gpu_matmul.cyr build/gpu_matmul && ./build/gpu_matmul
+# Exit:   0 = all shapes bit-exact (or cleanly skipped, no GPU); 1 = mismatch/fallback.
+
+include "lib/rosnet.cyr"         # linear_fwd — the CPU f64 oracle
+include "lib/mabda.cyr"          # GPU foundation
+include "src/gpu.cyr"            # gpu_matmul_fwd (the unit under test)
+
+fn print_cstr(s): i64 { syscall(1, 1, s, strlen(s)); return 0; }
+fn print_i64(n): i64 { var b[32]; memset(&b, 0, 32); var l = fmt_int_buf(n, &b); syscall(1, 1, &b, l); return 0; }
+fn print_hex64(v): i64 {
+    var digits = "0123456789ABCDEF"; var b[18]; store8(&b + 0, 48); store8(&b + 1, 120);
+    var i = 0; while (i < 16) { store8(&b + 2 + i, load8(digits + ((v >> ((15 - i) * 4)) & 0xF))); i = i + 1; }
+    syscall(1, 1, &b, 18); return 0;
+}
+
+# Deterministic varied f64 fill: val = ((seed*2654435761 + i*40503) % 1000 - 500)/100,
+# i.e. ~[-5.0, 5.0) at 0.01 granularity — finite, mixed sign/magnitude.
+fn fill(buf, n, seed): i64 {
+    var i = 0;
+    while (i < n) {
+        var h = ((seed * 2654435761) + (i * 40503)) % 1000;
+        if (h < 0) { h = h + 1000; }
+        store64(buf + i * 8, f64_div(f64_from(h - 500), f64_from(100)));
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Run one shape: GPU vs CPU linear_fwd, bit-exact. with_bias 0/1. Returns 1 ok, 0 fail.
+fn run_shape(M, K, N, with_bias): i64 {
+    var x  = alloc(M * K * 8);
+    var W  = alloc(K * N * 8);
+    var b  = 0;
+    if (with_bias == 1) { b = alloc(N * 8); }
+    var yr = alloc(M * N * 8);   # CPU reference
+    var yg = alloc(M * N * 8);   # GPU result
+    fill(x, M * K, 1);
+    fill(W, K * N, 7);
+    if (with_bias == 1) { fill(b, N, 3); }
+    var i = 0; while (i < M * N) { store64(yr + i * 8, 0); store64(yg + i * 8, 0); i = i + 1; }
+
+    linear_fwd(x, W, b, yr, M, K, N);
+    var rc = gpu_matmul_fwd(x, W, b, yg, M, K, N);
+
+    print_cstr("  M="); print_i64(M); print_cstr(" K="); print_i64(K); print_cstr(" N="); print_i64(N);
+    print_cstr(" bias="); print_i64(with_bias); print_cstr(": ");
+    if (rc != 0) {
+        print_cstr("GPU FALLBACK (rc="); print_i64(rc); print_cstr(") — expected on-device for this shape\n");
+        return 0;
+    }
+    var ok = 1; i = 0;
+    while (i < M * N) {
+        if (load64(yg + i * 8) != load64(yr + i * 8)) {
+            if (ok == 1) {
+                print_cstr("MISMATCH at "); print_i64(i); print_cstr(" gpu="); print_hex64(load64(yg + i * 8));
+                print_cstr(" cpu="); print_hex64(load64(yr + i * 8)); print_cstr("\n");
+            }
+            ok = 0;
+        }
+        i = i + 1;
+    }
+    if (ok == 1) { print_cstr("BIT-EXACT ("); print_i64(M * N); print_cstr(" cells)\n"); }
+    return ok;
+}
+
+fn main(): i64 {
+    alloc_init();
+    print_cstr("attn11 GPU matmul validation (M18 1.8.0) — gpu_matmul_fwd vs linear_fwd oracle\n");
+    if (_gpu_init() == 0) {
+        print_cstr("no native AMD GPU — SKIPPED (CPU oracle unaffected; build verified)\n");
+        return 0;
+    }
+    print_cstr("native AMD f64 GPU online — validating attn11's real matmul shapes:\n");
+    var ok = 1;
+    # default config (C=32, T=16): QKV/O, MLP up, MLP down, single-row decode
+    if (run_shape(16, 32, 32, 1) == 0) { ok = 0; }
+    if (run_shape(16, 32, 32, 0) == 0) { ok = 0; }
+    if (run_shape(16, 32, 128, 1) == 0) { ok = 0; }
+    if (run_shape(16, 128, 32, 1) == 0) { ok = 0; }
+    if (run_shape(1, 32, 32, 1) == 0) { ok = 0; }
+    # preset config (C=64, T=64): MLP up / down
+    if (run_shape(64, 64, 256, 1) == 0) { ok = 0; }
+    if (run_shape(64, 256, 64, 1) == 0) { ok = 0; }
+
+    # a non-GPU_TK-multiple K must cleanly fall back (rc != 0), NOT silently mis-run
+    print_cstr("  fallback check (K=24, not a GPU_TK multiple): ");
+    var xf = alloc(8 * 24 * 8); var Wf = alloc(24 * 8 * 8); var yf = alloc(8 * 8 * 8);
+    fill(xf, 8 * 24, 1); fill(Wf, 24 * 8, 7);
+    if (gpu_matmul_fwd(xf, Wf, 0, yf, 8, 24, 8) != 0) { print_cstr("falls back to CPU (correct)\n"); }
+    else { print_cstr("UNEXPECTED on-device run for K=24\n"); ok = 0; }
+
+    print_cstr("GPU matmuls dispatched on-device: "); print_i64(gpu_mm_count()); print_cstr("\n");
+    if (ok == 0) { print_cstr("\nFAIL: GPU matmul not bit-exact vs the CPU oracle\n"); return 1; }
+    print_cstr("\nOK — gpu_matmul_fwd BIT-EXACT vs linear_fwd across all attn11 shapes\n");
+    return 0;
+}
+
+var exit_code = main();
+sys_exit(exit_code);

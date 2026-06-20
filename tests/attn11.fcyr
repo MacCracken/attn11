@@ -16,6 +16,8 @@
 
 include "lib/tyche.cyr"          # extracted PRNG (rng_*, _rng_state)
 include "lib/rosnet.cyr"         # extracted tensor/BLAS-1/matmul (+ gradient)
+include "lib/mabda.cyr"          # M18: GPU foundation (ops.cyr's qlinear_fwd hook needs it)
+include "src/gpu.cyr"            # M18: --gpu matmul backend (g_gpu==0 here → CPU, byte-identical)
 include "src/tensor.cyr"
 include "src/fileio.cyr"
 include "src/ops.cyr"
