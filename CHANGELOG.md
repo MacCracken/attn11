@@ -4,6 +4,45 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.8.5] - 2026-06-20
+
+**M18 1.8.5: the Adam optimizer step on the GPU — BIT-EXACT, the first backward-arc op (E-infra;
+ADR 0016, X033).** Adds **`gpu_adam_step`** at the `model_adam_step` seam: the per-parameter Adam
+update (`m=b1·m+om1·g`; `v=b2·v+om2·g²`; `p-=lr·(m/bc1)/(√(v/bc2)+eps)`) runs on the native-AMD
+f64 SPIR-V path, **bit-for-bit identical** to the CPU. Because it is bit-exact it rides **plain
+`--gpu`** (not `--gpu-tc`) and **keeps a `--gpu` run's checkpoint byte-identical to the CPU's** —
+now including the optimizer state, not just the forward. This is the first step of the
+backward+Adam arc toward a full training step on-device.
+
+**Bit-exactness verified, not assumed.** No prior bit-exact kernel used an in-shader f64 `sqrt`
+or `FDiv` (layernorm does its `1/sqrt` on the host; GELU's `FDiv` rides tolerance). Adam needs
+both per element (`√(v/bc2)`, three divisions), so before wiring it I spiked them on the hardware:
+mabda's Newton-Goldschmidt `sqrt` and Newton-reciprocal `FDiv` are **correctly-rounded** — 1000/1000
+random inputs bit-identical to `f64_sqrt`/`f64_div`, and the full Adam formula 1000/1000 (m, v, and
+param all exact). So the bit-exact claim is hardware-proven.
+
+**Design.** Elementwise (one thread per parameter), so the simplest GPU op yet — no reduction, no
+index decomposition (zero synth-id pressure from div/mod). The 8 scalars (`b1 b2 om1 om2 eps bc1
+bc2 lr`) are **host-computed identically** to the CPU (including `bc{1,2}=1−β^t` via `f64_pow`) and
+passed as a **uniform buffer** — never baked as hex consts, so the inputs are guaranteed
+bit-identical and the shader never recompiles per step. The grid is **host-tiled in
+`MABDA_MAX_DISPATCH_DIM` (65535) chunks** (preset `g_NP`≈208 k exceeds the 1-D dispatch cap); the
+chunk base is baked + cached (`kind=12`, keyed by base). Buffers reuse the 7-BO pool by role
+(grads→x, params→W, m→γ, v→β, scalars→S); params/m/v are RMW in place, then read back.
+
+**Reordered from the design plan.** The backward-arc design (a 6-agent workflow) sequenced shared
+matmul-bwd infra first; but Adam needs none of it, is the easiest op, and is bit-exact — so it
+ships first (every version carries a real, validatable consumer), and the shared infra lands with
+its first real consumer (linear_bwd) later.
+
+**Validation (X033).** New `tests/gpu_adam.cyr` (`make gpu-test`): `gpu_adam_step` vs a
+`model_adam_step` replica, **bit-exact** at NP ∈ {1000, 39488 (default), 100000 (>65535 →
+grid-tiled, 2 chunks)} — 0 bit differences in params/m/v. End-to-end: a plain `--gpu` 40-step run's
+checkpoint is **byte-identical** to the no-flag run (now with 40 Adam steps + matmuls + layernorms
+all on-device). Full gate green: 1056 grad-checks (x86_64 + aarch64/qemu — CPU path unchanged),
+agnos main+tcyr, lint (0 warn), fuzz, smoke. Adam rides `g_gpu` (bit-exact); the tolerance forward
+ops stay on `g_gpu_tc`. cyrius pin stays **6.2.29**; `mabda = 3.4.1`.
+
 ## [1.8.4] - 2026-06-20
 
 **M18 1.8.4: the FULL fused attention core on the GPU — the whole forward now runs on-device,

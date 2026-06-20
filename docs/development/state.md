@@ -5,7 +5,30 @@
 
 ## Version
 
-**1.8.4** — *M18 1.8.4: the FULL fused attention core on the GPU — the whole forward now runs
+**1.8.5** — *M18 1.8.5: the Adam optimizer step on the GPU — BIT-EXACT, the first backward-arc op*
+(E-infra; ADR 0016, X033). Adds **`gpu_adam_step`** at the `model_adam_step` seam: the
+per-parameter Adam update runs on the native-AMD f64 path **bit-for-bit identical** to the CPU, so
+it rides **plain `--gpu`** and **keeps a `--gpu` checkpoint byte-identical** (now incl. optimizer
+state, not just the forward). **Bit-exactness verified, not assumed:** no prior bit-exact kernel
+used in-shader f64 `sqrt`/`FDiv` (ln does `1/sqrt` on host; GELU's `FDiv` is tolerance); a hardware
+spike proved mabda's Newton-Goldschmidt `sqrt` + Newton-reciprocal `FDiv` are correctly-rounded
+(1000/1000 bit-identical, full Adam 1000/1000). **Design:** elementwise (simplest op — no reduction,
+no index div/mod); the 8 scalars (`b1 b2 om1 om2 eps bc1 bc2 lr`) host-computed identically + passed
+as a **uniform buffer** (no baked hex, no per-step recompile); grid **host-tiled in 65535 chunks**
+(preset `g_NP`≈208k > the 1-D cap), base baked+cached (kind=12); 7-BO pool reused by role. Adam ships
+**first** (reordered from the design plan's infra-first) because it needs no shared infra, is
+easiest, and is bit-exact — every version carries a real consumer; shared matmul-bwd infra lands
+with linear_bwd. **Validation (X033):** `tests/gpu_adam.cyr` (`make gpu-test`) bit-exact at NP ∈
+{1000, 39488, 100000 (>65535 → grid-tiled)}, 0 diffs; a plain `--gpu` 40-step checkpoint
+byte-identical to no-flag (40 Adam steps on-device). **Gate:** 1056 grad-checks x86_64 **and**
+aarch64/qemu (CPU path unchanged); agnos main+tcyr; lint (0 warn); fuzz; `make smoke`; all gpu tests
+re-pass. `gpu_adam_step` + `_gpu_adam_k` in `src/gpu.cyr`; hook in `src/model.cyr`; new
+`tests/gpu_adam.cyr`. **Next (1.8.6+):** the backward ops (gelu_bwd, linear_bwd + shared matmul-bwd
+infra, head_bwd, ln_bwd, attn_core_bwd) → the full training step end-to-end on GPU. cyrius pin stays
+**6.2.29** (installed cycc 6.2.31, benign drift); pin `mabda = 3.4.1`. `src/*.cyr` unchanged except
+the additive GPU wiring + CFG_VERSION.
+
+(**1.8.4** — *M18 1.8.4: the FULL fused attention core on the GPU — the whole forward now runs
 on-device, TOLERANCE* (E-infra; ADR 0016, X031). Adds **`gpu_attn_core`** at the
 `attn_core_fwd` seam (causal MHA): QK scores + the causal softmax + the PV weighted-sum, all on
 the native-AMD f64 SPIR-V path. **Every heavy forward op** (matmuls + ln + GELU + head +
@@ -25,10 +48,19 @@ NaN, bits/byte tracks CPU. **Gate:** plain `--gpu` byte-identical to no-flag (at
 engaged); **1056** grad-checks x86_64 **and** aarch64/qemu (CPU path unchanged); AGNOS
 main+tcyr clean; lint + fuzz + `make smoke` green; matmul + ln + gelu + head tests re-pass.
 `gpu_attn_core` + `_gpu_attn_{scores,rowmax,expsum,pv}` in `src/gpu.cyr`; hook in
-`src/attn.cyr`; new `tests/gpu_attn.cyr`; `docs/architecture/011-gpu-attention.md`. **Next
-(1.8.5):** backward + Adam + the honest perf X-entry. cyrius pin stays **6.2.29** (installed
-cycc 6.2.31, benign drift); pin `mabda = 3.4.1`. `src/*.cyr` unchanged except the additive GPU
-wiring + CFG_VERSION.
+`src/attn.cyr`; new `tests/gpu_attn.cyr`; `docs/architecture/011-gpu-attention.md`.
+
+**Honest perf measured (X032, docs/benchmarks.md B4).** With the full forward on-device, the GPU
+is **2–4× SLOWER** than the CPU at attn11's scale (default 50-step: CPU 2.94s vs `--gpu` 10.3s
+/3.5× vs `--gpu-tc` 12.3s /4.2×; preset 20-step: CPU 20.5s vs 39.2s /1.9× vs 45.4s /2.2×; min of
+4 warm reps). The gap **narrows with scale** (4.2→2.2×) — per-op host↔device transfer + scalar
+VALU f64 (no matrix core on Cezanne) dominate. **The GPU backend is the validated sovereign-stack
+/ oracle milestone it was scoped to be, NOT a speedup — the CPU stays the production path.**
+
+**Next (1.8.5+):** backward + Adam on GPU → the *full training step end-to-end on GPU* sovereign
+milestone (a known perf loss, justified by completeness, not throughput). cyrius pin stays
+**6.2.29** (installed cycc 6.2.31, benign drift); pin `mabda = 3.4.1`. `src/*.cyr` unchanged
+except the additive GPU wiring + CFG_VERSION.)
 
 (**1.8.3** — *M18 1.8.3: the LM head on the GPU — a transposed-weight matmul, TOLERANCE*
 (E-infra; ADR 0016, X030). Adds **`head_fwd`** (`logits = f · tokembᵀ`) to **`--gpu-tc`**,

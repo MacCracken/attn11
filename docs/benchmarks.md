@@ -406,7 +406,50 @@ So the **raw-throughput tables (B1/B2) are harness-ready, not yet populated**: f
 matched-config competitor numbers come from one `scripts/compete-bench.sh` run on a host
 with PyTorch + the GPT-2 data-prep installed (the harness asserts the param-count match
 before accepting each row). The **zero-deps story (B3) above is complete** — it needs no
-competitor run. **B4 (GPU)** rides the M18 1.8.x GPU backend.
+competitor run.
+
+## B4 — GPU backend (M18): the honest negative, measured (X032)
+
+The full forward now runs on the native-AMD f64 SPIR-V path (`--gpu` = matmul + layernorm,
+bit-exact; `--gpu-tc` = + GELU + LM head + attention, tolerance — 1.8.0–1.8.4). This is the
+"numbers or it didn't happen" measurement of whether that helps. **It does not — the GPU
+forward is 2–4× *slower* than the CPU at attn11's scale**, exactly as the charter framed it
+(a correctness / oracle / sovereign-stack path, never a speedup at this size).
+
+End-to-end training wall-clock, AMD Cezanne (gfx90c) APU, this dev box, **min of 4 warm reps**
+(back-to-back; the numbers are stable to <2% once warm):
+
+| shape | steps | CPU | `--gpu` (bit-exact) | `--gpu-tc` (+gelu/head/attn) |
+|-------|-------|-----|---------------------|------------------------------|
+| default (ctx16·d32·4h·3L) | 50 | **2.94 s** | 10.32 s (**3.5× slower**) | 12.32 s (**4.2× slower**) |
+| preset (ctx64·d64·8h·4L)  | 20 | **20.50 s** | 39.22 s (**1.9× slower**) | 45.44 s (**2.2× slower**) |
+
+**Why it's slower (root causes, in order of impact).**
+1. **Per-op host↔device transfer.** Every `gpu_*_fwd` call uploads its inputs and downloads
+   its outputs over GTT each invocation — no fusion across ops, no persistent device-resident
+   weights/activations. A default run dispatches thousands of ops (e.g. ~11 k matmuls + 4 k
+   layernorms + 1.8 k GELUs + 128 heads + 384 attention cores per 30 steps), each paying that
+   round trip. At attn11's tiny tensors the transfer dwarfs the compute.
+2. **Scalar VALU f64, no matrix core.** Cezanne has no full-rate `V_MFMA_F64`, so the kernels
+   are scalar `V_*_F64` — correctness-grade, not throughput-grade.
+3. **Serialized dispatches.** Each matmul is `ceil(K/16)` host-tiled RMW dispatches; attention
+   is 1 + 3·`ceil(T/4)` + `ceil(T/4)` passes — dispatch latency adds up.
+4. **Per-process shader (re)compile.** The kernel cache is in-process, so a fresh run compiles
+   every kernel once (amortized over steps, but it adds a cold-start tail — the first run after
+   the GPU idles can be ~2× a warm run; hence min-of-warm-reps above).
+
+**The scale trend is the tell.** The gap shrinks 4.2×→2.2× from default to preset — bigger
+tensors give more compute per transfer. Extrapolating, the GPU would only reach parity at a
+model far larger than attn11, and only *win* with (a) persistent device residency + fused
+multi-op kernels (no per-op transfer) and/or (b) matrix-core f64 hardware. None of those are
+attn11's scale or this box's silicon. **Conclusion: the GPU backend is the sovereign-stack
+correctness milestone it was scoped to be — every heavy op validated on-device against the CPU
+oracle — not a speedup. The CPU stays the production path.** This also frames backward + Adam
+on GPU (1.8.5+): worth building for the *end-to-end-on-GPU* milestone, but a known perf loss,
+not a throughput goal.
+
+Reproduce: `for m in "" --gpu --gpu-tc; do time ./build/attn11 $m --steps 50; done`
+(and `--preset`).
 
 Reproduce: `scripts/compete-bench.sh` (records the upstream commit it builds; emits
 `competitor-bench.csv` + the table above).

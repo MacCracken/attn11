@@ -1427,6 +1427,13 @@ fn model_clip_grads(clip): i64 {
 # moments; defaults b1=0.9, b2=0.999, eps=1e-8 are the paper's.
 # lr is an f64 bit pattern; step is the 1-based update count.
 fn model_adam_step(lr, step): i64 {
+#ifndef CYRIUS_TARGET_AGNOS
+    # GPU Adam (bit-exact: in-shader f64 sqrt/div are correctly-rounded) → keeps the --gpu
+    # checkpoint byte-identical. Plain g_gpu gate; self-falls-back to CPU (no device / NP too big).
+    if (g_gpu == 1) {
+        if (gpu_adam_step(lr, step) == 0) { return 0; }
+    }
+#endif
     var b1 = f64_div(f64_from(9), f64_from(10));        # 0.9
     var b2 = f64_div(f64_from(999), f64_from(1000));    # 0.999
     var om1 = f64_div(f64_from(1), f64_from(10));       # 1-b1

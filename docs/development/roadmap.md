@@ -13,13 +13,17 @@
 
 ## Where we are
 
-Current: **v1.8.4** — **M18 in progress**: `--gpu` runs **matmul** (1.8.0) **+ layernorm**
-(1.8.1) bit-exact (byte-identical run); **`--gpu-tc`** adds **GELU** (1.8.2) + the **LM head**
-(1.8.3) + the **full fused attention core** (1.8.4, X031 — QK scores + causal softmax + PV) at a
-*tolerance* (transcendental / SIMD-tree-order — so a separate gate keeps plain `--gpu`
-byte-identical). With 1.8.4 the **entire forward** can run on-device. Remaining: backward + Adam
-(1.8.5) → then the honest perf X-entry. All on the native-AMD f64 SPIR-V path (mabda 3.4.1). The
-v1.0 surface is frozen and additive-only
+Current: **v1.8.5** — **M18 in progress**: `--gpu` runs **matmul** (1.8.0) **+ layernorm** (1.8.1)
+**+ the Adam optimizer step** (1.8.5, X033) bit-exact (a `--gpu` checkpoint is byte-identical to the
+CPU's — now incl. optimizer state); **`--gpu-tc`** adds **GELU** (1.8.2) + the **LM head** (1.8.3) +
+the **full fused attention core** (1.8.4, X031) at a *tolerance* (transcendental / SIMD-tree-order —
+a separate gate keeps plain `--gpu` byte-identical). The **entire forward** runs on-device, and
+1.8.5 starts the backward+Adam arc. The **honest perf X-entry is done (X032):** the GPU forward is
+**2–4× slower** than the CPU at attn11's scale (per-op host↔device transfer + scalar-VALU f64
+dominate; gap narrows with scale) — a validated sovereign-stack / oracle milestone, **not** a
+speedup; the CPU stays the production path. Remaining: the backward ops (1.8.6+) → the *full training
+step end-to-end on GPU* milestone (a known perf loss, justified by completeness). All on the
+native-AMD f64 SPIR-V path (mabda 3.4.1). The v1.0 surface is frozen and additive-only
 ([`STABILITY.md`](../STABILITY.md)); the reusable numeric core lives in
 **[rosnet](https://github.com/MacCracken/rosnet)** + **[tyche](https://github.com/MacCracken/tyche)**
 (v1.1.0). **The full milestone chain M12–M17 is complete**, plus both data arcs:
@@ -431,11 +435,41 @@ for the native-AMD f64 route.
   (`nkv==nh`, `g_bidir==0`) — GQA / bidir / non-`TK`-divisible T fall back to the CPU core. With
   this, the **entire forward** can run on the GPU. `tests/gpu_attn.cyr`. Detail:
   [`../architecture/011-gpu-attention.md`](../architecture/011-gpu-attention.md).
-- **1.8.5 — backward + Adam on GPU; the honest perf X-entry.** `linear_bwd`,
-  `attn_core_bwd`, `head_bwd`, `ln_bwd`, `gelu_bwd`, `model_adam_step` — a full `--gpu`
-  training step. Then the straight GPU-vs-CPU comparison (default / preset / a larger
-  config) with the transfer-cost caveat, logged as an X-entry (expected: a wash or loss
-  at reference scale, a win only at scale — the documented honest result).
+- **Forward-perf X-entry — ✅ DONE (X032).** With the full forward on-device, measured straight:
+  GPU **2–4× slower** than CPU (default 4.2×, preset 2.2×; gap narrows with scale) — per-op
+  host↔device transfer + scalar-VALU f64 dominate. The GPU backend is the validated
+  sovereign-stack / oracle milestone, **not** a speedup. `docs/benchmarks.md` B4.
+- **The backward + Adam arc (1.8.5 → the full training step on-device).** Sequenced by a 6-agent
+  design workflow against the real seams (`qlinear_bwd` ops.cyr, `ln_bwd`/`gelu_bwd` ops.cyr,
+  `attn_core_bwd` attn.cyr, `head_bwd`/`model_adam_step` model.cyr) + the 256-id cap / synth-id
+  budget. **GO-with-caveats:** worth building for the *full-training-step-on-GPU* sovereign
+  milestone (a known perf loss, larger than the forward's — ~5 tensors transferred per op per
+  layer per step), with **three ops bit-exact** (Adam, head_bwd, ln_bwd) keeping the `--gpu`
+  checkpoint byte-identical. Order = easiest / bit-exact / shared-infra-aware:
+  - **1.8.5 — `model_adam_step` (BIT-EXACT, plain --gpu) — ✅ SHIPPED (X033).** Elementwise; no
+    reduction; in-shader f64 sqrt/div verified correctly-rounded on the hardware (1000/1000); 8
+    scalars as a uniform buffer; grid host-tiled in 65535 chunks. First bit-exact GPU backward-side
+    op → a `--gpu` checkpoint stays byte-identical incl. optimizer state. `tests/gpu_adam.cyr`.
+  - **1.8.6 — `gelu_bwd` (TOLERANCE, --gpu-tc).** Elementwise `dx = dy·gelu'(x)`; reuses
+    `_gpu_emit_exp`; no reduction/tiling. Lowest-risk genuine backward op.
+  - **1.8.7 — `linear_bwd`/`qlinear_bwd` (--gpu-tc) + the shared matmul-bwd infra.** Builds the
+    accumulating `_gpu_build_tile_dw` (dW = xᵀ·dy, sequential-m → bit-exact arithmetic) + the
+    bit-exact host-RMW-accumulate helper (zero scratch → GPU-Σ → host `f64_add` onto the caller's
+    grad); dx via `_gpu_build_tile_t` (tolerance, sequential vs CPU 4-lane-tree); db on host. The
+    highest-FLOP backward; whole op rides `--gpu-tc` (dx forces tolerance).
+  - **1.8.8 — `head_bwd` (BIT-EXACT, plain --gpu).** The CPU head_bwd is pure-scalar sequential →
+    a sequential GPU AXPY matches bit-for-bit (unlike the SIMD-tree forward head). First bit-exact
+    *gradient* op; keeps byte-identity. Reuses the 1.8.7 matmul-bwd kernels + the gemb RMW.
+  - **1.8.9 — `ln_bwd` (BIT-EXACT, plain --gpu).** Sequential reductions + sqrt/div → bit-exact;
+    4 passes, dgamma/dbeta accumulated **serialized per-row** (race-free + matches CPU order).
+  - **1.8.10 — `attn_core_bwd` (TOLERANCE, --gpu-tc) → the full `--gpu-tc` step on-device.** The
+    hardest, landed last: dP/dotPdP + the softmax-Jacobian `dscore = P·(dP − dotPdP)` (catastrophic
+    cancellation → grad-check band ~1e-12, not 1e-13), and the **dV/dK write-collision re-grid**
+    (gather over queries, one thread per key-row, not per-query). Causal MHA only.
+  - **1.8.11 — the backward perf X-entry + P(-1) hardening close-out.** Mirror X032 for the step
+    (expect a larger loss); security audit of the new device-buffer surface; ADR/arch-note; declare
+    the milestone done. (Out of scope this arc: device-resident m/v + fwd→bwd P-residency — a
+    separate fusion project.)
 - **f64 track (gate now OPEN — re-sequenceable to first-class, 2026-06-19):** the f64
   oracle no longer waits on an unshipped capability — mabda's native SPIR-V→GFX9 f64 path
   is proven on the dev Cezanne (X025). Re-run the op set on the

@@ -50,13 +50,13 @@
 #                                   AR; reward-weighted softmax-CE over rollouts)
 #   attn11 --rl-target C            REINFORCE reward = count of char C per rollout
 #                                   (default space; needs --objective rl)
-#   attn11 --gpu                    run the forward matmul + layernorm on the GPU (M18;
-#                                   native-AMD f64 SPIR-V via mabda, BIT-EXACT vs the CPU
-#                                   oracle; auto CPU fallback where no device / unsupported)
-#   attn11 --gpu-tc                 also run GELU + the LM head on the GPU (implies --gpu).
-#                                   TOLERANCE, not bit-exact (GELU: in-shader f64 exp ≠ x86
-#                                   exp; head: sequential vs the CPU's tree dot) — ~1e-13-close
-#                                   to CPU, not byte-identical
+#   attn11 --gpu                    run matmul + layernorm + the Adam step on the GPU (M18;
+#                                   native-AMD f64 SPIR-V via mabda, BIT-EXACT vs the CPU oracle —
+#                                   a --gpu checkpoint is byte-identical; auto CPU fallback)
+#   attn11 --gpu-tc                 also run GELU + the LM head + attention on the GPU (implies
+#                                   --gpu). TOLERANCE, not bit-exact (in-shader f64 exp ≠ x86 exp;
+#                                   sequential vs the CPU's tree dot) — ~1e-13-close, not
+#                                   byte-identical
 #   attn11 --help, -h               show usage and exit
 #   attn11 --version                print the version and exit
 #
@@ -131,7 +131,7 @@ fn _atoi(s): i64 {
 }
 
 # Kept in sync with the VERSION file (CI's docs job gates the match).
-fn CFG_VERSION(): i64 { return "1.8.4"; }
+fn CFG_VERSION(): i64 { return "1.8.5"; }
 
 fn usage(): i64 {
     puts("attn11 — a from-scratch GPT-style transformer, trained, in Cyrius\n");
@@ -752,9 +752,11 @@ fn main(): i64 {
     #ifndef CYRIUS_TARGET_AGNOS
     if (g_gpu == 1) {
         if ((gpu_mm_count() > 0) || (gpu_ln_count() > 0) || (gpu_gelu_count() > 0) ||
-            (gpu_head_count() > 0) || (gpu_attn_count() > 0)) {
+            (gpu_head_count() > 0) || (gpu_attn_count() > 0) || (gpu_adam_count() > 0)) {
             puts("GPU: dispatched "); fmt_int(gpu_mm_count()); puts(" matmuls + ");
-            fmt_int(gpu_ln_count()); puts(" layernorms (bit-exact)");
+            fmt_int(gpu_ln_count()); puts(" layernorms");
+            if (gpu_adam_count() > 0) { puts(" + "); fmt_int(gpu_adam_count()); puts(" adam steps"); }
+            puts(" (bit-exact)");
             if (gpu_gelu_count() > 0) { puts(" + "); fmt_int(gpu_gelu_count()); puts(" gelus"); }
             if (gpu_head_count() > 0) { puts(" + "); fmt_int(gpu_head_count()); puts(" heads"); }
             if (gpu_attn_count() > 0) { puts(" + "); fmt_int(gpu_attn_count()); puts(" attention cores"); }

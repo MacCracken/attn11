@@ -1457,3 +1457,63 @@ and does the final normalize. Reductions j-tiled (`TK=4`) so id_bound stays ≪ 
 **Scope.** Causal MHA only (`nkv==nh`, `g_bidir==0`); GQA / bidir / non-`TK`-divisible T → CPU
 fallback. Reproduce: `make gpu-test`; `./build/attn11 --gpu-tc --steps 80 --eval-corpus held.txt`
 vs CPU. Invariants: [`../architecture/011-gpu-attention.md`](../architecture/011-gpu-attention.md); ADR 0016.
+
+## X032 — M18: the honest GPU-vs-CPU forward perf measurement (the documented negative) (M18, v1.8.4, 2026-06-20)
+
+**Result.** With the full forward on the GPU (1.8.0–1.8.4), measured end-to-end training
+wall-clock on this box (AMD Cezanne gfx90c), min of 4 warm reps: the GPU forward is **2–4×
+slower** than the CPU. Default (ctx16·d32·4h·3L, 50 steps): CPU **2.94 s**, `--gpu` 10.32 s
+(3.5×), `--gpu-tc` 12.32 s (4.2×). Preset (ctx64·d64·8h·4L, 20 steps): CPU **20.50 s**, `--gpu`
+39.22 s (1.9×), `--gpu-tc` 45.44 s (2.2×). The gap **narrows with scale** (4.2×→2.2×) — more
+compute per host↔device transfer — but never closes at attn11's size. This is the documented
+honest negative; the GPU path is a **correctness / oracle / sovereign-stack** milestone, not a
+speedup, exactly as the charter + `docs/guides/gpu.md` framed it.
+
+**Root causes (ranked).** (1) **Per-op host↔device transfer** — every `gpu_*_fwd` uploads
+inputs + downloads outputs over GTT each call; no fusion, no persistent device residency; at
+attn11's tiny tensors transfer dwarfs compute (a 30-step default run is ~11k matmuls + 4k lns +
+1.8k gelus + 128 heads + 384 attn cores, each a round trip). (2) **Scalar VALU f64** — Cezanne
+has no `V_MFMA_F64` matrix core → correctness-grade, not throughput. (3) **Serialized dispatches**
+(`ceil(K/16)` per matmul; ~1+4·`ceil(T/4)` per attention). (4) **Per-process shader recompile**
+(in-process cache → cold-start tail ~2× warm; hence min-of-warm-reps).
+
+**What would change it:** a much larger model, persistent device-resident weights/activations +
+fused multi-op kernels (kill the per-op transfer), and/or matrix-core f64 hardware. None are
+attn11's scale or this silicon.
+
+**Implication for 1.8.5+ (backward + Adam on GPU):** worth building for the *full training step
+end-to-end on GPU* sovereign milestone (the charter's "gradient-based learning expressible on
+the sovereign stack" — including on-device), but it will be a **known perf loss**, not a
+throughput goal. The CPU stays the production path. Reproduce:
+`for m in "" --gpu --gpu-tc; do time ./build/attn11 $m --steps 50; done` (+ `--preset`).
+Detail: `docs/benchmarks.md` B4. Methodology note: warm back-to-back reps (cold GPU clocks/driver
+init make a first idle run ~2× slower — not representative).
+
+## X033 — M18 1.8.5: Adam optimizer step on GPU, BIT-EXACT (first backward-arc op) (M18, v1.8.5, 2026-06-20)
+
+**Result.** `gpu_adam_step` (src/gpu.cyr) at the `model_adam_step` seam runs the per-parameter Adam
+update on the native-AMD f64 SPIR-V path **bit-for-bit identical** to the CPU. It rides **plain
+`--gpu`** (bit-exact → keeps the checkpoint byte-identical, now incl. optimizer state). `tests/gpu_adam.cyr`
+(`make gpu-test`): bit-exact at NP ∈ {1000, 39488, 100000} (the last >65535 → grid-tiled), 0 diffs
+in params/m/v; end-to-end a plain `--gpu` 40-step checkpoint is byte-identical to no-flag (40 Adam
+steps + matmuls + lns on-device). First op of the backward+Adam arc toward a full training step on GPU.
+
+**Bit-exactness verified, not assumed (the key finding).** No prior bit-exact kernel used an
+in-shader f64 `sqrt` or `FDiv` (ln does `1/sqrt` on the host; GELU's `FDiv` rides tolerance). Adam
+needs both per element. A throwaway spike on the Cezanne proved mabda's Newton-Goldschmidt `sqrt`
+and Newton-reciprocal `FDiv` are **correctly-rounded**: 1000/1000 random inputs bit-identical to
+`f64_sqrt`/`f64_div`, and the full Adam formula 1000/1000 (m, v, param all exact). This unblocks
+bit-exact sqrt/div for the later bit-exact backward ops (head_bwd, ln_bwd).
+
+**Design.** Elementwise (one thread/param) → simplest op yet, no reduction, no index decomposition
+(zero div/mod synth-id pressure). The 8 scalars (b1 b2 om1 om2 eps bc1 bc2 lr) are host-computed
+identically (bc=1−β^t via f64_pow) + passed as a **uniform buffer** (never baked hex → guaranteed
+bit-identical, no per-step recompile). Grid **host-tiled in 65535 chunks** (preset g_NP≈208k > the
+1-D dispatch cap), base baked + cached (kind=12). Buffers reuse the 7-BO pool (grads→x params→W
+m→γ v→β scalars→S); params/m/v RMW in place.
+
+**Sequencing note.** The 6-agent backward-design workflow (X032 follow-on) put shared matmul-bwd
+infra first; reordered to Adam-first because Adam needs none of it, is easiest, and is bit-exact —
+every version ships a real validatable consumer; shared infra lands with linear_bwd. Reproduce:
+`make gpu-test`; `./build/attn11 --gpu --steps 40 --save /tmp/g.ckpt` vs no-flag + `cmp`. Detail:
+ADR 0016; the backward-arc sequence is in roadmap M18.

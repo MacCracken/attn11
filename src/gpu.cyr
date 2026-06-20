@@ -63,6 +63,7 @@ var _gpu_ln_count = 0;   # forward layernorms actually dispatched on-device
 var _gpu_gelu_count = 0; # forward GELUs actually dispatched on-device (tolerance)
 var _gpu_head_count = 0; # forward LM-head matmuls actually dispatched on-device (tolerance)
 var _gpu_attn_count = 0; # fused attention cores actually dispatched on-device (tolerance)
+var _gpu_adam_count = 0; # Adam optimizer steps actually dispatched on-device (bit-exact)
 
 # Counts of forward ops run on the GPU (vs CPU fallback). >0 proves the device ran.
 fn gpu_mm_count(): i64 { return _gpu_mm_count; }
@@ -70,6 +71,7 @@ fn gpu_ln_count(): i64 { return _gpu_ln_count; }
 fn gpu_gelu_count(): i64 { return _gpu_gelu_count; }
 fn gpu_head_count(): i64 { return _gpu_head_count; }
 fn gpu_attn_count(): i64 { return _gpu_attn_count; }
+fn gpu_adam_count(): i64 { return _gpu_adam_count; }
 
 # SPIR-V word emitters. op<wc> writes one <wc>-word instruction (word0 = (wc<<16)|op)
 # and returns the next byte offset. One instruction per source line → readable + ≤120c.
@@ -98,6 +100,13 @@ fn _gpu_ecf(buf, o, id, bits): i64 {
     store32(buf + o, 0x0005002B); store32(buf + o + 4, 7); store32(buf + o + 8, id);
     store32(buf + o + 12, bits & 0xFFFFFFFF); store32(buf + o + 16, (bits >> 32) & 0xFFFFFFFF);
     return o + 20;
+}
+
+# AccessChain(ptr = buf[mem][idx]) then Load(val) of an f64 — the common load-an-element pair.
+fn _gpu_acl(buf, o, ptr, val, bnd, mem, idx): i64 {
+    o = _gpu_op6(buf, o, 0x00060041, 11, ptr, bnd, mem, idx);
+    o = _gpu_op4(buf, o, 0x0004003D, 7, val, ptr);
+    return o;
 }
 
 # Generate the GPU_TK-tile RMW matmul kernel for (K, N, k0) into buf; return bytes.
@@ -1145,6 +1154,123 @@ fn gpu_attn_core(Qc, Kc, Vc, Pc, concat, T, C, nh, nkv): i64 {
     }
     i = 0; while (i < on) { store64(concat + i*8, load64(_gpu_ym + i*8)); i = i + 1; }
     _gpu_attn_count = _gpu_attn_count + 1;
+    return 0;
+}
+
+# ===========================================================================
+# 1.8.5 — Adam optimizer step on GPU, BIT-EXACT (the first backward-arc op). Elementwise over
+# the flat param vector: m=b1·m+om1·g; v=b2·v+om2·g²; p-=lr·(m/bc1)/(√(v/bc2)+eps) — EXACTLY
+# model_adam_step (model.cyr). In-shader f64 sqrt + FDiv are correctly-rounded vs the CPU
+# (verified bit-for-bit on Cezanne), so this keeps a --gpu run's checkpoint byte-identical to
+# CPU — it rides plain g_gpu (NOT g_gpu_tc). The 8 scalars (b1 b2 om1 om2 eps bc1 bc2 lr) are
+# host-computed identically + passed as a uniform buffer (no baked hex → guaranteed bit-exact);
+# grid host-tiled in MABDA_MAX_DISPATCH_DIM chunks (g_NP exceeds it at preset).
+# ===========================================================================
+
+# Adam kernel: grads=0(%15) params=1(%16) m=2(%17) v=3(%18) scalars=4(%19). consts %20..27=0..7
+# (member/scalar indices) %28=base. idx=gid.x+base. fn %30.
+fn _gpu_adam_k(buf, base): i64 {
+    var o = _gpu_pre_a(buf, 5, 30);
+    var k = 0; while (k <= 7) { o = _gpu_op4(buf, o, 0x0004002B, 4, 20+k, k); k = k+1; }
+    o = _gpu_op4(buf, o, 0x0004002B, 4, 28, base);
+    o = _gpu_op5(buf, o, 0x00050036, 2, 30, 0, 3); o = _gpu_op2(buf, o, 0x000200F8, 31);
+    o = _gpu_op4(buf, o, 0x0004003D, 5, 32, 14);
+    o = _gpu_op5(buf, o, 0x00050051, 4, 33, 32, 0);          # gid.x
+    o = _gpu_op5(buf, o, 0x00050080, 4, 34, 33, 28);        # idx = gid.x + base
+    var nid = 35;
+    # load b1 b2 om1 om2 eps bc1 bc2 lr from scalars(%19); g m v p from their bindings (idx %34)
+    var b1=nid+1;  o=_gpu_acl(buf,o,nid,b1,19,20,20); nid=nid+2;
+    var b2=nid+1;  o=_gpu_acl(buf,o,nid,b2,19,20,21); nid=nid+2;
+    var om1=nid+1; o=_gpu_acl(buf,o,nid,om1,19,20,22); nid=nid+2;
+    var om2=nid+1; o=_gpu_acl(buf,o,nid,om2,19,20,23); nid=nid+2;
+    var eps=nid+1; o=_gpu_acl(buf,o,nid,eps,19,20,24); nid=nid+2;
+    var bc1=nid+1; o=_gpu_acl(buf,o,nid,bc1,19,20,25); nid=nid+2;
+    var bc2=nid+1; o=_gpu_acl(buf,o,nid,bc2,19,20,26); nid=nid+2;
+    var lr=nid+1;  o=_gpu_acl(buf,o,nid,lr,19,20,27); nid=nid+2;
+    var g=nid+1;   o=_gpu_acl(buf,o,nid,g,15,20,34); nid=nid+2;
+    var pm=nid;    var mo=nid+1; o=_gpu_acl(buf,o,pm,mo,17,20,34); nid=nid+2;
+    var pv=nid;    var vo=nid+1; o=_gpu_acl(buf,o,pv,vo,18,20,34); nid=nid+2;
+    var pp=nid;    var po=nid+1; o=_gpu_acl(buf,o,pp,po,16,20,34); nid=nid+2;
+    var t1=nid; nid=nid+1; o=_gpu_op5(buf,o,0x00050085,7,t1,b1,mo);
+    var t2=nid; nid=nid+1; o=_gpu_op5(buf,o,0x00050085,7,t2,om1,g);
+    var mn=nid; nid=nid+1; o=_gpu_op5(buf,o,0x00050081,7,mn,t1,t2);
+    var gg=nid; nid=nid+1; o=_gpu_op5(buf,o,0x00050085,7,gg,g,g);
+    var t3=nid; nid=nid+1; o=_gpu_op5(buf,o,0x00050085,7,t3,b2,vo);
+    var t4=nid; nid=nid+1; o=_gpu_op5(buf,o,0x00050085,7,t4,om2,gg);
+    var vn=nid; nid=nid+1; o=_gpu_op5(buf,o,0x00050081,7,vn,t3,t4);
+    o=_gpu_op3(buf,o,0x0003003E,pm,mn); o=_gpu_op3(buf,o,0x0003003E,pv,vn);
+    var mh=nid;nid=nid+1;o=_gpu_op5(buf,o,0x00050088,7,mh,mn,bc1);
+    var vh=nid;nid=nid+1;o=_gpu_op5(buf,o,0x00050088,7,vh,vn,bc2);
+    var sq=nid;nid=nid+1;o=_gpu_op6(buf,o,0x0006000C,7,sq,1,31,vh);
+    var den=nid;nid=nid+1;o=_gpu_op5(buf,o,0x00050081,7,den,sq,eps);
+    var upd=nid;nid=nid+1;o=_gpu_op5(buf,o,0x00050088,7,upd,mh,den);
+    var lu=nid;nid=nid+1;o=_gpu_op5(buf,o,0x00050085,7,lu,lr,upd);
+    var pn=nid;nid=nid+1;o=_gpu_op5(buf,o,0x00050083,7,pn,po,lu);
+    o=_gpu_op3(buf,o,0x0003003E,pp,pn);
+    o = _gpu_op2(buf, o, 0x000100FD, 0x00010038); store32(buf+12, nid); return o;
+}
+
+# Compile+cache an Adam kernel (kind 12, keyed by base).
+fn _gpu_get_adam(base): i64 {
+    var key = (12 << 56) | base;
+    var c = _gpu_cache_get(key);
+    if (c == (0 - 1)) { return 0; }
+    if (c != 0) { return c; }
+    var spv[8192];
+    var nbytes = _gpu_adam_k(&spv, base);
+    var shmod = gpu_shader_module_create_spirv(_gpu_ctx, &spv, nbytes);
+    if (shmod == 0) { _gpu_cache_put(key, 0 - 1); return 0; }
+    _gpu_cache_put(key, shmod);
+    return shmod;
+}
+
+# GPU Adam step (BIT-EXACT, plain --gpu). Mirrors model_adam_step over g_params/g_grads/
+# g_adam_m/g_adam_v (NP = g_NP). Returns 0 = ran on device, -1 = use CPU. lr is an f64 bit
+# pattern; step is the 1-based Adam timestep.
+fn gpu_adam_step(lr, step): i64 {
+    if (_gpu_init() == 0) { return 0 - 1; }
+    var NP = g_NP;
+    if ((NP * 8) > GPU_BO_MAX()) { return 0 - 1; }
+    # host-compute the 8 scalars EXACTLY as model_adam_step (bit-identical inputs)
+    var b1 = f64_div(f64_from(9), f64_from(10));
+    var b2 = f64_div(f64_from(999), f64_from(1000));
+    var om1 = f64_div(f64_from(1), f64_from(10));
+    var om2 = f64_div(f64_from(1), f64_from(1000));
+    var eps = f64_div(f64_from(1), f64_from(100000000));
+    var one = f64_from(1);
+    var bc1 = f64_sub(one, f64_pow(b1, f64_from(step)));
+    var bc2 = f64_sub(one, f64_pow(b2, f64_from(step)));
+    store64(_gpu_sm + 0, b1); store64(_gpu_sm + 8, b2); store64(_gpu_sm + 16, om1);
+    store64(_gpu_sm + 24, om2); store64(_gpu_sm + 32, eps); store64(_gpu_sm + 40, bc1);
+    store64(_gpu_sm + 48, bc2); store64(_gpu_sm + 56, lr);
+    # upload grads→x, params→W, m→gamma, v→beta
+    var i = 0;
+    while (i < NP) { store64(_gpu_xm + i*8, load64(g_grads + i*8)); i = i + 1; }
+    i = 0; while (i < NP) { store64(_gpu_wm + i*8, load64(g_params + i*8)); i = i + 1; }
+    i = 0; while (i < NP) { store64(_gpu_gm + i*8, load64(g_adam_m + i*8)); i = i + 1; }
+    i = 0; while (i < NP) { store64(_gpu_bbm + i*8, load64(g_adam_v + i*8)); i = i + 1; }
+    # dispatch in MABDA_MAX_DISPATCH_DIM chunks (g_NP exceeds it at preset)
+    var base = 0;
+    while (base < NP) {
+        var n = NP - base;
+        if (n > MABDA_MAX_DISPATCH_DIM) { n = MABDA_MAX_DISPATCH_DIM; }
+        var sh = _gpu_get_adam(base);
+        if (sh == 0) { return 0 - 1; }
+        var bp[96];
+        store64(&bp+0, 5);
+        store64(&bp+8, _gpu_xh); store64(&bp+16, _GPU_XVA());
+        store64(&bp+24, _gpu_wh); store64(&bp+32, _GPU_WVA());
+        store64(&bp+40, _gpu_gh); store64(&bp+48, _GPU_GVA());
+        store64(&bp+56, _gpu_bbh); store64(&bp+64, _GPU_BVA());
+        store64(&bp+72, _gpu_sh); store64(&bp+80, _GPU_SVA());
+        if (gpu_compute_dispatch(_gpu_ctx, sh, n, 1, 1, &bp) != 0) { return 0 - 1; }
+        base = base + n;
+    }
+    # download params/m/v (RMW in place in the BOs)
+    i = 0; while (i < NP) { store64(g_params + i*8, load64(_gpu_wm + i*8)); i = i + 1; }
+    i = 0; while (i < NP) { store64(g_adam_m + i*8, load64(_gpu_gm + i*8)); i = i + 1; }
+    i = 0; while (i < NP) { store64(g_adam_v + i*8, load64(_gpu_bbm + i*8)); i = i + 1; }
+    _gpu_adam_count = _gpu_adam_count + 1;
     return 0;
 }
 
