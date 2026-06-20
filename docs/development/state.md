@@ -26,8 +26,10 @@ Validated by `tests/gpu_matmul.cyr` (`make gpu-test`, X027): `gpu_matmul_fwd` vs
 cleanly with no GPU, so the grad-check total stays environment-independent), **not** in the
 CI release gate. End-to-end: a `--gpu` 40-step run's checkpoint is byte-identical to CPU's.
 **1056** grad-checks unchanged green x86_64 **and** aarch64/qemu (mabda cross-compiles; no
-device under qemu → clean CPU fallback); lint clean; fuzz + `make smoke` green; no-flag run
-byte-identical to pre-M18 (proven vs the HEAD binary). New files `src/gpu.cyr` (the backend)
+device under qemu → clean CPU fallback); **AGNOS static-ELF builds clean** (main + suites; a
+one-line `#ifdef CYRIUS_TARGET_AGNOS var SYS_IOCTL = 16` lets the auto-prepended Linux-only
+mabda dep type-check as dead code there — cyrius has no target-conditional deps); lint clean;
+fuzz + `make smoke` green; no-flag run byte-identical to pre-M18 (proven vs the HEAD binary). New files `src/gpu.cyr` (the backend)
 + `tests/gpu_matmul.cyr`; invariants in
 [`../architecture/008-gpu-matmul-spirv.md`](../architecture/008-gpu-matmul-spirv.md).
 **Binary SIZE (a cost, never a gate):** `qlinear_fwd` now references `src/gpu.cyr`, so every

@@ -7,8 +7,16 @@
 
 include "lib/tyche.cyr"          # extracted PRNG (rng_*, _rng_state)
 include "lib/rosnet.cyr"         # extracted tensor/BLAS-1/matmul (+ gradient)
-include "lib/mabda.cyr"          # M18: GPU foundation (ops.cyr's qlinear_fwd hook needs it)
-include "src/gpu.cyr"            # M18: --gpu matmul backend (g_gpu==0 here → CPU, byte-identical)
+# mabda (Linux-only GPU dep) auto-prepends from [deps.mabda] on all targets; on AGNOS it is
+# dead code but still references SYS_IOCTL (absent from the agnos syscall peer) — define it so
+# the auto-prepended dep compiles. The GPU backend (src/gpu.cyr) that consumes it is Linux-gated
+# (g_gpu==0 here regardless → the CPU oracle path, byte-identical).
+#ifdef CYRIUS_TARGET_AGNOS
+var SYS_IOCTL = 16;
+#endif
+#ifndef CYRIUS_TARGET_AGNOS
+include "src/gpu.cyr"            # M18: --gpu matmul backend (qlinear_fwd hook; CPU here)
+#endif
 include "src/tensor.cyr"
 include "src/fileio.cyr"
 include "src/ops.cyr"

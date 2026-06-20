@@ -52,7 +52,17 @@ dispatched 17 514 forward matmuls in a default 30-step run.
 **Gate.** `--gpu` matmul bit-exact vs `linear_fwd` (X027); no-flag run byte-identical to
 pre-M18 (proven against the HEAD binary); **1056** grad-checks green on x86_64 **and**
 aarch64/qemu (mabda cross-compiles; the device is absent under qemu → clean CPU fallback);
-lint clean; fuzz + `make smoke` green. **Cost (not a gate):** `qlinear_fwd` now pulls in
+**AGNOS static-ELF builds clean** (main + grad-check/fuzz/bench suites); lint clean; fuzz +
+`make smoke` green.
+
+**AGNOS cross-target note.** cyrius auto-prepends a dep's `modules` on *every* target
+(including `--agnos`), with no target-conditional dep syntax — so mabda is injected into the
+AGNOS build even though it is Linux-only (`syscall(SYS_IOCTL, …)` for DRM, a constant the
+AGNOS syscall peer omits). The whole GPU path is `#ifndef CYRIUS_TARGET_AGNOS`-gated (the
+`src/gpu.cyr` include, the `--gpu` flag, the `g_gpu`/`gpu_matmul_fwd` refs in `qlinear_fwd`),
+so mabda's ioctl code is dead code on AGNOS — a one-line `#ifdef CYRIUS_TARGET_AGNOS
+var SYS_IOCTL = 16;` lets the auto-prepended dep type-check there. See
+[`docs/architecture/008-gpu-matmul-spirv.md`](docs/architecture/008-gpu-matmul-spirv.md). **Cost (not a gate):** `qlinear_fwd` now pulls in
 `lib/mabda.cyr`, so every binary that includes `ops.cyr` carries mabda's ~1 MB dist (binary
 ~373 KB → ~1.34 MB) until cyrius ships `dep-module-call` (slims back with zero attn11 change).
 mabda is **consumed, never modified** (ADR 0016). Pin `mabda = 3.4.1` (the collision-fixed

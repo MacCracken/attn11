@@ -83,3 +83,24 @@ The cost: `qlinear_fwd` now references `gpu.cyr`, so every harness that includes
 (main, `.tcyr`, `.fcyr`, `.bcyr`) pulls in `lib/mabda.cyr` (~1 MB dist → binary ~373 KB →
 ~1.34 MB). That is a transient binary-SIZE cost pending cyrius `dep-module-call`; it never
 gated M18. With `g_gpu == 0` the path is the unchanged CPU code (byte-identical).
+
+## AGNOS: mabda auto-prepends on EVERY target — gate the consumer, stub the one symbol
+
+cyrius auto-prepends a declared dep's `modules` (`[deps.mabda] modules = ["dist/mabda.cyr"]`)
+into **every** build, including `--agnos` — and there is no target-conditional dependency
+syntax, nor a way to fetch a dep without auto-prepending it (dropping `modules` stops the
+fetch entirely). So `#ifndef CYRIUS_TARGET_AGNOS` around an *explicit* `include "lib/mabda.cyr"`
+does nothing: mabda is injected regardless (the explicit include was redundant — removed).
+
+mabda is **Linux-only** (it `syscall(SYS_IOCTL, …)` for DRM), and the AGNOS ring-3 syscall
+peer omits `SYS_IOCTL`, so the auto-prepended dep failed to compile for `--agnos`. The fix,
+given the constraints (can't modify vendored `lib/`, can't make the dep conditional): on
+AGNOS the entire GPU path is already gated out (`#ifndef CYRIUS_TARGET_AGNOS` on the
+`src/gpu.cyr` include, the `--gpu` flag, and the `g_gpu`/`gpu_matmul_fwd` refs in
+`qlinear_fwd`), so mabda's ioctl code is **dead code** there — it only needs to *type-check*.
+A one-line `#ifdef CYRIUS_TARGET_AGNOS  var SYS_IOCTL = 16;  #endif` (in `main.cyr` and each
+harness, before the includes) satisfies the reference; cyrius resolves top-level globals
+whole-program, so the def is found even though mabda is prepended ahead of it. On Linux the
+stdlib syscalls peer owns `SYS_IOCTL`, so the `#ifdef` avoids a duplicate definition; on
+aarch64-Linux mabda compiles unchanged (`SYS_IOCTL` is in the aarch64 syscall peer). Result:
+AGNOS builds (main + grad-check/fuzz/bench suites) are clean static ELFs, GPU-free.

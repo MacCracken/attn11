@@ -62,10 +62,24 @@
 # (heads not dividing d_model, kv-heads not dividing heads) abort cleanly in
 # model_init.
 
+# M18 GPU backend rides mabda's native-AMD DRM path — Linux-only. cyrius auto-prepends a
+# declared dep's `modules` on EVERY target (incl. --agnos), and mabda references SYS_IOCTL
+# (DRM ioctls) which the AGNOS ring-3 syscall peer omits. On AGNOS the whole GPU path is
+# #ifndef-guarded out (no `--gpu` flag, src/gpu.cyr not included, g_gpu unsettable), so
+# mabda's ioctl functions are DEAD CODE there — they only need to *compile*. Provide the
+# one missing constant for AGNOS so the auto-prepended dep type-checks; it is never invoked.
+# (On Linux the stdlib syscalls peer owns SYS_IOCTL — this #ifdef avoids a duplicate def.)
+#ifdef CYRIUS_TARGET_AGNOS
+var SYS_IOCTL = 16;
+#endif
+
 include "lib/tyche.cyr"          # extracted PRNG (rng_*, _rng_state)
 include "lib/rosnet.cyr"         # extracted tensor/BLAS-1/matmul (+ gradient)
-include "lib/mabda.cyr"          # M18: GPU foundation (native-AMD f64 SPIR-V compute)
+# mabda itself is auto-prepended from [deps.mabda] on all targets (see above); only the
+# attn11-local GPU backend that consumes it is gated — AGNOS keeps qlinear_fwd pure CPU.
+#ifndef CYRIUS_TARGET_AGNOS
 include "src/gpu.cyr"            # M18: --gpu matmul backend on mabda (ADR 0016)
+#endif
 include "src/tensor.cyr"
 include "src/fileio.cyr"
 include "src/ops.cyr"
@@ -200,7 +214,9 @@ fn main(): i64 {
         elif (streq(a, "--save") == 1) { i = i + 1; save_path = _av(i, a); }
         elif (streq(a, "--steps") == 1) { i = i + 1; steps = _atoi(_av(i, a)); }
         elif (streq(a, "--gen-only") == 1) { gen_only = 1; }
+        #ifndef CYRIUS_TARGET_AGNOS
         elif (streq(a, "--gpu") == 1) { g_gpu = 1; }
+        #endif
         elif (streq(a, "--preset") == 1) { cfg_c = 64; cfg_t = 64; cfg_nh = 8; cfg_nl = 4; }
         elif (streq(a, "--heads") == 1) { i = i + 1; cfg_nh = _atoi(_av(i, a)); }
         elif (streq(a, "--kv-heads") == 1) { i = i + 1; cfg_nkv = _atoi(_av(i, a)); }
@@ -256,8 +272,11 @@ fn main(): i64 {
     }
     # M18: report GPU status once when --gpu is requested (the matmul backend lazily
     # brings the device up on first use; this is just a user-facing probe). A missing
-    # device is non-fatal — qlinear_fwd self-falls-back to the CPU oracle.
+    # device is non-fatal — qlinear_fwd self-falls-back to the CPU oracle. (Linux-only;
+    # --gpu isn't a recognized flag on AGNOS, so g_gpu cannot be set there.)
+    #ifndef CYRIUS_TARGET_AGNOS
     if (g_gpu == 1) { gpu_probe(); }
+    #endif
     if (cfg_nkv == 0) { cfg_nkv = cfg_nh; }
     # MLA uses full heads (the cache compression is the latent, not head-sharing);
     # force nkv = nh and default d_c to C/2 (~4x KV-cache cut vs MHA's 2*Ckv) when
@@ -724,6 +743,7 @@ fn main(): i64 {
     }
 
     # M18: report GPU engagement so a silent CPU fallback is never mistaken for a GPU run.
+    #ifndef CYRIUS_TARGET_AGNOS
     if (g_gpu == 1) {
         if (gpu_mm_count() > 0) {
             puts("GPU: dispatched "); fmt_int(gpu_mm_count());
@@ -732,6 +752,7 @@ fn main(): i64 {
             puts("GPU: requested but no matmul ran on-device — CPU fallback was used throughout\n");
         }
     }
+    #endif
 
     return rc;
 }

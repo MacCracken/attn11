@@ -695,11 +695,15 @@ fn ternary_quant(W, out, K, N): i64 {
 # byte-identical.
 fn qlinear_fwd(x, W, b, y, M, K, N): i64 {
     if (g_ternary == 0) {
+        #ifndef CYRIUS_TARGET_AGNOS
         if (g_gpu == 1) { if (gpu_matmul_fwd(x, W, b, y, M, K, N) == 0) { return 0; } }
+        #endif
         return linear_fwd(x, W, b, y, M, K, N);
     }
     ternary_quant(W, g_qscratch, K, N);
+    #ifndef CYRIUS_TARGET_AGNOS
     if (g_gpu == 1) { if (gpu_matmul_fwd(x, g_qscratch, b, y, M, K, N) == 0) { return 0; } }
+    #endif
     return linear_fwd(x, g_qscratch, b, y, M, K, N);
 }
 fn qlinear_bwd(x, W, dy, dx, dW, db, M, K, N): i64 {
