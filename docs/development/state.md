@@ -5,7 +5,35 @@
 
 ## Version
 
-**1.8.0** — *M18: the GPU compute backend — `--gpu` forward matmul on the native-AMD
+**1.8.1** — *M18 1.8.1: layernorm forward on the GPU — bit-exact, the second `--gpu` op*
+(E-infra; ADR 0016, X028). Extends `--gpu` from matmul (1.8.0) to **`ln_fwd`** (~2×/layer).
+Same native-AMD f64 SPIR-V path (mabda 3.4.1); **bit-exact** vs the CPU `ln_fwd` oracle —
+a `--gpu` run's checkpoint is **byte-identical** to the no-flag run with **both** matmul and
+layernorm on-device (verified 30 steps: 17,514 matmuls + 6,811 layernorms dispatched,
+identical checkpoint). **The transcendental wall (the gating finding):** `ln_fwd`'s
+reductions are **sequential** and use only sqrt/div → bit-exact; but **softmax** and **GELU**
+(=`tanh`=exp-based) need `f64_exp`, an **x86 hardware builtin** with no SPIR-V bit-exact
+equivalent (and mabda's native path has no f64 transcendentals), and **`head_fwd`**/QK dots
+use SIMD **tree** reductions (different order) — so they cannot be bit-exact and are a
+separately-gated next increment (in-shader polynomial exp at a *tolerance*, which would break
+byte-identity). 1.8.1 ships only the op that **keeps the invariant**. **Implementation:** the
+256-id compile cap forbids a per-row unroll, so ln is **3-pass host-tiled** — (1) tiled Σx →
+`S`, host `mean=S/C`; (2) tiled Σ(x−mu)² → `V`, host `rstd=1/√(V/C+eps)`; (3) elementwise
+normalize — with `mean`/`rstd` written for the CPU backward. Three generated SPIR-V kernels
+share a new `_gpu_pre` preamble; the GTT buffer set grew 3→7 via a clean alloc/teardown pair
+(matmul re-validated, no regression). `gpu_ln_fwd` hooked at `ln_fwd` (`ops.cyr`), g_gpu-gated
++ `#ifndef CYRIUS_TARGET_AGNOS`; per-shape CPU fallback (no device / `C`∤16 / over limits).
+Validated by `tests/gpu_ln.cyr` (`make gpu-test`, X028): bit-exact (y+mean+rstd) across
+default 16×32 / preset 64×64 / decode 1×32 / wide 8×128, engagement proven, `C=24` fallback
+checked; the 1.8.0 matmul test re-passes. **1056** grad-checks green x86_64 **and**
+aarch64/qemu; AGNOS static-ELF builds clean (GPU guarded out + `SYS_IOCTL` stub); lint clean;
+fuzz + `make smoke` green; `--gpu` run byte-identical to no-flag. Binary unchanged in
+character (mabda already vendored at 1.8.0); pin `mabda = 3.4.1`. New `tests/gpu_ln.cyr`;
+invariants in [`../architecture/009-gpu-layernorm-and-the-transcendental-wall.md`](../architecture/009-gpu-layernorm-and-the-transcendental-wall.md).
+The cyrius pin stays **6.2.29** (installed cycc 6.2.30 warns of drift, builds+runs clean —
+separate realign). `src/*.cyr` unchanged except the additive GPU wiring + CFG_VERSION.
+
+(**1.8.0** — *M18: the GPU compute backend — `--gpu` forward matmul on the native-AMD
 f64 SPIR-V path, bit-exact vs the CPU oracle* (E-infra; ADR 0016, X027). The first
 execution-target milestone. The hand-derived forward matmul now dispatches to the GPU
 behind **`--gpu`**, riding **mabda 3.4.1**'s in-tree SPIR-V→GFX9 f64 emitter
@@ -38,7 +66,7 @@ binary **373,504 → ~1,376,680 B** — until cyrius ships `dep-module-call` (sl
 zero attn11 change). mabda is **consumed, never modified**; pin **`mabda = 3.4.1`** (the
 collision-fixed release). The cyrius toolchain pin stays **6.2.29**; the installed cycc
 (6.2.30) warns of drift but builds + runs clean on both arches (the realign is separate
-maintenance). `src/*.cyr` unchanged except the additive GPU wiring + CFG_VERSION.
+maintenance). `src/*.cyr` unchanged except the additive GPU wiring + CFG_VERSION.)
 
 (**1.7.4** — *Toolchain realign (cyrius 6.2.27 → 6.2.29) + M18 GPU-arc unblock verified*
 (maintenance + a milestone-status finding). The installed cycc rolled ahead of the pin (drift

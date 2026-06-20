@@ -27,12 +27,18 @@ On start `--gpu` reports the device (`native AMD compute device online` / `f64 S
 compute supported`); after the run it reports how many forward matmuls actually dispatched
 on-device, so a silent CPU fallback is never mistaken for a GPU run.
 
-What runs on GPU: the matmul at the `qlinear_fwd` seam — Q/K/V and the output projection,
-and the MLP up/down (~80% of FLOPs). The tied-weight LM head, the attention core, and the
-`lin`/`ssm` mixers stay on CPU. Backward + Adam stay on CPU until 1.8.2. Each matmul
-self-falls-back to CPU if the device is absent, the contraction dimension `K` is not a
-multiple of `GPU_TK` (16), or a buffer/dispatch limit is exceeded — all of attn11's
-default/preset matmul shapes (K ∈ {32,64,128,256}) run on-device.
+What runs on GPU (all **bit-exact** vs the CPU oracle):
+- **matmul** at the `qlinear_fwd` seam — Q/K/V + output projection, MLP up/down (~80% of
+  FLOPs) — 1.8.0.
+- **layernorm** (`ln_fwd`) — run ~2×/layer — 1.8.1.
+
+What stays on CPU: **softmax** and **GELU** hit the *transcendental wall* — they need f64
+`exp`, an x86 hardware builtin with no bit-exact SPIR-V equivalent (so they can't be
+bit-exact; a tolerance-validated in-shader exp is the 1.8.2 increment). The tied-weight LM
+head + attention QK dots use a SIMD tree-reduction order (a future kernel). Backward + Adam
+stay on CPU. Each op self-falls-back to CPU if the device is absent, the contraction
+dimension isn't a multiple of `GPU_TK` (16), or a buffer/dispatch limit is exceeded — all of
+attn11's default/preset shapes (matmul K ∈ {32,64,128,256}; ln C ∈ {32,64}) run on-device.
 
 ## Verify it
 
@@ -40,11 +46,12 @@ default/preset matmul shapes (K ∈ {32,64,128,256}) run on-device.
 make gpu-test     # build + run tests/gpu_matmul.cyr
 ```
 
-This validates `gpu_matmul_fwd` against the CPU `linear_fwd` oracle across attn11's real
-shapes (bit-exact), proves the device actually engaged, and checks the K-not-tileable CPU
-fallback. On a box with no AMD GPU it **skips cleanly** (exit 0) — so it is a standalone
-target, *not* part of `make release` (the CI gate runs without a GPU). The end-to-end
-oracle check is byte-identity of the checkpoints:
+This builds + runs `tests/gpu_matmul.cyr` (matmul) and `tests/gpu_ln.cyr` (layernorm),
+validating `gpu_matmul_fwd`/`gpu_ln_fwd` against the CPU `linear_fwd`/`ln_fwd` oracles across
+attn11's real shapes (bit-exact), proving the device actually engaged, and checking the
+shape-not-tileable CPU fallback. On a box with no AMD GPU they **skip cleanly** (exit 0) — so
+it is a standalone target, *not* part of `make release` (the CI gate runs without a GPU). The
+end-to-end oracle check is byte-identity of the checkpoints:
 
 ```sh
 ./build/attn11 --steps 40 --save /tmp/cpu.ckpt
@@ -64,8 +71,10 @@ larger model and/or matrix-core f64 hardware (a future mabda capability).
 
 - Backend + kernel generator: [`src/gpu.cyr`](../../src/gpu.cyr).
 - The non-obvious constraints (no SPIR-V loops/phi, the 256-id compile cap → host-tiling,
-  the reserved-VA layout, why it's bit-exact):
+  the reserved-VA layout, why matmul is bit-exact):
   [`../architecture/008-gpu-matmul-spirv.md`](../architecture/008-gpu-matmul-spirv.md).
+- Layernorm (3-pass tiled reduction) + the transcendental wall (why softmax/GELU aren't on
+  GPU): [`../architecture/009-gpu-layernorm-and-the-transcendental-wall.md`](../architecture/009-gpu-layernorm-and-the-transcendental-wall.md).
 - The boundary decision (kernels are rosnet's GPU backend layered on mabda, never in mabda)
   + the f32→f64 sequencing (inverted to f64-first on AMD):
   [ADR 0016](../adr/0016-gpu-backend-layered-on-mabda.md).

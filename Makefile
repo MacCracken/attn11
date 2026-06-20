@@ -43,6 +43,7 @@ compete-bench:
 gpu-test:
 	@mkdir -p build
 	cyrius build tests/gpu_matmul.cyr build/gpu_matmul && ./build/gpu_matmul
+	cyrius build tests/gpu_ln.cyr build/gpu_ln && ./build/gpu_ln
 
 build:
 	@mkdir -p build

@@ -13,9 +13,12 @@
 
 ## Where we are
 
-Current: **v1.8.0** — **M18 shipped**: the `--gpu` forward matmul runs on the native-AMD
-f64 SPIR-V path (mabda 3.4.1), bit-exact vs the CPU oracle (ADR 0016, X027; see the M18
-section below). The v1.0 surface is frozen and additive-only
+Current: **v1.8.1** — **M18 in progress**: the `--gpu` forward runs **matmul** (1.8.0, X027)
+**+ layernorm** (1.8.1, X028) on the native-AMD f64 SPIR-V path (mabda 3.4.1), both bit-exact
+vs the CPU oracle (a `--gpu` run is byte-identical to the no-flag run). The remaining forward
+ops (softmax/GELU) hit the **transcendental wall** (no bit-exact f64 `exp` on the GPU) and are
+the next, tolerance-validated increment — see the M18 section below. The v1.0 surface is
+frozen and additive-only
 ([`STABILITY.md`](../STABILITY.md)); the reusable numeric core lives in
 **[rosnet](https://github.com/MacCracken/rosnet)** + **[tyche](https://github.com/MacCracken/tyche)**
 (v1.1.0). **The full milestone chain M12–M17 is complete**, plus both data arcs:
@@ -389,10 +392,27 @@ for the native-AMD f64 route.
   the attn11-local GPU layer (to be extracted to rosnet's GPU backend) + the validation
   harness (`tests/gpu_matmul.cyr`, `make gpu-test`); every later op reuses the pattern. The
   **portable f32 / WGSL path** for non-AMD GPUs is now a later increment, not the entry point.
-- **1.8.1 — the rest of the forward on GPU.** WGSL kernels for `attn_core_fwd`,
-  `head_fwd`, `ln_fwd`, `gelu_fwd`, `softmax` — a full `--gpu` forward, each op
-  f32-validated against its CPU f64 reference.
-- **1.8.2 — backward + Adam on GPU; the honest perf X-entry.** `linear_bwd`,
+- **1.8.1 — `ln_fwd` on GPU, BIT-EXACT — ✅ SHIPPED (X028).** Re-scoped from "the whole
+  rest of the forward" by **the transcendental wall** (the gating finding, X028): the only
+  other forward ops are `softmax`/`GELU` (need `f64_exp` — an x86 hardware builtin with no
+  SPIR-V bit-exact equivalent; mabda's native path has no f64 transcendentals) and
+  `head_fwd`/QK dots (SIMD **tree** reductions, a different rounding order). `ln_fwd` alone
+  is bit-exact (sequential reductions + sqrt/div), so it ships first and **keeps the
+  byte-identical `--gpu` invariant**. 3-pass host-tiled (the 256-id cap forbids a per-row
+  unroll): tiled Σx → mean, tiled Σ(x−mu)² → rstd, elementwise normalize; mean/rstd written
+  for the CPU backward. `gpu_ln_fwd` at the `ln_fwd` seam; `tests/gpu_ln.cyr`. Detail:
+  [`../architecture/009-gpu-layernorm-and-the-transcendental-wall.md`](../architecture/009-gpu-layernorm-and-the-transcendental-wall.md).
+- **1.8.2 — softmax + GELU on GPU (TOLERANCE-validated) — the transcendental increment.**
+  Hand-roll an in-shader f64 `exp` (polynomial range-reduction over the proven
+  add/mul/fma/div/ldexp primitives) for `softmax` (attn scores + masked-CE) and `gelu_fwd`.
+  Unlike 1.8.0/1.8.1 these are **NOT bit-exact** (the in-shader exp ≠ the x86 builtin), so
+  they introduce the dual-precision **tolerance** gate ADR 0016 anticipated (f64-tight, e.g.
+  maxrel ~1e-12) + a loss-descends/never-NaN statistical check — and a `--gpu` run with them
+  on is *tolerance-close*, not byte-identical (so they stay opt-in behind a sub-flag or land
+  once the tolerance story is accepted). `head_fwd`/QK dots (bit-exact but needing a
+  tree-reduction kernel) fold in here too. This is the increment that makes a *full* `--gpu`
+  forward.
+- **1.8.3 — backward + Adam on GPU; the honest perf X-entry.** `linear_bwd`,
   `attn_core_bwd`, `head_bwd`, `ln_bwd`, `gelu_bwd`, `model_adam_step` — a full `--gpu`
   training step. Then the straight GPU-vs-CPU comparison (default / preset / a larger
   config) with the transfer-cost caveat, logged as an X-entry (expected: a wash or loss

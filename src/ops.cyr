@@ -30,6 +30,11 @@ fn _gelu_a(): i64 { return f64_div(f64_from(44715), f64_from(1000000)); } # 0.04
 # Source: Ba, Kiros, Hinton (2016), "Layer Normalization", arXiv:1607.06450.
 # ===========================================================================
 fn ln_fwd(x, gamma, beta, y, mean, rstd, M, C): i64 {
+    # M18 1.8.1: with --gpu the layernorm runs on the GPU (bit-exact vs this CPU path,
+    # writes mean/rstd for the CPU backward), self-falling-back for any unsupported shape.
+    #ifndef CYRIUS_TARGET_AGNOS
+    if (g_gpu == 1) { if (gpu_ln_fwd(x, gamma, beta, y, mean, rstd, M, C) == 0) { return 0; } }
+    #endif
     var eps = _eps_ln();
     var invC = f64_div(f64_from(1), f64_from(C));
     var m = 0;

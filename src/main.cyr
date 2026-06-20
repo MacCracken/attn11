@@ -50,9 +50,9 @@
 #                                   AR; reward-weighted softmax-CE over rollouts)
 #   attn11 --rl-target C            REINFORCE reward = count of char C per rollout
 #                                   (default space; needs --objective rl)
-#   attn11 --gpu                    run the forward matmul on the GPU (M18; native-AMD
-#                                   f64 SPIR-V via mabda, bit-exact vs the CPU oracle;
-#                                   auto CPU fallback where no device / unsupported)
+#   attn11 --gpu                    run the forward matmul + layernorm on the GPU (M18;
+#                                   native-AMD f64 SPIR-V via mabda, bit-exact vs the CPU
+#                                   oracle; auto CPU fallback where no device / unsupported)
 #   attn11 --help, -h               show usage and exit
 #   attn11 --version                print the version and exit
 #
@@ -127,7 +127,7 @@ fn _atoi(s): i64 {
 }
 
 # Kept in sync with the VERSION file (CI's docs job gates the match).
-fn CFG_VERSION(): i64 { return "1.8.0"; }
+fn CFG_VERSION(): i64 { return "1.8.1"; }
 
 fn usage(): i64 {
     puts("attn11 — a from-scratch GPT-style transformer, trained, in Cyrius\n");
@@ -160,7 +160,7 @@ fn usage(): i64 {
     puts("  --ternary       BitNet-style ternary weights {-1,0,+1} (mha + dense + ar; STE backward)\n");
     puts("  --decode-steps N   diffusion decode iterations (default = ctx)\n");
     puts("  --decode-schedule S  diffusion unmask schedule: cosine (default) or linear\n");
-    puts("  --gpu           run the forward matmul on the GPU (native-AMD f64; CPU stays the oracle + fallback)\n");
+    puts("  --gpu           forward matmul + layernorm on the GPU (native-AMD f64; CPU stays oracle + fallback)\n");
     puts("  --help, -h      show this help and exit\n");
     puts("  --version       print the version and exit\n");
     return 0;
@@ -745,11 +745,11 @@ fn main(): i64 {
     # M18: report GPU engagement so a silent CPU fallback is never mistaken for a GPU run.
     #ifndef CYRIUS_TARGET_AGNOS
     if (g_gpu == 1) {
-        if (gpu_mm_count() > 0) {
-            puts("GPU: dispatched "); fmt_int(gpu_mm_count());
-            puts(" forward matmuls on-device (CPU oracle bit-exact)\n");
+        if ((gpu_mm_count() > 0) || (gpu_ln_count() > 0)) {
+            puts("GPU: dispatched "); fmt_int(gpu_mm_count()); puts(" matmuls + ");
+            fmt_int(gpu_ln_count()); puts(" layernorms on-device (CPU oracle bit-exact)\n");
         } else {
-            puts("GPU: requested but no matmul ran on-device — CPU fallback was used throughout\n");
+            puts("GPU: requested but nothing ran on-device — CPU fallback was used throughout\n");
         }
     }
     #endif

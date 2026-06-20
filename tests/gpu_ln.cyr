@@ -1,0 +1,119 @@
+# tests/gpu_ln.cyr — M18 1.8.1 GPU layernorm validation.
+#
+# Validates the real backend `gpu_ln_fwd` (src/gpu.cyr) against an inline CPU reference
+# identical to src/ops.cyr `ln_fwd`, BIT-EXACT (the native-AMD f64 path matches the
+# sequential CPU reduction op-for-op). Engagement is proven: a non-zero gpu_ln_fwd
+# return on a GPU-eligible shape is a FAILURE. Device-dependent → SKIPS cleanly (exit 0)
+# where no AMD f64 GPU exists; build-verified everywhere, NOT in the CI release gate.
+#
+# Build:  cyrius build tests/gpu_ln.cyr build/gpu_ln && ./build/gpu_ln
+# Exit:   0 = all shapes bit-exact (or cleanly skipped); 1 = mismatch/fallback.
+
+include "lib/mabda.cyr"          # GPU foundation
+include "src/gpu.cyr"            # gpu_ln_fwd (the unit under test)
+
+fn print_cstr(s): i64 { syscall(1, 1, s, strlen(s)); return 0; }
+fn print_i64(n): i64 { var b[32]; memset(&b, 0, 32); var l = fmt_int_buf(n, &b); syscall(1, 1, &b, l); return 0; }
+fn print_hex64(v): i64 {
+    var digits = "0123456789ABCDEF"; var b[18]; store8(&b + 0, 48); store8(&b + 1, 120);
+    var i = 0; while (i < 16) { store8(&b + 2 + i, load8(digits + ((v >> ((15 - i) * 4)) & 0xF))); i = i + 1; }
+    syscall(1, 1, &b, 18); return 0;
+}
+
+fn fill(buf, n, seed): i64 {
+    var i = 0;
+    while (i < n) {
+        var h = ((seed * 2654435761) + (i * 40503)) % 1000;
+        if (h < 0) { h = h + 1000; }
+        store64(buf + i * 8, f64_div(f64_from(h - 500), f64_from(100)));
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Inline CPU reference — identical op order to src/ops.cyr ln_fwd (eps = 1e-5).
+fn cpu_ln(x, gamma, beta, y, mean, rstd, M, C): i64 {
+    var eps = f64_div(f64_from(1), f64_from(100000));
+    var invC = f64_div(f64_from(1), f64_from(C));
+    var m = 0;
+    while (m < M) {
+        var row = x + m * C * 8;
+        var mu = f64_from(0); var i = 0;
+        while (i < C) { mu = f64_add(mu, load64(row + i * 8)); i = i + 1; }
+        mu = f64_mul(mu, invC);
+        var v = f64_from(0); i = 0;
+        while (i < C) { var d = f64_sub(load64(row + i * 8), mu); v = f64_add(v, f64_mul(d, d)); i = i + 1; }
+        v = f64_mul(v, invC);
+        var rs = f64_div(f64_from(1), f64_sqrt(f64_add(v, eps)));
+        store64(mean + m * 8, mu); store64(rstd + m * 8, rs);
+        i = 0;
+        while (i < C) {
+            var xhat = f64_mul(f64_sub(load64(row + i * 8), mu), rs);
+            store64(y + (m * C + i) * 8, f64_add(f64_mul(xhat, load64(gamma + i * 8)), load64(beta + i * 8)));
+            i = i + 1;
+        }
+        m = m + 1;
+    }
+    return 0;
+}
+
+fn run_shape(M, C): i64 {
+    var x = alloc(M * C * 8); var g = alloc(C * 8); var b = alloc(C * 8);
+    var yr = alloc(M * C * 8); var mr = alloc(M * 8); var rr = alloc(M * 8);
+    var yg = alloc(M * C * 8); var mg = alloc(M * 8); var rg = alloc(M * 8);
+    fill(x, M * C, 1); fill(g, C, 5); fill(b, C, 9);
+    var i = 0; while (i < M * C) { store64(yr + i*8, 0); store64(yg + i*8, 0); i = i + 1; }
+
+    cpu_ln(x, g, b, yr, mr, rr, M, C);
+    var rc = gpu_ln_fwd(x, g, b, yg, mg, rg, M, C);
+
+    print_cstr("  M="); print_i64(M); print_cstr(" C="); print_i64(C); print_cstr(": ");
+    if (rc != 0) { print_cstr("GPU FALLBACK (rc="); print_i64(rc); print_cstr(") — expected on-device\n"); return 0; }
+    var ok = 1; i = 0;
+    while (i < M * C) {
+        if (load64(yg + i*8) != load64(yr + i*8)) {
+            if (ok == 1) { print_cstr("y MISMATCH @"); print_i64(i); print_cstr(" gpu="); print_hex64(load64(yg+i*8)); print_cstr(" cpu="); print_hex64(load64(yr+i*8)); print_cstr("\n"); }
+            ok = 0;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < M) {
+        if (load64(mg + i*8) != load64(mr + i*8)) { if (ok == 1) { print_cstr("mean MISMATCH @"); print_i64(i); print_cstr("\n"); } ok = 0; }
+        if (load64(rg + i*8) != load64(rr + i*8)) { if (ok == 1) { print_cstr("rstd MISMATCH @"); print_i64(i); print_cstr("\n"); } ok = 0; }
+        i = i + 1;
+    }
+    if (ok == 1) { print_cstr("BIT-EXACT (y + mean + rstd, "); print_i64(M * C); print_cstr(" cells)\n"); }
+    return ok;
+}
+
+fn main(): i64 {
+    alloc_init();
+    print_cstr("attn11 GPU layernorm validation (M18 1.8.1) — gpu_ln_fwd vs ln_fwd oracle\n");
+    if (_gpu_init() == 0) {
+        print_cstr("no native AMD GPU — SKIPPED (CPU oracle unaffected; build verified)\n");
+        return 0;
+    }
+    print_cstr("native AMD f64 GPU online — validating attn11's real layernorm shapes:\n");
+    var ok = 1;
+    if (run_shape(16, 32) == 0) { ok = 0; }    # default config (T=16, C=32)
+    if (run_shape(64, 64) == 0) { ok = 0; }    # preset config (T=64, C=64)
+    if (run_shape(1, 32) == 0) { ok = 0; }     # single-row decode
+    if (run_shape(8, 128) == 0) { ok = 0; }    # wider C (8 tiles)
+
+    # a non-GPU_TK-multiple C must cleanly fall back (rc != 0), not silently mis-run
+    print_cstr("  fallback check (C=24, not a GPU_TK multiple): ");
+    var x = alloc(4 * 24 * 8); var g = alloc(24 * 8); var b = alloc(24 * 8);
+    var y = alloc(4 * 24 * 8); var mn = alloc(4 * 8); var rs = alloc(4 * 8);
+    fill(x, 4 * 24, 1); fill(g, 24, 5); fill(b, 24, 9);
+    if (gpu_ln_fwd(x, g, b, y, mn, rs, 4, 24) != 0) { print_cstr("falls back to CPU (correct)\n"); }
+    else { print_cstr("UNEXPECTED on-device run for C=24\n"); ok = 0; }
+
+    print_cstr("GPU layernorms dispatched on-device: "); print_i64(gpu_ln_count()); print_cstr("\n");
+    if (ok == 0) { print_cstr("\nFAIL: GPU layernorm not bit-exact vs the CPU oracle\n"); return 1; }
+    print_cstr("\nOK — gpu_ln_fwd BIT-EXACT vs ln_fwd across all attn11 shapes\n");
+    return 0;
+}
+
+var exit_code = main();
+sys_exit(exit_code);

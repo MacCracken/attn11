@@ -4,6 +4,52 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.8.1] - 2026-06-20
+
+**M18 1.8.1: layernorm forward on the GPU — bit-exact, the second `--gpu` op (E-infra;
+ADR 0016, X028).** Extends the `--gpu` forward from matmul (1.8.0) to **`ln_fwd`** (run
+~2×/layer — the most frequent non-matmul op). Like the matmul, it rides mabda 3.4.1's
+native-AMD f64 SPIR-V path and is **bit-exact** vs the CPU `ln_fwd` oracle: a `--gpu`
+training run's checkpoint stays **byte-identical** to the no-flag run (now with both matmul
+*and* layernorm on-device — verified through 30 steps: 17,514 matmuls + 6,811 layernorms
+dispatched, identical checkpoint). The CPU path stays the oracle + automatic fallback.
+
+**Why layernorm and not the rest of the forward — the transcendental wall (the gating
+finding).** `ln_fwd` uses **sequential** reductions (`mu += x`, `v += (x-mu)²`), so a tiled
+sequential-sum GPU kernel matches it op-for-op, and it needs only sqrt/div (no
+transcendental) — both bit-exact on the native path (X025 proved the sqrt/div core). The
+*other* forward ops are blocked from bit-exactness: **softmax** (attention scores, masked-CE)
+and **GELU** (which is `tanh` = `(eˣ−e⁻ˣ)/(eˣ+e⁻ˣ)`) need **`f64_exp`**, an **x86 hardware
+builtin** (`math.cyr` only has an *aarch64 polyfill*) — replicating it bit-for-bit in SPIR-V
+is infeasible, and mabda's native path has no f64 transcendentals anyway. And **`head_fwd`**
+/ the attention QK dots use **SIMD 4-lane-tree** reductions (`f64v_fmadd` + tree-sum), a
+different rounding order than a sequential kernel. So `ln_fwd` is the clean bit-exact op that
+**preserves the byte-identical invariant**; softmax/GELU (and an in-shader polynomial exp with
+*tolerance* validation) are the next, separately-gated increment. See
+[`docs/architecture/009-gpu-layernorm-and-the-transcendental-wall.md`](docs/architecture/009-gpu-layernorm-and-the-transcendental-wall.md).
+
+**How it works.** The 256-id native-compile cap forbids a full per-row unroll, so the
+contraction is **host-tiled** in 3 passes: (1) tiled Σx → per-row `S` (RMW), host `mean =
+S/C`; (2) tiled Σ(x−mu)² → per-row `V` (RMW, reads mean), host `rstd = 1/√(V/C+eps)`; (3)
+elementwise normalize (one thread per (m,c)). The per-row scalars are computed host-side
+identically to `ln_fwd` (bit-exact); `mean`/`rstd` are written for the CPU backward. Three
+generated SPIR-V kernels (`_gpu_build_mean`/`_gpu_build_var`/`_gpu_build_norm`) share a new
+`_gpu_pre` preamble helper; the buffer set grew from 3 to 7 (a clean alloc/teardown pair
+replaced the matmul-only ladder, with matmul re-validated). New `gpu_ln_fwd` hooked at
+`ln_fwd` (`ops.cyr`), `g_gpu`-gated and `#ifndef CYRIUS_TARGET_AGNOS`-guarded; per-shape CPU
+fallback (no device / `C` not a `GPU_TK` multiple / over limits).
+
+**Gate.** `gpu_ln_fwd` bit-exact vs `ln_fwd` across attn11's real shapes (default 16×32,
+preset 64×64, single-row decode, wide 8×128; y + mean + rstd; `C=24` CPU-fallback checked) —
+new `tests/gpu_ln.cyr` (`make gpu-test`, X028); engagement proven (non-zero return = silent
+fallback = failure). The matmul test (`tests/gpu_matmul.cyr`) re-passes (the 7-buffer pool
+refactor didn't regress 1.8.0). `--gpu` run byte-identical to the no-flag run; **1056**
+grad-checks green on x86_64 **and** aarch64/qemu; AGNOS static-ELF builds clean (main +
+suites — the GPU path is guarded out, the `SYS_IOCTL` stub keeps the auto-prepended mabda
+compiling); lint clean; fuzz + `make smoke` green. Binary unchanged in character (mabda
+already vendored at 1.8.0); pin `mabda = 3.4.1`. cyrius pin stays **6.2.29** (installed cycc
+6.2.30 warns of drift but builds + runs clean — the realign is separate maintenance).
+
 ## [1.8.0] - 2026-06-20
 
 **M18: the GPU compute backend — `--gpu` forward matmul on the native-AMD f64 SPIR-V

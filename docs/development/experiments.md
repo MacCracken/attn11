@@ -1291,3 +1291,55 @@ generated-SPIR-V + host-tiling pattern extends to the rest of the forward (1.8.1
 backward + Adam (1.8.2). Reproduce: `make gpu-test` on an AMD GFX9 box (skips cleanly
 elsewhere); `./build/attn11 --gpu --steps 40 --save g.ckpt` vs the same without `--gpu`,
 then `cmp` the checkpoints. Invariants: [`../architecture/008-gpu-matmul-spirv.md`](../architecture/008-gpu-matmul-spirv.md); ADR 0016.
+
+## X028 — M18 1.8.1: layernorm on GPU bit-exact, and the transcendental wall (M18, v1.8.1, 2026-06-20)
+
+**Question.** 1.8.0 put the matmul on the GPU bit-exact. The 1.8.1 question: what is the
+*rest of the forward*, and how much of it can stay bit-exact (preserving the byte-identical
+`--gpu` invariant) on the native-AMD f64 path?
+
+**Finding (the gating one): the transcendental wall.** Auditing the forward ops by their CPU
+reduction order + math dependency:
+- **`ln_fwd`** — **sequential** reductions (`mu += x`, `v += (x-mu)²`), only sqrt/div. A tiled
+  sequential-sum GPU kernel matches it op-for-op → **bit-exact**. ✓
+- **softmax** (attention scores, masked-CE) + **GELU** (`tanh` = `(eˣ−e⁻ˣ)/(eˣ+e⁻ˣ)`) — need
+  **`f64_exp`**, which is an **x86 hardware builtin** (`lib/math.cyr` ships only an *aarch64
+  polyfill*). Reproducing it bit-for-bit in SPIR-V is infeasible, and mabda's native path has
+  no f64 transcendentals (spirv-val rejects `exp`/`log` on `double`). An in-shader polynomial
+  exp matches only within a **tolerance** → would break byte-identity.
+- **`head_fwd`** + the attention QK dots — bit-exact in principle, but use **SIMD 4-lane
+  partials + a tree horizontal sum** (`f64v_fmadd` into `acc[4]`), a *different rounding
+  order* than a sequential kernel.
+
+So `ln_fwd` is the one forward op (besides matmul) that is cleanly bit-exact, and 1.8.1 ships
+**only** it — keeping the invariant. softmax/GELU (in-shader exp, tolerance-validated) and
+head/QK (tree-reduction kernel) are the next, separately-gated increment (1.8.2).
+
+**Method.** A throwaway HW spike proved the 3-pass tiled layernorm bit-exact (M=4 C=32, then
+M=8 C=64) before integration. Then `gpu_ln_fwd` landed in `src/gpu.cyr`: the 256-id
+native-compile cap forbids a per-row unroll, so the contraction is **host-tiled** — pass1
+tiled Σx → per-row `S` (RMW), host `mean = S/C`; pass2 tiled Σ(x−mu)² → `V` (reads mean), host
+`rstd = 1/√(V/C+eps)`; pass3 elementwise normalize (1 thread per (m,c)). Per-row scalars are
+computed host-side with `ln_fwd`'s exact ops; `mean`/`rstd` are written for the CPU backward.
+Three generated SPIR-V kernels share a new `_gpu_pre` preamble; the GTT buffer pool grew 3→7
+via a clean alloc/teardown pair. Hooked at the `ln_fwd` seam, g_gpu-gated + AGNOS-guarded.
+
+**Result.**
+- **Bit-exact** across attn11's real shapes — default 16×32, preset 64×64, single-row decode
+  1×32, wide 8×128 — on y **and** the `mean`/`rstd` outputs (`tests/gpu_ln.cyr`,
+  `make gpu-test`); engagement proven (a non-zero return = silent fallback = test failure);
+  `C=24` (not a `GPU_TK` multiple) correctly falls back to CPU.
+- **A `--gpu` run reproduces the CPU run** with **both** matmul and layernorm on-device: a
+  30-step run dispatched **17,514 matmuls + 6,811 layernorms** and produced a checkpoint
+  **byte-identical** to the no-flag run.
+- **No regression:** the 1.8.0 matmul test re-passes (the 3→7 buffer-pool refactor is clean);
+  **1056** grad-checks green on x86_64 **and** aarch64/qemu; AGNOS static-ELF builds clean
+  (the GPU path guarded out, the `SYS_IOCTL` stub keeps the auto-prepended mabda compiling);
+  lint + fuzz + `make smoke` green.
+
+**Takeaway.** The bit-exact GPU forward now covers the two highest-frequency ops (matmul +
+layernorm) and the byte-identical invariant holds. The transcendental wall is the real
+boundary: making the *full* forward GPU-resident requires an in-shader exp and accepting
+tolerance (not bit-exact) for softmax/GELU — the explicit subject of 1.8.2. Reproduce:
+`make gpu-test`; `./build/attn11 --gpu --steps 40 --save g.ckpt` vs without `--gpu`, `cmp`.
+Invariants: [`../architecture/009-gpu-layernorm-and-the-transcendental-wall.md`](../architecture/009-gpu-layernorm-and-the-transcendental-wall.md); ADR 0016.
