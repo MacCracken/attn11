@@ -13,12 +13,12 @@
 
 ## Where we are
 
-Current: **v1.8.2** — **M18 in progress**: `--gpu` runs **matmul** (1.8.0) **+ layernorm**
-(1.8.1) bit-exact (byte-identical run); **`--gpu-tc`** adds **GELU** (1.8.2, X029) via an
-in-shader f64 `exp` at a *tolerance* (the transcendental wall — no bit-exact f64 `exp` on the
-GPU — so it's a separate gate, keeping plain `--gpu` byte-identical). Remaining: **softmax** +
-head/QK → the full forward (1.8.3), then backward + Adam (1.8.4). All on the native-AMD f64
-SPIR-V path (mabda 3.4.1). The v1.0 surface is frozen and additive-only
+Current: **v1.8.3** — **M18 in progress**: `--gpu` runs **matmul** (1.8.0) **+ layernorm**
+(1.8.1) bit-exact (byte-identical run); **`--gpu-tc`** adds **GELU** (1.8.2) + the **LM head**
+(1.8.3, X030) at a *tolerance* (transcendental / SIMD-tree-order — so a separate gate keeps
+plain `--gpu` byte-identical). Remaining: **softmax** → the full forward (1.8.4), then backward
++ Adam (1.8.5). All on the native-AMD f64 SPIR-V path (mabda 3.4.1). The v1.0 surface is frozen
+and additive-only
 ([`STABILITY.md`](../STABILITY.md)); the reusable numeric core lives in
 **[rosnet](https://github.com/MacCracken/rosnet)** + **[tyche](https://github.com/MacCracken/tyche)**
 (v1.1.0). **The full milestone chain M12–M17 is complete**, plus both data arcs:
@@ -412,12 +412,19 @@ for the native-AMD f64 route.
   zero-crossings) + the statistical check (a `--gpu-tc` run's loss tracks CPU to print
   precision, never NaN). `tests/gpu_gelu.cyr`. Detail:
   [`../architecture/010-gpu-transcendentals.md`](../architecture/010-gpu-transcendentals.md).
-- **1.8.3 — softmax + head/QK on GPU → the *full* forward.** **softmax** (attn scores +
-  masked-CE) reuses the `_gpu_emit_exp` primitive + the ln-style max/sum reduction tiling
-  (tolerance, like GELU — rides `--gpu-tc`). **`head_fwd`/QK dots** are bit-exact in principle
-  but need a kernel replicating the CPU's SIMD 4-lane-partial + tree reduction order (not the
-  sequential order matmul/ln use). Completes a full `--gpu`(+`--gpu-tc`) forward.
-- **1.8.4 — backward + Adam on GPU; the honest perf X-entry.** `linear_bwd`,
+- **1.8.3 — the LM head on GPU (TOLERANCE) — ✅ SHIPPED (X030).** `head_fwd` (`logits =
+  f · tokembᵀ`) added to `--gpu-tc` via a **transposed-weight** variant of the 1.8.0 tiled
+  matmul (`_gpu_build_tile_t`: weight index `n·K+k`, advance +1). Sequential reduction → matches
+  the CPU head's 4-lane-tree dot only to ~1e-15 → tolerance (the bespoke tree kernel was deferred
+  as not worth it; sequential + `--gpu-tc` is the low-cost path). `tests/gpu_head.cyr`. Detail:
+  [`../architecture/010-gpu-transcendentals.md`](../architecture/010-gpu-transcendentals.md).
+- **1.8.4 — softmax on GPU → the *full* forward.** The fine-grained remaining op: attention
+  scores + masked-CE softmax (per-head, per-query over the keys). Reuses `_gpu_emit_exp` + an
+  ln-style max/sum reduction (numerically-stable `exp(x−max)`); tolerance, rides `--gpu-tc`. It
+  is the awkward one at attn11's tiny scale (a fused/online-softmax kernel — the 256-id cap
+  forces tiling), and the matmuls already dominate FLOPs, so it completes coverage rather than
+  adding speed. Then the QKV/attention-core dots if a tree kernel proves worth it.
+- **1.8.5 — backward + Adam on GPU; the honest perf X-entry.** `linear_bwd`,
   `attn_core_bwd`, `head_bwd`, `ln_bwd`, `gelu_bwd`, `model_adam_step` — a full `--gpu`
   training step. Then the straight GPU-vs-CPU comparison (default / preset / a larger
   config) with the transfer-cost caveat, logged as an X-entry (expected: a wash or loss

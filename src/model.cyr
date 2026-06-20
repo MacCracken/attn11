@@ -944,6 +944,11 @@ fn head_fwd_row(f_row, logits_row): i64 {
 
 # logits(n,V) = f(n,C) @ tokemb^T over the first n rows
 fn head_fwd_n(n): i64 {
+    # M18 1.8.3: --gpu-tc runs the LM head on the GPU (logits = f · tokembᵀ) at a TOLERANCE
+    # (sequential vs the CPU head's 4-lane-tree dot) — rides g_gpu_tc, never plain g_gpu.
+    #ifndef CYRIUS_TARGET_AGNOS
+    if (g_gpu_tc == 1) { if (gpu_head_fwd(A_f, P_tokemb(), A_logits, n, g_V, g_C) == 0) { return 0; } }
+    #endif
     var t = 0;
     while (t < n) {
         head_fwd_row(A_f + t * g_C * 8, A_logits + t * g_V * 8);

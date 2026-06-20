@@ -53,9 +53,10 @@
 #   attn11 --gpu                    run the forward matmul + layernorm on the GPU (M18;
 #                                   native-AMD f64 SPIR-V via mabda, BIT-EXACT vs the CPU
 #                                   oracle; auto CPU fallback where no device / unsupported)
-#   attn11 --gpu-tc                 also run GELU on the GPU (implies --gpu). TOLERANCE, not
-#                                   bit-exact: the in-shader f64 exp ≠ the x86 hardware exp,
-#                                   so a --gpu-tc run is ~1e-13-close to CPU, not byte-identical
+#   attn11 --gpu-tc                 also run GELU + the LM head on the GPU (implies --gpu).
+#                                   TOLERANCE, not bit-exact (GELU: in-shader f64 exp ≠ x86
+#                                   exp; head: sequential vs the CPU's tree dot) — ~1e-13-close
+#                                   to CPU, not byte-identical
 #   attn11 --help, -h               show usage and exit
 #   attn11 --version                print the version and exit
 #
@@ -130,7 +131,7 @@ fn _atoi(s): i64 {
 }
 
 # Kept in sync with the VERSION file (CI's docs job gates the match).
-fn CFG_VERSION(): i64 { return "1.8.2"; }
+fn CFG_VERSION(): i64 { return "1.8.3"; }
 
 fn usage(): i64 {
     puts("attn11 — a from-scratch GPT-style transformer, trained, in Cyrius\n");
@@ -164,7 +165,7 @@ fn usage(): i64 {
     puts("  --decode-steps N   diffusion decode iterations (default = ctx)\n");
     puts("  --decode-schedule S  diffusion unmask schedule: cosine (default) or linear\n");
     puts("  --gpu           forward matmul + layernorm on the GPU (native-AMD f64, bit-exact; CPU fallback)\n");
-    puts("  --gpu-tc        also run GELU on the GPU (implies --gpu; tolerance, not bit-exact)\n");
+    puts("  --gpu-tc        also run GELU + LM head on the GPU (implies --gpu; tolerance, not bit-exact)\n");
     puts("  --help, -h      show this help and exit\n");
     puts("  --version       print the version and exit\n");
     return 0;
@@ -750,10 +751,12 @@ fn main(): i64 {
     # M18: report GPU engagement so a silent CPU fallback is never mistaken for a GPU run.
     #ifndef CYRIUS_TARGET_AGNOS
     if (g_gpu == 1) {
-        if ((gpu_mm_count() > 0) || (gpu_ln_count() > 0) || (gpu_gelu_count() > 0)) {
+        if ((gpu_mm_count() > 0) || (gpu_ln_count() > 0) || (gpu_gelu_count() > 0) || (gpu_head_count() > 0)) {
             puts("GPU: dispatched "); fmt_int(gpu_mm_count()); puts(" matmuls + ");
             fmt_int(gpu_ln_count()); puts(" layernorms (bit-exact)");
-            if (gpu_gelu_count() > 0) { puts(" + "); fmt_int(gpu_gelu_count()); puts(" gelus (tolerance)"); }
+            if (gpu_gelu_count() > 0) { puts(" + "); fmt_int(gpu_gelu_count()); puts(" gelus"); }
+            if (gpu_head_count() > 0) { puts(" + "); fmt_int(gpu_head_count()); puts(" heads"); }
+            if ((gpu_gelu_count() > 0) || (gpu_head_count() > 0)) { puts(" (tolerance)"); }
             puts(" on-device\n");
         } else {
             puts("GPU: requested but nothing ran on-device — CPU fallback was used throughout\n");

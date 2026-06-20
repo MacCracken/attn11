@@ -5,7 +5,26 @@
 
 ## Version
 
-**1.8.2** — *M18 1.8.2: GELU on the GPU via an in-shader f64 `exp` — the first TOLERANCE
+**1.8.3** — *M18 1.8.3: the LM head on the GPU — a transposed-weight matmul, TOLERANCE*
+(E-infra; ADR 0016, X030). Adds **`head_fwd`** (`logits = f · tokembᵀ`) to **`--gpu-tc`**,
+reusing 1.8.0's `GPU_TK`-tiled matmul with a **transposed-weight** kernel (`_gpu_build_tile_t`:
+embedding contracted on its last dim → weight index `n·K+k`, advance +1). The reduction is
+**sequential**, so vs the CPU head's 4-lane-partial + tree dot (`head_fwd_row`) it matches only
+to ~1e-15 → TOLERANCE (the QKV/O/MLP matmuls are bit-exact because `linear_fwd` accumulates
+sequentially; the head's SIMD-tree order is the difference). Rides `g_gpu_tc`, never plain
+`--gpu`. **Validation (X030):** `tests/gpu_head.cyr` (`make gpu-test`) — allclose
+(`atol=rtol=1e-10`, worst ~4.5e-13) across default (T16·V25·C32) / preset (T64·V256·C64) /
+max-BPE (T64·V768·C64), engagement proven; statistical — a `--gpu-tc` 500-step run's loss +
+bits/byte match CPU to print precision (`0.17790`; `0.29942`), no NaN. **Gate:** plain `--gpu`
+byte-identical to no-flag (head not engaged, verified); **1056** grad-checks green x86_64 **and**
+aarch64/qemu; AGNOS static-ELF clean (GPU path incl. head guarded out); lint clean; fuzz +
+`make smoke` green; matmul + ln + gelu tests re-pass. `gpu_head_fwd` at the `head_fwd_n` seam;
+new `tests/gpu_head.cyr`. **Remaining for the full forward (1.8.4):** softmax (fine-grained,
+fused-attention — `_gpu_emit_exp` + max/sum reduction), then backward + Adam + the perf X-entry.
+pin `mabda = 3.4.1`; cyrius pin stays **6.2.29** (installed cycc 6.2.31, benign drift).
+`src/*.cyr` unchanged except the additive GPU wiring + CFG_VERSION.
+
+(**1.8.2** — *M18 1.8.2: GELU on the GPU via an in-shader f64 `exp` — the first TOLERANCE
 op* (E-infra; ADR 0016, X029). Crosses the transcendental wall (X028): f64 `exp` is an x86
 hardware builtin with no bit-exact SPIR-V equivalent, so GELU is the first `--gpu` op that is
 **not** bit-exact. It rides a **separate gate** — **`--gpu-tc`** (implies `--gpu`); **plain
@@ -25,7 +44,7 @@ aarch64/qemu; AGNOS static-ELF builds clean (GPU path incl. GELU guarded out); l
 the `gelu_fwd` seam; `tests/gpu_gelu.cyr`. **Still CPU:** softmax + `head_fwd`/QK (1.8.3), then
 backward + Adam. pin `mabda = 3.4.1`; cyrius pin stays **6.2.29** (installed cycc 6.2.31, benign
 drift). Invariants: [`../architecture/010-gpu-transcendentals.md`](../architecture/010-gpu-transcendentals.md).
-`src/*.cyr` unchanged except the additive GPU wiring + CFG_VERSION.
+`src/*.cyr` unchanged except the additive GPU wiring + CFG_VERSION.)
 
 (**1.8.1** — *M18 1.8.1: layernorm forward on the GPU — bit-exact, the second `--gpu` op*
 (E-infra; ADR 0016, X028). Extends `--gpu` from matmul (1.8.0) to **`ln_fwd`** (~2×/layer).

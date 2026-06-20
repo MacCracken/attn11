@@ -4,6 +4,40 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.8.3] - 2026-06-20
+
+**M18 1.8.3: the LM head on the GPU — a transposed-weight matmul, TOLERANCE-gated (E-infra;
+ADR 0016, X030).** Adds **`head_fwd`** (`logits = f · tokembᵀ`, the tied-embedding output
+projection) to `--gpu-tc`, alongside GELU. It reuses 1.8.0's `GPU_TK`-tiled matmul host path
+with a **transposed-weight** kernel variant (`_gpu_build_tile_t`): the embedding is contracted
+on its last dim, so the weight index is `n·K+k` (advance +1) instead of matmul's `k·N+n`
+(advance +N). The reduction is **sequential**, so vs the CPU head's **4-lane-partial + tree**
+dot (`head_fwd_row`, the M9 SIMD head) it matches only to ~1e-15 — hence TOLERANCE, on the
+`g_gpu_tc` gate (never plain `--gpu`).
+
+**Why it's not bit-exact (the head's reduction order).** Unlike the QKV/O/MLP matmuls (whose
+`linear_fwd` accumulates sequentially per output → 1.8.0 bit-exact), `head_fwd_row` uses
+`f64v_fmadd` into a 4-lane accumulator + a tree horizontal sum. Replicating that order on the
+GPU is possible but needs a 2-pass tiled tree (the 256-id cap blocks a per-output unroll even at
+C=32); the sequential transposed-matmul is the low-cost path and tolerance is already the
+`--gpu-tc` contract. So the LM head joins GELU there rather than gaining a bespoke tree kernel.
+
+**Validation (X030).** New `tests/gpu_head.cyr` (`make gpu-test`): `gpu_head_fwd` vs `head_fwd`
+via **allclose** (`atol=rtol=1e-10`) across default (T16·V25·C32), preset (T64·V256·C64), and
+max-BPE (T64·V768·C64) shapes — worst ~4.5e-13; engagement proven (non-zero return = silent
+fallback = failure). Statistical: a `--gpu-tc` 500-step run's loss + eval bits/byte match the CPU
+run to print precision (`0.17790`; `0.29942`), never NaN. The 1.8.0/1.8.1/1.8.2 tests re-pass.
+
+**Gate.** Plain `--gpu` **byte-identical** to the no-flag run (head NOT engaged — verified);
+**1056** grad-checks green on x86_64 **and** aarch64/qemu; AGNOS static-ELF builds clean (GPU
+path incl. head guarded out); lint clean; fuzz + `make smoke` green. `gpu_head_fwd` hooked at
+`head_fwd_n` (`model.cyr`); pin `mabda = 3.4.1`. cyrius pin stays **6.2.29** (installed cycc
+rolled to 6.2.31; benign drift, builds + runs clean — separate realign).
+
+**Remaining for the full forward (1.8.4):** **softmax** (attention scores + masked-CE) — the
+fine-grained, fused-attention piece (per-head, per-query — needs `_gpu_emit_exp` + an online/max-sum
+reduction). Then backward + Adam + the honest perf X-entry.
+
 ## [1.8.2] - 2026-06-20
 
 **M18 1.8.2: GELU on the GPU via an in-shader f64 `exp` — the first TOLERANCE-validated op

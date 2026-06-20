@@ -33,17 +33,18 @@ no-flag run):
   FLOPs) — 1.8.0.
 - **layernorm** (`ln_fwd`) — run ~2×/layer — 1.8.1.
 
-**`--gpu-tc`** (implies `--gpu`) additionally runs **GELU** — 1.8.2. GELU needs f64 `exp`, an
-x86 hardware builtin with no bit-exact SPIR-V equivalent, so the in-shader exp matches the CPU
-only to ~1e-13 (*tolerance*, not bit-exact). To keep plain `--gpu` byte-identical, GELU is
-behind this **separate** gate: a `--gpu-tc` run tracks the CPU run to ~1e-13 (loss matches to
+**`--gpu-tc`** (implies `--gpu`) additionally runs **GELU** (1.8.2) and the **LM head** (1.8.3,
+`logits = f · tokembᵀ`) at a *tolerance* (~1e-13), not bit-exact — GELU because the in-shader
+f64 `exp` ≠ the x86 hardware `exp`; the head because its sequential GPU reduction differs from
+the CPU's SIMD-tree dot order. To keep plain `--gpu` byte-identical, these are behind this
+**separate** gate: a `--gpu-tc` run tracks the CPU run to ~1e-13 (loss + eval bits/byte match to
 print precision, never NaN) but is **not** byte-identical.
 
-What stays on CPU: **softmax** and the tied-weight LM head + attention QK dots (softmax also
-needs exp; head/QK use a SIMD tree-reduction order) — the 1.8.3 increment. Backward + Adam stay
-on CPU. Each op self-falls-back to CPU if the device is absent, the contraction dimension isn't
-a multiple of `GPU_TK` (16), or a buffer/dispatch limit is exceeded — all of attn11's
-default/preset shapes (matmul K ∈ {32,64,128,256}; ln C ∈ {32,64}; GELU any width) run on-device.
+What stays on CPU: **softmax** (attention scores + masked-CE — the fine-grained fused-attention
+piece, the 1.8.4 increment) and backward + Adam. Each op self-falls-back to CPU if the device is
+absent, the contraction dimension isn't a multiple of `GPU_TK` (16), or a buffer/dispatch limit
+is exceeded — all of attn11's default/preset shapes (matmul K ∈ {32,64,128,256}; ln C ∈ {32,64};
+GELU any width; head C ∈ {32,64}) run on-device.
 
 ## Verify it
 

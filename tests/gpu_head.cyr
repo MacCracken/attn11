@@ -1,0 +1,107 @@
+# tests/gpu_head.cyr — M18 1.8.3 GPU LM-head validation (TOLERANCE, not bit-exact).
+#
+# Validates `gpu_head_fwd` (src/gpu.cyr) against an inline CPU reference identical to
+# src/model.cyr `head_fwd_row` (4-lane-partial + tree dot), within a TOLERANCE: the GPU uses
+# a sequential reduction (reusing the matmul k-tiling, transposed weight), which matches the
+# CPU's tree order only to ~1e-15 — so the LM head rides --gpu-tc, never plain --gpu.
+# Engagement proven (non-zero return = silent fallback = failure). Device-dependent → SKIPS
+# cleanly (exit 0) where no AMD f64 GPU exists; build-verified everywhere, NOT in the CI gate.
+#
+# Build:  cyrius build tests/gpu_head.cyr build/gpu_head && ./build/gpu_head
+# Exit:   0 = all shapes within tolerance (or cleanly skipped); 1 = exceeds tol / fallback.
+
+include "lib/mabda.cyr"
+include "src/gpu.cyr"
+
+fn print_cstr(s): i64 { syscall(1, 1, s, strlen(s)); return 0; }
+fn print_i64(n): i64 { var b[32]; memset(&b, 0, 32); var l = fmt_int_buf(n, &b); syscall(1, 1, &b, l); return 0; }
+fn print_hex64(v): i64 {
+    var digits = "0123456789ABCDEF"; var b[18]; store8(&b + 0, 48); store8(&b + 1, 120);
+    var i = 0; while (i < 16) { store8(&b + 2 + i, load8(digits + ((v >> ((15 - i) * 4)) & 0xF))); i = i + 1; }
+    syscall(1, 1, &b, 18); return 0;
+}
+
+fn fill(buf, n, seed): i64 {
+    var i = 0;
+    while (i < n) {
+        var h = ((seed * 2654435761) + (i * 40503)) % 1000; if (h < 0) { h = h + 1000; }
+        store64(buf + i * 8, f64_div(f64_from(h - 500), f64_from(100)));
+        i = i + 1;
+    }
+    return 0;
+}
+
+# CPU reference — identical 4-lane-partial + tree reduction to src/model.cyr head_fwd_row.
+fn cpu_head(f, emb, logits, T, V, C): i64 {
+    var c4 = C - (C % 4);
+    var t = 0;
+    while (t < T) {
+        var frow = f + t * C * 8;
+        var v = 0;
+        while (v < V) {
+            var erow = emb + v * C * 8;
+            var a0 = f64_from(0); var a1 = f64_from(0); var a2 = f64_from(0); var a3 = f64_from(0);
+            var c = 0;
+            while (c < c4) {
+                a0 = f64_add(a0, f64_mul(load64(frow + c*8), load64(erow + c*8)));
+                a1 = f64_add(a1, f64_mul(load64(frow + (c+1)*8), load64(erow + (c+1)*8)));
+                a2 = f64_add(a2, f64_mul(load64(frow + (c+2)*8), load64(erow + (c+2)*8)));
+                a3 = f64_add(a3, f64_mul(load64(frow + (c+3)*8), load64(erow + (c+3)*8)));
+                c = c + 4;
+            }
+            var dot = f64_add(f64_add(a0, a1), f64_add(a2, a3));
+            while (c < C) { dot = f64_add(dot, f64_mul(load64(frow + c*8), load64(erow + c*8))); c = c + 1; }
+            store64(logits + (t * V + v) * 8, dot);
+            v = v + 1;
+        }
+        t = t + 1;
+    }
+    return 0;
+}
+
+fn run_shape(T, V, C, atol, rtol): i64 {
+    var f = alloc(T * C * 8); var emb = alloc(V * C * 8);
+    var lr = alloc(T * V * 8); var lg = alloc(T * V * 8);
+    fill(f, T * C, 1); fill(emb, V * C, 7);
+    var i = 0; while (i < T * V) { store64(lr + i*8, 0); store64(lg + i*8, 0); i = i + 1; }
+    cpu_head(f, emb, lr, T, V, C);
+    var rc = gpu_head_fwd(f, emb, lg, T, V, C);
+    print_cstr("  T="); print_i64(T); print_cstr(" V="); print_i64(V); print_cstr(" C="); print_i64(C); print_cstr(": ");
+    if (rc != 0) { print_cstr("GPU FALLBACK (rc="); print_i64(rc); print_cstr(")\n"); return 0; }
+    var maxabs = f64_from(0); var ok = 1;
+    i = 0;
+    while (i < T * V) {
+        var ref = load64(lr + i*8);
+        var abserr = f64_abs(f64_sub(load64(lg + i*8), ref));
+        if (f64_gt(abserr, maxabs) == 1) { maxabs = abserr; }
+        var bound = f64_add(atol, f64_mul(rtol, f64_abs(ref)));
+        if (f64_gt(abserr, bound) == 1) { ok = 0; }
+        i = i + 1;
+    }
+    print_cstr("max|abs err|="); print_hex64(maxabs);
+    if (ok == 1) { print_cstr("  WITHIN TOL ("); print_i64(T*V); print_cstr(" logits)\n"); return 1; }
+    print_cstr("  EXCEEDS TOL\n"); return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    print_cstr("attn11 GPU LM-head validation (M18 1.8.3) — gpu_head_fwd vs head_fwd, TOLERANCE\n");
+    if (_gpu_init() == 0) {
+        print_cstr("no native AMD GPU — SKIPPED (CPU oracle unaffected; build verified)\n");
+        return 0;
+    }
+    print_cstr("native AMD f64 GPU online — validating attn11's real head shapes (atol+rtol 1e-10):\n");
+    var atol = f64_div(f64_from(1), f64_from(10000000000));
+    var rtol = f64_div(f64_from(1), f64_from(10000000000));
+    var ok = 1;
+    if (run_shape(16, 25, 32, atol, rtol) == 0) { ok = 0; }    # default (byte vocab)
+    if (run_shape(64, 256, 64, atol, rtol) == 0) { ok = 0; }   # preset (BPE-256)
+    if (run_shape(64, 768, 64, atol, rtol) == 0) { ok = 0; }   # preset, max BPE vocab
+    print_cstr("GPU heads dispatched on-device: "); print_i64(gpu_head_count()); print_cstr("\n");
+    if (ok == 0) { print_cstr("\nFAIL: GPU head exceeds tolerance vs the CPU oracle\n"); return 1; }
+    print_cstr("\nOK — gpu_head_fwd allclose(atol=rtol=1e-10) to head_fwd across all attn11 shapes\n");
+    return 0;
+}
+
+var exit_code = main();
+sys_exit(exit_code);

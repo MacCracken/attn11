@@ -1383,3 +1383,42 @@ proven primitives is ~2e-13-accurate, plenty for a tolerance-validated op, and t
 `_gpu_emit_exp` is now the reusable foundation for **softmax** (1.8.3, which adds the max/sum
 reduction tiling). Reproduce: `make gpu-test`; `./build/attn11 --gpu-tc --steps 500 --eval` vs
 `--gpu`/CPU. Invariants: [`../architecture/010-gpu-transcendentals.md`](../architecture/010-gpu-transcendentals.md); ADR 0016.
+
+## X030 — M18 1.8.3: the LM head on GPU (transposed-weight matmul, tolerance) (M18, v1.8.3, 2026-06-20)
+
+**Question.** With matmul (X027) + layernorm (X028) bit-exact and GELU (X029) tolerance on
+`--gpu-tc`, the next forward op is the LM head (`logits = f · tokembᵀ`). Can it reuse the matmul
+machinery, and is it bit-exact or tolerance?
+
+**Finding.** The head is a matmul but with two twists: (1) the tied embedding is contracted on
+its **last** dim, so the weight index is `n·K+k` (transposed) not matmul's `k·N+n`; and (2) the
+CPU `head_fwd_row` uses a **4-lane-partial + tree** reduction (the M9 SIMD head), not the
+sequential per-output accumulation that made the QKV/O/MLP matmuls bit-exact (X027). So a
+sequential GPU reduction matches the head only to ~1e-15 → **tolerance**, not bit-exact.
+Replicating the tree order would need a 2-pass tiled-tree kernel (the 256-id cap blocks a
+per-output unroll even at C=32) — deferred as not worth it; the sequential transposed-matmul on
+the existing `--gpu-tc` tolerance gate is the low-cost path.
+
+**Method.** `_gpu_build_tile_t` — a transposed-weight variant of the 1.8.0 `GPU_TK`-tile kernel
+(weight index `n·K+k`, advance +1; x = f, RMW into logits, no bias). `gpu_head_fwd(f, emb,
+logits, T, V, C)` reuses the matmul host path (upload, tiled dispatch, readback), hooked at
+`head_fwd_n` behind `g_gpu_tc`.
+
+**Result.**
+- **Within tolerance** across attn11's real head shapes — default (T16·V25·C32), preset
+  (T64·V256·C64), max-BPE (T64·V768·C64) — worst absolute error **~4.5e-13** vs `head_fwd` via
+  allclose (`atol=rtol=1e-10`); `tests/gpu_head.cyr` (`make gpu-test`). Engagement proven
+  (non-zero return = silent fallback = failure).
+- **Statistical:** a `--gpu-tc` 500-step run (now matmul + ln bit-exact + GELU + head tolerance)
+  matches the CPU run's loss (`0.17790`) and eval bits/byte (`0.29942`) to print precision,
+  never NaN — 153090 matmuls + 59535 layernorms + 25515 gelus + 8012 heads dispatched.
+- **Invariant intact:** plain `--gpu` does NOT engage the head → byte-identical to the no-flag
+  run (verified). No regression: matmul/ln/gelu tests re-pass; **1056** grad-checks x86_64 +
+  aarch64/qemu; AGNOS clean; lint + fuzz + smoke green.
+
+**Takeaway.** The LM head joins the GPU forward cheaply by reusing the matmul tiling with a
+transposed weight — tolerance (the head's SIMD-tree reduction order), so it rides `--gpu-tc`.
+The only remaining forward op is **softmax** (attention scores + masked-CE) — the fine-grained,
+fused-attention piece (1.8.4), reusing `_gpu_emit_exp` + a max/sum reduction. Reproduce:
+`make gpu-test`; `./build/attn11 --gpu-tc --steps 500 --eval` vs `--gpu`/CPU. Invariants:
+[`../architecture/010-gpu-transcendentals.md`](../architecture/010-gpu-transcendentals.md); ADR 0016.
