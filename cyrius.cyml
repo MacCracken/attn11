@@ -15,6 +15,19 @@ output = "build/attn11"
 [deps]
 stdlib = ["string", "fmt", "alloc", "io", "vec", "str", "syscalls", "assert", "bench", "math", "ganita", "args"]
 
+# M18 (v1.8.x GPU arc) — STAGED / commented out until two upstream items land:
+#   1. mabda 3.4.1 — fixes the `F64_HALF`/`F64_TWO` symbol collision with the `math`
+#      stdlib (filed: mabda `docs/development/issues/2026-06-19-f64-half-two-collide-
+#      with-math-stdlib.md`). Including `lib/mabda.cyr` today statically zeroes those
+#      constants → NaN in ganita tanh/GELU on the non-`--gpu` path.
+#   2. cyrius `dep-module-call` — call into mabda without amalgamating its ~1 MB dist
+#      (today DCE only NOPs it, bloating the binary 373 KB → 1.3 MB even unused).
+# The native-AMD f64 GPU path itself is PROVEN (bit-exact on Cezanne, X025); only the
+# host-side integration waits. To re-enable: append mabda's stdlib needs to the list
+# above — "hashmap", "tagged", "fnptr", "mmap", "dynlib", "sakshi", "thread",
+# "sankoch" — and uncomment [deps.mabda] below + the `include "lib/mabda.cyr"` in
+# src/main.cyr (src/gpu.cyr is already staged for it).
+
 # Extracted at the v1 freeze: the tensor storage / BLAS-1 / matmul (+ gradient)
 # layer -> rosnet; the deterministic statistical PRNG -> tyche. attn11 now
 # consumes both and dogfoods them — its own finite-difference grad-checks
@@ -28,4 +41,15 @@ modules = ["dist/tyche.cyr"]
 git = "https://github.com/MacCracken/rosnet"
 tag = "0.1.1"
 modules = ["dist/rosnet.cyr"]
+
+# M18 (the v1.8.x GPU arc): mabda is the GPU *foundation* — device/context init,
+# buffers, compute-pipeline + dispatch. attn11 consumes the native-AMD SPIR-V f64
+# compute path (proven bit-exact on Cezanne, X025), launcher-free + pure-Cyrius, so
+# the binary stays static/no-libc. The tensor kernels are attn11/rosnet's, layered
+# ON mabda's primitives (ADR 0016) — mabda is consumed, never modified.
+# STAGED — uncomment once mabda 3.4.1 + cyrius dep-module-call land (see [deps] note).
+# [deps.mabda]
+# git = "https://github.com/MacCracken/mabda"
+# tag = "3.4.1"
+# modules = ["dist/mabda.cyr"]
 ---

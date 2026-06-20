@@ -1,0 +1,31 @@
+# src/gpu.cyr — M18 (the v1.8.x GPU arc): the GPU compute foundation.
+#
+# attn11's opt-in GPU sibling. Brings up mabda's NATIVE-AMD SPIR-V f64 compute
+# device (launcher-free, pure-Cyrius — proven bit-exact on AMD Cezanne, see the
+# X025 experiment) behind `--gpu`. The CPU scalar/SIMD path stays the f64 reference
+# and the byte-identical no-flag default; mabda is consumed, never modified
+# (ADR 0016). The tensor kernels are attn11/rosnet's, layered ON mabda's primitives
+# — landing attn11-local here first, extracted to rosnet's GPU backend once proven.
+#
+# 1.8.0 step 0: the device-bring-up smoke. Proves attn11 can open the native GPU
+# end-to-end before any kernel lands; every later op reuses this context path.
+
+# gpu_probe — bring the native GPU context up, report device + f64 capability, release.
+# Returns 0 = GPU online; 1 = no native device (clean fallback, never fatal — the CPU
+# f64 path is unaffected and stays the reference oracle).
+fn gpu_probe(): i64 {
+    var res = gpu_context_new_native();
+    if (is_err_result(res) == 1) {
+        puts("GPU: no native AMD device available — CPU path unaffected\n");
+        return 1;
+    }
+    var ctx = payload(res);
+    puts("GPU: native AMD compute device online (launcher-free, pure-Cyrius)\n");
+    if (gpu_caps_native_shader_f64() == 1) {
+        puts("GPU: f64 SPIR-V compute supported — the f64 oracle can run on-device\n");
+    } else {
+        puts("GPU: f64 SPIR-V compute UNSUPPORTED on this device\n");
+    }
+    gpu_context_release(ctx);
+    return 0;
+}
