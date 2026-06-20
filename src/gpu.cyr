@@ -56,12 +56,16 @@ var _gpu_vh = 0; var _gpu_vm = 0;   # per-row Σ(x-mu)² → rstd (ln)
 var _gpu_ck[1024];       # 128 packed keys
 var _gpu_cv[1024];       # 128 shader-module handles (or -1 = known compile-fail)
 var _gpu_cn = 0;
+var g_gpu_tc = 0;        # 1 = --gpu-tc: also run transcendental ops (GELU) on GPU at a
+                         # TOLERANCE (not bit-exact → breaks byte-identity); requires g_gpu
 var _gpu_mm_count = 0;   # forward matmuls actually dispatched on-device (engagement proof)
 var _gpu_ln_count = 0;   # forward layernorms actually dispatched on-device
+var _gpu_gelu_count = 0; # forward GELUs actually dispatched on-device (tolerance)
 
 # Counts of forward ops run on the GPU (vs CPU fallback). >0 proves the device ran.
 fn gpu_mm_count(): i64 { return _gpu_mm_count; }
 fn gpu_ln_count(): i64 { return _gpu_ln_count; }
+fn gpu_gelu_count(): i64 { return _gpu_gelu_count; }
 
 # SPIR-V word emitters. op<wc> writes one <wc>-word instruction (word0 = (wc<<16)|op)
 # and returns the next byte offset. One instruction per source line → readable + ≤120c.
@@ -80,6 +84,16 @@ fn _gpu_op5(buf, o, w0, p1, p2, p3, p4): i64 {
 fn _gpu_op6(buf, o, w0, p1, p2, p3, p4, p5): i64 {
     store32(buf + o, w0); store32(buf + o + 4, p1); store32(buf + o + 8, p2);
     store32(buf + o + 12, p3); store32(buf + o + 16, p4); store32(buf + o + 20, p5); return o + 24;
+}
+fn _gpu_op7(buf, o, w0, p1, p2, p3, p4, p5, p6): i64 {
+    store32(buf + o, w0); store32(buf + o + 4, p1); store32(buf + o + 8, p2); store32(buf + o + 12, p3);
+    store32(buf + o + 16, p4); store32(buf + o + 20, p5); store32(buf + o + 24, p6); return o + 28;
+}
+# f64 OpConstant %id of type %7 (double) from a 64-bit pattern. (1.8.2 transcendental consts.)
+fn _gpu_ecf(buf, o, id, bits): i64 {
+    store32(buf + o, 0x0005002B); store32(buf + o + 4, 7); store32(buf + o + 8, id);
+    store32(buf + o + 12, bits & 0xFFFFFFFF); store32(buf + o + 16, (bits >> 32) & 0xFFFFFFFF);
+    return o + 20;
 }
 
 # Generate the GPU_TK-tile RMW matmul kernel for (K, N, k0) into buf; return bytes.
@@ -570,6 +584,142 @@ fn gpu_ln_fwd(x, gamma, beta, y, mean, rstd, M, C): i64 {
     i = 0;
     while (i < nx) { store64(y + i * 8, load64(_gpu_ym + i * 8)); i = i + 1; }
     _gpu_ln_count = _gpu_ln_count + 1;
+    return 0;
+}
+
+# ===========================================================================
+# 1.8.2 — transcendental ops (GELU), TOLERANCE-validated (not bit-exact). f64 exp is an
+# x86 hardware builtin with no SPIR-V bit-exact equivalent, so the in-shader exp (Cody-Waite
+# range reduction + 11-term Taylor Horner + ldexp, transliterated from math.cyr's aarch64
+# polyfill) matches the CPU only to ~1e-13. These break the byte-identical --gpu invariant,
+# so they ride a SEPARATE gate (g_gpu_tc / --gpu-tc); plain --gpu stays bit-exact.
+# See docs/architecture/010-gpu-transcendentals.md.
+# ===========================================================================
+
+# Emit exp(%xid) inline. Uses fixed const ids LOG2E=%17 LN2=%18 MAGIC=%19, c10..c0=%20..%30;
+# signed int %12, double %7, GLSL.std.450 import %1. st[0]=nid (in/out); result id → st[1].
+fn _gpu_emit_exp(buf, o, xid, st): i64 {
+    var nid = load64(st);
+    var y = nid; nid = nid + 1;  o = _gpu_op5(buf, o, 0x00050085, 7, y, xid, 17);   # y = x*LOG2E
+    var t1 = nid; nid = nid + 1; o = _gpu_op5(buf, o, 0x00050081, 7, t1, y, 19);    # y+MAGIC
+    var nf = nid; nid = nid + 1; o = _gpu_op5(buf, o, 0x00050083, 7, nf, t1, 19);   # round: (y+M)-M
+    var m1 = nid; nid = nid + 1; o = _gpu_op5(buf, o, 0x00050085, 7, m1, nf, 18);   # nf*LN2
+    var r = nid; nid = nid + 1;  o = _gpu_op5(buf, o, 0x00050083, 7, r, xid, m1);   # r = x - nf*LN2
+    var p = 20; var ci = 21;
+    while (ci <= 30) {                                          # Horner: p = c + r*p, c9..c0
+        var mul = nid; nid = nid + 1; o = _gpu_op5(buf, o, 0x00050085, 7, mul, r, p);
+        var add = nid; nid = nid + 1; o = _gpu_op5(buf, o, 0x00050081, 7, add, ci, mul);
+        p = add; ci = ci + 1;
+    }
+    var ni = nid; nid = nid + 1;  o = _gpu_op4(buf, o, 0x0004006E, 12, ni, nf);          # i32(nf)
+    var res = nid; nid = nid + 1; o = _gpu_op7(buf, o, 0x0007000C, 7, res, 1, 53, p, ni); # ldexp(p,ni)
+    store64(st, nid); store64(st + 8, res);
+    return o;
+}
+
+# GELU kernel: bindings x=0(%14), y=1(%15), one thread per element (grid n).
+# y = 0.5·x·(1+tanh(inner)), inner = c·(x+a·x³), tanh(z) = (eᶻ−e⁻ᶻ)/(eᶻ+e⁻ᶻ) — exp inlined ×2.
+# Preamble carries the GLSL import (%1) + signed-int type (%12). Consts %16..%35. Fn %36.
+fn _gpu_build_gelu(buf): i64 {
+    var cbits = f64_sqrt(f64_div(f64_from(2), F64_PI));            # == _gelu_c() sqrt(2/pi)
+    var abits = f64_div(f64_from(44715), f64_from(1000000));       # == _gelu_a() 0.044715
+    var o = _gpu_op3(buf, 0, 0x07230203, 0x00010300, 0x00000000);
+    var bound_off = o; o = _gpu_op2(buf, o, 0x00000000, 0x00000000);
+    o = _gpu_op2(buf, o, 0x00020011, 1); o = _gpu_op2(buf, o, 0x00020011, 10);
+    o = _gpu_op3(buf, o, 0x0006000B, 1, 0x4C534C47);              # OpExtInstImport %1 "GLSL.std.450"
+    store32(buf + o, 0x6474732E); store32(buf + o + 4, 0x3035342E); store32(buf + o + 8, 0x00000000); o = o + 12;
+    o = _gpu_op3(buf, o, 0x0003000E, 0, 1);
+    o = _gpu_op6(buf, o, 0x0006000F, 5, 36, 0x6E69616D, 0x00000000, 13);   # EntryPoint %36 "main" gid
+    o = _gpu_op6(buf, o, 0x00060010, 36, 17, 1, 1, 1);           # LocalSize 1
+    o = _gpu_op4(buf, o, 0x00040047, 13, 11, 28);               # gid BuiltIn
+    o = _gpu_op4(buf, o, 0x00040047, 14, 33, 0); o = _gpu_op4(buf, o, 0x00040047, 14, 34, 0);
+    o = _gpu_op4(buf, o, 0x00040047, 15, 33, 1); o = _gpu_op4(buf, o, 0x00040047, 15, 34, 0);
+    o = _gpu_op2(buf, o, 0x00020013, 2); o = _gpu_op3(buf, o, 0x00030021, 3, 2);
+    o = _gpu_op4(buf, o, 0x00040015, 4, 32, 0); o = _gpu_op4(buf, o, 0x00040017, 5, 4, 3);
+    o = _gpu_op4(buf, o, 0x00040020, 6, 1, 5); o = _gpu_op3(buf, o, 0x00030016, 7, 64);
+    o = _gpu_op3(buf, o, 0x0003001D, 8, 7); o = _gpu_op3(buf, o, 0x0003001E, 9, 8);
+    o = _gpu_op4(buf, o, 0x00040020, 10, 12, 9); o = _gpu_op4(buf, o, 0x00040020, 11, 12, 7);
+    o = _gpu_op4(buf, o, 0x00040015, 12, 32, 1);               # %12 signed int (ConvertFToS/ldexp)
+    o = _gpu_op4(buf, o, 0x0004003B, 6, 13, 1);
+    o = _gpu_op4(buf, o, 0x0004003B, 10, 14, 12); o = _gpu_op4(buf, o, 0x0004003B, 10, 15, 12);
+    o = _gpu_op4(buf, o, 0x0004002B, 4, 16, 0);               # %16 uint 0
+    o = _gpu_ecf(buf, o, 17, 0x3FF71547652B82FE);             # LOG2E
+    o = _gpu_ecf(buf, o, 18, 0x3FE62E42FEFA39EF);             # LN2
+    o = _gpu_ecf(buf, o, 19, 0x4338000000000000);             # MAGIC = 1.5*2^52
+    o = _gpu_ecf(buf, o, 20, 0x3E927E4FB7789F5C);             # c10 = 1/10!
+    o = _gpu_ecf(buf, o, 21, 0x3EC71DE3A556C734); o = _gpu_ecf(buf, o, 22, 0x3EFA01A01A01A01A);
+    o = _gpu_ecf(buf, o, 23, 0x3F2A01A01A01A01A); o = _gpu_ecf(buf, o, 24, 0x3F56C16C16C16C17);
+    o = _gpu_ecf(buf, o, 25, 0x3F81111111111111); o = _gpu_ecf(buf, o, 26, 0x3FA5555555555555);
+    o = _gpu_ecf(buf, o, 27, 0x3FC5555555555555); o = _gpu_ecf(buf, o, 28, 0x3FE0000000000000);
+    o = _gpu_ecf(buf, o, 29, 0x3FF0000000000000); o = _gpu_ecf(buf, o, 30, 0x3FF0000000000000);
+    o = _gpu_ecf(buf, o, 31, cbits);                          # %31 gelu c
+    o = _gpu_ecf(buf, o, 32, abits);                          # %32 gelu a
+    o = _gpu_ecf(buf, o, 33, 0x3FE0000000000000);             # %33 half
+    o = _gpu_ecf(buf, o, 34, 0x3FF0000000000000);             # %34 one
+    o = _gpu_ecf(buf, o, 35, 0xBFF0000000000000);             # %35 neg1
+    o = _gpu_op5(buf, o, 0x00050036, 2, 36, 0, 3); o = _gpu_op2(buf, o, 0x000200F8, 37);
+    o = _gpu_op4(buf, o, 0x0004003D, 5, 38, 13);             # gid
+    o = _gpu_op5(buf, o, 0x00050051, 4, 39, 38, 0);          # idx
+    o = _gpu_op6(buf, o, 0x00060041, 11, 40, 14, 16, 39);    # &x[idx]
+    o = _gpu_op4(buf, o, 0x0004003D, 7, 41, 40);             # xv
+    o = _gpu_op5(buf, o, 0x00050085, 7, 42, 41, 41);         # x2
+    o = _gpu_op5(buf, o, 0x00050085, 7, 43, 42, 41);         # x3
+    o = _gpu_op5(buf, o, 0x00050085, 7, 44, 32, 43);         # a*x3
+    o = _gpu_op5(buf, o, 0x00050081, 7, 45, 41, 44);         # x + a*x3
+    o = _gpu_op5(buf, o, 0x00050085, 7, 46, 31, 45);         # inner = c*(...)
+    var st[16]; store64(&st, 47);
+    o = _gpu_emit_exp(buf, o, 46, &st);                      # ex = exp(inner)
+    var ex = load64(&st + 8); var nid = load64(&st);
+    var negi = nid; nid = nid + 1; o = _gpu_op5(buf, o, 0x00050085, 7, negi, 46, 35);  # -inner
+    store64(&st, nid);
+    o = _gpu_emit_exp(buf, o, negi, &st);                    # enx = exp(-inner)
+    var enx = load64(&st + 8); nid = load64(&st);
+    var num = nid; nid = nid + 1; o = _gpu_op5(buf, o, 0x00050083, 7, num, ex, enx);   # ex-enx
+    var den = nid; nid = nid + 1; o = _gpu_op5(buf, o, 0x00050081, 7, den, ex, enx);   # ex+enx
+    var t = nid; nid = nid + 1;   o = _gpu_op5(buf, o, 0x00050088, 7, t, num, den);    # tanh = num/den
+    var hx = nid; nid = nid + 1;  o = _gpu_op5(buf, o, 0x00050085, 7, hx, 33, 41);     # 0.5*x
+    var ot = nid; nid = nid + 1;  o = _gpu_op5(buf, o, 0x00050081, 7, ot, 34, t);      # 1 + tanh
+    var yv = nid; nid = nid + 1;  o = _gpu_op5(buf, o, 0x00050085, 7, yv, hx, ot);     # y
+    var yp = nid; nid = nid + 1;  o = _gpu_op6(buf, o, 0x00060041, 11, yp, 15, 16, 39);# &y[idx]
+    o = _gpu_op3(buf, o, 0x0003003E, yp, yv);               # y[idx] = yv
+    o = _gpu_op2(buf, o, 0x000100FD, 0x00010038);
+    store32(buf + bound_off, nid);
+    return o;
+}
+
+# Get (compile+cache) the GELU kernel (one fixed kernel; key kind=4). 0 = unavailable.
+fn _gpu_get_gelu(): i64 {
+    var key = 4 << 56;
+    var c = _gpu_cache_get(key);
+    if (c == (0 - 1)) { return 0; }
+    if (c != 0) { return c; }
+    var spv[8192];
+    var nbytes = _gpu_build_gelu(&spv);
+    var shmod = gpu_shader_module_create_spirv(_gpu_ctx, &spv, nbytes);
+    if (shmod == 0) { _gpu_cache_put(key, 0 - 1); return 0; }
+    _gpu_cache_put(key, shmod);
+    return shmod;
+}
+
+# GPU forward GELU: y[0..n) = gelu(x[0..n)), elementwise. Returns 0 on success, -1 = use CPU.
+# TOLERANCE (~1e-13 vs CPU gelu_fwd), NOT bit-exact — gated by g_gpu_tc, never plain g_gpu.
+fn gpu_gelu_fwd(x, y, n): i64 {
+    if (_gpu_init() == 0) { return 0 - 1; }
+    if (n <= 0) { return 0 - 1; }
+    if (n > MABDA_MAX_DISPATCH_DIM) { return 0 - 1; }
+    if ((n * 8) > GPU_BO_MAX()) { return 0 - 1; }
+    var sh = _gpu_get_gelu();
+    if (sh == 0) { return 0 - 1; }
+    var i = 0;
+    while (i < n) { store64(_gpu_xm + i * 8, load64(x + i * 8)); i = i + 1; }
+    var bp[40];
+    store64(&bp + 0, 2);
+    store64(&bp + 8, _gpu_xh); store64(&bp + 16, _GPU_XVA());
+    store64(&bp + 24, _gpu_yh); store64(&bp + 32, _GPU_YVA());
+    if (gpu_compute_dispatch(_gpu_ctx, sh, n, 1, 1, &bp) != 0) { return 0 - 1; }
+    i = 0;
+    while (i < n) { store64(y + i * 8, load64(_gpu_ym + i * 8)); i = i + 1; }
+    _gpu_gelu_count = _gpu_gelu_count + 1;
     return 0;
 }
 

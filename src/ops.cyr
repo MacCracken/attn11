@@ -114,6 +114,11 @@ fn ln_bwd(x, gamma, dy, mean, rstd, dx, dgamma, dbeta, M, C): i64 {
 # arXiv:1606.08415 — the tanh form and the constant 0.044715.
 # ===========================================================================
 fn gelu_fwd(x, y, n): i64 {
+    # M18 1.8.2: --gpu-tc runs GELU on the GPU at a TOLERANCE (in-shader exp ≠ x86 builtin,
+    # ~1e-13) — NOT bit-exact, so it rides g_gpu_tc, never plain g_gpu. Self-falls-back to CPU.
+    #ifndef CYRIUS_TARGET_AGNOS
+    if (g_gpu_tc == 1) { if (gpu_gelu_fwd(x, y, n) == 0) { return 0; } }
+    #endif
     var c = _gelu_c();
     var a = _gelu_a();
     var half = f64_div(f64_from(1), f64_from(2));

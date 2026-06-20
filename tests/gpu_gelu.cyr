@@ -1,0 +1,94 @@
+# tests/gpu_gelu.cyr — M18 1.8.2 GPU GELU validation (TOLERANCE, not bit-exact).
+#
+# Validates the real backend `gpu_gelu_fwd` (src/gpu.cyr) against an inline CPU reference
+# identical to src/ops.cyr `gelu_fwd`, within a TOLERANCE — the in-shader f64 exp (Cody-Waite
+# + Taylor + ldexp) can't match the x86 hardware `f64_exp` bit-for-bit, so GELU is the first
+# tolerance-validated GPU op (it rides --gpu-tc, never plain --gpu). Engagement is proven: a
+# non-zero gpu_gelu_fwd return on an eligible shape is a FAILURE. Device-dependent → SKIPS
+# cleanly (exit 0) where no AMD f64 GPU exists; build-verified everywhere, NOT in the CI gate.
+#
+# Build:  cyrius build tests/gpu_gelu.cyr build/gpu_gelu && ./build/gpu_gelu
+# Exit:   0 = all shapes within tolerance (or cleanly skipped); 1 = exceeds tol / fallback.
+
+include "lib/mabda.cyr"          # GPU foundation
+include "src/gpu.cyr"            # gpu_gelu_fwd (the unit under test)
+
+fn print_cstr(s): i64 { syscall(1, 1, s, strlen(s)); return 0; }
+fn print_i64(n): i64 { var b[32]; memset(&b, 0, 32); var l = fmt_int_buf(n, &b); syscall(1, 1, &b, l); return 0; }
+fn print_hex64(v): i64 {
+    var digits = "0123456789ABCDEF"; var b[18]; store8(&b + 0, 48); store8(&b + 1, 120);
+    var i = 0; while (i < 16) { store8(&b + 2 + i, load8(digits + ((v >> ((15 - i) * 4)) & 0xF))); i = i + 1; }
+    syscall(1, 1, &b, 18); return 0;
+}
+
+# Inline CPU reference — identical to src/ops.cyr gelu_fwd.
+fn cpu_gelu(x, y, n): i64 {
+    var c = f64_sqrt(f64_div(f64_from(2), F64_PI));
+    var a = f64_div(f64_from(44715), f64_from(1000000));
+    var half = f64_div(f64_from(1), f64_from(2)); var one = f64_from(1);
+    var i = 0;
+    while (i < n) {
+        var xv = load64(x + i * 8);
+        var x3 = f64_mul(f64_mul(xv, xv), xv);
+        var inner = f64_mul(c, f64_add(xv, f64_mul(a, x3)));
+        var t = f64_tanh(inner);
+        store64(y + i * 8, f64_mul(f64_mul(half, xv), f64_add(one, t)));
+        i = i + 1;
+    }
+    return 0;
+}
+
+# allclose(gpu, cpu): pass if |gpu-cpu| <= atol + rtol*|cpu| for ALL elements. Pure relative
+# error is the wrong gate near gelu's zero-crossings (|cpu|→0 blows it up while |gpu-cpu| stays
+# ~1e-13), so the standard atol+rtol form is used. Reports the worst absolute error.
+fn run_shape(n, atol, rtol): i64 {
+    var x = alloc(n * 8); var yr = alloc(n * 8); var yg = alloc(n * 8);
+    var i = 0;
+    while (i < n) {
+        # x in [-6, +6): exercises both gelu tails + the linear middle
+        var h = ((i * 2654435761) + 7) % 12000; if (h < 0) { h = h + 12000; }
+        store64(x + i * 8, f64_div(f64_from(h - 6000), f64_from(1000)));
+        store64(yr + i * 8, 0); store64(yg + i * 8, 0);
+        i = i + 1;
+    }
+    cpu_gelu(x, yr, n);
+    var rc = gpu_gelu_fwd(x, yg, n);
+    print_cstr("  n="); print_i64(n); print_cstr(": ");
+    if (rc != 0) { print_cstr("GPU FALLBACK (rc="); print_i64(rc); print_cstr(") — expected on-device\n"); return 0; }
+    var maxabs = f64_from(0); var ok = 1;
+    i = 0;
+    while (i < n) {
+        var ref = load64(yr + i*8);
+        var abserr = f64_abs(f64_sub(load64(yg + i*8), ref));
+        if (f64_gt(abserr, maxabs) == 1) { maxabs = abserr; }
+        var bound = f64_add(atol, f64_mul(rtol, f64_abs(ref)));
+        if (f64_gt(abserr, bound) == 1) { ok = 0; }
+        i = i + 1;
+    }
+    print_cstr("max|abs err|="); print_hex64(maxabs);
+    if (ok == 1) { print_cstr("  WITHIN TOL ("); print_i64(n); print_cstr(" elts)\n"); return 1; }
+    print_cstr("  EXCEEDS TOL\n"); return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    print_cstr("attn11 GPU GELU validation (M18 1.8.2) — gpu_gelu_fwd vs gelu_fwd, TOLERANCE\n");
+    if (_gpu_init() == 0) {
+        print_cstr("no native AMD GPU — SKIPPED (CPU oracle unaffected; build verified)\n");
+        return 0;
+    }
+    print_cstr("native AMD f64 GPU online — validating attn11's real GELU widths (atol+rtol 1e-10):\n");
+    var atol = f64_div(f64_from(1), f64_from(10000000000));    # 1e-10 absolute
+    var rtol = f64_div(f64_from(1), f64_from(10000000000));    # 1e-10 relative
+    var ok = 1;
+    if (run_shape(2048, atol, rtol) == 0) { ok = 0; }    # default T*F = 16*128
+    if (run_shape(16384, atol, rtol) == 0) { ok = 0; }   # preset T*F = 64*256
+    if (run_shape(128, atol, rtol) == 0) { ok = 0; }     # single-row F (decode)
+    print_cstr("GPU gelus dispatched on-device: "); print_i64(gpu_gelu_count()); print_cstr("\n");
+    if (ok == 0) { print_cstr("\nFAIL: GPU gelu exceeds tolerance vs the CPU oracle\n"); return 1; }
+    print_cstr("\nOK — gpu_gelu_fwd allclose(atol=rtol=1e-10) to gelu_fwd across all attn11 widths\n");
+    return 0;
+}
+
+var exit_code = main();
+sys_exit(exit_code);

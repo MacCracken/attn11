@@ -4,6 +4,47 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.8.2] - 2026-06-20
+
+**M18 1.8.2: GELU on the GPU via an in-shader f64 `exp` — the first TOLERANCE-validated op
+(E-infra; ADR 0016, X029).** Crosses the transcendental wall (X028): f64 `exp` is an x86
+hardware builtin with no bit-exact SPIR-V equivalent, so this is the first `--gpu` op that is
+**not** bit-exact. To protect the byte-identical invariant, GELU rides a **separate gate** —
+`--gpu-tc` (implies `--gpu`); plain `--gpu` stays matmul + layernorm only and remains
+**byte-identical** to the no-flag run.
+
+**The in-shader f64 exp.** Transliterated from `lib/math.cyr`'s aarch64 `_f64_exp_polyfill`:
+Cody-Waite range reduction (`n = round(x/ln2)` via the `1.5·2⁵²` magic-rounding trick;
+`r = x − n·ln2`), an 11-term Taylor Horner for `exp(r)`, then `ldexp(p, n)` (GLSL Ldexp 53,
+HW-proven X025) — built from the proven f64 primitives (FMul/FAdd/FSub/ConvertFToS/Ldexp), no
+device transcendental needed. Measured **~2.3e-13** max relative error vs the CPU `f64_exp`
+over `[−16, 0]`. GELU composes it twice (`tanh(z) = (eᶻ−e⁻ᶻ)/(eᶻ+e⁻ᶻ)`, FDiv proven):
+`gpu_gelu_fwd` is **~3e-14 absolute** vs `gelu_fwd`. Single elementwise kernel (one thread per
+element); the generator shares an `_gpu_emit_exp` helper (emitted inline twice) + the GLSL
+import + signed-int type in a transcendental preamble.
+
+**Validation (X029).** New `tests/gpu_gelu.cyr` (`make gpu-test`): `gpu_gelu_fwd` vs `gelu_fwd`
+via **allclose** (`atol = rtol = 1e-10` — pure relative error is the wrong gate near GELU's
+zero-crossings, where `|ref|→0` blows it up while abs error stays ~1e-14); engagement proven
+(non-zero return = silent fallback = failure); default (2048), preset (16384), decode (128)
+widths. The **statistical gate**: a `--gpu-tc` 500-step training run's loss and eval bits/byte
+match the CPU run to print precision (`0.30858 → 0.17790`; bits/byte `0.29942`), never NaN —
+the ~1e-13 per-op divergence is invisible at 5 decimals. The 1.8.0 matmul + 1.8.1 layernorm
+tests re-pass.
+
+**Gate.** Plain `--gpu` run **byte-identical** to the no-flag run (GELU NOT engaged — verified);
+`--gpu-tc` engages GELU (loss tracks CPU, no NaN); **1056** grad-checks green on x86_64 **and**
+aarch64/qemu; AGNOS static-ELF builds clean (the whole GPU path incl. GELU is
+`#ifndef CYRIUS_TARGET_AGNOS`-guarded); lint clean; fuzz + `make smoke` green. New `g_gpu_tc`
+gate + `--gpu-tc` flag; `gpu_gelu_fwd` hooked at the `gelu_fwd` seam. Binary unchanged in
+character; pin `mabda = 3.4.1`. cyrius pin stays **6.2.29** (installed cycc rolled to 6.2.31;
+benign drift, builds + runs clean — separate realign). Invariants:
+[`docs/architecture/010-gpu-transcendentals.md`](docs/architecture/010-gpu-transcendentals.md).
+
+**Still CPU (the rest of the forward):** softmax (attention scores + masked-CE — reductions +
+exp) and `head_fwd`/QK dots (SIMD tree-reduction order) are the next increment (1.8.3); then
+backward + Adam + the honest perf X-entry.
+
 ## [1.8.1] - 2026-06-20
 
 **M18 1.8.1: layernorm forward on the GPU — bit-exact, the second `--gpu` op (E-infra;

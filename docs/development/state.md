@@ -5,7 +5,29 @@
 
 ## Version
 
-**1.8.1** — *M18 1.8.1: layernorm forward on the GPU — bit-exact, the second `--gpu` op*
+**1.8.2** — *M18 1.8.2: GELU on the GPU via an in-shader f64 `exp` — the first TOLERANCE
+op* (E-infra; ADR 0016, X029). Crosses the transcendental wall (X028): f64 `exp` is an x86
+hardware builtin with no bit-exact SPIR-V equivalent, so GELU is the first `--gpu` op that is
+**not** bit-exact. It rides a **separate gate** — **`--gpu-tc`** (implies `--gpu`); **plain
+`--gpu` stays matmul + layernorm only and remains byte-identical** to the no-flag run (the
+strong invariant is preserved, opt out of it explicitly). **In-shader exp:** transliterated
+from `math.cyr`'s aarch64 `_f64_exp_polyfill` — Cody-Waite reduction (magic-`1.5·2⁵²` round),
+11-term Taylor Horner, `ldexp` (GLSL 53) — from proven f64 primitives only; **~2.3e-13** rel
+vs CPU `f64_exp`. GELU composes it twice (`tanh=(eᶻ−e⁻ᶻ)/(eᶻ+e⁻ᶻ)`); `gpu_gelu_fwd` is
+**~3e-14 abs** vs `gelu_fwd`, one elementwise kernel (id_bound ~110, no tiling). **Validation
+(X029):** `tests/gpu_gelu.cyr` (`make gpu-test`) — **allclose** (`atol=rtol=1e-10`; pure
+relative error is wrong near GELU's zero-crossings) on default/preset/decode widths, engagement
+proven; plus the statistical gate — a `--gpu-tc` 500-step run's loss + eval bits/byte match CPU
+to print precision (0.30858→0.17790; bits/byte 0.29942), never NaN. **Gate:** plain `--gpu`
+byte-identical to no-flag (GELU not engaged, verified); **1056** grad-checks green x86_64 **and**
+aarch64/qemu; AGNOS static-ELF builds clean (GPU path incl. GELU guarded out); lint clean; fuzz
++ `make smoke` green; matmul + ln tests re-pass. New `g_gpu_tc` + `--gpu-tc`; `gpu_gelu_fwd` at
+the `gelu_fwd` seam; `tests/gpu_gelu.cyr`. **Still CPU:** softmax + `head_fwd`/QK (1.8.3), then
+backward + Adam. pin `mabda = 3.4.1`; cyrius pin stays **6.2.29** (installed cycc 6.2.31, benign
+drift). Invariants: [`../architecture/010-gpu-transcendentals.md`](../architecture/010-gpu-transcendentals.md).
+`src/*.cyr` unchanged except the additive GPU wiring + CFG_VERSION.
+
+(**1.8.1** — *M18 1.8.1: layernorm forward on the GPU — bit-exact, the second `--gpu` op*
 (E-infra; ADR 0016, X028). Extends `--gpu` from matmul (1.8.0) to **`ln_fwd`** (~2×/layer).
 Same native-AMD f64 SPIR-V path (mabda 3.4.1); **bit-exact** vs the CPU `ln_fwd` oracle —
 a `--gpu` run's checkpoint is **byte-identical** to the no-flag run with **both** matmul and
@@ -31,7 +53,7 @@ fuzz + `make smoke` green; `--gpu` run byte-identical to no-flag. Binary unchang
 character (mabda already vendored at 1.8.0); pin `mabda = 3.4.1`. New `tests/gpu_ln.cyr`;
 invariants in [`../architecture/009-gpu-layernorm-and-the-transcendental-wall.md`](../architecture/009-gpu-layernorm-and-the-transcendental-wall.md).
 The cyrius pin stays **6.2.29** (installed cycc 6.2.30 warns of drift, builds+runs clean —
-separate realign). `src/*.cyr` unchanged except the additive GPU wiring + CFG_VERSION.
+separate realign). `src/*.cyr` unchanged except the additive GPU wiring + CFG_VERSION.)
 
 (**1.8.0** — *M18: the GPU compute backend — `--gpu` forward matmul on the native-AMD
 f64 SPIR-V path, bit-exact vs the CPU oracle* (E-infra; ADR 0016, X027). The first

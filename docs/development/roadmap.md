@@ -13,12 +13,12 @@
 
 ## Where we are
 
-Current: **v1.8.1** — **M18 in progress**: the `--gpu` forward runs **matmul** (1.8.0, X027)
-**+ layernorm** (1.8.1, X028) on the native-AMD f64 SPIR-V path (mabda 3.4.1), both bit-exact
-vs the CPU oracle (a `--gpu` run is byte-identical to the no-flag run). The remaining forward
-ops (softmax/GELU) hit the **transcendental wall** (no bit-exact f64 `exp` on the GPU) and are
-the next, tolerance-validated increment — see the M18 section below. The v1.0 surface is
-frozen and additive-only
+Current: **v1.8.2** — **M18 in progress**: `--gpu` runs **matmul** (1.8.0) **+ layernorm**
+(1.8.1) bit-exact (byte-identical run); **`--gpu-tc`** adds **GELU** (1.8.2, X029) via an
+in-shader f64 `exp` at a *tolerance* (the transcendental wall — no bit-exact f64 `exp` on the
+GPU — so it's a separate gate, keeping plain `--gpu` byte-identical). Remaining: **softmax** +
+head/QK → the full forward (1.8.3), then backward + Adam (1.8.4). All on the native-AMD f64
+SPIR-V path (mabda 3.4.1). The v1.0 surface is frozen and additive-only
 ([`STABILITY.md`](../STABILITY.md)); the reusable numeric core lives in
 **[rosnet](https://github.com/MacCracken/rosnet)** + **[tyche](https://github.com/MacCracken/tyche)**
 (v1.1.0). **The full milestone chain M12–M17 is complete**, plus both data arcs:
@@ -402,17 +402,22 @@ for the native-AMD f64 route.
   unroll): tiled Σx → mean, tiled Σ(x−mu)² → rstd, elementwise normalize; mean/rstd written
   for the CPU backward. `gpu_ln_fwd` at the `ln_fwd` seam; `tests/gpu_ln.cyr`. Detail:
   [`../architecture/009-gpu-layernorm-and-the-transcendental-wall.md`](../architecture/009-gpu-layernorm-and-the-transcendental-wall.md).
-- **1.8.2 — softmax + GELU on GPU (TOLERANCE-validated) — the transcendental increment.**
-  Hand-roll an in-shader f64 `exp` (polynomial range-reduction over the proven
-  add/mul/fma/div/ldexp primitives) for `softmax` (attn scores + masked-CE) and `gelu_fwd`.
-  Unlike 1.8.0/1.8.1 these are **NOT bit-exact** (the in-shader exp ≠ the x86 builtin), so
-  they introduce the dual-precision **tolerance** gate ADR 0016 anticipated (f64-tight, e.g.
-  maxrel ~1e-12) + a loss-descends/never-NaN statistical check — and a `--gpu` run with them
-  on is *tolerance-close*, not byte-identical (so they stay opt-in behind a sub-flag or land
-  once the tolerance story is accepted). `head_fwd`/QK dots (bit-exact but needing a
-  tree-reduction kernel) fold in here too. This is the increment that makes a *full* `--gpu`
-  forward.
-- **1.8.3 — backward + Adam on GPU; the honest perf X-entry.** `linear_bwd`,
+- **1.8.2 — GELU on GPU via an in-shader f64 `exp` (TOLERANCE) — ✅ SHIPPED (X029).** The
+  first non-bit-exact `--gpu` op: f64 `exp` is an x86 hardware builtin with no bit-exact SPIR-V
+  equivalent, so it's hand-rolled (Cody-Waite reduction + 11-term Taylor Horner + `ldexp`, from
+  proven f64 primitives; ~2.3e-13 vs CPU `f64_exp`). GELU composes it twice; `gpu_gelu_fwd`
+  ~3e-14 abs vs `gelu_fwd`. **To protect the byte-identical invariant it rides a SEPARATE gate
+  — `--gpu-tc` (implies `--gpu`); plain `--gpu` stays bit-exact (matmul + ln).** Introduces the
+  **allclose tolerance gate** (`atol=rtol=1e-10` — pure relative error is wrong near GELU's
+  zero-crossings) + the statistical check (a `--gpu-tc` run's loss tracks CPU to print
+  precision, never NaN). `tests/gpu_gelu.cyr`. Detail:
+  [`../architecture/010-gpu-transcendentals.md`](../architecture/010-gpu-transcendentals.md).
+- **1.8.3 — softmax + head/QK on GPU → the *full* forward.** **softmax** (attn scores +
+  masked-CE) reuses the `_gpu_emit_exp` primitive + the ln-style max/sum reduction tiling
+  (tolerance, like GELU — rides `--gpu-tc`). **`head_fwd`/QK dots** are bit-exact in principle
+  but need a kernel replicating the CPU's SIMD 4-lane-partial + tree reduction order (not the
+  sequential order matmul/ln use). Completes a full `--gpu`(+`--gpu-tc`) forward.
+- **1.8.4 — backward + Adam on GPU; the honest perf X-entry.** `linear_bwd`,
   `attn_core_bwd`, `head_bwd`, `ln_bwd`, `gelu_bwd`, `model_adam_step` — a full `--gpu`
   training step. Then the straight GPU-vs-CPU comparison (default / preset / a larger
   config) with the transfer-cost caveat, logged as an X-entry (expected: a wash or loss

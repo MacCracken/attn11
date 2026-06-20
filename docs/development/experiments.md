@@ -1343,3 +1343,43 @@ boundary: making the *full* forward GPU-resident requires an in-shader exp and a
 tolerance (not bit-exact) for softmax/GELU — the explicit subject of 1.8.2. Reproduce:
 `make gpu-test`; `./build/attn11 --gpu --steps 40 --save g.ckpt` vs without `--gpu`, `cmp`.
 Invariants: [`../architecture/009-gpu-layernorm-and-the-transcendental-wall.md`](../architecture/009-gpu-layernorm-and-the-transcendental-wall.md); ADR 0016.
+
+## X029 — M18 1.8.2: crossing the transcendental wall — in-shader f64 exp + GELU (M18, v1.8.2, 2026-06-20)
+
+**Question.** X028 named the wall: softmax/GELU need f64 `exp`, an x86 hardware builtin with
+no bit-exact SPIR-V equivalent. Can an in-shader f64 `exp` be made accurate enough to put GELU
+on the GPU at a *tolerance*, and how is that done without losing the byte-identical `--gpu`
+invariant matmul (X027) + layernorm (X028) hold?
+
+**Method.** Two throwaway HW spikes first: (1) an in-shader exp transliterated from
+`lib/math.cyr`'s aarch64 `_f64_exp_polyfill` — Cody-Waite range reduction (`n = round(x/ln2)`
+via the `1.5·2⁵²` magic-rounding trick, since mabda lowers no `Round` ext-inst), an 11-term
+Taylor Horner for `exp(r)`, then `ldexp(p, n)` (GLSL Ldexp 53) — built only from the X025-proven
+f64 primitives (FMul/FAdd/FSub/ConvertFToS/Ldexp), no device transcendental; (2) GELU composing
+it twice (`tanh(z) = (eᶻ−e⁻ᶻ)/(eᶻ+e⁻ᶻ)`, FDiv proven). Then `gpu_gelu_fwd` landed in
+`src/gpu.cyr` (one elementwise kernel; `_gpu_emit_exp` emitted inline twice — gfx9_compile is
+single-function), hooked at `gelu_fwd` behind a **separate** gate `g_gpu_tc`/`--gpu-tc`.
+
+**Result.**
+- **Accuracy.** In-shader exp: **~2.3e-13** max relative error vs the CPU `f64_exp` over
+  `[−16, 0]`. GELU: **~3e-14** absolute error vs `gelu_fwd` across default (2048) / preset
+  (16384) / decode (128) widths (`tests/gpu_gelu.cyr`, `make gpu-test`). The gate is
+  **allclose** (`|gpu−cpu| ≤ atol+rtol·|cpu|`, `atol=rtol=1e-10`) — pure relative error is the
+  wrong metric near GELU's zero-crossings (`|ref|→0` blows it up while abs error stays ~1e-14).
+- **Invariant preserved.** Plain `--gpu` does NOT engage GELU → its run stays **byte-identical**
+  to the no-flag run (verified). GELU rides `--gpu-tc` only; engagement proven (a non-zero
+  `gpu_gelu_fwd` return = silent fallback = test failure).
+- **Statistical gate.** A `--gpu-tc` 500-step training run's loss (`0.30858 → 0.17790`) and eval
+  bits/byte (`0.29942`) match the CPU run to 5-decimal print precision, never NaN — the ~1e-13
+  per-op divergence is invisible at that precision. So `--gpu-tc` is numerically a faithful
+  training run, just not byte-identical.
+- **No regression:** matmul (X027) + layernorm (X028) tests re-pass; **1056** grad-checks green
+  x86_64 + aarch64/qemu; AGNOS static-ELF clean (GPU path incl. GELU guarded out); lint + fuzz +
+  smoke green.
+
+**Takeaway.** The transcendental wall is crossed for elementwise GELU: an in-shader f64 exp from
+proven primitives is ~2e-13-accurate, plenty for a tolerance-validated op, and the separate
+`--gpu-tc` gate keeps the bit-exact `--gpu` invariant intact while offering the fuller forward.
+`_gpu_emit_exp` is now the reusable foundation for **softmax** (1.8.3, which adds the max/sum
+reduction tiling). Reproduce: `make gpu-test`; `./build/attn11 --gpu-tc --steps 500 --eval` vs
+`--gpu`/CPU. Invariants: [`../architecture/010-gpu-transcendentals.md`](../architecture/010-gpu-transcendentals.md); ADR 0016.

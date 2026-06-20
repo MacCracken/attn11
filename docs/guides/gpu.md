@@ -27,18 +27,23 @@ On start `--gpu` reports the device (`native AMD compute device online` / `f64 S
 compute supported`); after the run it reports how many forward matmuls actually dispatched
 on-device, so a silent CPU fallback is never mistaken for a GPU run.
 
-What runs on GPU (all **bit-exact** vs the CPU oracle):
+`--gpu` runs (all **bit-exact** vs the CPU oracle — a `--gpu` run is byte-identical to the
+no-flag run):
 - **matmul** at the `qlinear_fwd` seam — Q/K/V + output projection, MLP up/down (~80% of
   FLOPs) — 1.8.0.
 - **layernorm** (`ln_fwd`) — run ~2×/layer — 1.8.1.
 
-What stays on CPU: **softmax** and **GELU** hit the *transcendental wall* — they need f64
-`exp`, an x86 hardware builtin with no bit-exact SPIR-V equivalent (so they can't be
-bit-exact; a tolerance-validated in-shader exp is the 1.8.2 increment). The tied-weight LM
-head + attention QK dots use a SIMD tree-reduction order (a future kernel). Backward + Adam
-stay on CPU. Each op self-falls-back to CPU if the device is absent, the contraction
-dimension isn't a multiple of `GPU_TK` (16), or a buffer/dispatch limit is exceeded — all of
-attn11's default/preset shapes (matmul K ∈ {32,64,128,256}; ln C ∈ {32,64}) run on-device.
+**`--gpu-tc`** (implies `--gpu`) additionally runs **GELU** — 1.8.2. GELU needs f64 `exp`, an
+x86 hardware builtin with no bit-exact SPIR-V equivalent, so the in-shader exp matches the CPU
+only to ~1e-13 (*tolerance*, not bit-exact). To keep plain `--gpu` byte-identical, GELU is
+behind this **separate** gate: a `--gpu-tc` run tracks the CPU run to ~1e-13 (loss matches to
+print precision, never NaN) but is **not** byte-identical.
+
+What stays on CPU: **softmax** and the tied-weight LM head + attention QK dots (softmax also
+needs exp; head/QK use a SIMD tree-reduction order) — the 1.8.3 increment. Backward + Adam stay
+on CPU. Each op self-falls-back to CPU if the device is absent, the contraction dimension isn't
+a multiple of `GPU_TK` (16), or a buffer/dispatch limit is exceeded — all of attn11's
+default/preset shapes (matmul K ∈ {32,64,128,256}; ln C ∈ {32,64}; GELU any width) run on-device.
 
 ## Verify it
 
@@ -73,8 +78,10 @@ larger model and/or matrix-core f64 hardware (a future mabda capability).
 - The non-obvious constraints (no SPIR-V loops/phi, the 256-id compile cap → host-tiling,
   the reserved-VA layout, why matmul is bit-exact):
   [`../architecture/008-gpu-matmul-spirv.md`](../architecture/008-gpu-matmul-spirv.md).
-- Layernorm (3-pass tiled reduction) + the transcendental wall (why softmax/GELU aren't on
-  GPU): [`../architecture/009-gpu-layernorm-and-the-transcendental-wall.md`](../architecture/009-gpu-layernorm-and-the-transcendental-wall.md).
+- Layernorm (3-pass tiled reduction) + the transcendental wall:
+  [`../architecture/009-gpu-layernorm-and-the-transcendental-wall.md`](../architecture/009-gpu-layernorm-and-the-transcendental-wall.md).
+- The in-shader f64 `exp`, GELU, and the `--gpu-tc` tolerance gate:
+  [`../architecture/010-gpu-transcendentals.md`](../architecture/010-gpu-transcendentals.md).
 - The boundary decision (kernels are rosnet's GPU backend layered on mabda, never in mabda)
   + the f32→f64 sequencing (inverted to f64-first on AMD):
   [ADR 0016](../adr/0016-gpu-backend-layered-on-mabda.md).
