@@ -1198,3 +1198,48 @@ a CPU fallback could not produce that, so the f64 is genuinely executing on the 
    then `cyrius build programs/native_spirv_f64_layernorm_e2e.cyr build/ln && ./build/ln` on
    any AMD GFX9 box with a readable `/dev/dri/renderD128`. (Audit material + the 13-program
    sweep script: ephemeral, under `/tmp`.)
+
+## X026 — M18 integration: mabda 3.4.1 clears the collision, the GPU path is buildable (M18, v1.7.4, 2026-06-19)
+
+**Question.** X025 proved mabda's native-AMD f64 SPIR-V compute is bit-exact on the dev
+Cezanne. The open follow-on: can attn11 actually *consume* mabda end-to-end — `include
+"lib/mabda.cyr"` + bring the device up behind `--gpu` — now that mabda has cut **3.4.1** (the
+release that fixes the `F64_HALF`/`F64_TWO` symbol collision filed during the 1.7.x staging)
+and the installed cyrius is **6.2.29**? The staging note listed two blockers; this entry
+resolves both empirically.
+
+**Method.** An isolated-worktree integration probe (the realign tree stays clean): pin
+`[deps.mabda] tag 3.4.1`, append mabda's stdlib needs
+(`hashmap`/`tagged`/`fnptr`/`mmap`/`dynlib`/`sakshi`/`thread`/`sankoch`), `cyrius deps`,
+`include "lib/mabda.cyr"` in `src/main.cyr`, wire `--gpu → gpu_probe()`, then `CYRIUS_DCE=1`
+build and run — measuring binary size and the default-run loss with and without mabda.
+
+**Result.**
+- **mabda 3.4.1 resolves** — `cyrius deps` checks out tag 3.4.1; `lib/mabda.cyr` = 1,109,827 B
+  (~1.06 MB dist); the upstream issue doc ships marked *RESOLVED — mabda 3.4.1*.
+- **Gate 1 (the real one) — CLEARED.** mabda 3.4.1 renamed its constants to
+  `MABDA_F64_HALF`/`MABDA_F64_TWO`, leaving the `math` stdlib sole owner of
+  `F64_HALF`/`F64_TWO`. `include "lib/mabda.cyr"` now **builds clean** (first time ever — no
+  "conflicting fn"), and the default no-`--gpu` run is **byte-identical** to the base binary
+  — it reproduces the base run's finite loss trajectory bit-for-bit (0.31234 at step 250 down
+  to 0.13807 at step 2000), no NaN. The collision that statically zeroed those
+  constants → NaN in ganita tanh/GELU is permanently retired.
+- **GPU online.** `--gpu → gpu_probe()` builds + runs on the Cezanne (gfx90c): *"native AMD
+  compute device online (launcher-free, pure-Cyrius)"* + *"f64 SPIR-V compute supported"* —
+  the X025 device path is reachable from attn11's own host context, not just mabda's tests.
+- **Gate 2 — a transient binary-size cost, NOT a gate.** cyrius 6.2.29 has no
+  `dep-module-call` (absent from `cyrius build --help` + a full grep of
+  `~/.cyrius/versions/6.2.29`), so DCE NOPs mabda's unused code but still **amalgamates** the
+  ~1 MB dist: base **373,504 B** → with-mabda **1,338,344 B** (+964,840, ×3.6) even when
+  `--gpu` is unused. `dep-module-call` (call-without-amalgamate) is slated for the 6.2.x line
+  and removes the bloat with **zero attn11 change** — it gates binary SIZE, not the milestone.
+
+**Takeaway.** M18 is **buildable + functional end-to-end today** — the mabda gate is cleared
+and the native AMD f64 device comes up. The only open item is binary leanness, which a later
+6.2.x hands back for free, so it does not gate the GPU kernel work (the 1.8.x increments:
+matmul → forward → backward + Adam). attn11 holds mabda **staged out of the default build**
+purely to keep the lean single-static-ELF story (the B3 benchmark) intact until the landing
+approach is chosen — un-stage now and accept the interim 1.3 MB binary, or wait for
+`dep-module-call`. This supersedes X025's "pin `mabda = 3.3.0`": the correct pin is **3.4.1**
+(the collision-fixed release). Reproduce: isolated worktree, mabda tag 3.4.1, cyrius 6.2.29,
+`CYRIUS_DCE=1 cyrius build src/main.cyr` with/without the mabda include; sizes above are exact.

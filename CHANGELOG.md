@@ -4,6 +4,34 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.7.4] - 2026-06-19
+
+**Toolchain realign (cyrius 6.2.27 → 6.2.29) + M18 GPU-arc unblock verified (mabda 3.4.1).**
+A maintenance cut with one milestone-status finding. The installed cycc had rolled ahead of
+the pin (local builds warned of drift at 6.2.27 vs 6.2.29); bumped `cyrius.cyml` and resynced
+the gitignored `lib/` snapshot + `cyrius.lock`. The 6.2.27 → 6.2.29 stdlib snapshot differs in
+**only 5 files**, four off attn11's compile path entirely (`bayan`, `fdlopen`, `hashmap_fast`,
+`tls_native_conn`); the fifth, `syscalls_aarch64_linux.cyr`, is a genuine upstream **bugfix** —
+`SYS_FACCESSAT` renumbered 48 → 269 to dodge an ESYSXLAT collision that made native-aarch64
+`sys_access()` return -EBADF (it remapped to `setsockopt`). attn11 calls no `sys_access`, so the
+fix is in uninvoked code: the **x86_64 binary is byte-identical** across the bump (proven —
+`1f8683b0…` ≡ `1f8683b0…`, 373,504-byte static ELF), and the aarch64 binary differs *only* in
+that one constant with a **byte-identical default run**. **1056** checks green (x86_64 +
+aarch64/qemu); lint + fuzz + `make smoke` exit 0. `src/*.cyr` unchanged except `CFG_VERSION`.
+
+The milestone finding (X026): the **M18 GPU arc is unblocked**. An isolated-worktree
+integration probe against cyrius 6.2.29 + **mabda 3.4.1** proved the one real blocker — the
+`F64_HALF`/`F64_TWO` symbol collision with the `math` stdlib that statically zeroed those
+constants → NaN in ganita tanh/GELU — is **fixed**: mabda 3.4.1 renames its copies to
+`MABDA_F64_*`, so `include "lib/mabda.cyr"` now builds clean and the no-`--gpu` CPU path is
+byte-identical (finite loss, no NaN). `gpu_probe` (src/gpu.cyr) brings the **native-AMD Cezanne
+f64 SPIR-V device online** (launcher-free, pure-Cyrius; X025). The previously-listed second
+item — cyrius `dep-module-call` — is **reclassified as a transient binary-size cost, not a
+gate**: without it, including mabda amalgamates its ~1 MB dist (binary 373,504 → 1,338,344 B
+measured) even when `--gpu` is unused; it is slated for the 6.2.x line and slims back with zero
+attn11 change. So M18 is **GO**; mabda stays staged in the default build only to keep it lean
+until the landing approach is chosen. Binary unchanged this cut (mabda not yet included).
+
 ## [1.7.3] - 2026-06-19
 
 **Toolchain realign (cyrius 6.2.6 → 6.2.27) + dependency bump (tyche/rosnet 0.1.0 → 0.1.1).**

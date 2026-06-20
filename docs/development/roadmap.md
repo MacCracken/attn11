@@ -29,9 +29,11 @@ E1–E9 have all graduated. For *what* shipped, see [`CHANGELOG.md`](../../CHANG
 
 **The plan ahead is two infra tracks** (no new training science; both scoped from the
 2026-06-14 mabda recon, **revised 2026-06-19** by an on-hardware proof — see below):
-**v1.7.2 — the B-series competitor benchmarks** (B0–B3, the honest CPU + zero-deps story;
-the next cut, no GPU dependency), then the **v1.8.x mini-arc — the M18 GPU compute backend**
-on **mabda** (1.8.0 plumbing + matmul → 1.8.1 forward → 1.8.2 backward + Adam). The original
+**v1.7.2 shipped the B-series competitor benchmarks** (B0–B3, the honest CPU + zero-deps
+story, no GPU dependency); the toolchain then realigned through **v1.7.4 (cyrius 6.2.29)**,
+which also **verified M18's unblock** (mabda 3.4.1 clears the real gate, GPU online — X026).
+Next is the **v1.8.x mini-arc — the M18 GPU compute backend** on **mabda** (1.8.0 plumbing +
+matmul → 1.8.1 forward → 1.8.2 backward + Adam), now unblocked. The original
 recon framed this as **f32-only on the GPU** (portable wgpu/WGSL has no f64). That still
 holds for the *portable* path — but the 2026-06-19 proof changes the f64 story: **bit-exact
 f64 GPU compute is real on AMD** (mabda's own SPIR-V→GFX9 emitter, landed mabda 3.2.12) and
@@ -285,8 +287,8 @@ heavier follow-on — REINFORCE earns the question, not yet the heavier machiner
 **Moved in from Out-of-scope per the user (2026-06-13); scoped from a mabda recon
 (2026-06-14).** A GPU *compute* backend for the same hand-derived forward/backward —
 an execution target, not a new dependency. The f64 tensor ops dispatch to the
-**[mabda](https://github.com/MacCracken/mabda)** GPU foundation (v3.0.1, vendored in
-the resolved `lib/mabda.cyr`) — **no cuBLAS / cuDNN / autodiff**; the
+**[mabda](https://github.com/MacCracken/mabda)** GPU foundation (pin **3.4.1**, vendored into
+the resolved `lib/mabda.cyr` when un-staged; integration proven X026) — **no cuBLAS / cuDNN / autodiff**; the
 "everything-is-i64, hand-derived, grad-checked" invariant is device-independent. The
 CPU scalar/SIMD path stays the reference oracle and the byte-identical no-flag default;
 the GPU rides behind a `--gpu` flag. Sequenced as a **1.8.x mini-arc** (per the user)
@@ -336,11 +338,19 @@ the mabda 3.x dependency below). See [ADR 0016](../adr/0016-gpu-backend-layered-
     **correctness/oracle path, not a speed win** at any scale attn11 runs; and **no f64
     transcendentals** (`exp`/`log` are rejected by spirv-val on `double`) — GELU/softmax
     `exp` must be hand-rolled in-shader from the proven primitives.
-  - **The cross-repo gate is now OPEN.** The "gated on mabda v3.2 Vulkan-f64, not-yet-shipped"
-    premise is **obsolete** — f64 SPIR-V compute landed mabda **3.2.12** and is HW-verified on
-    the dev Cezanne. attn11 should pin `mabda = 3.3.0` at the dep add. The heavier
-    full-rate-f64 route (native CDNA `V_MFMA_F64` on Instinct MI100/200/300) remains a future
-    mabda capability, not present today.
+  - **The cross-repo gate is OPEN and the host-side integration is now PROVEN (X026,
+    2026-06-19).** f64 SPIR-V compute landed mabda **3.2.12** (HW-verified on the dev Cezanne,
+    X025); the integration probe then confirmed attn11 can *consume* it end-to-end — on **mabda
+    3.4.1** + cyrius 6.2.29, `include "lib/mabda.cyr"` builds clean, the no-`--gpu` CPU path is
+    byte-identical, and `gpu_probe` brings the native AMD device up. **Pin `mabda = 3.4.1`** at
+    the dep add — *not* 3.3.0: 3.3.0 shipped f64 but its `F64_HALF`/`F64_TWO` constants collided
+    with the `math` stdlib (statically zeroed → NaN on the CPU path); **3.4.1 renames them
+    `MABDA_F64_*` and fixes it**. The one residual item — cyrius has no `dep-module-call`, so
+    including mabda amalgamates its ~1 MB dist (binary 373,504 → 1,338,344 B until the GPU build
+    is split out or the feature lands in the 6.2.x line) — is a **transient binary-size cost,
+    not a gate**: it resolves with zero attn11 change, and does not block the GPU kernel work.
+    The heavier full-rate-f64 route (native CDNA `V_MFMA_F64` on Instinct MI100/200/300) remains
+    a future mabda capability, not present today.
 - **Clean seam.** Matmul is ~80% of FLOPs and funnels through `qlinear_fwd/bwd`
   (`ops.cyr`) over rosnet `linear_fwd/bwd` — one hook for the dominant op. The rest:
   `attn_core_fwd/bwd`, `head_fwd/bwd`, `ln_fwd/bwd`, `gelu_fwd/bwd`, `softmax_xent`,

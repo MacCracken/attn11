@@ -5,14 +5,36 @@
 
 ## Version
 
-**1.7.3** — *Toolchain realign + dependency bump* (maintenance). cyrius pin **6.2.6 →
+**1.7.4** — *Toolchain realign (cyrius 6.2.27 → 6.2.29) + M18 GPU-arc unblock verified*
+(maintenance + a milestone-status finding). The installed cycc rolled ahead of the pin (drift
+at 6.2.27 vs 6.2.29); bumped `cyrius.cyml` and resynced the gitignored `lib/` + `cyrius.lock`.
+The 6.2.27 → 6.2.29 stdlib snapshot differs in **only 5 files** — four off attn11's compile
+path (`bayan`/`fdlopen`/`hashmap_fast`/`tls_native_conn`), the fifth an upstream **bugfix**
+(`syscalls_aarch64_linux.cyr`: `SYS_FACCESSAT` 48 → 269, dodging an ESYSXLAT collision that made
+native-aarch64 `sys_access()` return -EBADF; attn11 calls none). So the **x86_64 binary is
+byte-identical** across the bump (proven — `1f8683b0…` ≡ `1f8683b0…`, 373,504-byte static ELF),
+and the aarch64 binary differs only in that one uninvoked constant (default run byte-identical).
+**1056** checks green x86_64 + aarch64/qemu; lint + fuzz + `make smoke` exit 0. `src/*.cyr`
+unchanged except CFG_VERSION. **Milestone finding (X026):** an isolated-worktree integration
+probe proved **M18 is unblocked**. mabda **3.4.1** fixes the one real gate — the `F64_HALF`/
+`F64_TWO` symbol collision with `math` that statically zeroed those constants → NaN in ganita
+tanh/GELU — by renaming its copies to `MABDA_F64_*`; `include "lib/mabda.cyr"` now builds clean
+and the no-`--gpu` CPU path is byte-identical (finite loss, no NaN), and `gpu_probe`
+(`src/gpu.cyr`) brings the native-AMD Cezanne f64 SPIR-V device online (X025). The second item,
+cyrius `dep-module-call`, is **reclassified as a transient binary-size cost, not a gate** —
+without it, including mabda amalgamates its ~1 MB dist (binary 373,504 → 1,338,344 B measured)
+even when `--gpu` is unused; it is slated for the 6.2.x line and slims back with **zero attn11
+change**. So M18 is **GO**; mabda stays staged in the default build only to keep it lean until
+the landing approach is chosen — binary unchanged this cut.
+
+(**1.7.3** — *Toolchain realign + dependency bump* (maintenance). cyrius pin **6.2.6 →
 6.2.27** (installed cycc had rolled well ahead; local builds warned of drift) plus the first
 realign where the consumed AGNOS crates move too: **tyche 0.1.0 → 0.1.1** and **rosnet 0.1.0
 → 0.1.1**, each itself a pure toolchain-realign (6.2.11 pin + `dist/` regen, no API change),
 so attn11's call surface is untouched. `cyrius update` resynced the gitignored `lib/`
 snapshot + `cyrius.lock`; default training run **byte-identical** to 1.7.2 (baseline binary
 built pre-bump, diffed post-bump). **1056** checks unchanged green; no pin-drift warning.
-`src/*.cyr` unchanged except CFG_VERSION.
+`src/*.cyr` unchanged except CFG_VERSION.)
 
 (**1.7.2** — *Competitor benchmarks (B-series B0) + toolchain realign* (the wrap-up cut
 before the GPU pause on mabda 3.x). **B0 harness** `scripts/compete-bench.sh` (+ `make
@@ -507,17 +529,23 @@ deterministic resume. 0.2.0: stacked layers, grad clipping, LR schedule.)
 
 ## Toolchain
 
-- **Cyrius pin**: `6.2.27` (in `cyrius.cyml [package].cyrius`) — bumped from 6.2.6
-  in 1.7.3 (6.2.5 → 6.2.6 in 1.7.2, 6.2.2 → 6.2.5 in 1.7.1) to realign with the
-  fast-rolling installed cycc (`cyrius update` resyncs the gitignored `lib/`
+- **Cyrius pin**: `6.2.29` (in `cyrius.cyml [package].cyrius`) — bumped from 6.2.27
+  in 1.7.4 (6.2.6 → 6.2.27 in 1.7.3, 6.2.5 → 6.2.6 in 1.7.2, 6.2.2 → 6.2.5 in 1.7.1) to
+  realign with the fast-rolling installed cycc (`cyrius update` resyncs the gitignored `lib/`
   snapshot + `cyrius.lock`; tracked diff = `cyrius.cyml` + `cyrius.lock`). 1.7.3 also
   moved the consumed AGNOS crates for the first time — **tyche/rosnet 0.1.0 → 0.1.1**
-  (each a pure 6.2.11-pin realign + `dist/` regen, no API change). Each realign's lib
+  (each a pure 6.2.11-pin realign + `dist/` regen, no API change). Most realigns' lib
   changes are in files attn11 doesn't use on its Linux path (networking/TLS, threading,
   `chrono`, `syscalls_x86_64_agnos`); the core libs (`rosnet`/`tyche`/`alloc`/`fmt`/`io`/
   `math`/`simd`/…) are functionally unchanged, so all runs (default/RL/ternary/etc.) stay
-  byte-identical across the bump (verified 1.7.1 + 1.7.2 + 1.7.3); 1056 checks green both
-  arches, no drift warning. (1.3.0 moved the pin 6.2.1 → 6.2.2; 1.2.4 moved
+  byte-identical across the bump (verified 1.7.1 + 1.7.2 + 1.7.3 + 1.7.4). **1.7.4 is the
+  first realign to touch an on-path file:** the 6.2.27 → 6.2.29 snapshot differs in only
+  5 files, and one — `syscalls_aarch64_linux.cyr` — is compiled on the aarch64 target
+  (`SYS_FACCESSAT` 48 → 269, an upstream ESYSXLAT-collision bugfix that had made native
+  aarch64 `sys_access()` return -EBADF). attn11 invokes no `sys_access`, so x86_64 stays
+  **binary-identical** (`1f8683b0…`) and the aarch64 binary differs only in that one
+  uninvoked constant (default run byte-identical). 1056 checks green both arches, no drift
+  warning. (1.3.0 moved the pin 6.2.1 → 6.2.2; 1.2.4 moved
   6.1.37 → 6.2.1.) The pin and snapshot must always move together: cycc
   6.1.32 fixed attn11's agnos argv-capture issue (r15-parked init rsp; the old
   `_agnos_init_rsp` global is gone) during M6, and a new-compiler/old-lib
