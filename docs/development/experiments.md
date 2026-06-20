@@ -1122,3 +1122,79 @@ the M17 flags). SFT baseline corpus bits/byte **0.241**.
    the seeded logit gradient, grad-checked three ways (`test_rl_op`: RL grad == advantage ×
    AR grad to rounding; FD vs the numeric gradient of `advantage × CE`; sign-flip + zero
    advantage). Reproduce: `scripts/m17-rl.sh [steps]` (deterministic; seed 1337; cross-arch).
+
+## X025 — f64 on the GPU: mabda's native AMD path, proven bit-exact (M18 recon, 2026-06-19)
+
+**Setup**: an M18 GPU-readiness probe (not a training run), done while cutting v1.7.3. The
+question: now that mabda has moved 3.0.1 → **3.3.0**, does it actually provide what attn11's
+GPU compute backend needs — and specifically, can the **f64 oracle run on the GPU**, which
+the 2026-06-14 recon had assumed was blocked on an unshipped mabda v3.2 capability? Verified
+two ways: (1) an adversarial audit of the 3.3.0 dist API surface + CHANGELOG, then (2) an
+**on-hardware run** on this dev box — **AMD Cezanne (gfx90c)**, `amdgpu`/RADV,
+`/dev/dri/renderD128` (mode 0666, no root), kernel 7.0.11, cyrius 6.2.27. mabda cloned at tag
+**3.3.0** (HEAD `c09bc84`); each `programs/native_spirv_f64_*_e2e.cyr` built with `cyrius
+build` and run. These are mabda's own conformance programs, but they exercise *exactly* the
+public consumer path attn11 would use.
+
+**The path under test** (launcher-free, pure-Cyrius — no wgpu, no C launcher, no libc):
+`gpu_context_new_native()` opens the DRM render node → an f64 SPIR-V kernel is compiled
+**in-tree** by mabda's `gfx9_compile` (SPIR-V → GFX9 ISA, scalar `V_*_F64`) → published to a
+BO → dispatched via PM4/DRM → results read back and checked **bit-exact** against an
+in-process CPU reference. (This is mabda's *own* SPIR-V→GFX9 emitter, landed mabda **3.2.12**
+— **not** wgpu: portable wgpu compute is `MABDA_WGPU_COMPUTE=0` with a `GPU_ERR_OTHER`
+dispatch stub, so portable f64 does not run. f64 on the GPU exists *only* on this native-AMD
+route.)
+
+**Result** — all 13 native f64 op-programs **exit 0, bit-exact on Cezanne**:
+
+| program | f64 op surface | verdict |
+|---------|----------------|---------|
+| native_f64_fma | hand-authored `V_FMA_F64` (the F.4–F.6 baseline) | ✅ 8/8 bit-exact |
+| native_spirv_f64_fma | **compiled** fma (`OpExtInst Fma` → `V_FMA_F64`) | ✅ 8/8, matches *fused* (≠ unfused CPU) |
+| native_spirv_f64_arith | FADD / FMUL / FMIN / FMAX | ✅ 8/8 |
+| native_spirv_f64_subabs | FSub + FAbs (src modifiers) | ✅ 8/8 |
+| native_spirv_f64_div | OpFDiv (reciprocal-Newton, correctly rounded) | ✅ 8/8 |
+| native_spirv_f64_sqrt | Sqrt (Newton-Goldschmidt, incl. 3 subnormals) | ✅ 8/8 |
+| native_spirv_f64_const | f64 OpConstant operands (Horner poly) | ✅ |
+| native_spirv_f64_select | ordered compare + OpSelect | ✅ |
+| native_spirv_f64_cvt | f32 ↔ f64 round-trip | ✅ 8/8 |
+| native_spirv_f64_i32_cvt | i32 ↔ f64 (round-toward-zero) | ✅ |
+| native_spirv_f64_ldexp | Ldexp | ✅ |
+| native_spirv_f64_vec | `array<dvec2>` add (vectorized) | ✅ 8/8 |
+| **native_spirv_f64_layernorm** | **`(x-mean)/sqrt(var+eps)` via the PUBLIC API** | ✅ 8/8 bit-exact |
+
+The `native_spirv_f64_fma` lane is the decisive one: lanes 0/1/6 the GPU result matches the
+**fused** single-rounding FMA and *differs* from the unfused CPU `f64_add(f64_mul(a,b),c)` —
+a CPU fallback could not produce that, so the f64 is genuinely executing on the silicon. The
+**layernorm** is the attn11-shaped proof: a real transformer normalization (`FSub`+`FAdd`+
+`OpConstant`+`Sqrt`+`FDiv`), bit-exact, through `gpu_shader_module_create_spirv` →
+`gpu_compute_dispatch`.
+
+**Takeaways**:
+1. **The f64 oracle can live on the GPU — on AMD, proven here.** Every scalar f64 primitive
+   attn11's tensor kernels need (add/mul/fma/div/sqrt/sub/abs/select/convert/ldexp/vec) runs
+   bit-exact on the dev Cezanne, plus a full layernorm. The 2026-06-14 "f64 gated on an
+   unshipped mabda capability" premise is **obsolete** — it shipped in mabda 3.2.12. ADR 0016
+   + roadmap M18 amended accordingly.
+2. **This path fits the charter *better* than the portable f32 path.** Native-AMD f64 is
+   launcher-free + pure-Cyrius + bit-exact f64 — it preserves all three attn11 invariants
+   (f64 oracle, dependency-free single-static-ELF, sovereign). The portable wgpu path is the
+   opposite: f32-only **and** needs a C launcher (wgpu-native + libc), breaking the
+   dependency-free charter. So on AMD, native f64 is a viable *first-class* M18 target, not a
+   deferred follow-on; portable f32 is the route for non-AMD GPUs.
+3. **Honest limits (none are blockers, all are known).** (a) **Scalar VALU** f64 — no matrix
+   core (`V_MFMA_F64` absent; Cezanne is FP64-throttled anyway), so this is a
+   **correctness/oracle** path, **not a speed win** at attn11's scale (same honest-negative
+   footing as ternary X023). (b) **No f64 transcendentals** — `exp`/`log` are rejected by
+   spirv-val on `double`; layernorm needs only sqrt/div (proven), but **GELU + softmax `exp`
+   must be hand-rolled in-shader** as polynomials from the proven primitives — the one real
+   f64-track work item mabda doesn't cover, squarely attn11's "transformer math is our
+   domain." (c) **AMD GFX9 only today** — a *first-substrate* limit, not a ceiling: AMD is
+   mabda's first GPU substrate; further variants (NVIDIA, Intel) are on mabda's roadmap, so
+   attn11's native-f64 GPU coverage broadens as mabda's does, with no change to attn11's
+   kernel layer.
+4. **Pin `mabda = 3.3.0`** when the dep is added at 1.8.0 (clean superset: f32 WGSL pipeline
+   from 2.4.0 + the f64 SPIR-V→GFX9 path from 3.2.12). Reproduce: clone mabda at tag 3.3.0,
+   then `cyrius build programs/native_spirv_f64_layernorm_e2e.cyr build/ln && ./build/ln` on
+   any AMD GFX9 box with a readable `/dev/dri/renderD128`. (Audit material + the 13-program
+   sweep script: ephemeral, under `/tmp`.)

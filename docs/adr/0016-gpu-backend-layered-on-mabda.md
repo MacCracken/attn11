@@ -1,7 +1,41 @@
 # 0016 — GPU compute backend layered on mabda (not in it); precision-tiered f32→f64
 
-**Status**: Accepted
+**Status**: Accepted — *amended 2026-06-19 (see Update)*
 **Date**: 2026-06-14
+
+## Update (2026-06-19) — f64 proven on-hardware; f64-track sequencing revised
+
+A mabda re-recon against **3.3.0** plus an **on-hardware run** on the dev box's
+**AMD Cezanne (gfx90c)** resolved the precision questions this ADR left open
+(evidence: X025 in [`experiments.md`](../development/experiments.md)). Three facts supersede the
+2026-06-14 assumptions below:
+
+1. **Portable-wgpu f64 is a dead end — confirmed, not just suspected.** mabda's
+   `MABDA_WGPU_COMPUTE = 0` and `_backend_wgpu_compute_dispatch` is a `GPU_ERR_OTHER`
+   stub; naga accepts an f64 module but nothing dispatches. There is **no portable f64
+   GPU compute** (an industry fact — WGSL omits f64), so on the portable path attn11 is
+   f32-only, full stop.
+2. **Native-AMD f64 is real and PROVEN.** mabda ships its **own** SPIR-V→GFX9 ISA
+   emitter (`gfx9_compile`, landed mabda **3.2.12**) that lowers f64 SPIR-V to scalar
+   `V_*_F64` and dispatches via PM4/DRM — **launcher-free, pure-Cyrius**. All 13 native
+   f64 op-tests (fma/add/mul/min/max/div/sqrt/sub/abs/select/convert/ldexp/vec + a full
+   layernorm) pass **bit-exact** on the dev Cezanne. The "gated on mabda v3.2, not yet
+   shipped" premise in §Context and §Consequences is **obsolete**.
+3. **Sequencing revised.** The native-AMD f64 path fits attn11's charter *better* than the
+   portable f32 path: it keeps bit-exact f64 **and** stays dependency-free/pure-Cyrius,
+   whereas portable wgpu needs a C launcher (breaking the single-static-ELF charter) and
+   loses f64. So Decision §3's "f32 portable first, f64 gated later" is no longer strictly
+   locked — **on AMD, native f64 is a viable first-class target.** The portable f32 path
+   becomes the route for non-AMD GPUs.
+
+**Caveats (real, not blockers):** the native f64 path is **scalar VALU** (no matrix core —
+`V_MFMA_F64` full-rate is absent; an oracle/correctness path, not a speed win at attn11's
+scale); it has **no f64 transcendentals** (`exp`/`log` rejected by spirv-val → GELU/softmax
+`exp` is attn11's to hand-roll in-shader); and it is **AMD GFX9 only today**. That last one
+is a *first-substrate* limit, not a ceiling — **AMD is mabda's first GPU substrate; further
+variants (NVIDIA, Intel) are on mabda's own roadmap**, so attn11's native f64 GPU coverage
+broadens as mabda's does, with no attn11-side change to the kernel layer. Pin `mabda = 3.3.0`
+at the dep add.
 
 ## Context
 
@@ -53,7 +87,9 @@ order?*
    native-CDNA MFMA). The CPU scalar/SIMD path remains the f64 reference and the
    byte-identical no-flag default; the GPU is `--gpu`-gated.
 
-3. **Sequencing is LOCKED: f32 portable first, then the f64 track.**
+3. **Sequencing is LOCKED: f32 portable first, then the f64 track.** *(Revised
+   2026-06-19 — see Update: on AMD the proven native f64 path is now a viable first-class
+   target, so this strict lock no longer holds.)*
    - **1.8.0** GPU foundation + matmul (portable f32, the working wgpu backend) →
      **1.8.1** rest of the forward (f32) → **1.8.2** backward + Adam (f32) + an honest
      GPU-vs-CPU perf X-entry.
@@ -84,8 +120,9 @@ order?*
 - M18 introduces exactly **one** new discipline: f32-tolerance dual-precision validation
   on the portable path. The f64 track returns to the bit-tight f64 oracle every prior
   milestone holds.
-- A **cross-repo dependency** on mabda 3.x (the Vulkan-compute f64 device capability)
-  gates the f64 track — recorded on mabda's own v3.2 roadmap (2026-06-14).
+- A **cross-repo dependency** on mabda 3.x (the f64 device capability) gates the f64 track.
+  *(Resolved 2026-06-19 — shipped in mabda 3.2.12 as a native SPIR-V→GFX9 path, proven
+  bit-exact on the dev Cezanne; see Update. The gate is open.)*
 - **Open risk** (deferred to the native f64 follow-on): mabda's native-AMD path uses raw
   PM4-over-graphics-DRM, which is under-documented (Mesa/RADV + AMD PAL headers are the
   next references); the documented HSA/amdkfd AQL path is a different submission route.

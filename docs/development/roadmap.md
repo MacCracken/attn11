@@ -28,12 +28,17 @@ E1–E9 have all graduated. For *what* shipped, see [`CHANGELOG.md`](../../CHANG
 [`state.md`](state.md) (the live snapshot — flags, counts, perf).
 
 **The plan ahead is two infra tracks** (no new training science; both scoped from the
-2026-06-14 mabda recon): **v1.7.2 — the B-series competitor benchmarks** (B0–B3, the honest
-CPU + zero-deps story; the next cut, no GPU dependency), then the **v1.8.x mini-arc — the
-M18 GPU compute backend** on **mabda** (1.8.0 plumbing + matmul → 1.8.1 forward → 1.8.2
-backward + Adam), which is **f32 on the GPU vs the CPU f64 reference** (mabda/WGSL has no
-f64) and unblocks B4 (the GPU competitor row). Detail on both is below. This file is the
-plan ahead only.
+2026-06-14 mabda recon, **revised 2026-06-19** by an on-hardware proof — see below):
+**v1.7.2 — the B-series competitor benchmarks** (B0–B3, the honest CPU + zero-deps story;
+the next cut, no GPU dependency), then the **v1.8.x mini-arc — the M18 GPU compute backend**
+on **mabda** (1.8.0 plumbing + matmul → 1.8.1 forward → 1.8.2 backward + Adam). The original
+recon framed this as **f32-only on the GPU** (portable wgpu/WGSL has no f64). That still
+holds for the *portable* path — but the 2026-06-19 proof changes the f64 story: **bit-exact
+f64 GPU compute is real on AMD** (mabda's own SPIR-V→GFX9 emitter, landed mabda 3.2.12) and
+**runs on the dev box's Cezanne today** (fma + a real layernorm, bit-exact, launcher-free —
+X025). So the f64 oracle *can* follow attn11 to the GPU on AMD; only
+portable f64 is impossible. The arc unblocks B4 (the GPU competitor row). Detail on both is
+below. This file is the plan ahead only.
 
 > **Beyond attn11's own tracks — the ecosystem ML-paradigm map.** The wider
 > sovereign-ML horizon (the *other* generative paradigms that come online as
@@ -316,17 +321,26 @@ the mabda 3.x dependency below). See [ADR 0016](../adr/0016-gpu-backend-layered-
     f64→f32, gated by an **f32-tolerance** dual-precision test (GPU-f32 op vs CPU-f64 op,
     ~1e-3..1e-5) **plus** a statistical gate (loss descends / never NaNs) — the one new
     discipline. (attn11 is f64 everywhere, CPU grad-checked at maxrel 1e-5.)
-  - **f64 IS reachable on AMD** — preserving the f64 oracle — two ways: **(a)
-    Vulkan-compute + SPIR-V** (Vulkan's `shaderFloat64`; wgpu exposes it as the
-    `SHADER_F64` feature — native-Vulkan only, driver-gated, ~16–64× slower than f32, and
-    naga may not validate f64 → possibly raw SPIR-V); **(b) native AMD CDNA MFMA**
-    (Instinct MI100/200/300: full-rate FP64, **1:1 FP64:FP32 matrix** via `V_MFMA_F64`).
-    Consumer Radeon (RDNA) is FP64-throttled (~1:16–1:32) → f64 perf pays only on
-    datacenter parts.
-  - **Cross-repo dependency — on mabda's roadmap now (v3.2, 3.x).** The Vulkan-compute f64
-    path is a mabda **device-layer** capability (not ML), added to mabda's v3.2 plan
-    (2026-06-14); attn11's f64-on-GPU oracle rides it. The fully-sovereign full-rate route
-    (native GFX9+ PM4 + `V_MFMA_F64`) is mabda's heavier native follow-on.
+  - **f64 IS real on AMD — and PROVEN on the dev box (2026-06-19, X025).**
+    The recon listed two *candidate* f64 routes; reality resolved them: **(a)** wgpu's
+    `SHADER_F64` is a dead end on the portable path — naga's frontend accepts an f64 module
+    but `MABDA_WGPU_COMPUTE=0` and the wgpu compute *dispatch* is a `GPU_ERR_OTHER` stub, so
+    portable f64 does **not** run end-to-end. **(b)** mabda instead ships its **own
+    in-tree SPIR-V→GFX9 ISA emitter** (`gfx9_compile`, landed mabda 3.2.12) that lowers f64
+    SPIR-V to scalar `V_*_F64` GFX9 instructions and dispatches via PM4/DRM —
+    **launcher-free, pure-Cyrius**. On the dev box's **AMD Cezanne (gfx90c)** all 13 of
+    mabda's native f64 op-tests pass bit-exact (fma/add/mul/min/max/div/sqrt/sub/abs/select/
+    convert/ldexp/vec + a full layernorm). So attn11's f64 oracle CAN live on the GPU — on
+    AMD GFX9. Caveats: **scalar VALU f64** (no matrix core — `V_MFMA_F64` full-rate is
+    **absent**, and Cezanne/consumer parts are FP64-throttled anyway), so it is a
+    **correctness/oracle path, not a speed win** at any scale attn11 runs; and **no f64
+    transcendentals** (`exp`/`log` are rejected by spirv-val on `double`) — GELU/softmax
+    `exp` must be hand-rolled in-shader from the proven primitives.
+  - **The cross-repo gate is now OPEN.** The "gated on mabda v3.2 Vulkan-f64, not-yet-shipped"
+    premise is **obsolete** — f64 SPIR-V compute landed mabda **3.2.12** and is HW-verified on
+    the dev Cezanne. attn11 should pin `mabda = 3.3.0` at the dep add. The heavier
+    full-rate-f64 route (native CDNA `V_MFMA_F64` on Instinct MI100/200/300) remains a future
+    mabda capability, not present today.
 - **Clean seam.** Matmul is ~80% of FLOPs and funnels through `qlinear_fwd/bwd`
   (`ops.cyr`) over rosnet `linear_fwd/bwd` — one hook for the dominant op. The rest:
   `attn_core_fwd/bwd`, `head_fwd/bwd`, `ln_fwd/bwd`, `gelu_fwd/bwd`, `softmax_xent`,
@@ -364,11 +378,18 @@ for the native-AMD f64 route.
   training step. Then the straight GPU-vs-CPU comparison (default / preset / a larger
   config) with the transfer-cost caveat, logged as an X-entry (expected: a wash or loss
   at reference scale, a win only at scale — the documented honest result).
-- **f64 track (later 1.8.x / M19 — gated on mabda 3.x's Vulkan-f64 capability):** re-run
-  the op set on the **Vulkan-compute + SPIR-V f64** path to **restore the f64 oracle**
-  (the tighter gate); then native-AMD CDNA `V_MFMA_F64` for full-rate f64 once mabda's
-  native compute dispatch + the PM4-over-DRM gap resolve. This is where attn11's f64
-  identity returns to the GPU; on CDNA it can also become a genuine speed win.
+- **f64 track (gate now OPEN — re-sequenceable to first-class, 2026-06-19):** the f64
+  oracle no longer waits on an unshipped capability — mabda's native SPIR-V→GFX9 f64 path
+  is proven on the dev Cezanne (X025). Re-run the op set on the
+  **native-AMD** path (`gpu_context_new_native` → `gpu_shader_module_create_spirv` →
+  `gpu_compute_dispatch`) to restore the bit-exact f64 oracle on-device. **Sequencing note:**
+  the native-AMD f64 path actually fits attn11's charter *better* than the portable f32 path
+  — it is launcher-free + pure-Cyrius + keeps bit-exact f64, whereas portable wgpu needs a C
+  launcher (breaking the dependency-free single-ELF charter) **and** loses f64 (see the
+  launcher caveat under 1.8.0). So on AMD hardware the f64 track is a viable *first* target,
+  not a deferred follow-on; the portable f32 track is the one for non-AMD GPUs. Full-rate f64
+  (native CDNA `V_MFMA_F64`) stays a future win once mabda adds matrix-core support — on
+  Cezanne the f64 path is scalar and oracle-only, never faster than the CPU at attn11's scale.
 - **Follow-ons (additive, not gating the arc):** MoE / ternary / RoPE GPU kernels;
   pipelined host↔device transfer. **The arc unblocks benchmark phase B4** (the GPU
   competitor comparison).
