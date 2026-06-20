@@ -4,6 +4,39 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.8.11] - 2026-06-20
+
+**M18 1.8.11: the M18 close-out — the honest full-step perf X-entry + the P(-1) hardening pass
+(E-infra; ADR 0016, X039).** No code change; the measurement + audit + docs that complete the M18
+GPU arc. With the full training step running end-to-end on the GPU (1.8.10), this records the honest
+number and audits the new surface.
+
+**The full-step perf (X039 / benchmarks B5).** Measured end-to-end wall-clock (AMD Cezanne, warm
+reps): the GPU full step is **4–7× slower** than the CPU — larger than the forward-only 2–4× (X032),
+as the backward adds passes + ~5-tensor transfers per op. Default (`--bpe 7`, T16 → all ops
+on-device, 40 steps): CPU **2.37 s**, `--gpu` (bit-exact subset) 10.55 s (**4.5×**), `--gpu-tc`
+(full step) 16.74 s (**7.1×**). Preset (T64; attn-bwd + head → CPU, 16 steps): CPU 16.10 s vs
+`--gpu-tc` 63.51 s (**3.9×**). The gap narrows with scale; same structural cause as the forward
+(per-op host↔device transfer + scalar-VALU f64, no matrix core). The GPU backend is the
+**sovereign-stack / oracle milestone** it was scoped to be — gradient-based learning expressible
+*and running* end-to-end on the assembly-up, no-BLAS/no-autodiff stack — **not** a speedup; the CPU
+stays the production path.
+
+**P(-1) hardening (`docs/audit/2026-06-20-gpu-backward-audit.md`).** Security/correctness audit of
+the 1.8.5–1.8.10 GPU backward + Adam surface: **GO, 0 residual blockers**. The GPU path touches no
+untrusted input (model tensors only); every backward kernel's AccessChain index is bounded by its
+dispatch shape; the dV/dK unmasked gather is sound (relies on `Pc[h,i,j]=0` for `j>i`); accumulators
+match each CPU op's own order (bit-exact); the mabda DRM surface stays AGNOS-gated. Records the four
+bugs the bit-exact tests caught + fixed during the arc (the 1.8.6 layering bug, 1.8.8 accumulation
+order, 1.8.9 `FLAT_NONVGPR`, 1.8.10 `_gpu_ecf` type-id) and the hardening lesson (run `make gpu-test`
+after any `src/gpu.cyr` change — the release gate doesn't build the gpu harnesses).
+
+**Gate:** unchanged + re-verified — lint 0 warnings, 1056 grad-checks (x86_64 + aarch64/qemu),
+11-test gpu suite, agnos main+tcyr, fuzz, smoke, plain `--gpu` byte-identical. **The M18 GPU arc
+(1.8.0 → 1.8.11) is complete.** Future (post-M18): tiling the attention backward + the head ops for
+preset-scale on-device coverage; device-resident tensors + fused kernels for an actual speedup (a
+later mabda capability). cyrius pin stays **6.2.29**; `mabda = 3.4.1`.
+
 ## [1.8.10] - 2026-06-20
 
 **M18 1.8.10: attention backward on the GPU — the last op; the FULL training step now runs

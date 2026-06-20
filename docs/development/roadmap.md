@@ -13,8 +13,8 @@
 
 ## Where we are
 
-Current: **v1.8.10** — **M18: the full training step now runs end-to-end on the GPU (the sovereign
-milestone, X038).** `--gpu` runs **matmul** (1.8.0) **+ layernorm** (1.8.1) **+ Adam** (1.8.5) **+ the
+Current: **v1.8.11** — **M18 COMPLETE: the full training step runs end-to-end on the GPU (the
+sovereign milestone, X038); the honest full-step perf + P(-1) audit closed it out (1.8.11, X039).** `--gpu` runs **matmul** (1.8.0) **+ layernorm** (1.8.1) **+ Adam** (1.8.5) **+ the
 LM-head backward** (1.8.8) **+ the layernorm backward** (1.8.9) all bit-exact (a `--gpu` checkpoint is
 byte-identical to the CPU's — incl. optimizer state + the bit-exact gradients); **`--gpu-tc`** adds
 **GELU** (1.8.2) + the **LM head** (1.8.3) + the **fused attention forward** (1.8.4) + the **GELU /
@@ -479,10 +479,13 @@ for the native-AMD f64 route.
     `_gpu_ecf` f64-const type `%7` is wrong under `_gpu_pre` (double=`%6`) → `_gpu_ecf6`. dQ/dK/dV
     0-diff vs a sequential replica. `tests/gpu_attn_bwd.cyr`. With it, a `--bpe 7 --gpu-tc` step runs
     the **full training step (fwd+bwd+Adam) on-device** — the M18 sovereign milestone.
-  - **1.8.11 — the backward perf X-entry + P(-1) hardening close-out.** Mirror X032 for the step
-    (expect a larger loss); security audit of the new device-buffer surface; ADR/arch-note; declare
-    the milestone done. (Out of scope this arc: device-resident m/v + fwd→bwd P-residency — a
-    separate fusion project.)
+  - **1.8.11 — the backward perf X-entry + P(-1) hardening close-out — ✅ SHIPPED (X039).** Measured
+    the full step: **4–7× slower** than CPU (default 7.1×, preset 3.9×; gap narrows with scale) — the
+    documented honest negative, end-to-end. P(-1) security audit of the GPU backward surface (GO, 0
+    blockers; `docs/audit/2026-06-20-gpu-backward-audit.md`). **The M18 GPU arc (1.8.0→1.8.11) is
+    complete** — the full training step runs on the sovereign stack, validated against the CPU oracle.
+    (Out of scope this arc: device-resident m/v + fwd→bwd P-residency — a separate fusion project;
+    tiling attn-bwd + head for preset-scale on-device coverage — a post-M18 follow-up.)
 - **f64 track (gate now OPEN — re-sequenceable to first-class, 2026-06-19):** the f64
   oracle no longer waits on an unshipped capability — mabda's native SPIR-V→GFX9 f64 path
   is proven on the dev Cezanne (X025). Re-run the op set on the

@@ -5,7 +5,27 @@
 
 ## Version
 
-**1.8.10** — *M18 1.8.10: attention backward on the GPU — the last op; THE FULL TRAINING STEP NOW
+**1.8.11** — *M18 1.8.11: the M18 close-out — the honest full-step perf X-entry + the P(-1)
+hardening pass* (E-infra; ADR 0016, X039). No code change; the measurement + audit + docs that
+complete the M18 GPU arc. **Full-step perf (X039 / benchmarks B5):** the GPU full step is **4–7×
+slower** than the CPU (default `--bpe 7` T16, 40 steps: CPU 2.37s vs `--gpu` 10.55s /4.5× vs
+`--gpu-tc` 16.74s /7.1×; preset T64, 16 steps: CPU 16.10s vs `--gpu-tc` 63.51s /3.9× — attn-bwd +
+head fall back at T=64) — larger than the forward 2–4× (backward adds passes + transfers), gap
+narrows with scale; per-op host↔device transfer + scalar-VALU f64 dominate. The GPU backend is the
+validated **sovereign-stack / oracle** milestone, NOT a speedup; CPU stays production. **P(-1) audit
+(`docs/audit/2026-06-20-gpu-backward-audit.md`): GO, 0 residual blockers** — no untrusted input on
+the GPU path; all backward AccessChain indices bounded by dispatch shape; the dV/dK unmasked gather
+sound (Pc upper triangle = 0); accumulators match each CPU op's order; mabda DRM AGNOS-gated. Records
+the 4 bugs the bit-exact tests caught+fixed in-arc + the lesson (run `make gpu-test` after any
+gpu.cyr change). **Gate (re-verified):** lint 0 warn; 1056 grad-checks x86_64 **and** aarch64/qemu;
+11-test gpu suite; agnos main+tcyr; fuzz; smoke; plain `--gpu` byte-identical. **THE M18 GPU ARC
+(1.8.0→1.8.11) IS COMPLETE** — the full training step (fwd+bwd+Adam) runs end-to-end on the sovereign
+native-AMD f64 GPU stack, validated against the CPU oracle. **Future (post-M18):** tile attn-bwd +
+head for preset on-device; device-resident + fused kernels for a real speedup (later mabda). cyrius
+pin stays **6.2.29** (installed cycc 6.2.31, benign drift); pin `mabda = 3.4.1`. `src/*.cyr` unchanged
+except CFG_VERSION + the additive `--gpu-tc` usage comment.
+
+(**1.8.10** — *M18 1.8.10: attention backward on the GPU — the last op; THE FULL TRAINING STEP NOW
 RUNS END-TO-END ON THE GPU* (E-infra; ADR 0016, X038 — the M18 sovereign milestone). Adds
 **`gpu_attn_core_bwd`** at the `attn_core_bwd` seam (causal MHA). With it, **every heavy op** of a
 step (forward + backward + Adam) runs on the native-AMD f64 path — a `--bpe 7 --gpu-tc` step
@@ -23,7 +43,7 @@ grad-checks x86_64 **and** aarch64/qemu; agnos main+tcyr; lint (0 warn); fuzz; s
 + 5 kernels in `src/gpu.cyr`; hook in `src/attn.cyr` (attn_core_bwd); new `tests/gpu_attn_bwd.cyr`.
 **Next (1.8.11):** the honest backward perf X-entry + the P(-1) hardening close-out (+ optional
 attn-bwd tiling for preset). cyrius pin stays **6.2.29** (installed cycc 6.2.31, benign drift); pin
-`mabda = 3.4.1`. `src/*.cyr` unchanged except the additive GPU wiring + CFG_VERSION.
+`mabda = 3.4.1`. `src/*.cyr` unchanged except the additive GPU wiring + CFG_VERSION.)
 
 (**1.8.9** — *M18 1.8.9: layernorm backward on the GPU — BIT-EXACT, the most complex bit-exact op*
 (E-infra; ADR 0016, X037). Adds **`gpu_ln_bwd`** at the `ln_bwd` seam: dx + dgamma/dbeta from the

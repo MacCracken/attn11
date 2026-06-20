@@ -1645,3 +1645,24 @@ double is `%6`) → sds's scale const was mistyped (−21 UNSUPPORTED_TYPE); fix
 **Lesson: the f64-const helper must use the double type-id of the preamble in use (_gpu_pre → %6,
 attn preamble → %7).** Reproduce: `make gpu-test`; `./build/attn11 --bpe 7 --gpu-tc --steps 10`. Next:
 1.8.11 backward perf X-entry + P(-1) close-out (+ optional attn-bwd tiling for preset). Detail: ADR 0016.
+
+## X039 — M18 1.8.11: the honest full-training-step perf (the documented negative, end-to-end) (M18, v1.8.11, 2026-06-20)
+
+**Result.** With the full step on the GPU (1.8.10), measured end-to-end training wall-clock (AMD
+Cezanne gfx90c, min of warm reps): the GPU full step is **4–7× slower** than the CPU — larger than
+the forward-only 2–4× (X032), as predicted (the backward adds passes + ~5-tensor transfers per op).
+Default (`--bpe 7`, T=16, V=32 → ALL ops on-device, 40 steps): CPU **2.37 s**, `--gpu` (bit-exact
+subset: matmul+ln+Adam+head-bwd+ln-bwd) 10.55 s (**4.5×**), `--gpu-tc` (the FULL step) 16.74 s
+(**7.1×**). Preset (T=64, 16 steps; attn-bwd + head fall back to CPU, rest on-device): CPU 16.10 s,
+`--gpu-tc` 63.51 s (**3.9×**). The gap **narrows with scale** (7.1×→3.9×) — more compute per
+host↔device transfer — but never closes at attn11's size.
+
+**This is the M18 close-out, not a speedup.** The full training step (forward + backward + Adam) now
+runs end-to-end on the sovereign native-AMD f64 SPIR-V path, validated against the CPU oracle (the
+charter: gradient-based learning expressible on the assembly-up stack — including on-device). It is a
+known perf LOSS, for the same structural reasons as the forward (X032): per-op host↔device transfer
++ scalar-VALU f64 (no matrix core on Cezanne) dominate the small kernels. The CPU stays the
+production path. A real win needs batched, device-resident tensors kept across the whole step + fused
+multi-op kernels + matrix-core f64 — a later mabda capability + a fusion project, NOT this per-op
+M18 pattern. Reproduce: `for m in "" --gpu --gpu-tc; do time ./build/attn11 --bpe 7 $m --steps 40; done`.
+Detail: `docs/benchmarks.md` B5; security audit `docs/audit/2026-06-20-gpu-backward-audit.md`.

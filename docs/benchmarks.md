@@ -451,5 +451,27 @@ not a throughput goal.
 Reproduce: `for m in "" --gpu --gpu-tc; do time ./build/attn11 $m --steps 50; done`
 (and `--preset`).
 
+## B5 — the full training step on GPU (M18 1.8.10/1.8.11): the honest negative, end-to-end (X039)
+
+With 1.8.10, the **full training step** (forward + backward + Adam) runs end-to-end on the GPU. The
+honest wall-clock (same box + warm-rep method as B4):
+
+| shape | steps | CPU | `--gpu` (bit-exact subset) | `--gpu-tc` (full step) |
+|-------|-------|-----|----------------------------|------------------------|
+| default `--bpe 7` (T16, V32 — all ops on-device) | 40 | **2.37 s** | 10.55 s (**4.5×**) | 16.74 s (**7.1×**) |
+| preset (T64; attn-bwd + head → CPU) | 16 | **16.10 s** | — | 63.51 s (**3.9×**) |
+
+The full step is **4–7× slower** than the CPU — larger than the forward-only 2–4× (B4), because the
+backward adds more passes and transfers (~5 full-tensor host↔device copies per op). The gap
+**narrows with scale** (7.1×→3.9×). Same structural cause as the forward: per-op host↔device
+transfer + scalar-VALU f64 (no matrix core on Cezanne) dominate the small kernels.
+
+**This completes the M18 arc as the sovereign-stack / oracle milestone it was scoped to be:**
+gradient-based learning — forward, hand-derived backward, and Adam — is now expressible *and runs*
+end-to-end on the assembly-up, no-BLAS/no-autodiff GPU path, validated bit-exact (matmul/ln/Adam/
+head-bwd/ln-bwd) or to ~1e-13 (the transcendental/SIMD-tree ops) against the CPU. It is **not** a
+speedup, and the CPU remains the production path. Reproduce:
+`for m in "" --gpu --gpu-tc; do time ./build/attn11 --bpe 7 $m --steps 40; done`.
+
 Reproduce: `scripts/compete-bench.sh` (records the upstream commit it builds; emits
 `competitor-bench.csv` + the table above).
