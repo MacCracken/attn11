@@ -1517,3 +1517,27 @@ infra first; reordered to Adam-first because Adam needs none of it, is easiest, 
 every version ships a real validatable consumer; shared infra lands with linear_bwd. Reproduce:
 `make gpu-test`; `./build/attn11 --gpu --steps 40 --save /tmp/g.ckpt` vs no-flag + `cmp`. Detail:
 ADR 0016; the backward-arc sequence is in roadmap M18.
+
+## X034 — M18 1.8.6: GELU backward on GPU, TOLERANCE (second backward-arc op) (M18, v1.8.6, 2026-06-20)
+
+**Result.** `gpu_gelu_bwd` (src/gpu.cyr) at the `gelu_bwd` seam runs `dx = dy·gelu'(x)` on the
+native-AMD f64 path. Elementwise (one thread/elt — no reduction/tiling/index-decomposition),
+reusing `_gpu_emit_exp` for the two exps of `tanh`. TOLERANCE (in-shader exp), rides `--gpu-tc`.
+`tests/gpu_gelu_bwd.cyr` (`make gpu-test`): allclose(atol=rtol=1e-10) at widths 2048 (default MLP
+hidden), 16384 (preset), 128 — all ~1e-13. Second backward op after Adam (X033). Plain `--gpu`
+stays byte-identical (gelu_bwd is `--gpu-tc`-only); a `--gpu-tc` run dispatches it in the backward
+pass, no NaN.
+
+**Kernel detail.** Mirrors the forward GELU kernel's preamble but with 3 bindings (x, dy, dx). The
+extra binding pushes `uint0` to %37 and the GELU consts (c, a, half, one, neg1, 3a) to %31–36, so
+`_gpu_emit_exp`'s hardcoded exp consts stay at %17–30 (and GLSL import %1 / signed-int %12) where it
+expects them. Body: inner = c(x+a·x³); t = (eⁱ−e⁻ⁱ)/(eⁱ+e⁻ⁱ); then 1−t², 3a·x², the two terms, and
+dx = dy·grad. One FDiv (tanh), no div/mod → trivially under the 256-id cap.
+
+**Fix folded in (1.8.5 layering bug).** `gpu_adam_step` had read model globals (g_NP etc.) directly,
+breaking every standalone gpu test that includes gpu.cyr without model.cyr (undefined g_NP) —
+unnoticed because `make release` doesn't build the gpu harnesses and `make gpu-test` wasn't re-run
+after Adam landed. Refactored to `gpu_adam_step(params, grads, m, v, NP, lr, step)` (caller passes
+buffers); gpu.cyr is self-contained again, all 7 gpu tests build. Reproduce: `make gpu-test`. Next:
+1.8.7 linear_bwd + the shared matmul-bwd infra (`_gpu_build_tile_dw` + the bit-exact host-RMW-accumulate
+helper — the accumulator-clobber trap). Detail: ADR 0016; the backward-arc sequence is in roadmap M18.

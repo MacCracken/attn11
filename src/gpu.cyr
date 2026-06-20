@@ -805,6 +805,123 @@ fn gpu_gelu_fwd(x, y, n): i64 {
     return 0;
 }
 
+# GELU backward kernel (1.8.6): bindings x=0(%14) dy=1(%15) dx=2(%16). dx = dy·gelu'(x),
+# gelu'(x) = 0.5(1+t) + 0.5·x·(1−t²)·c(1+3a·x²), t = tanh(c(x+a·x³)) — EXACTLY ops.cyr gelu_bwd.
+# Reuses _gpu_emit_exp (exp consts MUST stay at %17–30), so the 3rd binding pushes uint0 to %37,
+# 3a to %36, fn to %40. TOLERANCE (in-shader exp). One thread per element (grid n).
+fn _gpu_build_gelu_bwd(buf): i64 {
+    var cbits = f64_sqrt(f64_div(f64_from(2), F64_PI));
+    var abits = f64_div(f64_from(44715), f64_from(1000000));
+    var threea = f64_mul(f64_from(3), abits);
+    var o = _gpu_op3(buf, 0, 0x07230203, 0x00010300, 0x00000000);
+    var bound_off = o; o = _gpu_op2(buf, o, 0x00000000, 0x00000000);
+    o = _gpu_op2(buf, o, 0x00020011, 1); o = _gpu_op2(buf, o, 0x00020011, 10);
+    o = _gpu_op3(buf, o, 0x0006000B, 1, 0x4C534C47);
+    store32(buf + o, 0x6474732E); store32(buf + o + 4, 0x3035342E); store32(buf + o + 8, 0x00000000); o = o + 12;
+    o = _gpu_op3(buf, o, 0x0003000E, 0, 1);
+    o = _gpu_op6(buf, o, 0x0006000F, 5, 40, 0x6E69616D, 0x00000000, 13);
+    o = _gpu_op6(buf, o, 0x00060010, 40, 17, 1, 1, 1);
+    o = _gpu_op4(buf, o, 0x00040047, 13, 11, 28);
+    o = _gpu_op4(buf, o, 0x00040047, 14, 33, 0); o = _gpu_op4(buf, o, 0x00040047, 14, 34, 0);
+    o = _gpu_op4(buf, o, 0x00040047, 15, 33, 1); o = _gpu_op4(buf, o, 0x00040047, 15, 34, 0);
+    o = _gpu_op4(buf, o, 0x00040047, 16, 33, 2); o = _gpu_op4(buf, o, 0x00040047, 16, 34, 0);
+    o = _gpu_op2(buf, o, 0x00020013, 2); o = _gpu_op3(buf, o, 0x00030021, 3, 2);
+    o = _gpu_op4(buf, o, 0x00040015, 4, 32, 0); o = _gpu_op4(buf, o, 0x00040017, 5, 4, 3);
+    o = _gpu_op4(buf, o, 0x00040020, 6, 1, 5); o = _gpu_op3(buf, o, 0x00030016, 7, 64);
+    o = _gpu_op3(buf, o, 0x0003001D, 8, 7); o = _gpu_op3(buf, o, 0x0003001E, 9, 8);
+    o = _gpu_op4(buf, o, 0x00040020, 10, 12, 9); o = _gpu_op4(buf, o, 0x00040020, 11, 12, 7);
+    o = _gpu_op4(buf, o, 0x00040015, 12, 32, 1);
+    o = _gpu_op4(buf, o, 0x0004003B, 6, 13, 1);
+    o = _gpu_op4(buf, o, 0x0004003B, 10, 14, 12); o = _gpu_op4(buf, o, 0x0004003B, 10, 15, 12);
+    o = _gpu_op4(buf, o, 0x0004003B, 10, 16, 12);
+    o = _gpu_ecf(buf, o, 17, 0x3FF71547652B82FE); o = _gpu_ecf(buf, o, 18, 0x3FE62E42FEFA39EF);
+    o = _gpu_ecf(buf, o, 19, 0x4338000000000000); o = _gpu_ecf(buf, o, 20, 0x3E927E4FB7789F5C);
+    o = _gpu_ecf(buf, o, 21, 0x3EC71DE3A556C734); o = _gpu_ecf(buf, o, 22, 0x3EFA01A01A01A01A);
+    o = _gpu_ecf(buf, o, 23, 0x3F2A01A01A01A01A); o = _gpu_ecf(buf, o, 24, 0x3F56C16C16C16C17);
+    o = _gpu_ecf(buf, o, 25, 0x3F81111111111111); o = _gpu_ecf(buf, o, 26, 0x3FA5555555555555);
+    o = _gpu_ecf(buf, o, 27, 0x3FC5555555555555); o = _gpu_ecf(buf, o, 28, 0x3FE0000000000000);
+    o = _gpu_ecf(buf, o, 29, 0x3FF0000000000000); o = _gpu_ecf(buf, o, 30, 0x3FF0000000000000);
+    o = _gpu_ecf(buf, o, 31, cbits); o = _gpu_ecf(buf, o, 32, abits);
+    o = _gpu_ecf(buf, o, 33, 0x3FE0000000000000); o = _gpu_ecf(buf, o, 34, 0x3FF0000000000000);
+    o = _gpu_ecf(buf, o, 35, 0xBFF0000000000000); o = _gpu_ecf(buf, o, 36, threea);
+    o = _gpu_op4(buf, o, 0x0004002B, 4, 37, 0);             # %37 uint 0 (member index)
+    o = _gpu_op5(buf, o, 0x00050036, 2, 40, 0, 3); o = _gpu_op2(buf, o, 0x000200F8, 41);
+    o = _gpu_op4(buf, o, 0x0004003D, 5, 42, 13);            # gid
+    o = _gpu_op5(buf, o, 0x00050051, 4, 43, 42, 0);         # idx
+    o = _gpu_op6(buf, o, 0x00060041, 11, 44, 14, 37, 43); o = _gpu_op4(buf, o, 0x0004003D, 7, 45, 44);  # xv
+    o = _gpu_op5(buf, o, 0x00050085, 7, 46, 45, 45);        # x2
+    o = _gpu_op5(buf, o, 0x00050085, 7, 47, 46, 45);        # x3
+    o = _gpu_op5(buf, o, 0x00050085, 7, 48, 32, 47);        # a*x3
+    o = _gpu_op5(buf, o, 0x00050081, 7, 49, 45, 48);        # x + a*x3
+    o = _gpu_op5(buf, o, 0x00050085, 7, 50, 31, 49);        # inner = c*(...)
+    var st[16]; store64(&st, 51);
+    o = _gpu_emit_exp(buf, o, 50, &st);
+    var ex = load64(&st + 8); var nid = load64(&st);
+    var negi = nid; nid = nid + 1; o = _gpu_op5(buf, o, 0x00050085, 7, negi, 50, 35);   # -inner
+    store64(&st, nid);
+    o = _gpu_emit_exp(buf, o, negi, &st);
+    var enx = load64(&st + 8); nid = load64(&st);
+    var num = nid; nid = nid + 1; o = _gpu_op5(buf, o, 0x00050083, 7, num, ex, enx);
+    var den = nid; nid = nid + 1; o = _gpu_op5(buf, o, 0x00050081, 7, den, ex, enx);
+    var t = nid; nid = nid + 1; o = _gpu_op5(buf, o, 0x00050088, 7, t, num, den);       # tanh
+    var tt = nid; nid = nid + 1; o = _gpu_op5(buf, o, 0x00050085, 7, tt, t, t);
+    var sech2 = nid; nid = nid + 1; o = _gpu_op5(buf, o, 0x00050083, 7, sech2, 34, tt); # 1 - t²
+    var t3a = nid; nid = nid + 1; o = _gpu_op5(buf, o, 0x00050085, 7, t3a, 36, 46);     # 3a·x²
+    var inn1 = nid; nid = nid + 1; o = _gpu_op5(buf, o, 0x00050081, 7, inn1, 34, t3a);  # 1 + 3a·x²
+    var dinr = nid; nid = nid + 1; o = _gpu_op5(buf, o, 0x00050085, 7, dinr, 31, inn1); # c·(...)
+    var ot = nid; nid = nid + 1; o = _gpu_op5(buf, o, 0x00050081, 7, ot, 34, t);        # 1 + t
+    var tm1 = nid; nid = nid + 1; o = _gpu_op5(buf, o, 0x00050085, 7, tm1, 33, ot);     # 0.5(1+t)
+    var hx = nid; nid = nid + 1; o = _gpu_op5(buf, o, 0x00050085, 7, hx, 33, 45);       # 0.5·x
+    var sd = nid; nid = nid + 1; o = _gpu_op5(buf, o, 0x00050085, 7, sd, sech2, dinr);
+    var tm2 = nid; nid = nid + 1; o = _gpu_op5(buf, o, 0x00050085, 7, tm2, hx, sd);
+    var grad = nid; nid = nid + 1; o = _gpu_op5(buf, o, 0x00050081, 7, grad, tm1, tm2);
+    var dyp = nid; nid = nid + 1; o = _gpu_op6(buf, o, 0x00060041, 11, dyp, 15, 37, 43);
+    var dyv = nid; nid = nid + 1; o = _gpu_op4(buf, o, 0x0004003D, 7, dyv, dyp);
+    var dxv = nid; nid = nid + 1; o = _gpu_op5(buf, o, 0x00050085, 7, dxv, dyv, grad);  # dy·grad
+    var dxp = nid; nid = nid + 1; o = _gpu_op6(buf, o, 0x00060041, 11, dxp, 16, 37, 43);
+    o = _gpu_op3(buf, o, 0x0003003E, dxp, dxv);
+    o = _gpu_op2(buf, o, 0x000100FD, 0x00010038);
+    store32(buf + bound_off, nid);
+    return o;
+}
+
+# Compile+cache the GELU backward kernel (kind=13). 0 = unavailable.
+fn _gpu_get_gelu_bwd(): i64 {
+    var key = 13 << 56;
+    var c = _gpu_cache_get(key);
+    if (c == (0 - 1)) { return 0; }
+    if (c != 0) { return c; }
+    var spv[8192];
+    var nbytes = _gpu_build_gelu_bwd(&spv);
+    var shmod = gpu_shader_module_create_spirv(_gpu_ctx, &spv, nbytes);
+    if (shmod == 0) { _gpu_cache_put(key, 0 - 1); return 0; }
+    _gpu_cache_put(key, shmod);
+    return shmod;
+}
+
+# GPU GELU backward: dx[0..n) = dy·gelu'(x), elementwise. Returns 0 = ran, -1 = use CPU.
+# TOLERANCE (in-shader exp) → gated by g_gpu_tc. Buffers: x→x, dy→W, dx→y.
+fn gpu_gelu_bwd(x, dy, dx, n): i64 {
+    if (_gpu_init() == 0) { return 0 - 1; }
+    if (n <= 0) { return 0 - 1; }
+    if (n > MABDA_MAX_DISPATCH_DIM) { return 0 - 1; }
+    if ((n * 8) > GPU_BO_MAX()) { return 0 - 1; }
+    var sh = _gpu_get_gelu_bwd();
+    if (sh == 0) { return 0 - 1; }
+    var i = 0;
+    while (i < n) { store64(_gpu_xm + i*8, load64(x + i*8)); i = i + 1; }
+    i = 0; while (i < n) { store64(_gpu_wm + i*8, load64(dy + i*8)); i = i + 1; }
+    var bp[56];
+    store64(&bp+0, 3);
+    store64(&bp+8, _gpu_xh); store64(&bp+16, _GPU_XVA());
+    store64(&bp+24, _gpu_wh); store64(&bp+32, _GPU_WVA());
+    store64(&bp+40, _gpu_yh); store64(&bp+48, _GPU_YVA());
+    if (gpu_compute_dispatch(_gpu_ctx, sh, n, 1, 1, &bp) != 0) { return 0 - 1; }
+    i = 0; while (i < n) { store64(dx + i*8, load64(_gpu_ym + i*8)); i = i + 1; }
+    _gpu_gelu_count = _gpu_gelu_count + 1;
+    return 0;
+}
+
 # Get (compile+cache) the transposed head tile for (K, N, k0). Key kind=5. 0 = unavailable.
 fn _gpu_get_tile_t(K, N, k0): i64 {
     var key = (5 << 56) | (K << 28) | (N << 14) | k0;
@@ -1224,12 +1341,12 @@ fn _gpu_get_adam(base): i64 {
     return shmod;
 }
 
-# GPU Adam step (BIT-EXACT, plain --gpu). Mirrors model_adam_step over g_params/g_grads/
-# g_adam_m/g_adam_v (NP = g_NP). Returns 0 = ran on device, -1 = use CPU. lr is an f64 bit
-# pattern; step is the 1-based Adam timestep.
-fn gpu_adam_step(lr, step): i64 {
+# GPU Adam step (BIT-EXACT, plain --gpu). Mirrors model_adam_step over the caller's flat
+# params/grads/m/v vectors (NP entries each) — buffers passed in so gpu.cyr stays free of model
+# globals. Returns 0 = ran on device, -1 = use CPU. lr is an f64 bit pattern; step is the
+# 1-based Adam timestep.
+fn gpu_adam_step(params, grads, m, v, NP, lr, step): i64 {
     if (_gpu_init() == 0) { return 0 - 1; }
-    var NP = g_NP;
     if ((NP * 8) > GPU_BO_MAX()) { return 0 - 1; }
     # host-compute the 8 scalars EXACTLY as model_adam_step (bit-identical inputs)
     var b1 = f64_div(f64_from(9), f64_from(10));
@@ -1245,11 +1362,11 @@ fn gpu_adam_step(lr, step): i64 {
     store64(_gpu_sm + 48, bc2); store64(_gpu_sm + 56, lr);
     # upload grads→x, params→W, m→gamma, v→beta
     var i = 0;
-    while (i < NP) { store64(_gpu_xm + i*8, load64(g_grads + i*8)); i = i + 1; }
-    i = 0; while (i < NP) { store64(_gpu_wm + i*8, load64(g_params + i*8)); i = i + 1; }
-    i = 0; while (i < NP) { store64(_gpu_gm + i*8, load64(g_adam_m + i*8)); i = i + 1; }
-    i = 0; while (i < NP) { store64(_gpu_bbm + i*8, load64(g_adam_v + i*8)); i = i + 1; }
-    # dispatch in MABDA_MAX_DISPATCH_DIM chunks (g_NP exceeds it at preset)
+    while (i < NP) { store64(_gpu_xm + i*8, load64(grads + i*8)); i = i + 1; }
+    i = 0; while (i < NP) { store64(_gpu_wm + i*8, load64(params + i*8)); i = i + 1; }
+    i = 0; while (i < NP) { store64(_gpu_gm + i*8, load64(m + i*8)); i = i + 1; }
+    i = 0; while (i < NP) { store64(_gpu_bbm + i*8, load64(v + i*8)); i = i + 1; }
+    # dispatch in MABDA_MAX_DISPATCH_DIM chunks (NP exceeds it at preset)
     var base = 0;
     while (base < NP) {
         var n = NP - base;
@@ -1267,9 +1384,9 @@ fn gpu_adam_step(lr, step): i64 {
         base = base + n;
     }
     # download params/m/v (RMW in place in the BOs)
-    i = 0; while (i < NP) { store64(g_params + i*8, load64(_gpu_wm + i*8)); i = i + 1; }
-    i = 0; while (i < NP) { store64(g_adam_m + i*8, load64(_gpu_gm + i*8)); i = i + 1; }
-    i = 0; while (i < NP) { store64(g_adam_v + i*8, load64(_gpu_bbm + i*8)); i = i + 1; }
+    i = 0; while (i < NP) { store64(params + i*8, load64(_gpu_wm + i*8)); i = i + 1; }
+    i = 0; while (i < NP) { store64(m + i*8, load64(_gpu_gm + i*8)); i = i + 1; }
+    i = 0; while (i < NP) { store64(v + i*8, load64(_gpu_bbm + i*8)); i = i + 1; }
     _gpu_adam_count = _gpu_adam_count + 1;
     return 0;
 }

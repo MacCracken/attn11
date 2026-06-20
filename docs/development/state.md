@@ -5,7 +5,27 @@
 
 ## Version
 
-**1.8.5** — *M18 1.8.5: the Adam optimizer step on the GPU — BIT-EXACT, the first backward-arc op*
+**1.8.6** — *M18 1.8.6: GELU backward on the GPU — TOLERANCE, the second backward-arc op*
+(E-infra; ADR 0016, X034). Adds **`gpu_gelu_bwd`** at the `gelu_bwd` seam: `dx = dy·gelu'(x)`
+runs on the native-AMD f64 path — elementwise (no reduction/tiling/index-decomposition), reusing
+the proven `_gpu_emit_exp` for `tanh`'s two exps. TOLERANCE (in-shader exp), rides **`--gpu-tc`**.
+3 bindings (x→x, dy→W, dx→y); the extra binding pushes `uint0`→%37 + GELU consts→%31–36 so
+`_gpu_emit_exp`'s exp consts stay at %17–30. **Also fixes a 1.8.5 layering bug:** `gpu_adam_step`
+had read model globals (`g_NP` etc.) directly → `src/gpu.cyr` depended on `src/model.cyr`, silently
+breaking every standalone gpu test (`undefined g_NP`; missed because `make release` skips the gpu
+harnesses + `make gpu-test` wasn't re-run after Adam). Now `gpu_adam_step(params, grads, m, v, NP,
+lr, step)` — caller passes buffers, gpu.cyr is self-contained, all 7 gpu tests build (no behavior
+change; `--gpu` checkpoint still byte-identical). **Validation (X034):** `tests/gpu_gelu_bwd.cyr`
+(`make gpu-test`) allclose(atol=rtol=1e-10) at widths {2048 (default), 16384 (preset), 128} ~1e-13;
+full 7-test gpu suite re-passes; plain `--gpu` 40-step checkpoint byte-identical; `--gpu-tc`
+dispatches gelu_bwd in-pass, no NaN. **Gate:** 1056 grad-checks x86_64 **and** aarch64/qemu; agnos
+main+tcyr; lint (0 warn); fuzz; smoke. `gpu_gelu_bwd` + `_gpu_build_gelu_bwd` in `src/gpu.cyr`; hook
+in `src/ops.cyr`; new `tests/gpu_gelu_bwd.cyr`. **Next (1.8.7):** `linear_bwd` + the shared
+matmul-bwd infra (`_gpu_build_tile_dw` + the bit-exact host-RMW-accumulate helper). cyrius pin stays
+**6.2.29** (installed cycc 6.2.31, benign drift); pin `mabda = 3.4.1`. `src/*.cyr` unchanged except
+the additive GPU wiring + CFG_VERSION.
+
+(**1.8.5** — *M18 1.8.5: the Adam optimizer step on the GPU — BIT-EXACT, the first backward-arc op*
 (E-infra; ADR 0016, X033). Adds **`gpu_adam_step`** at the `model_adam_step` seam: the
 per-parameter Adam update runs on the native-AMD f64 path **bit-for-bit identical** to the CPU, so
 it rides **plain `--gpu`** and **keeps a `--gpu` checkpoint byte-identical** (now incl. optimizer
@@ -26,7 +46,7 @@ re-pass. `gpu_adam_step` + `_gpu_adam_k` in `src/gpu.cyr`; hook in `src/model.cy
 `tests/gpu_adam.cyr`. **Next (1.8.6+):** the backward ops (gelu_bwd, linear_bwd + shared matmul-bwd
 infra, head_bwd, ln_bwd, attn_core_bwd) → the full training step end-to-end on GPU. cyrius pin stays
 **6.2.29** (installed cycc 6.2.31, benign drift); pin `mabda = 3.4.1`. `src/*.cyr` unchanged except
-the additive GPU wiring + CFG_VERSION.
+the additive GPU wiring + CFG_VERSION.)
 
 (**1.8.4** — *M18 1.8.4: the FULL fused attention core on the GPU — the whole forward now runs
 on-device, TOLERANCE* (E-infra; ADR 0016, X031). Adds **`gpu_attn_core`** at the

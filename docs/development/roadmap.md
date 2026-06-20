@@ -13,10 +13,10 @@
 
 ## Where we are
 
-Current: **v1.8.5** — **M18 in progress**: `--gpu` runs **matmul** (1.8.0) **+ layernorm** (1.8.1)
+Current: **v1.8.6** — **M18 in progress**: `--gpu` runs **matmul** (1.8.0) **+ layernorm** (1.8.1)
 **+ the Adam optimizer step** (1.8.5, X033) bit-exact (a `--gpu` checkpoint is byte-identical to the
 CPU's — now incl. optimizer state); **`--gpu-tc`** adds **GELU** (1.8.2) + the **LM head** (1.8.3) +
-the **full fused attention core** (1.8.4, X031) at a *tolerance* (transcendental / SIMD-tree-order —
+the **full fused attention core** (1.8.4, X031) **+ GELU backward** (1.8.6, X034) at a *tolerance* (transcendental / SIMD-tree-order —
 a separate gate keeps plain `--gpu` byte-identical). The **entire forward** runs on-device, and
 1.8.5 starts the backward+Adam arc. The **honest perf X-entry is done (X032):** the GPU forward is
 **2–4× slower** than the CPU at attn11's scale (per-op host↔device transfer + scalar-VALU f64
@@ -450,8 +450,9 @@ for the native-AMD f64 route.
     reduction; in-shader f64 sqrt/div verified correctly-rounded on the hardware (1000/1000); 8
     scalars as a uniform buffer; grid host-tiled in 65535 chunks. First bit-exact GPU backward-side
     op → a `--gpu` checkpoint stays byte-identical incl. optimizer state. `tests/gpu_adam.cyr`.
-  - **1.8.6 — `gelu_bwd` (TOLERANCE, --gpu-tc).** Elementwise `dx = dy·gelu'(x)`; reuses
-    `_gpu_emit_exp`; no reduction/tiling. Lowest-risk genuine backward op.
+  - **1.8.6 — `gelu_bwd` (TOLERANCE, --gpu-tc) — ✅ SHIPPED (X034).** Elementwise `dx = dy·gelu'(x)`;
+    reuses `_gpu_emit_exp`; no reduction/tiling. Also fixed a 1.8.5 layering bug (`gpu_adam_step` now
+    takes buffers as params, not model globals → standalone gpu tests build again). `tests/gpu_gelu_bwd.cyr`.
   - **1.8.7 — `linear_bwd`/`qlinear_bwd` (--gpu-tc) + the shared matmul-bwd infra.** Builds the
     accumulating `_gpu_build_tile_dw` (dW = xᵀ·dy, sequential-m → bit-exact arithmetic) + the
     bit-exact host-RMW-accumulate helper (zero scratch → GPU-Σ → host `f64_add` onto the caller's

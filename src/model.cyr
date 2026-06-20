@@ -1431,7 +1431,7 @@ fn model_adam_step(lr, step): i64 {
     # GPU Adam (bit-exact: in-shader f64 sqrt/div are correctly-rounded) → keeps the --gpu
     # checkpoint byte-identical. Plain g_gpu gate; self-falls-back to CPU (no device / NP too big).
     if (g_gpu == 1) {
-        if (gpu_adam_step(lr, step) == 0) { return 0; }
+        if (gpu_adam_step(g_params, g_grads, g_adam_m, g_adam_v, g_NP, lr, step) == 0) { return 0; }
     }
 #endif
     var b1 = f64_div(f64_from(9), f64_from(10));        # 0.9

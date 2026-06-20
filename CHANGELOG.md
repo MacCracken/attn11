@@ -4,6 +4,34 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.8.6] - 2026-06-20
+
+**M18 1.8.6: GELU backward on the GPU — TOLERANCE, the second backward-arc op (E-infra; ADR
+0016, X034).** Adds **`gpu_gelu_bwd`** at the `gelu_bwd` seam: `dx = dy·gelu'(x)` (with
+`gelu'(x) = 0.5(1+t) + 0.5·x·(1−t²)·c(1+3a·x²)`, `t = tanh(c(x+a·x³))`) runs on the native-AMD f64
+SPIR-V path. Elementwise (one thread per element — no reduction, no tiling, no index
+decomposition), reusing the proven `_gpu_emit_exp` for the two `exp`s of `tanh`. TOLERANCE (the
+in-shader `exp` ≠ x86 `exp`, ~1e-13), so it rides **`--gpu-tc`** alongside the forward GELU, never
+plain `--gpu`. Bindings x→x, dy→W, dx→y on the 7-BO pool; the 3rd binding pushes `uint0` to %37 and
+the GELU consts to %31–36 so `_gpu_emit_exp`'s exp consts stay at the fixed %17–30 it expects.
+
+**Fix: `gpu_adam_step` no longer reads model globals (a 1.8.5 layering bug).** 1.8.5's
+`gpu_adam_step` read `g_params`/`g_grads`/`g_adam_m`/`g_adam_v`/`g_NP` directly, so `src/gpu.cyr`
+depended on `src/model.cyr` — which silently broke **every standalone gpu test** that includes
+gpu.cyr without model.cyr (`undefined variable 'g_NP'`); it went unnoticed because `make release`
+doesn't build the gpu-test harnesses and `make gpu-test` wasn't re-run after the Adam landing. The
+signature is now `gpu_adam_step(params, grads, m, v, NP, lr, step)` — the caller (the
+`model_adam_step` hook) passes the buffers, so gpu.cyr is self-contained again and all gpu tests
+build. (No behavior change — the byte-identical `--gpu` checkpoint is preserved.)
+
+**Validation (X034).** New `tests/gpu_gelu_bwd.cyr` (`make gpu-test`): `gpu_gelu_bwd` vs a
+`gelu_bwd` replica via **allclose** (`atol=rtol=1e-10`) at the default MLP hidden width (T16·4C=2048),
+preset (T64·4C=16384), and a tiny width — all within ~1e-13. The **full 7-test gpu suite** re-passes
+(matmul + ln + Adam bit-exact; GELU/head/attention/gelu_bwd tolerance). Plain `--gpu` 40-step
+checkpoint byte-identical to no-flag (gelu_bwd is `--gpu-tc`-only); a `--gpu-tc` run dispatches the
+gelu backward in-pass, no NaN. Full gate green: 1056 grad-checks (x86_64 + aarch64/qemu — CPU path
+unchanged), agnos main+tcyr, lint (0 warn), fuzz, smoke. cyrius pin stays **6.2.29**; `mabda = 3.4.1`.
+
 ## [1.8.5] - 2026-06-20
 
 **M18 1.8.5: the Adam optimizer step on the GPU — BIT-EXACT, the first backward-arc op (E-infra;

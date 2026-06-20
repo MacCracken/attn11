@@ -137,6 +137,12 @@ fn gelu_fwd(x, y, n): i64 {
 
 # dy -> dx (length n). Needs the original x.
 fn gelu_bwd(x, dy, dx, n): i64 {
+#ifndef CYRIUS_TARGET_AGNOS
+    # GPU GELU backward (tolerance: in-shader exp) under --gpu-tc; self-falls-back to CPU.
+    if (g_gpu_tc == 1) {
+        if (gpu_gelu_bwd(x, dy, dx, n) == 0) { return 0; }
+    }
+#endif
     var c = _gelu_c();
     var a = _gelu_a();
     var half = f64_div(f64_from(1), f64_from(2));
