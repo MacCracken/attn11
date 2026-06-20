@@ -49,9 +49,9 @@ passes** — scores (`nh·T·T`) → rowmax → exp+sum → PV — because a sin
 kernel exceeds the 256-id compile cap; it covers **causal MHA** (`nkv==nh`, `g_bidir==0`).
 
 What stays on CPU: **GQA / bidirectional (diffusion) attention** (fall back to the CPU core) and
-the rest of the **backward pass** (`linear_bwd`/`head_bwd`/`ln_bwd`/`attn_core_bwd` — the 1.8.7+
-arc; `gelu_bwd` is on `--gpu-tc` as of 1.8.6, the Adam *step* on `--gpu` as of 1.8.5). Each op
-self-falls-back to CPU if the device is absent, the contraction
+the rest of the **backward pass** (`head_bwd`/`ln_bwd`/`attn_core_bwd` — the 1.8.8+ arc; as of
+1.8.7 `gelu_bwd` + `linear_bwd` run on `--gpu-tc`, and the Adam *step* on `--gpu` as of 1.8.5).
+Each op self-falls-back to CPU if the device is absent, the contraction
 dimension isn't a multiple of `GPU_TK` (16) / the tile `TK` (4), or a buffer/dispatch limit is
 exceeded — all of attn11's default/preset shapes (matmul K ∈ {32,64,128,256}; ln C ∈ {32,64};
 GELU any width; head C ∈ {32,64}; attention T ∈ {16,64}) run on-device.
@@ -64,8 +64,9 @@ make gpu-test     # build + run tests/gpu_matmul.cyr
 
 This builds + runs the GPU validation suite — `tests/gpu_matmul.cyr` (matmul) and
 `tests/gpu_ln.cyr` (layernorm) + `tests/gpu_adam.cyr` (the Adam step) bit-exact, plus
-`tests/gpu_gelu.cyr`, `tests/gpu_head.cyr`, `tests/gpu_attn.cyr` (the fused attention core), and
-`tests/gpu_gelu_bwd.cyr` (GELU backward) at tolerance — validating each against its CPU
+`tests/gpu_gelu.cyr`, `tests/gpu_head.cyr`, `tests/gpu_attn.cyr` (the fused attention core),
+`tests/gpu_gelu_bwd.cyr` (GELU backward), and `tests/gpu_linear_bwd.cyr` (linear backward —
+dx tolerance, dW/db bit-exact) at tolerance — validating each against its CPU
 oracle (`linear_fwd`/`ln_fwd`/`gelu_fwd`/`head_fwd`/`attn_core_fwd`) across attn11's real shapes,
 proving the device actually engaged, and checking the shape-not-tileable CPU fallback. On a box
 with no AMD GPU they **skip cleanly** (exit 0) — so it is a standalone target, *not* part of

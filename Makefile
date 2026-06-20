@@ -49,6 +49,7 @@ gpu-test:
 	cyrius build tests/gpu_attn.cyr build/gpu_attn && ./build/gpu_attn
 	cyrius build tests/gpu_adam.cyr build/gpu_adam && ./build/gpu_adam
 	cyrius build tests/gpu_gelu_bwd.cyr build/gpu_gelu_bwd && ./build/gpu_gelu_bwd
+	cyrius build tests/gpu_linear_bwd.cyr build/gpu_linear_bwd && ./build/gpu_linear_bwd
 
 build:
 	@mkdir -p build

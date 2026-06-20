@@ -4,6 +4,38 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.8.7] - 2026-06-20
+
+**M18 1.8.7: linear backward on the GPU — the highest-FLOP backward op + the shared matmul-bwd
+infra (E-infra; ADR 0016, X035).** Adds **`gpu_linear_bwd`** at the `qlinear_bwd` seam (dense +
+ternary), running all three gradients of a linear on the native-AMD f64 path:
+- **dx = dy·Wᵀ** (contract N) — reuses the proven transposed tile `_gpu_build_tile_t` (output
+  M×K, GPU_TK-tiled, RMW from 0). TOLERANCE (~1e-13): the GPU's sequential reduction vs the CPU's
+  4-lane-partial + tree dot — the same reason the forward LM head is tolerance.
+- **dW += xᵀ·dy** (contract M) — a NEW `_gpu_build_tile_dw` (clone of the forward tile, but both
+  operands stride by their row width over the contracted m: x +K, dy +N, write k·N+n), **RMW
+  onto the caller's pre-uploaded running dW**. Because the kernel accumulates sequentially in m
+  starting from the uploaded gradient, dW comes out **bit-identical** to the CPU's `+=` (0 error
+  measured, not just within tolerance).
+- **db += colsum_m(dy)** — on the host (N is tiny; sequential m → also **bit-identical**).
+
+Because dx forces tolerance, the whole op rides **`--gpu-tc`** (never plain `--gpu`). It is the
+highest-FLOP backward (the Q/K/V/O + MLP-up/down linears, ~2–3 per layer), and the first consumer
+of the shared matmul-bwd infra (`_gpu_build_tile_dw` + the RMW-accumulate-onto-uploaded-grad
+protocol) that head_bwd/ln_bwd will reuse. The accumulator-clobber trap the design flagged is
+solved by the upload-then-RMW pattern (no host-side re-add, so the accumulation order matches the
+CPU exactly). Buffers reuse the 7-BO pool, re-bound per phase (dx: dy→x, W→W, dx←y; dW: x→x,
+dy→W, dW↔y RMW). Gates: `N%16==0` (dx tiles N), `M%16==0` (dW tiles M), grids `M·K`/`K·N` ≤ 65535
+— all default/preset linear shapes qualify; else CPU fallback.
+
+**Validation (X035).** New `tests/gpu_linear_bwd.cyr` (`make gpu-test`): `gpu_linear_bwd` vs the
+CPU `linear_bwd` across default + preset linear shapes, with a **nonzero seeded dW/db** to exercise
+the `+=` accumulation — **dx within ~1e-13, dW and db bit-identical (0 error)**. The full **8-test**
+gpu suite re-passes. Plain `--gpu` 40-step checkpoint byte-identical to no-flag (linear_bwd is
+`--gpu-tc`-only); a `--gpu-tc` run dispatches 2880 linear-bwd ops in the backward pass, no NaN.
+Full gate green: 1056 grad-checks (x86_64 + aarch64/qemu — CPU path unchanged), agnos main+tcyr,
+lint (0 warn), fuzz, smoke. cyrius pin stays **6.2.29**; `mabda = 3.4.1`.
+
 ## [1.8.6] - 2026-06-20
 
 **M18 1.8.6: GELU backward on the GPU — TOLERANCE, the second backward-arc op (E-infra; ADR

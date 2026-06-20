@@ -1,0 +1,93 @@
+# tests/gpu_linear_bwd.cyr — M18 1.8.7 GPU linear-backward validation (TOLERANCE).
+#
+# Validates `gpu_linear_bwd` (src/gpu.cyr) against the CPU `linear_bwd` (lib/rosnet.cyr): dx=dy·Wᵀ,
+# dW+=xᵀ·dy, db+=colsum(dy). dx is TOLERANCE (the GPU's sequential reduction vs the CPU's
+# 4-lane-partial+tree dot, ~1e-13), so the whole op rides --gpu-tc. dW/db are bit-exact in
+# arithmetic order (sequential m; dW RMW onto the pre-uploaded running grad) — tested here with a
+# NONZERO initial dW/db to exercise the += accumulation. Engagement proven (non-zero return =
+# silent fallback = failure). Device-dependent → SKIPS cleanly (exit 0) where no AMD f64 GPU.
+#
+# Build:  cyrius build tests/gpu_linear_bwd.cyr build/gpu_linear_bwd && ./build/gpu_linear_bwd
+# Exit:   0 = all shapes within tolerance (or cleanly skipped); 1 = exceeds tol / fallback.
+
+include "lib/mabda.cyr"
+include "lib/rosnet.cyr"
+include "src/gpu.cyr"
+
+fn print_cstr(s): i64 { syscall(1, 1, s, strlen(s)); return 0; }
+fn print_i64(n): i64 { var b[32]; memset(&b, 0, 32); var l = fmt_int_buf(n, &b); syscall(1, 1, &b, l); return 0; }
+fn print_hex64(v): i64 {
+    var digits = "0123456789ABCDEF"; var b[18]; store8(&b + 0, 48); store8(&b + 1, 120);
+    var i = 0; while (i < 16) { store8(&b + 2 + i, load8(digits + ((v >> ((15 - i) * 4)) & 0xF))); i = i + 1; }
+    syscall(1, 1, &b, 18); return 0;
+}
+
+fn frand(i, seed): i64 {
+    var x = ((i * 2654435761) + (seed * 40503)) % 1000; if (x < 0) { x = x + 1000; }
+    return f64_div(f64_from(x - 500), f64_from(100));
+}
+
+# compare two f64 arrays with allclose(atol+rtol·|ref|); returns max|abs err| in *out, 1 if ok
+fn allclose(g, r, n, atol, rtol, out): i64 {
+    var maxabs = f64_from(0); var ok = 1; var i = 0;
+    while (i < n) {
+        var ref = load64(r + i*8);
+        var ae = f64_abs(f64_sub(load64(g + i*8), ref));
+        if (f64_gt(ae, maxabs) == 1) { maxabs = ae; }
+        var bound = f64_add(atol, f64_mul(rtol, f64_abs(ref)));
+        if (f64_gt(ae, bound) == 1) { ok = 0; }
+        i = i + 1;
+    }
+    store64(out, maxabs);
+    return ok;
+}
+
+fn run_shape(M, K, N, atol, rtol): i64 {
+    var x = alloc(M*K*8); var W = alloc(K*N*8); var dy = alloc(M*N*8);
+    var dxr = alloc(M*K*8); var dWr = alloc(K*N*8); var dbr = alloc(N*8);
+    var dxg = alloc(M*K*8); var dWg = alloc(K*N*8); var dbg = alloc(N*8);
+    var i = 0; while (i < M*K) { store64(x + i*8, frand(i, 1)); i = i + 1; }
+    i = 0; while (i < K*N) { store64(W + i*8, frand(i, 2)); i = i + 1; }
+    i = 0; while (i < M*N) { store64(dy + i*8, frand(i, 3)); i = i + 1; }
+    # dW/db are += accumulators — seed with a nonzero "prior gradient" (same for CPU + GPU)
+    i = 0; while (i < K*N) { var p = frand(i, 5); store64(dWr + i*8, p); store64(dWg + i*8, p); i = i + 1; }
+    i = 0; while (i < N) { var p = frand(i, 7); store64(dbr + i*8, p); store64(dbg + i*8, p); i = i + 1; }
+    linear_bwd(x, W, dy, dxr, dWr, dbr, M, K, N);
+    var rc = gpu_linear_bwd(x, W, dy, dxg, dWg, dbg, M, K, N);
+    print_cstr("  M="); print_i64(M); print_cstr(" K="); print_i64(K); print_cstr(" N="); print_i64(N); print_cstr(": ");
+    if (rc != 0) { print_cstr("GPU FALLBACK (rc="); print_i64(rc); print_cstr(")\n"); return 0; }
+    var e[8]; var ok = 1;
+    if (allclose(dxg, dxr, M*K, atol, rtol, &e) == 0) { ok = 0; print_cstr("dx EXCEEDS "); }
+    else { print_cstr("dx="); print_hex64(load64(&e)); }
+    if (allclose(dWg, dWr, K*N, atol, rtol, &e) == 0) { ok = 0; print_cstr(" dW EXCEEDS "); }
+    else { print_cstr(" dW="); print_hex64(load64(&e)); }
+    if (allclose(dbg, dbr, N, atol, rtol, &e) == 0) { ok = 0; print_cstr(" db EXCEEDS "); }
+    else { print_cstr(" db="); print_hex64(load64(&e)); }
+    if (ok == 1) { print_cstr("  WITHIN TOL\n"); return 1; }
+    print_cstr("  FAIL\n"); return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    print_cstr("attn11 GPU linear-backward validation (M18 1.8.7) — gpu_linear_bwd vs linear_bwd, TOLERANCE\n");
+    if (_gpu_init() == 0) {
+        print_cstr("no native AMD GPU — SKIPPED (CPU oracle unaffected; build verified)\n");
+        return 0;
+    }
+    print_cstr("native AMD f64 GPU online — validating attn11's real linear shapes (atol+rtol 1e-10):\n");
+    var atol = f64_div(f64_from(1), f64_from(10000000000));
+    var rtol = f64_div(f64_from(1), f64_from(10000000000));
+    var ok = 1;
+    if (run_shape(16, 32, 32, atol, rtol) == 0) { ok = 0; }     # default o-proj
+    if (run_shape(16, 32, 128, atol, rtol) == 0) { ok = 0; }    # default MLP up
+    if (run_shape(16, 128, 32, atol, rtol) == 0) { ok = 0; }    # default MLP down
+    if (run_shape(64, 64, 256, atol, rtol) == 0) { ok = 0; }    # preset MLP up
+    if (run_shape(64, 256, 64, atol, rtol) == 0) { ok = 0; }    # preset MLP down
+    print_cstr("GPU linear-bwd ops dispatched on-device: "); print_i64(gpu_linbwd_count()); print_cstr("\n");
+    if (ok == 0) { print_cstr("\nFAIL: GPU linear_bwd exceeds tolerance vs the CPU oracle\n"); return 1; }
+    print_cstr("\nOK — gpu_linear_bwd allclose(atol=rtol=1e-10) to linear_bwd across all attn11 shapes\n");
+    return 0;
+}
+
+var exit_code = main();
+sys_exit(exit_code);

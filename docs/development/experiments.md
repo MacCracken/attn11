@@ -1541,3 +1541,27 @@ after Adam landed. Refactored to `gpu_adam_step(params, grads, m, v, NP, lr, ste
 buffers); gpu.cyr is self-contained again, all 7 gpu tests build. Reproduce: `make gpu-test`. Next:
 1.8.7 linear_bwd + the shared matmul-bwd infra (`_gpu_build_tile_dw` + the bit-exact host-RMW-accumulate
 helper — the accumulator-clobber trap). Detail: ADR 0016; the backward-arc sequence is in roadmap M18.
+
+## X035 — M18 1.8.7: linear backward on GPU (highest-FLOP op) + shared matmul-bwd infra (M18, v1.8.7, 2026-06-20)
+
+**Result.** `gpu_linear_bwd` (src/gpu.cyr) at the `qlinear_bwd` seam runs all three linear gradients
+on the native-AMD f64 path: dx=dy·Wᵀ (reuses `_gpu_build_tile_t`, contract N), dW+=xᵀ·dy (NEW
+`_gpu_build_tile_dw`, contract M, RMW onto the uploaded running grad), db+=colsum_m(dy) (host).
+`tests/gpu_linear_bwd.cyr` (`make gpu-test`) vs CPU `linear_bwd` with a nonzero-seeded dW/db: **dx
+~1e-13 (tolerance), dW + db BIT-IDENTICAL (0 error)**. The whole op rides `--gpu-tc` (dx's
+sequential reduction ≠ the CPU 4-lane-tree dot). Highest-FLOP backward (Q/K/V/O + MLP up/down,
+~2–3/layer); first consumer of the shared matmul-bwd infra (head_bwd/ln_bwd reuse it). 5/5 shapes
+on-device; a `--gpu-tc` run dispatches 2880 linear-bwd ops, no NaN; plain `--gpu` byte-identical.
+
+**The accumulator-clobber trap, solved.** dW/db are `+=` accumulators (the caller's running grad).
+The design flagged clobbering them as the #1 landmine. Solution: **upload the caller's dW into the
+output BO, then RMW**, so the GPU accumulates Σ_m sequentially STARTING FROM the uploaded value —
+bit-identical to the CPU's `dW += t_m` order (a host-side re-add `dW + Σ` would NOT be, since
+float add is non-associative: `V0+(Σ)` ≠ `((V0+t0)+t1)+…`). db is host (sequential m → exact).
+
+**`_gpu_build_tile_dw`** is a clone of the forward matmul tile, but both operands stride by their
+row width over the contracted m (x +K, dy +N) and write index k·N+n; consts %16=0 %17=N %18=K
+%19=m0·K %20=m0·N; cache kind=10. **dx** reuses `_gpu_build_tile_t(contract=N, outcols=K)` grid M·K
+— the head's transposed-tile, same shape as dy·Wᵀ. Gates: N%16 (dx tiles N), M%16 (dW tiles M),
+grids ≤65535. Reproduce: `make gpu-test`. Next: 1.8.8 head_bwd (BIT-EXACT — pure-scalar CPU ref →
+sequential GPU AXPY matches; reuses tile_dw + the RMW protocol). Detail: ADR 0016; roadmap M18.

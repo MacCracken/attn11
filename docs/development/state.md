@@ -5,7 +5,27 @@
 
 ## Version
 
-**1.8.6** — *M18 1.8.6: GELU backward on the GPU — TOLERANCE, the second backward-arc op*
+**1.8.7** — *M18 1.8.7: linear backward on the GPU — the highest-FLOP backward op + the shared
+matmul-bwd infra* (E-infra; ADR 0016, X035). Adds **`gpu_linear_bwd`** at the `qlinear_bwd` seam
+(dense + ternary): **dx = dy·Wᵀ** (reuses `_gpu_build_tile_t`, contract N → TOLERANCE ~1e-13,
+sequential vs CPU 4-lane-tree), **dW += xᵀ·dy** (NEW `_gpu_build_tile_dw`, contract M, RMW onto the
+uploaded running grad → **bit-identical**), **db += colsum_m(dy)** (host → **bit-identical**). dx
+forces the bundle onto **`--gpu-tc`**. Highest-FLOP backward (Q/K/V/O + MLP up/down) + first
+consumer of the shared matmul-bwd infra (head_bwd/ln_bwd reuse `_gpu_build_tile_dw` + the
+**RMW-onto-uploaded-grad** accumulate protocol — which solves the accumulator-clobber trap exactly,
+since a host-side `V0+Σ` re-add would break the CPU's sequential add order). Buffers reuse the 7-BO
+pool, re-bound per phase. Gates: N%16 (dx tiles N), M%16 (dW tiles M), grids ≤65535. **Validation
+(X035):** `tests/gpu_linear_bwd.cyr` (`make gpu-test`) vs CPU `linear_bwd` with nonzero-seeded
+dW/db — dx ~1e-13, dW + db **0 error**; full 8-test gpu suite re-passes; plain `--gpu` 40-step
+checkpoint byte-identical; `--gpu-tc` dispatches 2880 linear-bwd ops, no NaN. **Gate:** 1056
+grad-checks x86_64 **and** aarch64/qemu; agnos main+tcyr; lint (0 warn); fuzz; smoke. `gpu_linear_bwd`
++ `_gpu_build_tile_dw` in `src/gpu.cyr`; hook in `src/ops.cyr` (qlinear_bwd); new
+`tests/gpu_linear_bwd.cyr`. **Next (1.8.8):** `head_bwd` (BIT-EXACT — pure-scalar CPU ref →
+sequential GPU AXPY matches; reuses tile_dw + the RMW protocol). cyrius pin stays **6.2.29**
+(installed cycc 6.2.31, benign drift); pin `mabda = 3.4.1`. `src/*.cyr` unchanged except the
+additive GPU wiring + CFG_VERSION.
+
+(**1.8.6** — *M18 1.8.6: GELU backward on the GPU — TOLERANCE, the second backward-arc op*
 (E-infra; ADR 0016, X034). Adds **`gpu_gelu_bwd`** at the `gelu_bwd` seam: `dx = dy·gelu'(x)`
 runs on the native-AMD f64 path — elementwise (no reduction/tiling/index-decomposition), reusing
 the proven `_gpu_emit_exp` for `tanh`'s two exps. TOLERANCE (in-shader exp), rides **`--gpu-tc`**.
@@ -23,7 +43,7 @@ main+tcyr; lint (0 warn); fuzz; smoke. `gpu_gelu_bwd` + `_gpu_build_gelu_bwd` in
 in `src/ops.cyr`; new `tests/gpu_gelu_bwd.cyr`. **Next (1.8.7):** `linear_bwd` + the shared
 matmul-bwd infra (`_gpu_build_tile_dw` + the bit-exact host-RMW-accumulate helper). cyrius pin stays
 **6.2.29** (installed cycc 6.2.31, benign drift); pin `mabda = 3.4.1`. `src/*.cyr` unchanged except
-the additive GPU wiring + CFG_VERSION.
+the additive GPU wiring + CFG_VERSION.)
 
 (**1.8.5** — *M18 1.8.5: the Adam optimizer step on the GPU — BIT-EXACT, the first backward-arc op*
 (E-infra; ADR 0016, X033). Adds **`gpu_adam_step`** at the `model_adam_step` seam: the

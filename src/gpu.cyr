@@ -64,6 +64,7 @@ var _gpu_gelu_count = 0; # forward GELUs actually dispatched on-device (toleranc
 var _gpu_head_count = 0; # forward LM-head matmuls actually dispatched on-device (tolerance)
 var _gpu_attn_count = 0; # fused attention cores actually dispatched on-device (tolerance)
 var _gpu_adam_count = 0; # Adam optimizer steps actually dispatched on-device (bit-exact)
+var _gpu_linbwd_count = 0; # linear backward ops actually dispatched on-device (tolerance)
 
 # Counts of forward ops run on the GPU (vs CPU fallback). >0 proves the device ran.
 fn gpu_mm_count(): i64 { return _gpu_mm_count; }
@@ -72,6 +73,7 @@ fn gpu_gelu_count(): i64 { return _gpu_gelu_count; }
 fn gpu_head_count(): i64 { return _gpu_head_count; }
 fn gpu_attn_count(): i64 { return _gpu_attn_count; }
 fn gpu_adam_count(): i64 { return _gpu_adam_count; }
+fn gpu_linbwd_count(): i64 { return _gpu_linbwd_count; }
 
 # SPIR-V word emitters. op<wc> writes one <wc>-word instruction (word0 = (wc<<16)|op)
 # and returns the next byte offset. One instruction per source line → readable + ≤120c.
@@ -972,6 +974,149 @@ fn gpu_head_fwd(f, emb, logits, T, V, C): i64 {
     i = 0;
     while (i < MN) { store64(logits + i * 8, load64(_gpu_ym + i * 8)); i = i + 1; }
     _gpu_head_count = _gpu_head_count + 1;
+    return 0;
+}
+
+# ===========================================================================
+# 1.8.7 — linear backward on GPU (the highest-FLOP backward op). dx = dy·Wᵀ (reuses the
+# transposed tile _gpu_build_tile_t, contract N → TOLERANCE, sequential vs CPU 4-lane-tree),
+# dW += xᵀ·dy (NEW _gpu_build_tile_dw, contract M, RMW onto the pre-uploaded dW → bit-exact
+# accumulation), db += colsum_m(dy) on the host. The whole op rides g_gpu_tc (dx forces tolerance).
+# ===========================================================================
+
+# dW tile (contract M): dW[k,n] += Σ_{m∈tile} x[m·K+k]·dy[m·N+n]. Clone of _gpu_build_tile, but
+# both operands stride by their row width over the contracted m (x +K, dy +N), write index k·N+n.
+# consts %16=0 %17=N %18=K %19=m0·K %20=m0·N. RMW (host pre-fills dW = caller's running grad).
+fn _gpu_build_tile_dw(buf, K, N, m0, TK): i64 {
+    var m0K = m0 * K; var m0N = m0 * N;
+    var o = _gpu_op3(buf, 0, 0x07230203, 0x00010300, 0x00000000);
+    var bound_off = o;
+    o = _gpu_op2(buf, o, 0x00000000, 0x00000000);
+    o = _gpu_op2(buf, o, 0x00020011, 1); o = _gpu_op2(buf, o, 0x00020011, 10);
+    o = _gpu_op3(buf, o, 0x0003000E, 0, 1);
+    o = _gpu_op6(buf, o, 0x0006000F, 5, 22, 0x6E69616D, 0x00000000, 11);
+    o = _gpu_op6(buf, o, 0x00060010, 22, 17, 1, 1, 1);
+    o = _gpu_op4(buf, o, 0x00040047, 11, 11, 28);
+    o = _gpu_op4(buf, o, 0x00040047, 12, 33, 0); o = _gpu_op4(buf, o, 0x00040047, 12, 34, 0);
+    o = _gpu_op4(buf, o, 0x00040047, 13, 33, 1); o = _gpu_op4(buf, o, 0x00040047, 13, 34, 0);
+    o = _gpu_op4(buf, o, 0x00040047, 14, 33, 2); o = _gpu_op4(buf, o, 0x00040047, 14, 34, 0);
+    o = _gpu_op2(buf, o, 0x00020013, 1); o = _gpu_op3(buf, o, 0x00030021, 2, 1);
+    o = _gpu_op4(buf, o, 0x00040015, 3, 32, 0); o = _gpu_op4(buf, o, 0x00040017, 4, 3, 3);
+    o = _gpu_op4(buf, o, 0x00040020, 5, 1, 4); o = _gpu_op3(buf, o, 0x00030016, 6, 64);
+    o = _gpu_op3(buf, o, 0x0003001D, 7, 6); o = _gpu_op3(buf, o, 0x0003001E, 8, 7);
+    o = _gpu_op4(buf, o, 0x00040020, 9, 12, 8); o = _gpu_op4(buf, o, 0x00040020, 10, 12, 6);
+    o = _gpu_op4(buf, o, 0x0004002B, 3, 16, 0); o = _gpu_op4(buf, o, 0x0004002B, 3, 17, N);
+    o = _gpu_op4(buf, o, 0x0004002B, 3, 18, K); o = _gpu_op4(buf, o, 0x0004002B, 3, 19, m0K);
+    o = _gpu_op4(buf, o, 0x0004002B, 3, 20, m0N);
+    o = _gpu_op4(buf, o, 0x0004003B, 5, 11, 1);
+    o = _gpu_op4(buf, o, 0x0004003B, 9, 12, 12); o = _gpu_op4(buf, o, 0x0004003B, 9, 13, 12);
+    o = _gpu_op4(buf, o, 0x0004003B, 9, 14, 12);
+    o = _gpu_op5(buf, o, 0x00050036, 1, 22, 0, 2); o = _gpu_op2(buf, o, 0x000200F8, 23);
+    o = _gpu_op4(buf, o, 0x0004003D, 4, 24, 11);
+    o = _gpu_op5(buf, o, 0x00050051, 3, 25, 24, 0);            # idx
+    o = _gpu_op5(buf, o, 0x00050086, 3, 26, 25, 17);          # k = idx / N
+    o = _gpu_op5(buf, o, 0x00050089, 3, 27, 25, 17);          # n = idx % N
+    o = _gpu_op5(buf, o, 0x00050080, 3, 28, 26, 19);          # xi = k + m0·K
+    o = _gpu_op5(buf, o, 0x00050080, 3, 29, 27, 20);          # wi = n + m0·N
+    o = _gpu_op6(buf, o, 0x00060041, 10, 30, 14, 16, 25);     # &dW[idx]
+    o = _gpu_op4(buf, o, 0x0004003D, 6, 31, 30);              # acc = dW[idx] (RMW base)
+    var xi = 28; var wi = 29; var acc = 31; var nid = 32;
+    var j = 0;
+    while (j < TK) {
+        var ax = nid; nid = nid + 1; o = _gpu_op6(buf, o, 0x00060041, 10, ax, 12, 16, xi);
+        var vx = nid; nid = nid + 1; o = _gpu_op4(buf, o, 0x0004003D, 6, vx, ax);
+        var aw = nid; nid = nid + 1; o = _gpu_op6(buf, o, 0x00060041, 10, aw, 13, 16, wi);
+        var vw = nid; nid = nid + 1; o = _gpu_op4(buf, o, 0x0004003D, 6, vw, aw);
+        var prod = nid; nid = nid + 1; o = _gpu_op5(buf, o, 0x00050085, 6, prod, vx, vw);
+        var accn = nid; nid = nid + 1; o = _gpu_op5(buf, o, 0x00050081, 6, accn, acc, prod);
+        acc = accn;
+        if (j < TK - 1) {
+            var xin = nid; nid = nid + 1; o = _gpu_op5(buf, o, 0x00050080, 3, xin, xi, 18);  # xi += K
+            var win = nid; nid = nid + 1; o = _gpu_op5(buf, o, 0x00050080, 3, win, wi, 17);  # wi += N
+            xi = xin; wi = win;
+        }
+        j = j + 1;
+    }
+    o = _gpu_op3(buf, o, 0x0003003E, 30, acc);               # dW[idx] = acc
+    o = _gpu_op2(buf, o, 0x000100FD, 0x00010038);
+    store32(buf + bound_off, nid);
+    return o;
+}
+
+# Compile+cache the dW tile for (K, N, m0). Key kind=10. 0 = unavailable.
+fn _gpu_get_tile_dw(K, N, m0): i64 {
+    var key = (10 << 56) | (K << 28) | (N << 14) | m0;
+    var c = _gpu_cache_get(key);
+    if (c == (0 - 1)) { return 0; }
+    if (c != 0) { return c; }
+    var spv[8192];
+    var nbytes = _gpu_build_tile_dw(&spv, K, N, m0, GPU_TK());
+    var shmod = gpu_shader_module_create_spirv(_gpu_ctx, &spv, nbytes);
+    if (shmod == 0) { _gpu_cache_put(key, 0 - 1); return 0; }
+    _gpu_cache_put(key, shmod);
+    return shmod;
+}
+
+# GPU linear backward: dx(M,K)=dy·Wᵀ, dW(K,N)+=xᵀ·dy, db(N)+=colsum(dy). Returns 0 = ran, -1 = CPU.
+# TOLERANCE (dx's sequential reduction vs the CPU 4-lane-tree) → gated by g_gpu_tc. dW/db are
+# bit-exact in arithmetic (sequential m; dW RMW onto the caller's running grad). Buffers reused
+# per phase: dx → (dy→x, W→W, dx←y); dW → (x→x, dy→W, dW↔y RMW); db on host.
+fn gpu_linear_bwd(x, W, dy, dx, dW, db, M, K, N): i64 {
+    if (_gpu_init() == 0) { return 0 - 1; }
+    var TK = GPU_TK();
+    if (M <= 0) { return 0 - 1; }
+    if ((N % TK) != 0) { return 0 - 1; }            # dx tiles over N
+    if ((M % TK) != 0) { return 0 - 1; }            # dW tiles over M
+    if ((M * K) > MABDA_MAX_DISPATCH_DIM) { return 0 - 1; }
+    if ((K * N) > MABDA_MAX_DISPATCH_DIM) { return 0 - 1; }
+    var mk = M * K; var mn = M * N; var kn = K * N;
+    if ((mn * 8) > GPU_BO_MAX()) { return 0 - 1; }
+    if ((kn * 8) > GPU_BO_MAX()) { return 0 - 1; }
+    if ((mk * 8) > GPU_BO_MAX()) { return 0 - 1; }
+    # ---- dx = dy·Wᵀ (tile_t: contract N, output M×K), RMW from 0 ----
+    var i = 0;
+    while (i < mn) { store64(_gpu_xm + i*8, load64(dy + i*8)); i = i + 1; }    # dy → x-buf
+    i = 0; while (i < kn) { store64(_gpu_wm + i*8, load64(W + i*8)); i = i + 1; }   # W → W-buf
+    i = 0; while (i < mk) { store64(_gpu_ym + i*8, f64_from(0)); i = i + 1; }  # dx ← 0
+    var k0 = 0;
+    while (k0 < N) {
+        var sh = _gpu_get_tile_t(N, K, k0);          # contract = N, output cols = K
+        if (sh == 0) { return 0 - 1; }
+        var bp[56]; store64(&bp+0, 3);
+        store64(&bp+8, _gpu_xh); store64(&bp+16, _GPU_XVA());
+        store64(&bp+24, _gpu_wh); store64(&bp+32, _GPU_WVA());
+        store64(&bp+40, _gpu_yh); store64(&bp+48, _GPU_YVA());
+        if (gpu_compute_dispatch(_gpu_ctx, sh, mk, 1, 1, &bp) != 0) { return 0 - 1; }
+        k0 = k0 + TK;
+    }
+    i = 0; while (i < mk) { store64(dx + i*8, load64(_gpu_ym + i*8)); i = i + 1; }
+    # ---- dW += xᵀ·dy (tile_dw: contract M, output K×N), RMW onto caller's dW ----
+    i = 0; while (i < mk) { store64(_gpu_xm + i*8, load64(x + i*8)); i = i + 1; }   # x → x-buf
+    i = 0; while (i < mn) { store64(_gpu_wm + i*8, load64(dy + i*8)); i = i + 1; }  # dy → W-buf
+    i = 0; while (i < kn) { store64(_gpu_ym + i*8, load64(dW + i*8)); i = i + 1; }  # dW → y-buf (RMW base)
+    var m0 = 0;
+    while (m0 < M) {
+        var sh2 = _gpu_get_tile_dw(K, N, m0);
+        if (sh2 == 0) { return 0 - 1; }
+        var bp2[56]; store64(&bp2+0, 3);
+        store64(&bp2+8, _gpu_xh); store64(&bp2+16, _GPU_XVA());
+        store64(&bp2+24, _gpu_wh); store64(&bp2+32, _GPU_WVA());
+        store64(&bp2+40, _gpu_yh); store64(&bp2+48, _GPU_YVA());
+        if (gpu_compute_dispatch(_gpu_ctx, sh2, kn, 1, 1, &bp2) != 0) { return 0 - 1; }
+        m0 = m0 + TK;
+    }
+    i = 0; while (i < kn) { store64(dW + i*8, load64(_gpu_ym + i*8)); i = i + 1; }
+    # ---- db += colsum_m(dy) on host (bit-exact, matches CPU sequential m) ----
+    if (db != 0) {
+        var nb = 0;
+        while (nb < N) {
+            var accb = f64_from(0); var mm = 0;
+            while (mm < M) { accb = f64_add(accb, load64(dy + (mm*N + nb)*8)); mm = mm + 1; }
+            store64(db + nb*8, f64_add(load64(db + nb*8), accb));
+            nb = nb + 1;
+        }
+    }
+    _gpu_linbwd_count = _gpu_linbwd_count + 1;
     return 0;
 }
 

@@ -723,8 +723,21 @@ fn qlinear_fwd(x, W, b, y, M, K, N): i64 {
     return linear_fwd(x, g_qscratch, b, y, M, K, N);
 }
 fn qlinear_bwd(x, W, dy, dx, dW, db, M, K, N): i64 {
-    if (g_ternary == 0) { return linear_bwd(x, W, dy, dx, dW, db, M, K, N); }
+    if (g_ternary == 0) {
+#ifndef CYRIUS_TARGET_AGNOS
+        # GPU linear backward (tolerance: dx's sequential reduction) under --gpu-tc; CPU fallback.
+        if (g_gpu_tc == 1) {
+            if (gpu_linear_bwd(x, W, dy, dx, dW, db, M, K, N) == 0) { return 0; }
+        }
+#endif
+        return linear_bwd(x, W, dy, dx, dW, db, M, K, N);
+    }
     ternary_quant(W, g_qscratch, K, N);
+#ifndef CYRIUS_TARGET_AGNOS
+    if (g_gpu_tc == 1) {
+        if (gpu_linear_bwd(x, g_qscratch, dy, dx, dW, db, M, K, N) == 0) { return 0; }
+    }
+#endif
     return linear_bwd(x, g_qscratch, dy, dx, dW, db, M, K, N);
 }
 
