@@ -4,6 +4,43 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.8.10] - 2026-06-20
+
+**M18 1.8.10: attention backward on the GPU — the last op; the FULL training step now runs
+end-to-end on the GPU (E-infra; ADR 0016, X038). THE M18 SOVEREIGN MILESTONE.** Adds
+**`gpu_attn_core_bwd`** at the `attn_core_bwd` seam (causal MHA) — the scaled-dot-product
+attention backward. With it, **every heavy op of a training step** (forward + backward + Adam)
+can execute on the native-AMD f64 SPIR-V path: a `--bpe 7 --gpu-tc` step dispatches matmuls +
+layernorms + Adam + head-bwd + ln-bwd (bit-exact) and GELU + head + attention + linear-bwd +
+attn-bwd (tolerance) all on-device, no NaN. Gradient-based learning — the project's whole point —
+is now expressible and validated on the sovereign, assembly-up, no-BLAS/no-autodiff GPU stack.
+
+**6 passes / 5 kernels** (the hardest op). The key simplification: the forward zeroed `Pc`'s upper
+triangle (`Pc[h,i,j]=0` for `j>i`), so every reduction and the dV/dK **gather-over-queries** loop
+the full range **unmasked** — the `j>i` / `i<j` terms zero out:
+- **A** `dP[h,i,j] = Σ_d dconcat·V` (grid nh·T·T) · **B** `dotPdP[h,i] = Σ_j P·dP` (grid nh·T) ·
+  **C** `sds = scale·P·(dP − dotPdP)` (grid nh·T·T, in-place) · **D** `dQ = Σ_j sds·K` (grid nh·T·hd) ·
+  **G gather** `out[j] = Σ_i A[…i·T…]·B[…i·C…]` — used for **E** dV (A=P,B=dconcat) and **F** dK
+  (A=sds,B=Q) (grid nh·T·hd). 6 dispatches; buffers juggle the 7-BO pool (x=dconcat→P, y=dP/sds, W
+  cycles V/K/dconcat/Q, γ=dQ/dV/dK, β=dotPdP). TOLERANCE (P carries the in-shader-exp tolerance;
+  sequential dots vs the CPU 4-lane-tree; the softmax-Jacobian's cancellation) → rides `--gpu-tc`.
+
+**Scope + the one type-id bug.** Untiled (the reductions loop T) → gated **T ≤ 20** (the D/G
+kernels' 8-ids/iter + 2 UDiv-synth fit the 256-id cap there; default T=16 engages, preset T=64
+falls back to CPU — tiling is a follow-up). Caught a real bug: `_gpu_ecf` hardcodes the f64
+const's result-type as `%7`, which is `double` in the attn preamble but `runtimearray` in
+`_gpu_pre` (where double is `%6`) — sds's `scale` const got the wrong type (`−21
+MIR_ERR_UNSUPPORTED_TYPE`); fixed with a `_gpu_ecf6` (`%6`) variant.
+
+**Validation (X038).** New `tests/gpu_attn_bwd.cyr` (`make gpu-test`): `gpu_attn_core_bwd` vs a
+sequential `attn_core_bwd` replica — dQ, dK, dV **0 bit-diff** at (T,C,nh) ∈ {(16,32,4),(8,32,4),
+(16,64,4)} (the GPU's sequential reduction matches the sequential ref exactly; vs the production
+SIMD-tree CPU it's ~1e-13, hence `--gpu-tc`). Full **11-test** gpu suite passes. Plain `--gpu`
+40-step checkpoint byte-identical to no-flag (attn-bwd is `--gpu-tc`-only). Full gate green: 1056
+grad-checks (x86_64 + aarch64/qemu — CPU path unchanged), agnos main+tcyr, lint (0 warn), fuzz,
+smoke. **Next (1.8.11): the honest backward perf X-entry + the P(-1) hardening close-out** (and,
+optionally, tiling attn-bwd for preset). cyrius pin stays **6.2.29**; `mabda = 3.4.1`.
+
 ## [1.8.9] - 2026-06-20
 
 **M18 1.8.9: layernorm backward on the GPU — BIT-EXACT, the most complex bit-exact op (E-infra;

@@ -5,7 +5,27 @@
 
 ## Version
 
-**1.8.9** — *M18 1.8.9: layernorm backward on the GPU — BIT-EXACT, the most complex bit-exact op*
+**1.8.10** — *M18 1.8.10: attention backward on the GPU — the last op; THE FULL TRAINING STEP NOW
+RUNS END-TO-END ON THE GPU* (E-infra; ADR 0016, X038 — the M18 sovereign milestone). Adds
+**`gpu_attn_core_bwd`** at the `attn_core_bwd` seam (causal MHA). With it, **every heavy op** of a
+step (forward + backward + Adam) runs on the native-AMD f64 path — a `--bpe 7 --gpu-tc` step
+dispatches matmuls + ln + Adam + head-bwd + ln-bwd (bit-exact) and GELU + head + attention +
+linear-bwd + attn-bwd (tolerance), all on-device, no NaN. **6 passes / 5 kernels** (the forward
+zeroed Pc's upper triangle → all reductions + the dV/dK gather-over-queries loop UNMASKED): A dP →
+B dotPdP → C sds → D dQ → G gather (E dV, F dK). Buffers juggle the 7-BO pool. TOLERANCE (P's exp +
+seq-vs-tree dots + softmax-Jacobian cancellation) → `--gpu-tc`. **Scope:** untiled → gate **T ≤ 20**
+(default 16 engages; preset 64 → CPU; tiling is a follow-up). **Bug fixed:** `_gpu_ecf` hardcodes
+the f64-const type `%7` (double in the attn preamble, but runtimearray in `_gpu_pre` where double is
+`%6`) → `_gpu_ecf6` (`%6`) variant. **Validation (X038):** `tests/gpu_attn_bwd.cyr` (`make gpu-test`)
+dQ+dK+dV **0 bit-diff** vs a sequential replica at (T,C,nh)∈{(16,32,4),(8,32,4),(16,64,4)}; 11-test
+gpu suite passes; plain `--gpu` byte-identical (attn-bwd is `--gpu-tc`-only). **Gate:** 1056
+grad-checks x86_64 **and** aarch64/qemu; agnos main+tcyr; lint (0 warn); fuzz; smoke. `gpu_attn_core_bwd`
++ 5 kernels in `src/gpu.cyr`; hook in `src/attn.cyr` (attn_core_bwd); new `tests/gpu_attn_bwd.cyr`.
+**Next (1.8.11):** the honest backward perf X-entry + the P(-1) hardening close-out (+ optional
+attn-bwd tiling for preset). cyrius pin stays **6.2.29** (installed cycc 6.2.31, benign drift); pin
+`mabda = 3.4.1`. `src/*.cyr` unchanged except the additive GPU wiring + CFG_VERSION.
+
+(**1.8.9** — *M18 1.8.9: layernorm backward on the GPU — BIT-EXACT, the most complex bit-exact op*
 (E-infra; ADR 0016, X037). Adds **`gpu_ln_bwd`** at the `ln_bwd` seam: dx + dgamma/dbeta from the
 saved mean/rstd. rstd is a precomputed input → only sequential mul/add/sub (no transcendental, no
 SIMD tree) → bit-for-bit → plain **`--gpu`**, byte-identical. 3 passes (no GLSL; TK=8), run **1→3→2**
@@ -22,7 +42,7 @@ main+tcyr; lint (0 warn); fuzz; smoke; 10-test gpu suite re-passes. `gpu_ln_bwd`
 `src/gpu.cyr`; hook in `src/ops.cyr` (ln_bwd); new `tests/gpu_ln_bwd.cyr`. **Next (1.8.10):**
 `attn_core_bwd` (the hardest — softmax-Jacobian cancellation, dV/dK write-collision gather) → the
 **full training step end-to-end on GPU**. cyrius pin stays **6.2.29** (installed cycc 6.2.31, benign
-drift); pin `mabda = 3.4.1`. `src/*.cyr` unchanged except the additive GPU wiring + CFG_VERSION.
+drift); pin `mabda = 3.4.1`. `src/*.cyr` unchanged except the additive GPU wiring + CFG_VERSION.)
 
 (**1.8.8** — *M18 1.8.8: LM-head backward on the GPU — BIT-EXACT, the second bit-exact gradient op*
 (E-infra; ADR 0016, X036). Adds **`gpu_head_bwd`** at the `head_bwd` seam (tied-embedding

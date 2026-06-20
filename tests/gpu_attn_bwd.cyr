@@ -1,0 +1,146 @@
+# tests/gpu_attn_bwd.cyr — M18 1.8.10 GPU attention-backward validation (TOLERANCE).
+#
+# Validates `gpu_attn_core_bwd` (src/gpu.cyr) — the 6-pass causal-MHA attention backward — against
+# an inline CPU reference identical to src/attn.cyr `attn_core_bwd` (causal, MHA). dQ/dK/dV come out
+# at a TOLERANCE (P carries the forward in-shader-exp tolerance; dP/dQ/dK/dV use sequential dots vs
+# the CPU's 4-lane-tree, and the softmax-Jacobian `dscore = P·(dP − Σ P·dP)` amplifies error via
+# catastrophic cancellation) → it rides --gpu-tc. With this op, a full --gpu-tc training step runs
+# end-to-end on device. Engagement proven. Device-dependent → SKIPS cleanly (exit 0) where no AMD GPU.
+#
+# Build:  cyrius build tests/gpu_attn_bwd.cyr build/gpu_attn_bwd && ./build/gpu_attn_bwd
+# Exit:   0 = within tolerance (or cleanly skipped); 1 = exceeds tol / fallback.
+
+include "lib/mabda.cyr"
+include "src/gpu.cyr"
+
+fn print_cstr(s): i64 { syscall(1, 1, s, strlen(s)); return 0; }
+fn print_i64(n): i64 { var b[32]; memset(&b, 0, 32); var l = fmt_int_buf(n, &b); syscall(1, 1, &b, l); return 0; }
+fn print_hex64(v): i64 {
+    var digits = "0123456789ABCDEF"; var b[18]; store8(&b + 0, 48); store8(&b + 1, 120);
+    var i = 0; while (i < 16) { store8(&b + 2 + i, load8(digits + ((v >> ((15 - i) * 4)) & 0xF))); i = i + 1; }
+    syscall(1, 1, &b, 18); return 0;
+}
+fn frand(i, seed): i64 {
+    var x = ((i * 2654435761) + (seed * 40503)) % 1000; if (x < 0) { x = x + 1000; }
+    return f64_div(f64_from(x - 500), f64_from(100));
+}
+
+# Fill Pc(nh,T,T) with a real causal softmax of random scores (j>i = 0), as attn_core_fwd would.
+fn fill_pc(Pc, T, nh): i64 {
+    var h = 0;
+    while (h < nh) {
+        var i = 0;
+        while (i < T) {
+            var prow = Pc + (h*T + i)*T*8;
+            var j = 0; while (j < T) { store64(prow + j*8, f64_from(0)); j = j + 1; }
+            var mx = frand(h*T*T + i*T, 11);
+            j = 0; while (j <= i) { var s = frand((h*T+i)*T + j, 11); store64(prow + j*8, s); if (f64_gt(s, mx) == 1) { mx = s; } j = j + 1; }
+            var sum = f64_from(0);
+            j = 0; while (j <= i) { var e = f64_exp(f64_sub(load64(prow + j*8), mx)); store64(prow + j*8, e); sum = f64_add(sum, e); j = j + 1; }
+            var inv = f64_div(f64_from(1), sum);
+            j = 0; while (j <= i) { store64(prow + j*8, f64_mul(load64(prow + j*8), inv)); j = j + 1; }
+            i = i + 1;
+        }
+        h = h + 1;
+    }
+    return 0;
+}
+
+# CPU reference — identical to src/attn.cyr attn_core_bwd (causal MHA, gsz=1, Ckv=C, kvb=base=h*hd).
+fn cpu_attn_bwd(Qc, Kc, Vc, Pc, dconcat, dQ, dK, dV, dprow, T, C, nh): i64 {
+    var hd = C / nh; var Ckv = C; var scale = f64_div(f64_from(1), f64_sqrt(f64_from(hd)));
+    var i0 = 0; while (i0 < T*C) { store64(dQ + i0*8, f64_from(0)); store64(dK + i0*8, f64_from(0)); store64(dV + i0*8, f64_from(0)); i0 = i0 + 1; }
+    var h = 0;
+    while (h < nh) {
+        var base = h*hd;
+        var i = 0;
+        while (i < T) {
+            var prow = Pc + (h*T+i)*T*8; var dcbase = dconcat + (i*C+base)*8; var jhi = i;
+            var j = 0;
+            while (j <= jhi) {
+                var pij = load64(prow + j*8); var vbase = Vc + (j*Ckv+base)*8; var dvbase = dV + (j*Ckv+base)*8;
+                var dpj = f64_from(0); var d = 0;
+                while (d < hd) {
+                    var dc = load64(dcbase + d*8);
+                    dpj = f64_add(dpj, f64_mul(dc, load64(vbase + d*8)));
+                    store64(dvbase + d*8, f64_add(load64(dvbase + d*8), f64_mul(pij, dc)));
+                    d = d + 1;
+                }
+                store64(dprow + j*8, dpj); j = j + 1;
+            }
+            var dotPdP = f64_from(0);
+            j = 0; while (j <= jhi) { dotPdP = f64_add(dotPdP, f64_mul(load64(prow + j*8), load64(dprow + j*8))); j = j + 1; }
+            var dqbase = dQ + (i*C+base)*8; var qbase2 = Qc + (i*C+base)*8;
+            j = 0;
+            while (j <= jhi) {
+                var ds = f64_mul(load64(prow + j*8), f64_sub(load64(dprow + j*8), dotPdP));
+                var sds = f64_mul(scale, ds);
+                var kbase = Kc + (j*Ckv+base)*8; var dkbase = dK + (j*Ckv+base)*8; var d = 0;
+                while (d < hd) {
+                    store64(dqbase + d*8, f64_add(load64(dqbase + d*8), f64_mul(sds, load64(kbase + d*8))));
+                    store64(dkbase + d*8, f64_add(load64(dkbase + d*8), f64_mul(sds, load64(qbase2 + d*8))));
+                    d = d + 1;
+                }
+                j = j + 1;
+            }
+            i = i + 1;
+        }
+        h = h + 1;
+    }
+    return 0;
+}
+
+fn allclose(g, r, n, atol, rtol, out): i64 {
+    var maxabs = f64_from(0); var ok = 1; var i = 0;
+    while (i < n) {
+        var ref = load64(r + i*8); var ae = f64_abs(f64_sub(load64(g + i*8), ref));
+        if (f64_gt(ae, maxabs) == 1) { maxabs = ae; }
+        if (f64_gt(ae, f64_add(atol, f64_mul(rtol, f64_abs(ref)))) == 1) { ok = 0; }
+        i = i + 1;
+    }
+    store64(out, maxabs); return ok;
+}
+
+fn run_shape(T, C, nh, atol, rtol): i64 {
+    var hd = C / nh;
+    var Qc = alloc(T*C*8); var Kc = alloc(T*C*8); var Vc = alloc(T*C*8);
+    var Pc = alloc(nh*T*T*8); var dc = alloc(T*C*8);
+    var dQr = alloc(T*C*8); var dKr = alloc(T*C*8); var dVr = alloc(T*C*8); var dpr = alloc(T*8);
+    var dQg = alloc(T*C*8); var dKg = alloc(T*C*8); var dVg = alloc(T*C*8);
+    var i = 0;
+    while (i < T*C) { store64(Qc+i*8, frand(i,1)); store64(Kc+i*8, frand(i,2)); store64(Vc+i*8, frand(i,3)); store64(dc+i*8, frand(i,4)); i = i + 1; }
+    fill_pc(Pc, T, nh);
+    cpu_attn_bwd(Qc, Kc, Vc, Pc, dc, dQr, dKr, dVr, dpr, T, C, nh);
+    var rc = gpu_attn_core_bwd(Qc, Kc, Vc, Pc, dc, dQg, dKg, dVg, dpr, T, C, nh, nh);
+    print_cstr("  T="); print_i64(T); print_cstr(" C="); print_i64(C); print_cstr(" nh="); print_i64(nh); print_cstr(": ");
+    if (rc != 0) { print_cstr("GPU FALLBACK (rc="); print_i64(rc); print_cstr(")\n"); return 0; }
+    var e[8]; var ok = 1;
+    if (allclose(dQg, dQr, T*C, atol, rtol, &e) == 0) { ok = 0; print_cstr("dQ EXCEEDS "); } else { print_cstr("dQ="); print_hex64(load64(&e)); }
+    if (allclose(dKg, dKr, T*C, atol, rtol, &e) == 0) { ok = 0; print_cstr(" dK EXCEEDS "); } else { print_cstr(" dK="); print_hex64(load64(&e)); }
+    if (allclose(dVg, dVr, T*C, atol, rtol, &e) == 0) { ok = 0; print_cstr(" dV EXCEEDS "); } else { print_cstr(" dV="); print_hex64(load64(&e)); }
+    if (ok == 1) { print_cstr("  WITHIN TOL\n"); return 1; }
+    print_cstr("  FAIL\n"); return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    print_cstr("attn11 GPU attention-backward validation (M18 1.8.10) — gpu_attn_core_bwd vs attn_core_bwd, TOLERANCE\n");
+    if (_gpu_init() == 0) {
+        print_cstr("no native AMD GPU — SKIPPED (CPU oracle unaffected; build verified)\n");
+        return 0;
+    }
+    print_cstr("native AMD f64 GPU online — validating causal-MHA attention backward (atol+rtol 1e-9):\n");
+    var atol = f64_div(f64_from(1), f64_from(1000000000));    # 1e-9 (Jacobian cancellation band)
+    var rtol = atol;
+    var ok = 1;
+    if (run_shape(16, 32, 4, atol, rtol) == 0) { ok = 0; }    # default
+    if (run_shape(8, 32, 4, atol, rtol) == 0) { ok = 0; }     # small T
+    if (run_shape(16, 64, 4, atol, rtol) == 0) { ok = 0; }    # wider head (hd=16)
+    print_cstr("GPU attn-bwd cores dispatched on-device: "); print_i64(gpu_attnbwd_count()); print_cstr("\n");
+    if (ok == 0) { print_cstr("\nFAIL: GPU attn_core_bwd exceeds tolerance vs the CPU oracle\n"); return 1; }
+    print_cstr("\nOK — gpu_attn_core_bwd allclose(1e-9) to attn_core_bwd across causal-MHA shapes\n");
+    return 0;
+}
+
+var exit_code = main();
+sys_exit(exit_code);

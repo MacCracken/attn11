@@ -13,14 +13,15 @@
 
 ## Where we are
 
-Current: **v1.8.9** — **M18 in progress**: `--gpu` runs **matmul** (1.8.0) **+ layernorm** (1.8.1)
-**+ Adam** (1.8.5) **+ the LM-head backward** (1.8.8) **+ the layernorm backward** (1.8.9, X037) all
-bit-exact (a `--gpu` checkpoint is byte-identical to the CPU's — incl. optimizer state + most
-gradients); **`--gpu-tc`** adds **GELU** (1.8.2) + the **LM head** (1.8.3) +
-the **full fused attention core** (1.8.4, X031) **+ GELU backward** (1.8.6, X034) **+ linear
-backward** (1.8.7, X035 — dx/dW/db; dW+db bit-identical, dx tolerance) at a *tolerance* (transcendental / SIMD-tree-order —
-a separate gate keeps plain `--gpu` byte-identical). The **entire forward** runs on-device, and
-1.8.5 starts the backward+Adam arc. The **honest perf X-entry is done (X032):** the GPU forward is
+Current: **v1.8.10** — **M18: the full training step now runs end-to-end on the GPU (the sovereign
+milestone, X038).** `--gpu` runs **matmul** (1.8.0) **+ layernorm** (1.8.1) **+ Adam** (1.8.5) **+ the
+LM-head backward** (1.8.8) **+ the layernorm backward** (1.8.9) all bit-exact (a `--gpu` checkpoint is
+byte-identical to the CPU's — incl. optimizer state + the bit-exact gradients); **`--gpu-tc`** adds
+**GELU** (1.8.2) + the **LM head** (1.8.3) + the **fused attention forward** (1.8.4) + the **GELU /
+linear / attention backward** (1.8.6 / 1.8.7 / 1.8.10) at a *tolerance* (transcendental /
+SIMD-tree-order — a separate gate keeps plain `--gpu` byte-identical). So a `--bpe 7 --gpu-tc` step
+runs **every heavy op (forward + backward + Adam) on-device** (attn-bwd untiled → default T=16
+engages; preset T=64 → CPU, tiling is a follow-up). The **honest perf X-entry is done (X032):** the GPU forward is
 **2–4× slower** than the CPU at attn11's scale (per-op host↔device transfer + scalar-VALU f64
 dominate; gap narrows with scale) — a validated sovereign-stack / oracle milestone, **not** a
 speedup; the CPU stays the production path. Remaining: the backward ops (1.8.6+) → the *full training
@@ -471,10 +472,13 @@ for the native-AMD f64 route.
     dx; P2 dgamma/dbeta column-reduce RMW), run 1→3→2 to juggle the 7-BO pool. **Lesson:** loop-indexed
     (uniform) loads (gamma[c], mean/rstd[m]) hit `CMP_ERR_FLAT_NONVGPR` → taint the index with a
     VGPR-zero `gid−gid`. dx+dgamma+dbeta 0-diff; default `--gpu` runs 4480 ln-bwd on-device. `tests/gpu_ln_bwd.cyr`.
-  - **1.8.10 — `attn_core_bwd` (TOLERANCE, --gpu-tc) → the full `--gpu-tc` step on-device.** The
-    hardest, landed last: dP/dotPdP + the softmax-Jacobian `dscore = P·(dP − dotPdP)` (catastrophic
-    cancellation → grad-check band ~1e-12, not 1e-13), and the **dV/dK write-collision re-grid**
-    (gather over queries, one thread per key-row, not per-query). Causal MHA only.
+  - **1.8.10 — `attn_core_bwd` (TOLERANCE, --gpu-tc) → the full `--gpu-tc` step on-device — ✅ SHIPPED
+    (X038, THE MILESTONE).** 6 passes / 5 kernels (A dP → B dotPdP → C sds → D dQ → G gather for E dV
+    + F dK). The forward zeroed Pc's upper triangle, so all reductions + the dV/dK gather loop UNMASKED.
+    Untiled → gate **T ≤ 20** (default 16 engages; preset 64 → CPU, tiling is a follow-up). Bug fixed:
+    `_gpu_ecf` f64-const type `%7` is wrong under `_gpu_pre` (double=`%6`) → `_gpu_ecf6`. dQ/dK/dV
+    0-diff vs a sequential replica. `tests/gpu_attn_bwd.cyr`. With it, a `--bpe 7 --gpu-tc` step runs
+    the **full training step (fwd+bwd+Adam) on-device** — the M18 sovereign milestone.
   - **1.8.11 — the backward perf X-entry + P(-1) hardening close-out.** Mirror X032 for the step
     (expect a larger loss); security audit of the new device-buffer surface; ADR/arch-note; declare
     the milestone done. (Out of scope this arc: device-resident m/v + fwd→bwd P-residency — a

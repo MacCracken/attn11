@@ -1618,3 +1618,30 @@ zero-init Σ); dgamma/dbeta are RMW-from-seed (CPU's interleaved `+=` in the m-l
 0-diff. Reproduce: `make gpu-test`; `./build/attn11 --gpu --steps 40 --save g.ckpt` vs no-flag + cmp.
 With ln_bwd, only attn_core_bwd remains for the full step on GPU. Next: 1.8.10 attn_core_bwd (the
 hardest — softmax-Jacobian cancellation, dV/dK write-collision gather). Detail: ADR 0016; roadmap M18.
+
+## X038 — M18 1.8.10: attention backward on GPU → the FULL training step on-device (the milestone) (M18, v1.8.10, 2026-06-20)
+
+**Result — THE M18 SOVEREIGN MILESTONE.** `gpu_attn_core_bwd` (src/gpu.cyr) at the `attn_core_bwd`
+seam completes the backward arc: with it, **every heavy op of a training step runs on the native-AMD
+f64 GPU path**. A `--bpe 7 --gpu-tc` step dispatches matmuls + layernorms + Adam + head-bwd + ln-bwd
+(bit-exact) and GELU + head + attention + linear-bwd + attn-bwd (tolerance) — all on-device, no NaN.
+Gradient-based learning is now expressible + validated end-to-end on the sovereign GPU stack.
+`tests/gpu_attn_bwd.cyr` (`make gpu-test`): dQ/dK/dV **0 bit-diff** vs a sequential attn_core_bwd
+replica at (T,C,nh)∈{(16,32,4),(8,32,4),(16,64,4)}; 11 gpu tests total. Plain `--gpu` byte-identical
+(attn-bwd is `--gpu-tc`-only).
+
+**Design — 6 passes / 5 kernels (the hardest op).** The forward zeroed Pc's upper triangle
+(Pc[h,i,j]=0 for j>i), so every reduction + the dV/dK GATHER-over-queries loops the full range
+**UNMASKED** (j>i / i<j terms zero out — no per-element causal mask anywhere in the backward):
+A dP=Σ_d dconcat·V (nh·T·T); B dotPdP=Σ_j P·dP (nh·T); C sds=scale·P·(dP−dotPdP) (nh·T·T, in-place);
+D dQ=Σ_j sds·K (nh·T·hd); G gather out[j]=Σ_i A[h·TT+i·T+j]·B[i·C+base+d] — reused for E dV (A=P,B=
+dconcat) and F dK (A=sds,B=Q). Buffers juggle the 7-BO pool (x=dconcat→P, y=dP/sds, W cycles, γ=out,
+β=dotPdP). Tolerance (P's exp tolerance + sequential-vs-tree dots + Jacobian cancellation) → `--gpu-tc`.
+
+**Scope + bug.** Untiled (loops T) → gate **T ≤ 20** (D/G = 8 ids/iter + 2 UDiv synth fit the 256-id
+cap; default 16 engages, preset 64 → CPU; tiling is a follow-up). Bug caught: `_gpu_ecf` hardcodes
+the f64-const result-type `%7` (= double in the ATTN preamble, but = runtimearray in `_gpu_pre` where
+double is `%6`) → sds's scale const was mistyped (−21 UNSUPPORTED_TYPE); fixed via a `_gpu_ecf6` (`%6`).
+**Lesson: the f64-const helper must use the double type-id of the preamble in use (_gpu_pre → %6,
+attn preamble → %7).** Reproduce: `make gpu-test`; `./build/attn11 --bpe 7 --gpu-tc --steps 10`. Next:
+1.8.11 backward perf X-entry + P(-1) close-out (+ optional attn-bwd tiling for preset). Detail: ADR 0016.

@@ -67,6 +67,7 @@ var _gpu_adam_count = 0; # Adam optimizer steps actually dispatched on-device (b
 var _gpu_linbwd_count = 0; # linear backward ops actually dispatched on-device (tolerance)
 var _gpu_headbwd_count = 0; # LM-head backward ops actually dispatched on-device (bit-exact)
 var _gpu_lnbwd_count = 0;  # layernorm backward ops actually dispatched on-device (bit-exact)
+var _gpu_attnbwd_count = 0; # attention backward cores actually dispatched on-device (tolerance)
 
 # Counts of forward ops run on the GPU (vs CPU fallback). >0 proves the device ran.
 fn gpu_mm_count(): i64 { return _gpu_mm_count; }
@@ -78,6 +79,7 @@ fn gpu_adam_count(): i64 { return _gpu_adam_count; }
 fn gpu_linbwd_count(): i64 { return _gpu_linbwd_count; }
 fn gpu_headbwd_count(): i64 { return _gpu_headbwd_count; }
 fn gpu_lnbwd_count(): i64 { return _gpu_lnbwd_count; }
+fn gpu_attnbwd_count(): i64 { return _gpu_attnbwd_count; }
 
 # SPIR-V word emitters. op<wc> writes one <wc>-word instruction (word0 = (wc<<16)|op)
 # and returns the next byte offset. One instruction per source line → readable + ≤120c.
@@ -119,6 +121,12 @@ fn _gpu_acl6(buf, o, ptr, val, bnd, mem, idx): i64 {
     o = _gpu_op6(buf, o, 0x00060041, 10, ptr, bnd, mem, idx);
     o = _gpu_op4(buf, o, 0x0004003D, 6, val, ptr);
     return o;
+}
+# f64 OpConstant for _gpu_pre kernels (double type is %6, not the attn preamble's %7 that _gpu_ecf uses).
+fn _gpu_ecf6(buf, o, id, bits): i64 {
+    store32(buf + o, 0x0005002B); store32(buf + o + 4, 6); store32(buf + o + 8, id);
+    store32(buf + o + 12, bits & 0xFFFFFFFF); store32(buf + o + 16, (bits >> 32) & 0xFFFFFFFF);
+    return o + 20;
 }
 
 # Generate the GPU_TK-tile RMW matmul kernel for (K, N, k0) into buf; return bytes.
@@ -1457,6 +1465,249 @@ fn gpu_ln_bwd(x, gamma, dy, mean, rstd, dx, dgamma, dbeta, M, C): i64 {
         store64(dgamma + i*8, load64(_gpu_gm + i*8)); store64(dbeta + i*8, load64(_gpu_ym + i*8)); i = i + 1;
     }
     _gpu_lnbwd_count = _gpu_lnbwd_count + 1;
+    return 0;
+}
+
+# ===========================================================================
+# 1.8.10 — attention backward on GPU (causal MHA), TOLERANCE → the full training step on-device.
+# 6 dispatches / 5 kernels (E,F share the gather kernel). The forward zeroed Pc's upper triangle
+# (Pc[h,i,j]=0 for j>i), so every reduction/gather loops the FULL range UNMASKED — j>i / i<j terms
+# zero out. Untiled (loops T) → gate T ≤ 32 (default 16 engages; preset 64 → CPU). MHA only
+# (nkv==nh → base=kvb=h·hd, Ckv=C); caller gates g_bidir. See docs/architecture/011-gpu-attention.md.
+# ===========================================================================
+
+# A dP[h,i,j] = Σ_d dconcat[i,base+d]·V[j,base+d]. dc=0(%12) V=1(%13) dP=2(%14). grid nh·T·T.
+fn _gpu_build_abwd_dp(buf, T, C, hd): i64 {
+    var o = _gpu_pre(buf, 3, 21);
+    o=_gpu_op4(buf,o,0x0004002B,3,15,0); o=_gpu_op4(buf,o,0x0004002B,3,16,T);
+    o=_gpu_op4(buf,o,0x0004002B,3,17,C); o=_gpu_op4(buf,o,0x0004002B,3,18,hd);
+    o=_gpu_op4(buf,o,0x0004002B,3,19,T*T); o=_gpu_op4(buf,o,0x0004002B,3,20,1);
+    o=_gpu_op5(buf,o,0x00050036,1,21,0,2); o=_gpu_op2(buf,o,0x000200F8,22);
+    o=_gpu_op4(buf,o,0x0004003D,4,23,11); o=_gpu_op5(buf,o,0x00050051,3,24,23,0);
+    o=_gpu_op5(buf,o,0x00050086,3,25,24,19);                       # h = idx/TT
+    o=_gpu_op5(buf,o,0x00050084,3,26,25,19); o=_gpu_op5(buf,o,0x00050082,3,27,24,26);   # r
+    o=_gpu_op5(buf,o,0x00050086,3,28,27,16);                       # i = r/T
+    o=_gpu_op5(buf,o,0x00050084,3,29,28,16); o=_gpu_op5(buf,o,0x00050082,3,30,27,29);   # j
+    o=_gpu_op5(buf,o,0x00050084,3,31,25,18);                       # hhd = base
+    o=_gpu_op5(buf,o,0x00050084,3,32,28,17); o=_gpu_op5(buf,o,0x00050080,3,33,32,31);   # dcb = i*C+base
+    o=_gpu_op5(buf,o,0x00050084,3,34,30,17); o=_gpu_op5(buf,o,0x00050080,3,35,34,31);   # vb = j*C+base
+    var di=33; var vi=35; var nid=36; var acc=0; var d=0;
+    while (d < hd) {
+        var dp=nid; var dv=nid+1; o=_gpu_acl6(buf,o,dp,dv,12,15,di); nid=nid+2;
+        var vp=nid; var vv=nid+1; o=_gpu_acl6(buf,o,vp,vv,13,15,vi); nid=nid+2;
+        var pr=nid; nid=nid+1; o=_gpu_op5(buf,o,0x00050085,6,pr,dv,vv);
+        if (d==0) { acc=pr; } else { var an=nid; nid=nid+1; o=_gpu_op5(buf,o,0x00050081,6,an,acc,pr); acc=an; }
+        if (d<hd-1) {
+            var dn=nid;
+            nid=nid+1;
+            o=_gpu_op5(buf,o,0x00050080,3,dn,di,20);
+            di=dn;
+            var vn=nid;
+            nid=nid+1;
+            o=_gpu_op5(buf,o,0x00050080,3,vn,vi,20);
+            vi=vn;
+        }
+        d=d+1;
+    }
+    var pp=nid; nid=nid+1; o=_gpu_op6(buf,o,0x00060041,10,pp,14,15,24); o=_gpu_op3(buf,o,0x0003003E,pp,acc);
+    o=_gpu_op2(buf,o,0x000100FD,0x00010038); store32(buf+12,nid); return o;
+}
+
+# B dotPdP[h,i] = Σ_{j<T} P[prow+j]·dP[prow+j]. P=0(%12) dP=1(%13) dotPdP=2(%14). grid nh·T.
+fn _gpu_build_abwd_dot(buf, T): i64 {
+    var o = _gpu_pre(buf, 3, 18);
+    o=_gpu_op4(buf,o,0x0004002B,3,15,0); o=_gpu_op4(buf,o,0x0004002B,3,16,T); o=_gpu_op4(buf,o,0x0004002B,3,17,1);
+    o=_gpu_op5(buf,o,0x00050036,1,18,0,2); o=_gpu_op2(buf,o,0x000200F8,19);
+    o=_gpu_op4(buf,o,0x0004003D,4,20,11); o=_gpu_op5(buf,o,0x00050051,3,21,20,0);   # idx
+    o=_gpu_op5(buf,o,0x00050084,3,22,21,16);                       # prow = idx*T
+    var pj=22; var nid=23; var acc=0; var j=0;
+    while (j < T) {
+        var pp=nid; var pv=nid+1; o=_gpu_acl6(buf,o,pp,pv,12,15,pj); nid=nid+2;
+        var qp=nid; var qv=nid+1; o=_gpu_acl6(buf,o,qp,qv,13,15,pj); nid=nid+2;
+        var pr=nid; nid=nid+1; o=_gpu_op5(buf,o,0x00050085,6,pr,pv,qv);
+        if (j==0) { acc=pr; } else { var an=nid; nid=nid+1; o=_gpu_op5(buf,o,0x00050081,6,an,acc,pr); acc=an; }
+        if (j<T-1) { var pn=nid; nid=nid+1; o=_gpu_op5(buf,o,0x00050080,3,pn,pj,17); pj=pn; }
+        j=j+1;
+    }
+    var op=nid; nid=nid+1; o=_gpu_op6(buf,o,0x00060041,10,op,14,15,21); o=_gpu_op3(buf,o,0x0003003E,op,acc);
+    o=_gpu_op2(buf,o,0x000100FD,0x00010038); store32(buf+12,nid); return o;
+}
+
+# C sds[h,i,j] = scale·P[idx]·(dP[idx] − dotPdP[t2]). P=0(%12) dPsds=1(%13,io) dotPdP=2(%14). grid nh·T·T.
+fn _gpu_build_abwd_sds(buf, T, scale): i64 {
+    var o = _gpu_pre(buf, 3, 19);
+    o=_gpu_op4(buf,o,0x0004002B,3,15,0); o=_gpu_op4(buf,o,0x0004002B,3,16,T); o=_gpu_ecf6(buf,o,17,scale);
+    o=_gpu_op5(buf,o,0x00050036,1,19,0,2); o=_gpu_op2(buf,o,0x000200F8,20);
+    o=_gpu_op4(buf,o,0x0004003D,4,21,11); o=_gpu_op5(buf,o,0x00050051,3,22,21,0);   # idx
+    o=_gpu_op5(buf,o,0x00050086,3,23,22,16);                       # t2 = idx/T
+    o=_gpu_op6(buf,o,0x00060041,10,24,12,15,22); o=_gpu_op4(buf,o,0x0004003D,6,25,24);  # p = P[idx]
+    o=_gpu_op6(buf,o,0x00060041,10,26,13,15,22); o=_gpu_op4(buf,o,0x0004003D,6,27,26);  # dp = dPsds[idx]
+    o=_gpu_op6(buf,o,0x00060041,10,28,14,15,23); o=_gpu_op4(buf,o,0x0004003D,6,29,28);  # dd = dotPdP[t2]
+    o=_gpu_op5(buf,o,0x00050083,6,30,27,29);                       # dp - dd
+    o=_gpu_op5(buf,o,0x00050085,6,31,25,30);                       # p*(...)
+    o=_gpu_op5(buf,o,0x00050085,6,32,17,31);                       # scale*...
+    o=_gpu_op3(buf,o,0x0003003E,26,32);                            # dPsds[idx] = sds
+    o=_gpu_op2(buf,o,0x000100FD,0x00010038); store32(buf+12,33); return o;
+}
+
+# D dQ[i,base+d] = Σ_{j<T} sds[prow+j]·K[j*C+base+d]. sds=0(%12) K=1(%13) dQ=2(%14). grid nh·T·hd.
+fn _gpu_build_abwd_dq(buf, T, C, hd): i64 {
+    var o = _gpu_pre(buf, 3, 20);
+    o=_gpu_op4(buf,o,0x0004002B,3,15,0); o=_gpu_op4(buf,o,0x0004002B,3,16,T);
+    o=_gpu_op4(buf,o,0x0004002B,3,17,C); o=_gpu_op4(buf,o,0x0004002B,3,18,hd); o=_gpu_op4(buf,o,0x0004002B,3,19,1);
+    o=_gpu_op5(buf,o,0x00050036,1,20,0,2); o=_gpu_op2(buf,o,0x000200F8,21);
+    o=_gpu_op4(buf,o,0x0004003D,4,22,11); o=_gpu_op5(buf,o,0x00050051,3,23,22,0);   # idx
+    o=_gpu_op5(buf,o,0x00050086,3,24,23,18);
+    o=_gpu_op5(buf,o,0x00050084,3,25,24,18);
+    o=_gpu_op5(buf,o,0x00050082,3,26,23,25);
+    # d;
+    o=_gpu_op5(buf,o,0x00050086,3,27,24,16);
+    o=_gpu_op5(buf,o,0x00050084,3,28,27,16);
+    o=_gpu_op5(buf,o,0x00050082,3,29,24,28);
+    # i;
+    o=_gpu_op5(buf,o,0x00050084,3,30,27,18);                       # base = h*hd
+    o=_gpu_op5(buf,o,0x00050084,3,31,24,16);                       # prow = t2*T
+    o=_gpu_op5(buf,o,0x00050084,3,32,29,17);
+    o=_gpu_op5(buf,o,0x00050080,3,33,32,30);
+    o=_gpu_op5(buf,o,0x00050080,3,34,33,26);
+    # dqo = i*C+base+d;
+    o=_gpu_op5(buf,o,0x00050080,3,35,30,26);                       # kb0 = base+d
+    var sj=31; var ki=35; var nid=36; var acc=0; var j=0;
+    while (j < T) {
+        var sp=nid; var sv=nid+1; o=_gpu_acl6(buf,o,sp,sv,12,15,sj); nid=nid+2;
+        var kp=nid; var kv=nid+1; o=_gpu_acl6(buf,o,kp,kv,13,15,ki); nid=nid+2;
+        var pr=nid; nid=nid+1; o=_gpu_op5(buf,o,0x00050085,6,pr,sv,kv);
+        if (j==0) { acc=pr; } else { var an=nid; nid=nid+1; o=_gpu_op5(buf,o,0x00050081,6,an,acc,pr); acc=an; }
+        if (j<T-1) {
+            var sn=nid;
+            nid=nid+1;
+            o=_gpu_op5(buf,o,0x00050080,3,sn,sj,19);
+            sj=sn;
+            var kn=nid;
+            nid=nid+1;
+            o=_gpu_op5(buf,o,0x00050080,3,kn,ki,17);
+            ki=kn;
+        }
+        j=j+1;
+    }
+    var op=nid; nid=nid+1; o=_gpu_op6(buf,o,0x00060041,10,op,14,15,34); o=_gpu_op3(buf,o,0x0003003E,op,acc);
+    o=_gpu_op2(buf,o,0x000100FD,0x00010038); store32(buf+12,nid); return o;
+}
+
+# G gather: out[j,base+d] = Σ_{i<T} A[h*TT + i*T + j]·B[i*C + base+d]. A=0(%12) B=1(%13) out=2(%14).
+# grid nh·T·hd. Used for dV (A=P,B=dconcat) and dK (A=sds,B=Q).
+fn _gpu_build_abwd_gather(buf, T, C, hd): i64 {
+    var o = _gpu_pre(buf, 3, 21);
+    o=_gpu_op4(buf,o,0x0004002B,3,15,0); o=_gpu_op4(buf,o,0x0004002B,3,16,T);
+    o=_gpu_op4(buf,o,0x0004002B,3,17,C); o=_gpu_op4(buf,o,0x0004002B,3,18,hd); o=_gpu_op4(buf,o,0x0004002B,3,19,T*T);
+    o=_gpu_op5(buf,o,0x00050036,1,21,0,2); o=_gpu_op2(buf,o,0x000200F8,22);
+    o=_gpu_op4(buf,o,0x0004003D,4,23,11); o=_gpu_op5(buf,o,0x00050051,3,24,23,0);   # idx
+    o=_gpu_op5(buf,o,0x00050086,3,25,24,18);
+    o=_gpu_op5(buf,o,0x00050084,3,26,25,18);
+    o=_gpu_op5(buf,o,0x00050082,3,27,24,26);
+    # d;
+    o=_gpu_op5(buf,o,0x00050086,3,28,25,16);
+    o=_gpu_op5(buf,o,0x00050084,3,29,28,16);
+    o=_gpu_op5(buf,o,0x00050082,3,30,25,29);
+    # j;
+    o=_gpu_op5(buf,o,0x00050084,3,31,28,18);                       # base = h*hd
+    o=_gpu_op5(buf,o,0x00050084,3,32,28,19); o=_gpu_op5(buf,o,0x00050080,3,33,32,30);  # Ab0 = h*TT + j
+    o=_gpu_op5(buf,o,0x00050084,3,34,30,17);
+    o=_gpu_op5(buf,o,0x00050080,3,35,34,31);
+    o=_gpu_op5(buf,o,0x00050080,3,36,35,27);
+    # outo = j*C+base+d;
+    o=_gpu_op5(buf,o,0x00050080,3,37,31,27);                       # Bb0 = base+d
+    var ai=33; var bi=37; var nid=38; var acc=0; var i=0;
+    while (i < T) {
+        var ap=nid; var av=nid+1; o=_gpu_acl6(buf,o,ap,av,12,15,ai); nid=nid+2;
+        var bp=nid; var bv=nid+1; o=_gpu_acl6(buf,o,bp,bv,13,15,bi); nid=nid+2;
+        var pr=nid; nid=nid+1; o=_gpu_op5(buf,o,0x00050085,6,pr,av,bv);
+        if (i==0) { acc=pr; } else { var an=nid; nid=nid+1; o=_gpu_op5(buf,o,0x00050081,6,an,acc,pr); acc=an; }
+        if (i<T-1) {
+            var aN=nid;
+            nid=nid+1;
+            o=_gpu_op5(buf,o,0x00050080,3,aN,ai,16);
+            ai=aN;
+            var bN=nid;
+            nid=nid+1;
+            o=_gpu_op5(buf,o,0x00050080,3,bN,bi,17);
+            bi=bN;
+        }
+        i=i+1;
+    }
+    var op=nid; nid=nid+1; o=_gpu_op6(buf,o,0x00060041,10,op,14,15,36); o=_gpu_op3(buf,o,0x0003003E,op,acc);
+    o=_gpu_op2(buf,o,0x000100FD,0x00010038); store32(buf+12,nid); return o;
+}
+
+fn _gpu_get_abwd(kind, T, C, hd, scale): i64 {
+    var key = (kind << 56) | (C << 14) | T;
+    var c = _gpu_cache_get(key); if (c == (0 - 1)) { return 0; } if (c != 0) { return c; }
+    var spv[8192]; var nb = 0;
+    if (kind == 16) { nb = _gpu_build_abwd_dp(&spv, T, C, hd); }
+    elif (kind == 17) { nb = _gpu_build_abwd_dot(&spv, T); }
+    elif (kind == 18) { nb = _gpu_build_abwd_sds(&spv, T, scale); }
+    elif (kind == 19) { nb = _gpu_build_abwd_dq(&spv, T, C, hd); }
+    else { nb = _gpu_build_abwd_gather(&spv, T, C, hd); }
+    var sh = gpu_shader_module_create_spirv(_gpu_ctx, &spv, nb);
+    if (sh == 0) { _gpu_cache_put(key, 0 - 1); return 0; }
+    _gpu_cache_put(key, sh); return sh;
+}
+
+# one 3-binding dispatch (count, (h,va)×3)
+fn _gpu_abwd_disp(sh, h0,v0, h1,v1, h2,v2, grid): i64 {
+    var bp[56]; store64(&bp+0, 3);
+    store64(&bp+8,h0); store64(&bp+16,v0); store64(&bp+24,h1); store64(&bp+32,v1);
+    store64(&bp+40,h2); store64(&bp+48,v2);
+    return gpu_compute_dispatch(_gpu_ctx, sh, grid, 1, 1, &bp);
+}
+
+# GPU attention backward (causal MHA, TOLERANCE). dQ/dK/dV from Qc/Kc/Vc/Pc/dconcat. Returns 0 = ran,
+# -1 = CPU. dprow unused (GPU keeps dP in the y-buf). Buffers: x=dconcat→P, y=dP/sds, W cycles
+# (V/K/dconcat/Q), gamma=dQ/dV/dK out, beta=dotPdP. T≤32 (untiled loops T).
+fn gpu_attn_core_bwd(Qc, Kc, Vc, Pc, dconcat, dQ, dK, dV, dprow, T, C, nh, nkv): i64 {
+    if (_gpu_init() == 0) { return 0 - 1; }
+    if (nkv != nh) { return 0 - 1; }            # GQA → CPU
+    if (T > 20) { return 0 - 1; }               # untiled reductions loop T (D/G + 2 UDiv synth < 256-id cap)
+    var hd = C / nh; var Ckv = C;
+    var PN = nh * T * T;
+    if ((PN * 8) > GPU_BO_MAX()) { return 0 - 1; }
+    if (PN > MABDA_MAX_DISPATCH_DIM) { return 0 - 1; }
+    if ((nh * T * hd) > MABDA_MAX_DISPATCH_DIM) { return 0 - 1; }
+    var scale = f64_div(f64_from(1), f64_sqrt(f64_from(hd)));
+    var tc = T * C;
+    var i = 0;
+    # ---- A: dP = Σ_d dconcat·V → y. (dconcat→x, V→W) ----
+    while (i < tc) { store64(_gpu_xm + i*8, load64(dconcat + i*8)); i = i + 1; }
+    i = 0; while (i < tc) { store64(_gpu_wm + i*8, load64(Vc + i*8)); i = i + 1; }
+    var sa = _gpu_get_abwd(16, T, C, hd, scale);
+    if (sa == 0) { return 0 - 1; }
+    if (_gpu_abwd_disp(sa, _gpu_xh,_GPU_XVA(), _gpu_wh,_GPU_WVA(), _gpu_yh,_GPU_YVA(), PN) != 0) { return 0 - 1; }
+    # ---- B: dotPdP = Σ_j P·dP → beta. (P→x, dP in y) ----
+    i = 0; while (i < PN) { store64(_gpu_xm + i*8, load64(Pc + i*8)); i = i + 1; }
+    var sb = _gpu_get_abwd(17, T, C, hd, scale);
+    if (sb == 0) { return 0 - 1; }
+    if (_gpu_abwd_disp(sb, _gpu_xh,_GPU_XVA(), _gpu_yh,_GPU_YVA(), _gpu_bbh,_GPU_BVA(), nh*T) != 0) { return 0 - 1; }
+    # ---- C: sds = scale·P·(dP − dotPdP) → y (in-place). (P in x, dPsds in y, dotPdP in beta) ----
+    var sc = _gpu_get_abwd(18, T, C, hd, scale);
+    if (sc == 0) { return 0 - 1; }
+    if (_gpu_abwd_disp(sc, _gpu_xh,_GPU_XVA(), _gpu_yh,_GPU_YVA(), _gpu_bbh,_GPU_BVA(), PN) != 0) { return 0 - 1; }
+    # ---- D: dQ = Σ_j sds·K → gamma. (sds in y, K→W) ----
+    i = 0; while (i < tc) { store64(_gpu_wm + i*8, load64(Kc + i*8)); i = i + 1; }
+    var sd = _gpu_get_abwd(19, T, C, hd, scale);
+    if (sd == 0) { return 0 - 1; }
+    if (_gpu_abwd_disp(sd, _gpu_yh,_GPU_YVA(), _gpu_wh,_GPU_WVA(), _gpu_gh,_GPU_GVA(), nh*T*hd) != 0) { return 0 - 1; }
+    i = 0; while (i < tc) { store64(dQ + i*8, load64(_gpu_gm + i*8)); i = i + 1; }
+    # ---- E: dV = Σ_i P·dconcat → gamma. (P in x, dconcat→W) ----
+    i = 0; while (i < tc) { store64(_gpu_wm + i*8, load64(dconcat + i*8)); i = i + 1; }
+    var sg = _gpu_get_abwd(20, T, C, hd, scale);
+    if (sg == 0) { return 0 - 1; }
+    if (_gpu_abwd_disp(sg, _gpu_xh,_GPU_XVA(), _gpu_wh,_GPU_WVA(), _gpu_gh,_GPU_GVA(), nh*T*hd) != 0) { return 0 - 1; }
+    i = 0; while (i < tc) { store64(dV + i*8, load64(_gpu_gm + i*8)); i = i + 1; }
+    # ---- F: dK = Σ_i sds·Q → gamma. (sds in y, Q→W) — reuses the gather kernel (A=sds,B=Q) ----
+    i = 0; while (i < tc) { store64(_gpu_wm + i*8, load64(Qc + i*8)); i = i + 1; }
+    if (_gpu_abwd_disp(sg, _gpu_yh,_GPU_YVA(), _gpu_wh,_GPU_WVA(), _gpu_gh,_GPU_GVA(), nh*T*hd) != 0) { return 0 - 1; }
+    i = 0; while (i < tc) { store64(dK + i*8, load64(_gpu_gm + i*8)); i = i + 1; }
+    _gpu_attnbwd_count = _gpu_attnbwd_count + 1;
     return 0;
 }
 

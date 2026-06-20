@@ -53,10 +53,10 @@
 #   attn11 --gpu                    run matmul + layernorm + the Adam step on the GPU (M18;
 #                                   native-AMD f64 SPIR-V via mabda, BIT-EXACT vs the CPU oracle —
 #                                   a --gpu checkpoint is byte-identical; auto CPU fallback)
-#   attn11 --gpu-tc                 also run GELU + the LM head + attention on the GPU (implies
-#                                   --gpu). TOLERANCE, not bit-exact (in-shader f64 exp ≠ x86 exp;
-#                                   sequential vs the CPU's tree dot) — ~1e-13-close, not
-#                                   byte-identical
+#   attn11 --gpu-tc                 also run GELU + LM head + attention + the GELU/linear/attention
+#                                   BACKWARD on the GPU (implies --gpu) — so the full training step
+#                                   (fwd+bwd+Adam) runs on-device. TOLERANCE (in-shader f64 exp ≠ x86
+#                                   exp; sequential vs SIMD-tree dot) — ~1e-13-close, not byte-identical
 #   attn11 --help, -h               show usage and exit
 #   attn11 --version                print the version and exit
 #
@@ -131,7 +131,7 @@ fn _atoi(s): i64 {
 }
 
 # Kept in sync with the VERSION file (CI's docs job gates the match).
-fn CFG_VERSION(): i64 { return "1.8.9"; }
+fn CFG_VERSION(): i64 { return "1.8.10"; }
 
 fn usage(): i64 {
     puts("attn11 — a from-scratch GPT-style transformer, trained, in Cyrius\n");
@@ -753,7 +753,8 @@ fn main(): i64 {
     if (g_gpu == 1) {
         if ((gpu_mm_count() > 0) || (gpu_ln_count() > 0) || (gpu_gelu_count() > 0) ||
             (gpu_head_count() > 0) || (gpu_attn_count() > 0) || (gpu_adam_count() > 0) ||
-            (gpu_linbwd_count() > 0) || (gpu_headbwd_count() > 0) || (gpu_lnbwd_count() > 0)) {
+            (gpu_linbwd_count() > 0) || (gpu_headbwd_count() > 0) || (gpu_lnbwd_count() > 0) ||
+            (gpu_attnbwd_count() > 0)) {
             puts("GPU: dispatched "); fmt_int(gpu_mm_count()); puts(" matmuls + ");
             fmt_int(gpu_ln_count()); puts(" layernorms");
             if (gpu_adam_count() > 0) { puts(" + "); fmt_int(gpu_adam_count()); puts(" adam steps"); }
@@ -764,8 +765,9 @@ fn main(): i64 {
             if (gpu_head_count() > 0) { puts(" + "); fmt_int(gpu_head_count()); puts(" heads"); }
             if (gpu_attn_count() > 0) { puts(" + "); fmt_int(gpu_attn_count()); puts(" attention cores"); }
             if (gpu_linbwd_count() > 0) { puts(" + "); fmt_int(gpu_linbwd_count()); puts(" linear-bwd"); }
+            if (gpu_attnbwd_count() > 0) { puts(" + "); fmt_int(gpu_attnbwd_count()); puts(" attn-bwd"); }
             if ((gpu_gelu_count() > 0) || (gpu_head_count() > 0) || (gpu_attn_count() > 0) ||
-                (gpu_linbwd_count() > 0)) { puts(" (tolerance)"); }
+                (gpu_linbwd_count() > 0) || (gpu_attnbwd_count() > 0)) { puts(" (tolerance)"); }
             puts(" on-device\n");
         } else {
             puts("GPU: requested but nothing ran on-device — CPU fallback was used throughout\n");

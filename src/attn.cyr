@@ -478,6 +478,15 @@ fn attn_mla_fwd_row(Wq, bq, Wdkv, Wuk, buk, Wuv, buv, Wo, bo, x_row, out_row,
 # sequential, so the accumulation order is deterministic. Shared by attn_bwd
 # (MHA/GQA) and the MLA backward.
 fn attn_core_bwd(Qc, Kc, Vc, Pc, dconcat, dQ, dK, dV, dprow, T, C, nh, nkv): i64 {
+#ifndef CYRIUS_TARGET_AGNOS
+    # GPU attention backward (causal MHA) under --gpu-tc; self-falls-back (GQA, T>32, bidir, no
+    # device). TOLERANCE (P carries the in-shader-exp tolerance + sequential vs tree dots).
+    if (g_gpu_tc == 1) {
+        if (g_bidir == 0) {
+            if (gpu_attn_core_bwd(Qc, Kc, Vc, Pc, dconcat, dQ, dK, dV, dprow, T, C, nh, nkv) == 0) { return 0; }
+        }
+    }
+#endif
     var hd = C / nh;
     var Ckv = nkv * hd;
     var gsz = nh / nkv;
