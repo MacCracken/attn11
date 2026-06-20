@@ -13,7 +13,7 @@
 
 ## Where we are
 
-Current: **v1.7.2**. The v1.0 surface is frozen and additive-only
+Current: **v1.7.3**. The v1.0 surface is frozen and additive-only
 ([`STABILITY.md`](../STABILITY.md)); the reusable numeric core lives in
 **[rosnet](https://github.com/MacCracken/rosnet)** + **[tyche](https://github.com/MacCracken/tyche)**
 (v1.1.0). **The full milestone chain M12–M17 is complete**, plus both data arcs:

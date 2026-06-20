@@ -4,7 +4,7 @@ version = "${file:VERSION}"
 description = "attn11 — a from-scratch GPT-style transformer, trained, in Cyrius"
 license = "GPL-3.0-only"
 language = "cyrius"
-cyrius = "6.2.6"
+cyrius = "6.2.27"
 repository = "https://github.com/MacCracken/attn11"
 
 [build]
@@ -21,11 +21,11 @@ stdlib = ["string", "fmt", "alloc", "io", "vec", "str", "syscalls", "assert", "b
 # validate rosnet's linear, and a byte-identical training run proves the swap.
 [deps.tyche]
 git = "https://github.com/MacCracken/tyche"
-tag = "0.1.0"
+tag = "0.1.1"
 modules = ["dist/tyche.cyr"]
 
 [deps.rosnet]
 git = "https://github.com/MacCracken/rosnet"
-tag = "0.1.0"
+tag = "0.1.1"
 modules = ["dist/rosnet.cyr"]
 ---

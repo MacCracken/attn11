@@ -5,7 +5,16 @@
 
 ## Version
 
-**1.7.2** — *Competitor benchmarks (B-series B0) + toolchain realign* (the wrap-up cut
+**1.7.3** — *Toolchain realign + dependency bump* (maintenance). cyrius pin **6.2.6 →
+6.2.27** (installed cycc had rolled well ahead; local builds warned of drift) plus the first
+realign where the consumed AGNOS crates move too: **tyche 0.1.0 → 0.1.1** and **rosnet 0.1.0
+→ 0.1.1**, each itself a pure toolchain-realign (6.2.11 pin + `dist/` regen, no API change),
+so attn11's call surface is untouched. `cyrius update` resynced the gitignored `lib/`
+snapshot + `cyrius.lock`; default training run **byte-identical** to 1.7.2 (baseline binary
+built pre-bump, diffed post-bump). **1056** checks unchanged green; no pin-drift warning.
+`src/*.cyr` unchanged except CFG_VERSION.
+
+(**1.7.2** — *Competitor benchmarks (B-series B0) + toolchain realign* (the wrap-up cut
 before the GPU pause on mabda 3.x). **B0 harness** `scripts/compete-bench.sh` (+ `make
 compete-bench`, `competitor-bench.csv`): attn11 vs llm.c/nanoGPT/llama2.c/micrograd on
 training + decode, enforcing the fairness rules (matched config + **param-count assert**,
@@ -18,7 +27,7 @@ unpopulated** (need competitor stacks + GPT-2 data-prep on a bench machine; nano
 — no PyTorch here). B4 rides M18. **Toolchain**: cyrius pin **6.2.5 → 6.2.6** (`cyrius
 update` resync); default/RL/ternary runs **byte-identical** to 1.7.1. **1056** checks
 unchanged green x86_64 + aarch64/qemu; lint + fuzz + `make smoke` + `make release` exit 0.
-`src/*.cyr` unchanged except CFG_VERSION. Write-up: [`../benchmarks.md`](../benchmarks.md).
+`src/*.cyr` unchanged except CFG_VERSION. Write-up: [`../benchmarks.md`](../benchmarks.md).)
 
 (**1.7.1** — *Toolchain realignment* (maintenance): cyrius pin **6.2.2 → 6.2.5**. The
 installed cycc had moved ahead of the pin (local builds warned of toolchain drift); bumped
@@ -498,14 +507,16 @@ deterministic resume. 0.2.0: stacked layers, grad clipping, LR schedule.)
 
 ## Toolchain
 
-- **Cyrius pin**: `6.2.6` (in `cyrius.cyml [package].cyrius`) — bumped from 6.2.5
-  in 1.7.2 (and 6.2.2 → 6.2.5 in 1.7.1) to realign with the fast-rolling installed
-  cycc (`cyrius update` resyncs the gitignored `lib/` snapshot + `cyrius.lock`;
-  tracked diff = `cyrius.cyml` + `cyrius.lock`). Each realign's lib changes are in
-  files attn11 doesn't use on its Linux path (networking/TLS, threading, `chrono`,
-  `syscalls_x86_64_agnos`); the core libs (`rosnet`/`tyche`/`alloc`/`fmt`/`io`/
-  `math`/`simd`/…) are unchanged, so all runs (default/RL/ternary/etc.) stay
-  byte-identical across the bump (verified 1.7.1 + 1.7.2); 1056 checks green both
+- **Cyrius pin**: `6.2.27` (in `cyrius.cyml [package].cyrius`) — bumped from 6.2.6
+  in 1.7.3 (6.2.5 → 6.2.6 in 1.7.2, 6.2.2 → 6.2.5 in 1.7.1) to realign with the
+  fast-rolling installed cycc (`cyrius update` resyncs the gitignored `lib/`
+  snapshot + `cyrius.lock`; tracked diff = `cyrius.cyml` + `cyrius.lock`). 1.7.3 also
+  moved the consumed AGNOS crates for the first time — **tyche/rosnet 0.1.0 → 0.1.1**
+  (each a pure 6.2.11-pin realign + `dist/` regen, no API change). Each realign's lib
+  changes are in files attn11 doesn't use on its Linux path (networking/TLS, threading,
+  `chrono`, `syscalls_x86_64_agnos`); the core libs (`rosnet`/`tyche`/`alloc`/`fmt`/`io`/
+  `math`/`simd`/…) are functionally unchanged, so all runs (default/RL/ternary/etc.) stay
+  byte-identical across the bump (verified 1.7.1 + 1.7.2 + 1.7.3); 1056 checks green both
   arches, no drift warning. (1.3.0 moved the pin 6.2.1 → 6.2.2; 1.2.4 moved
   6.1.37 → 6.2.1.) The pin and snapshot must always move together: cycc
   6.1.32 fixed attn11's agnos argv-capture issue (r15-parked init rsp; the old

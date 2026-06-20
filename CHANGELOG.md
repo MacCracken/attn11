@@ -4,6 +4,18 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.7.3] - 2026-06-19
+
+**Toolchain realign (cyrius 6.2.6 → 6.2.27) + dependency bump (tyche/rosnet 0.1.0 → 0.1.1).**
+A maintenance cut. The installed cycc had rolled well ahead of the pin (local builds warned
+of toolchain drift at 6.2.6 vs 6.2.27); bumped `cyrius.cyml` and ran `cyrius update` to
+resync the gitignored `lib/` snapshot + `cyrius.lock`. Both consumed AGNOS crates moved with
+it: **tyche 0.1.0 → 0.1.1** and **rosnet 0.1.0 → 0.1.1** — each is itself a pure
+toolchain-realign (6.2.11 pin + `dist/` regen, no API change), so attn11's call surface is
+untouched. The default training run is **byte-identical** to 1.7.2 (verified: baseline binary
+built pre-bump, diffed against the post-bump binary). **1056** checks unchanged green; no pin
+drift warning. `src/*.cyr` unchanged except `CFG_VERSION`.
+
 ## [1.7.2] - 2026-06-14
 
 **Competitor benchmarks (the B-series, B0) + toolchain realign (cyrius 6.2.5 → 6.2.6).**
