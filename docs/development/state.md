@@ -5,7 +5,32 @@
 
 ## Version
 
-**1.8.3** — *M18 1.8.3: the LM head on the GPU — a transposed-weight matmul, TOLERANCE*
+**1.8.4** — *M18 1.8.4: the FULL fused attention core on the GPU — the whole forward now runs
+on-device, TOLERANCE* (E-infra; ADR 0016, X031). Adds **`gpu_attn_core`** at the
+`attn_core_fwd` seam (causal MHA): QK scores + the causal softmax + the PV weighted-sum, all on
+the native-AMD f64 SPIR-V path. **Every heavy forward op** (matmuls + ln + GELU + head +
+attention) can now run on the GPU; the CPU `attn_core_fwd` stays the oracle. **4 host-orchestrated
+passes** (a fused per-(head,query) kernel is ~900 ids ≫ the 256-id cap): scores `nh·T·T`
+causal-masked → rowmax `nh·T` → exp+sum `nh·T` (`_gpu_emit_exp`) → PV `nh·T·hd` RMW; reductions
+j-tiled (`TK=4`), host pre-inverts `1/L` + normalizes. **Hard-won:** the `j≤i` mask is
+`OpConvertSToF`+`OpFOrdGreaterThanEqual`+`OpSelect` (gfx9 lowers no integer compares); masked
+`j>i` stores **−1e8** (finite −∞ — `exp→0` clean, no i32 range-reduction overflow) so passes 2–4
+are mask-free; tiling + host `1/L` keep the div/mod Newton-macro **synth ids** under the cap
+(`MIR_ERR_ID_OOR` otherwise); a 3-D dispatch was rejected (mabda doesn't populate `gid.y/z`).
+Rides `g_gpu_tc`, never plain `--gpu`. **Scope:** causal MHA (`nkv==nh`, `g_bidir==0`); GQA /
+bidir / non-`TK`-divisible T → CPU fallback. **Validation (X031):** `tests/gpu_attn.cyr`
+(`make gpu-test`) — allclose (`atol=rtol=1e-10`) default T16·C32·nh4 (~1.5e-13) + preset
+T64·C64·nh8 (~1.6e-13), 2 cores engaged; a `--gpu-tc` run dispatches 384 attention cores, no
+NaN, bits/byte tracks CPU. **Gate:** plain `--gpu` byte-identical to no-flag (attention not
+engaged); **1056** grad-checks x86_64 **and** aarch64/qemu (CPU path unchanged); AGNOS
+main+tcyr clean; lint + fuzz + `make smoke` green; matmul + ln + gelu + head tests re-pass.
+`gpu_attn_core` + `_gpu_attn_{scores,rowmax,expsum,pv}` in `src/gpu.cyr`; hook in
+`src/attn.cyr`; new `tests/gpu_attn.cyr`; `docs/architecture/011-gpu-attention.md`. **Next
+(1.8.5):** backward + Adam + the honest perf X-entry. cyrius pin stays **6.2.29** (installed
+cycc 6.2.31, benign drift); pin `mabda = 3.4.1`. `src/*.cyr` unchanged except the additive GPU
+wiring + CFG_VERSION.
+
+(**1.8.3** — *M18 1.8.3: the LM head on the GPU — a transposed-weight matmul, TOLERANCE*
 (E-infra; ADR 0016, X030). Adds **`head_fwd`** (`logits = f · tokembᵀ`) to **`--gpu-tc`**,
 reusing 1.8.0's `GPU_TK`-tiled matmul with a **transposed-weight** kernel (`_gpu_build_tile_t`:
 embedding contracted on its last dim → weight index `n·K+k`, advance +1). The reduction is
@@ -22,7 +47,7 @@ aarch64/qemu; AGNOS static-ELF clean (GPU path incl. head guarded out); lint cle
 new `tests/gpu_head.cyr`. **Remaining for the full forward (1.8.4):** softmax (fine-grained,
 fused-attention — `_gpu_emit_exp` + max/sum reduction), then backward + Adam + the perf X-entry.
 pin `mabda = 3.4.1`; cyrius pin stays **6.2.29** (installed cycc 6.2.31, benign drift).
-`src/*.cyr` unchanged except the additive GPU wiring + CFG_VERSION.
+`src/*.cyr` unchanged except the additive GPU wiring + CFG_VERSION.)
 
 (**1.8.2** — *M18 1.8.2: GELU on the GPU via an in-shader f64 `exp` — the first TOLERANCE
 op* (E-infra; ADR 0016, X029). Crosses the transcendental wall (X028): f64 `exp` is an x86

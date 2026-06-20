@@ -1422,3 +1422,38 @@ The only remaining forward op is **softmax** (attention scores + masked-CE) — 
 fused-attention piece (1.8.4), reusing `_gpu_emit_exp` + a max/sum reduction. Reproduce:
 `make gpu-test`; `./build/attn11 --gpu-tc --steps 500 --eval` vs `--gpu`/CPU. Invariants:
 [`../architecture/010-gpu-transcendentals.md`](../architecture/010-gpu-transcendentals.md); ADR 0016.
+
+## X031 — M18 1.8.4: the full fused attention core on GPU (4-pass, tolerance) (M18, v1.8.4, 2026-06-20)
+
+**Result.** The causal MHA attention core runs end-to-end on the native-AMD f64 SPIR-V path —
+`gpu_attn_core` (`src/gpu.cyr`) at the `attn_core_fwd` seam, behind `--gpu-tc`. `tests/gpu_attn.cyr`
+(`make gpu-test`) validates it vs an `attn_core_fwd` replica via allclose (atol=rtol=1e-10):
+default T16·C32·nh4 → ~1.5e-13, preset T64·C64·nh8 → ~1.6e-13; 2 cores engaged on-device. A
+`--gpu-tc` training run dispatches 384 attention cores (alongside 11178 matmuls + 4347 lns +
+1863 gelus + 128 heads), no NaN, bits/byte tracks the CPU oracle (3.66 on a 112-byte held-out).
+With this, **every heavy forward op can run on the GPU**. Plain `--gpu` is unchanged and still
+byte-identical to the no-flag run (attention is `--gpu-tc`-only).
+
+**Design — 4 host-orchestrated passes** (a single fused per-(head,query) kernel is ~900 ids, far
+past the 256-id cap): (1) scores `nh·T·T` causal-masked; (2) rowmax `nh·T` j-tiled; (3) exp+sum
+`nh·T` j-tiled (reuses `_gpu_emit_exp`); (4) PV `nh·T·hd` j-tiled RMW. Host pre-inverts `1/L`
+and does the final normalize. Reductions j-tiled (`TK=4`) so id_bound stays ≪ cap for any T.
+
+**The bug trail (on-hardware, this box = Cezanne gfx90c).**
+1. **Causal mask → −20 `MIR_ERR_UNSUPPORTED_OP`.** `gfx9_compile` lowers `OpSelect` + float
+   compares (`OpFOrd*`) but **not** integer compares (`_spirv_alu_to_mir` omits them). Rebuilt
+   the `j≤i` mask as `OpConvertSToF` + `OpFOrdGreaterThanEqual` + `OpSelect`.
+2. **Sentinel choice.** Masked `j>i` stores **−1e8** (not 0 — pollutes the row max; not true
+   −∞ — overflows the i32 in `exp`'s range reduction). −1e8 is below any real score and
+   underflows `exp→0` cleanly, so passes 2–4 are mask-free.
+3. **−25 `MIR_ERR_ID_OOR` (synth overflow).** The 1-D gid → (h,i,j/d) div/mods each expand a
+   Newton macro whose hidden ids hit the 256 cap; un-tiled PV (id_bound 175) + 2 UDiv + FDiv
+   overflowed. Fixed by tiling every reduction (id_bound → ~80) + host `1/L` (drops FDiv) +
+   `idx−(idx/hd)·hd` for one mod. A **3-D dispatch** (gid.x/y/z to skip div/mods) compiled but
+   wrote garbage — mabda doesn't populate gid.y/z (uninitialised TGID SGPRs). Stayed 1-D.
+4. **Spike host-array overflow.** `Oref[2048]` (bytes) held 256 doubles but needed 512 (T·C),
+   smearing SPIR-V `"main"` bytes into the diff — a test-harness sizing bug, not a kernel bug.
+
+**Scope.** Causal MHA only (`nkv==nh`, `g_bidir==0`); GQA / bidir / non-`TK`-divisible T → CPU
+fallback. Reproduce: `make gpu-test`; `./build/attn11 --gpu-tc --steps 80 --eval-corpus held.txt`
+vs CPU. Invariants: [`../architecture/011-gpu-attention.md`](../architecture/011-gpu-attention.md); ADR 0016.

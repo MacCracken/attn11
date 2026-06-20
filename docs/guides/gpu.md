@@ -33,18 +33,24 @@ no-flag run):
   FLOPs) — 1.8.0.
 - **layernorm** (`ln_fwd`) — run ~2×/layer — 1.8.1.
 
-**`--gpu-tc`** (implies `--gpu`) additionally runs **GELU** (1.8.2) and the **LM head** (1.8.3,
-`logits = f · tokembᵀ`) at a *tolerance* (~1e-13), not bit-exact — GELU because the in-shader
-f64 `exp` ≠ the x86 hardware `exp`; the head because its sequential GPU reduction differs from
-the CPU's SIMD-tree dot order. To keep plain `--gpu` byte-identical, these are behind this
-**separate** gate: a `--gpu-tc` run tracks the CPU run to ~1e-13 (loss + eval bits/byte match to
-print precision, never NaN) but is **not** byte-identical.
+**`--gpu-tc`** (implies `--gpu`) additionally runs **GELU** (1.8.2), the **LM head** (1.8.3,
+`logits = f · tokembᵀ`), and the **full fused attention core** (1.8.4 — QK scores + the causal
+softmax + the PV weighted-sum) at a *tolerance* (~1e-13), not bit-exact — GELU and the softmax
+because the in-shader f64 `exp` ≠ the x86 hardware `exp`; the head because its sequential GPU
+reduction differs from the CPU's SIMD-tree dot order. To keep plain `--gpu` byte-identical, these
+are behind this **separate** gate: a `--gpu-tc` run tracks the CPU run to ~1e-13 (loss + eval
+bits/byte match to print precision, never NaN) but is **not** byte-identical. With attention
+on-device, the **entire forward** can run on the GPU.
 
-What stays on CPU: **softmax** (attention scores + masked-CE — the fine-grained fused-attention
-piece, the 1.8.4 increment) and backward + Adam. Each op self-falls-back to CPU if the device is
-absent, the contraction dimension isn't a multiple of `GPU_TK` (16), or a buffer/dispatch limit
-is exceeded — all of attn11's default/preset shapes (matmul K ∈ {32,64,128,256}; ln C ∈ {32,64};
-GELU any width; head C ∈ {32,64}) run on-device.
+The attention core (`gpu_attn_core` at the `attn_core_fwd` seam) is **4 host-orchestrated
+passes** — scores (`nh·T·T`) → rowmax → exp+sum → PV — because a single fused per-(head,query)
+kernel exceeds the 256-id compile cap; it covers **causal MHA** (`nkv==nh`, `g_bidir==0`).
+
+What stays on CPU: **GQA / bidirectional (diffusion) attention** (fall back to the CPU core) and
+**backward + Adam**. Each op self-falls-back to CPU if the device is absent, the contraction
+dimension isn't a multiple of `GPU_TK` (16) / the tile `TK` (4), or a buffer/dispatch limit is
+exceeded — all of attn11's default/preset shapes (matmul K ∈ {32,64,128,256}; ln C ∈ {32,64};
+GELU any width; head C ∈ {32,64}; attention T ∈ {16,64}) run on-device.
 
 ## Verify it
 
@@ -52,12 +58,14 @@ GELU any width; head C ∈ {32,64}) run on-device.
 make gpu-test     # build + run tests/gpu_matmul.cyr
 ```
 
-This builds + runs `tests/gpu_matmul.cyr` (matmul) and `tests/gpu_ln.cyr` (layernorm),
-validating `gpu_matmul_fwd`/`gpu_ln_fwd` against the CPU `linear_fwd`/`ln_fwd` oracles across
-attn11's real shapes (bit-exact), proving the device actually engaged, and checking the
-shape-not-tileable CPU fallback. On a box with no AMD GPU they **skip cleanly** (exit 0) — so
-it is a standalone target, *not* part of `make release` (the CI gate runs without a GPU). The
-end-to-end oracle check is byte-identity of the checkpoints:
+This builds + runs the GPU validation suite — `tests/gpu_matmul.cyr` (matmul) and
+`tests/gpu_ln.cyr` (layernorm) bit-exact, plus `tests/gpu_gelu.cyr`, `tests/gpu_head.cyr`, and
+`tests/gpu_attn.cyr` (the fused attention core) at tolerance — validating each against its CPU
+oracle (`linear_fwd`/`ln_fwd`/`gelu_fwd`/`head_fwd`/`attn_core_fwd`) across attn11's real shapes,
+proving the device actually engaged, and checking the shape-not-tileable CPU fallback. On a box
+with no AMD GPU they **skip cleanly** (exit 0) — so it is a standalone target, *not* part of
+`make release` (the CI gate runs without a GPU). The end-to-end oracle check is byte-identity of
+the checkpoints:
 
 ```sh
 ./build/attn11 --steps 40 --save /tmp/cpu.ckpt
@@ -83,6 +91,9 @@ larger model and/or matrix-core f64 hardware (a future mabda capability).
   [`../architecture/009-gpu-layernorm-and-the-transcendental-wall.md`](../architecture/009-gpu-layernorm-and-the-transcendental-wall.md).
 - The in-shader f64 `exp`, GELU, and the `--gpu-tc` tolerance gate:
   [`../architecture/010-gpu-transcendentals.md`](../architecture/010-gpu-transcendentals.md).
+- The full fused attention core (4 passes, the causal-mask-without-int-compares + finite-−∞
+  sentinel + synth-id-budget findings):
+  [`../architecture/011-gpu-attention.md`](../architecture/011-gpu-attention.md).
 - The boundary decision (kernels are rosnet's GPU backend layered on mabda, never in mabda)
   + the f32→f64 sequencing (inverted to f64-first on AMD):
   [ADR 0016](../adr/0016-gpu-backend-layered-on-mabda.md).

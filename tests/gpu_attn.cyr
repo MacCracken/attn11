@@ -1,0 +1,118 @@
+# tests/gpu_attn.cyr — M18 1.8.4 GPU fused-attention validation (TOLERANCE, not bit-exact).
+#
+# Validates `gpu_attn_core` (src/gpu.cyr) — the full causal MHA attention (scores → rowmax →
+# exp+sum → PV) — against an inline CPU reference identical to src/attn.cyr `attn_core_fwd`
+# (4-lane-tree QK dot, causal softmax, sequential PV). The GPU softmax uses an in-shader f64
+# exp (≠ x86 hardware exp), so it matches only to ~1e-13 → attention rides --gpu-tc, never
+# plain --gpu. Engagement proven (non-zero return = silent fallback = failure). Device-dependent
+# → SKIPS cleanly (exit 0) where no AMD f64 GPU exists; build-verified everywhere, NOT in CI gate.
+#
+# Build:  cyrius build tests/gpu_attn.cyr build/gpu_attn && ./build/gpu_attn
+# Exit:   0 = all shapes within tolerance (or cleanly skipped); 1 = exceeds tol / fallback.
+
+include "lib/mabda.cyr"
+include "src/gpu.cyr"
+
+fn print_cstr(s): i64 { syscall(1, 1, s, strlen(s)); return 0; }
+fn print_i64(n): i64 { var b[32]; memset(&b, 0, 32); var l = fmt_int_buf(n, &b); syscall(1, 1, &b, l); return 0; }
+fn print_hex64(v): i64 {
+    var digits = "0123456789ABCDEF"; var b[18]; store8(&b + 0, 48); store8(&b + 1, 120);
+    var i = 0; while (i < 16) { store8(&b + 2 + i, load8(digits + ((v >> ((15 - i) * 4)) & 0xF))); i = i + 1; }
+    syscall(1, 1, &b, 18); return 0;
+}
+
+fn fill(buf, n, seed): i64 {
+    var i = 0;
+    while (i < n) {
+        var h = ((seed * 2654435761) + (i * 40503)) % 1000; if (h < 0) { h = h + 1000; }
+        store64(buf + i * 8, f64_div(f64_from(h - 500), f64_from(100)));
+        i = i + 1;
+    }
+    return 0;
+}
+
+# CPU reference — identical to src/attn.cyr attn_core_fwd (causal MHA, nkv==nh → gsz=1,
+# kvb=h*hd, Ckv=C): 4-lane-tree QK dot, softmax over j<=i, sequential PV axpy.
+fn cpu_attn(Qc, Kc, Vc, concat, T, C, hd, Ckv, nh, scale): i64 {
+    var hd4 = hd - (hd % 4);
+    var prow[512];
+    var h = 0;
+    while (h < nh) {
+        var base = h*hd; var kvb = h*hd;
+        var i = 0;
+        while (i < T) {
+            var qbase = Qc + (i*C + base)*8;
+            var j = 0;
+            while (j <= i) {
+                var kbase = Kc + (j*Ckv + kvb)*8;
+                var a0=f64_from(0); var a1=f64_from(0); var a2=f64_from(0); var a3=f64_from(0); var d=0;
+                while (d < hd4) {
+                    a0=f64_add(a0,f64_mul(load64(qbase+d*8),load64(kbase+d*8)));
+                    a1=f64_add(a1,f64_mul(load64(qbase+(d+1)*8),load64(kbase+(d+1)*8)));
+                    a2=f64_add(a2,f64_mul(load64(qbase+(d+2)*8),load64(kbase+(d+2)*8)));
+                    a3=f64_add(a3,f64_mul(load64(qbase+(d+3)*8),load64(kbase+(d+3)*8)));
+                    d=d+4;
+                }
+                var dot=f64_add(f64_add(a0,a1),f64_add(a2,a3));
+                while (d<hd){dot=f64_add(dot,f64_mul(load64(qbase+d*8),load64(kbase+d*8)));d=d+1;}
+                store64(&prow + j*8, f64_mul(dot, scale));
+                j=j+1;
+            }
+            var mx=load64(&prow); j=1; while(j<=i){var s=load64(&prow+j*8); if(f64_gt(s,mx)==1){mx=s;} j=j+1;}
+            var sum=f64_from(0); j=0; while(j<=i){var e=f64_exp(f64_sub(load64(&prow+j*8),mx)); store64(&prow+j*8,e); sum=f64_add(sum,e); j=j+1;}
+            var inv=f64_div(f64_from(1),sum); j=0; while(j<=i){store64(&prow+j*8,f64_mul(load64(&prow+j*8),inv));j=j+1;}
+            var cbase = concat + (i*C + base)*8; var dz=0; while(dz<hd){store64(cbase+dz*8,f64_from(0));dz=dz+1;}
+            j=0; while(j<=i){var pij=load64(&prow+j*8); var vbase=Vc+(j*Ckv+kvb)*8; var d2=0; while(d2<hd){store64(cbase+d2*8,f64_add(load64(cbase+d2*8),f64_mul(pij,load64(vbase+d2*8))));d2=d2+1;} j=j+1;}
+            i=i+1;
+        }
+        h=h+1;
+    }
+    return 0;
+}
+
+fn run_shape(T, C, nh, atol, rtol): i64 {
+    var hd = C / nh; var Ckv = C;   # nkv == nh
+    var scale = f64_div(f64_from(1), f64_sqrt(f64_from(hd)));
+    var Qc = alloc(T*C*8); var Kc = alloc(T*Ckv*8); var Vc = alloc(T*Ckv*8);
+    var Pc = alloc(nh*T*T*8); var cref = alloc(T*C*8); var cg = alloc(T*C*8);
+    fill(Qc, T*C, 1); fill(Kc, T*Ckv, 7); fill(Vc, T*Ckv, 13);
+    var i=0; while(i<T*C){store64(cref+i*8,0); store64(cg+i*8,0); i=i+1;}
+    cpu_attn(Qc, Kc, Vc, cref, T, C, hd, Ckv, nh, scale);
+    var rc = gpu_attn_core(Qc, Kc, Vc, Pc, cg, T, C, nh, nh);
+    print_cstr("  T="); print_i64(T); print_cstr(" C="); print_i64(C); print_cstr(" nh="); print_i64(nh); print_cstr(": ");
+    if (rc != 0) { print_cstr("GPU FALLBACK (rc="); print_i64(rc); print_cstr(")\n"); return 0; }
+    var maxabs=f64_from(0); var ok=1; i=0;
+    while (i < T*C) {
+        var ref=load64(cref+i*8);
+        var abserr=f64_abs(f64_sub(load64(cg+i*8), ref));
+        if (f64_gt(abserr,maxabs)==1){maxabs=abserr;}
+        var bound=f64_add(atol, f64_mul(rtol, f64_abs(ref)));
+        if (f64_gt(abserr,bound)==1){ok=0;}
+        i=i+1;
+    }
+    print_cstr("max|abs err|="); print_hex64(maxabs);
+    if (ok==1) { print_cstr("  WITHIN TOL ("); print_i64(T*C); print_cstr(" outputs)\n"); return 1; }
+    print_cstr("  EXCEEDS TOL\n"); return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    print_cstr("attn11 GPU fused-attention validation (M18 1.8.4) — gpu_attn_core vs attn_core_fwd, TOLERANCE\n");
+    if (_gpu_init() == 0) {
+        print_cstr("no native AMD GPU — SKIPPED (CPU oracle unaffected; build verified)\n");
+        return 0;
+    }
+    print_cstr("native AMD f64 GPU online — validating attn11's real attention shapes (atol+rtol 1e-10):\n");
+    var atol = f64_div(f64_from(1), f64_from(10000000000));
+    var rtol = f64_div(f64_from(1), f64_from(10000000000));
+    var ok = 1;
+    if (run_shape(16, 32, 4, atol, rtol) == 0) { ok = 0; }    # default
+    if (run_shape(64, 64, 8, atol, rtol) == 0) { ok = 0; }    # preset
+    print_cstr("GPU attention cores dispatched on-device: "); print_i64(gpu_attn_count()); print_cstr("\n");
+    if (ok == 0) { print_cstr("\nFAIL: GPU attention exceeds tolerance vs the CPU oracle\n"); return 1; }
+    print_cstr("\nOK — gpu_attn_core allclose(atol=rtol=1e-10) to attn_core_fwd across all attn11 shapes\n");
+    return 0;
+}
+
+var exit_code = main();
+sys_exit(exit_code);

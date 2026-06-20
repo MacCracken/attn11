@@ -4,6 +4,54 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.8.4] - 2026-06-20
+
+**M18 1.8.4: the FULL fused attention core on the GPU — the whole forward now runs on-device,
+TOLERANCE-gated (E-infra; ADR 0016, X031).** Adds **`gpu_attn_core`** at the `attn_core_fwd`
+seam (causal MHA): the scaled-dot-product attention — QK scores, the causal softmax, and the
+PV weighted-sum — all execute on the native-AMD f64 SPIR-V path. With this, every heavy forward
+op (QKV/O/MLP matmuls, layernorm, GELU, LM head, **and now attention**) can run on the GPU; the
+CPU `attn_core_fwd` stays the reference oracle. Rides `--gpu-tc` (the in-shader `exp` in the
+softmax ≠ x86 hardware `exp` → tolerance, never plain `--gpu`).
+
+**Four passes (the 256-id cap + no-transcendental constraints shape all of them).** A single
+fused per-(head,query) kernel is ~900 ids (16 in-shader `exp` + the dots) — far past the cap —
+so attention is decomposed into four host-orchestrated passes over the Qc/Kc/Vc the QKV matmuls
+produced, with `Pc` as the score scratch:
+1. **scores** (grid `nh·T·T`) — `P[h,i,j] = scale·Σ_d q·k`, causal-masked.
+2. **rowmax** (grid `nh·T`, j-tiled) — `M[h,i] = max_j P` (the softmax shift).
+3. **exp+sum** (grid `nh·T`, j-tiled) — `P := exp(P−M)`, `L[h,i] = Σ` (reuses `_gpu_emit_exp`).
+4. **PV** (grid `nh·T·hd`, j-tiled RMW) — `concat = (1/L)·Σ_j P·V`; host pre-inverts `1/L` and
+   does the final normalize.
+
+**Three hard-won facts (new this increment).**
+- **Causal mask without integer compares.** `gfx9_compile` lowers `OpSelect` and *float*
+  compares (`OpFOrd*`) but **not** standalone integer compares (`_spirv_alu_to_mir` omits
+  them → `MIR_ERR_UNSUPPORTED_OP`). The `j≤i` mask is therefore built as
+  `OpConvertSToF` + `OpFOrdGreaterThanEqual` + `OpSelect`.
+- **A finite −∞ sentinel.** Masked entries (`j>i`) store **−1e8**, not 0 or true −∞: 0 would
+  pollute the row max, and a magnitude past ~1e8 overflows the i32 in `exp`'s range reduction
+  (`ConvertFToS`). −1e8 sits far below any real score yet underflows `exp→0` cleanly, so
+  passes 2–4 need **no per-element masking**.
+- **Synth-id budget.** The integer div/mods that decompose the 1-D `gid` each expand to a
+  Newton-reciprocal macro whose hidden ids count against the 256 cap; an un-tiled PV
+  (id_bound 175) overflowed (`MIR_ERR_ID_OOR`). Fix: **tile every reduction** (drops id_bound
+  to ~80) and move `1/L` to the host (kills the FDiv macro). A 3-D dispatch was rejected —
+  mabda doesn't populate `gid.y/z` (uninitialised TGID SGPRs → garbage).
+
+**Scope + fallback.** GPU path is **causal MHA** (`nkv==nh`, `g_bidir==0`); GQA (kvb mapping),
+bidirectional diffusion, and a non-`TK`-divisible `T` self-fall-back to the CPU core. Plain
+`--gpu` is unchanged and **still byte-identical** to the no-flag run (attention is `--gpu-tc`
+only). Buffers reuse the 7-BO GTT pool by role (Q=x, K=W, V=γ, P=β, M=S, L=V, concat=y).
+
+**Validation (X031).** New `tests/gpu_attn.cyr` (`make gpu-test`): `gpu_attn_core` vs an
+`attn_core_fwd` replica via **allclose** (`atol=rtol=1e-10`) at default (T16·C32·nh4) and preset
+(T64·C64·nh8) — both within ~1.5e-13; engagement proven (2 cores on-device). Full gate green:
+1056 grad-checks (x86_64 + aarch64/qemu — CPU path unchanged, attention is gated), agnos
+main+tcyr build, fuzz, smoke; plain `--gpu` checkpoint byte-identical; a `--gpu-tc` run dispatches
+384 attention cores and tracks the CPU bits/byte (no NaN). Detail:
+`docs/architecture/011-gpu-attention.md`.
+
 ## [1.8.3] - 2026-06-20
 
 **M18 1.8.3: the LM head on the GPU — a transposed-weight matmul, TOLERANCE-gated (E-infra;

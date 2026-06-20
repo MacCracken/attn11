@@ -13,12 +13,13 @@
 
 ## Where we are
 
-Current: **v1.8.3** — **M18 in progress**: `--gpu` runs **matmul** (1.8.0) **+ layernorm**
+Current: **v1.8.4** — **M18 in progress**: `--gpu` runs **matmul** (1.8.0) **+ layernorm**
 (1.8.1) bit-exact (byte-identical run); **`--gpu-tc`** adds **GELU** (1.8.2) + the **LM head**
-(1.8.3, X030) at a *tolerance* (transcendental / SIMD-tree-order — so a separate gate keeps
-plain `--gpu` byte-identical). Remaining: **softmax** → the full forward (1.8.4), then backward
-+ Adam (1.8.5). All on the native-AMD f64 SPIR-V path (mabda 3.4.1). The v1.0 surface is frozen
-and additive-only
+(1.8.3) + the **full fused attention core** (1.8.4, X031 — QK scores + causal softmax + PV) at a
+*tolerance* (transcendental / SIMD-tree-order — so a separate gate keeps plain `--gpu`
+byte-identical). With 1.8.4 the **entire forward** can run on-device. Remaining: backward + Adam
+(1.8.5) → then the honest perf X-entry. All on the native-AMD f64 SPIR-V path (mabda 3.4.1). The
+v1.0 surface is frozen and additive-only
 ([`STABILITY.md`](../STABILITY.md)); the reusable numeric core lives in
 **[rosnet](https://github.com/MacCracken/rosnet)** + **[tyche](https://github.com/MacCracken/tyche)**
 (v1.1.0). **The full milestone chain M12–M17 is complete**, plus both data arcs:
@@ -418,12 +419,18 @@ for the native-AMD f64 route.
   the CPU head's 4-lane-tree dot only to ~1e-15 → tolerance (the bespoke tree kernel was deferred
   as not worth it; sequential + `--gpu-tc` is the low-cost path). `tests/gpu_head.cyr`. Detail:
   [`../architecture/010-gpu-transcendentals.md`](../architecture/010-gpu-transcendentals.md).
-- **1.8.4 — softmax on GPU → the *full* forward.** The fine-grained remaining op: attention
-  scores + masked-CE softmax (per-head, per-query over the keys). Reuses `_gpu_emit_exp` + an
-  ln-style max/sum reduction (numerically-stable `exp(x−max)`); tolerance, rides `--gpu-tc`. It
-  is the awkward one at attn11's tiny scale (a fused/online-softmax kernel — the 256-id cap
-  forces tiling), and the matmuls already dominate FLOPs, so it completes coverage rather than
-  adding speed. Then the QKV/attention-core dots if a tree kernel proves worth it.
+- **1.8.4 — the FULL fused attention core on GPU (TOLERANCE) → the *full* forward — ✅ SHIPPED
+  (X031).** `gpu_attn_core` at the `attn_core_fwd` seam: QK scores + the causal softmax + the PV
+  weighted-sum, all on-device. **4 host-orchestrated passes** (a fused per-(head,query) kernel is
+  ~900 ids ≫ the 256-id cap): scores `nh·T·T` causal-masked → rowmax `nh·T` → exp+sum `nh·T`
+  (reuses `_gpu_emit_exp`) → PV `nh·T·hd` RMW; reductions j-tiled (`TK=4`), host pre-inverts
+  `1/L` + normalizes. The `j≤i` mask is float-compare + `OpSelect` (gfx9 lowers no integer
+  compares); masked `j>i` stores **−1e8** (a finite −∞ that `exp`s to 0 without i32
+  range-reduction overflow) so passes 2–4 are mask-free; tiling + host `1/L` keep the div/mod
+  synth ids under the cap. Tolerance (in-shader `exp`), rides `--gpu-tc`. **Causal MHA only**
+  (`nkv==nh`, `g_bidir==0`) — GQA / bidir / non-`TK`-divisible T fall back to the CPU core. With
+  this, the **entire forward** can run on the GPU. `tests/gpu_attn.cyr`. Detail:
+  [`../architecture/011-gpu-attention.md`](../architecture/011-gpu-attention.md).
 - **1.8.5 — backward + Adam on GPU; the honest perf X-entry.** `linear_bwd`,
   `attn_core_bwd`, `head_bwd`, `ln_bwd`, `gelu_bwd`, `model_adam_step` — a full `--gpu`
   training step. Then the straight GPU-vs-CPU comparison (default / preset / a larger

@@ -57,6 +57,15 @@ fn _at_lindS(ar, T, C, nh, Ckv): i64 { return _at_linS(ar, T, C, nh, Ckv) + (C /
 # nkv = nh / Ckv = C over up-projected full K/V, so the kernel never diverges
 # (docs/architecture/003).
 fn attn_core_fwd(Qc, Kc, Vc, Pc, concat, T, C, nh, nkv): i64 {
+#ifndef CYRIUS_TARGET_AGNOS
+    # GPU fused attention (causal MHA) under --gpu-tc; self-falls-back to CPU (GQA,
+    # non-tileable T, or no device → -1). Causal only (g_bidir==0). TOLERANCE: in-shader exp.
+    if (g_gpu_tc == 1) {
+        if (g_bidir == 0) {
+            if (gpu_attn_core(Qc, Kc, Vc, Pc, concat, T, C, nh, nkv) == 0) { return 0; }
+        }
+    }
+#endif
     var hd = C / nh;
     var Ckv = nkv * hd;
     var gsz = nh / nkv;             # query heads per K/V head (GQA group size)
