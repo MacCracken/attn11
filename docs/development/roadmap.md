@@ -13,8 +13,12 @@
 
 ## Where we are
 
-Current: **v1.9.0** — **M19 STARTED: the full `--gpu-tc` step now runs end-to-end at PRESET (T=64)
-too (X040)** — `attn_core_bwd` tiled over T (the old `T ≤ 20` gate gone) + the LM-head backward's
+Current: **v1.9.1** — **M19 in progress.** 1.9.1 (X041) added **RoPE Q/K rotation on the GPU,
+bit-exact** (plain `--gpu`, byte-identity preserved — the cos/sin table is host-precomputed, the GPU
+does only the rotation), and resolved the rest of the "remaining-op coverage" honestly: ternary
+already runs on the GPU (rides `qlinear→gpu_matmul`), and MoE's routed expert MLPs are deferred (M=1
+per-token-per-expert — a poor GPU fit). 1.9.0 (X040) ran **the full `--gpu-tc` step end-to-end at
+PRESET (T=64)** — `attn_core_bwd` tiled over T (the old `T ≤ 20` gate gone) + the LM-head backward's
 V-contraction tail-tiled so any vocab engages bit-exact; the adversarial review caught + fixed two
 pre-existing latent GPU bugs (a cache key missing `hd`, an untiled-`dp` build-buffer overflow at
 large `hd`). **M18 was COMPLETE: the full training step runs end-to-end on the GPU (the
@@ -526,10 +530,19 @@ for the native-AMD f64 route.
   cache key omitted `hd` (stale-kernel corruption when two shapes share (C,T) with different nh), and
   the untiled `dp` unroll overflowed its `spv[8192]` build buffer at `hd ≥ ~46` (`--heads 1` crash →
   `hd > 32` guard forces clean fallback).
-- **1.9.1 — remaining-op GPU coverage: MoE / ternary / RoPE kernels.** The non-default model axes —
-  `--experts` routing + expert MLPs, the `--ternary` i64-add matmul, RoPE Q/K rotation — still fall
-  back to the CPU. Add their GPU kernels so those configs also run on-device. Additive breadth, not
-  a perf bet.
+- **1.9.1 — remaining-op GPU coverage: RoPE kernel (bit-exact) + the ternary/MoE coverage map — ✅
+  SHIPPED (X041).** Resolved against the code: of the three named axes, **only RoPE was a genuine
+  kernel gap.** `gpu_rope_apply` runs the Q/K rotation on-device **BIT-EXACT** (plain `--gpu`,
+  byte-identity preserved) — the angles depend only on `(channel-pair, position)`, so the host
+  precomputes the cos/sin table (the trig stays on the proven CPU path) and the GPU does only the
+  rotation (f64 mul/add/sub). `dir` picks fwd/bwd; `rows<2` (decode) self-falls-back; new
+  `tests/gpu_rope.cyr`. Honest: the cos/sin (the real cost) stays host-side → coverage, not a speedup.
+  **The other two need no kernel / are deferred:** *ternary* already runs on the GPU (`--ternary`
+  quantizes `W→W_eff` then takes the same `qlinear→gpu_matmul` path; the i64-add collapse is
+  reference-only + slower, X023); *MoE* attention/projection matmuls already run on-device, but the
+  **routed expert MLPs are M=1 per-token-per-expert** matmuls (re-uploading `C·F` weights `T·K`×/step
+  — a poor GPU fit) → **deferred** (a real MoE GPU path needs a batched-per-expert gather). The
+  adversarial review (2 dims + on-HW verify) returned 0 findings.
 - **1.9.2 — the first real perf lever: device-resident tensors + pipelined transfer.** X039 pinned
   per-op host↔device transfer as the dominant cost. Keep the weights / Adam m,v / activations
   **device-resident across the whole step** (no per-op upload/download) and overlap transfer with

@@ -39,6 +39,9 @@ no-flag run, *including the optimizer state*):
   vocab** since 1.9.0 tail-tiled the D_f V-contraction; only `T%16≠0` still falls back).
 - **the layernorm backward** (`ln_bwd`) — dx + dgamma/dbeta from the saved mean/rstd; rstd is a
   precomputed input so the reductions are sequential (no transcendental) → bit-exact — 1.8.9.
+- **the RoPE Q/K rotation** (`rope_apply_fwd`/`bwd`, `--pos-kind rope`) — the angles depend only on
+  `(channel-pair, position)`, so the host precomputes the cos/sin table (the trig stays on the CPU)
+  and the GPU does only the rotation (f64 mul/add/sub) → bit-exact — 1.9.1 (decode rows=1 falls back).
 
 **`--gpu-tc`** (implies `--gpu`) additionally runs **GELU** (1.8.2), the **LM head** (1.8.3,
 `logits = f · tokembᵀ`), and the **full fused attention core** (1.8.4 — QK scores + the causal
@@ -60,10 +63,18 @@ The attention core (`gpu_attn_core` at the `attn_core_fwd` seam) is **4 host-orc
 passes** — scores (`nh·T·T`) → rowmax → exp+sum → PV — because a single fused per-(head,query)
 kernel exceeds the 256-id compile cap; it covers **causal MHA** (`nkv==nh`, `g_bidir==0`).
 
-What stays on CPU: **GQA / bidirectional (diffusion) attention** (fall back to the CPU core) and
-**very wide heads** (`hd > 32` — the untiled `dp` pass would exceed the build budget, so the
-attention backward self-falls-back; `--preset --heads 1` is the corner case). Everything else of a
-training step runs on the GPU at default and preset (as of 1.9.0). Each op
+**Non-default model axes:** **`--ternary`** already runs on the GPU (it quantizes `W→W_eff` then
+takes the same `qlinear→gpu_matmul` path — no separate kernel); **`--pos-kind rope`** runs its Q/K
+rotation on the GPU bit-exact (1.9.1, above); **`--experts` (MoE)** runs its attention/projection
+matmuls on the GPU, but the **routed expert MLPs stay on the CPU** — they are M=1 per-token-per-expert
+matmuls (re-uploading each expert's weights `T·K`×/step would be a poor GPU fit; a batched-per-expert
+gather is the deferred proper path).
+
+What stays on CPU: **GQA / bidirectional (diffusion) attention** (fall back to the CPU core), the
+**MoE routed expert MLPs** (above), and **very wide heads** (`hd > 32` — the untiled `dp` pass would
+exceed the build budget, so the attention backward self-falls-back; `--preset --heads 1` is the corner
+case). Everything else of a training step runs on the GPU at default and preset (RoPE since 1.9.1,
+preset-scale since 1.9.0). Each op
 self-falls-back to CPU if the device is absent, the contraction
 dimension isn't a multiple of `GPU_TK` (16) / the tile `TK` (4), or a buffer/dispatch limit is
 exceeded — all of attn11's default/preset shapes (matmul K ∈ {32,64,128,256}; ln C ∈ {32,64};

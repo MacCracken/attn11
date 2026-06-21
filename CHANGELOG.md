@@ -4,6 +4,49 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.9.1] - 2026-06-21
+
+**M19 1.9.1: RoPE Q/K rotation on the GPU — BIT-EXACT — + the remaining-op coverage map (E-infra;
+ADR 0016, X041).** The roadmap's "remaining-op GPU coverage (MoE / ternary / RoPE)" cut, resolved
+honestly against the code: **RoPE is the one genuine new kernel** (the other two already ride the
+matmul hook or are a poor fit — see below). Additive, GPU-only; the no-flag CPU run stays
+byte-identical to 1.9.0.
+
+**Added — `gpu_rope_apply` at the `rope_apply_fwd`/`rope_apply_bwd` seam (`--pos-kind rope`).** The
+rotation angles (cos/sin) depend ONLY on `(channel-pair, position)` — data-independent — so the host
+precomputes the cos/sin **table** bit-for-bit (the proven Maclaurin + binary-exponentiation trig
+stays on the CPU) and the GPU does ONLY the rotation (pure f64 mul/add/sub, correctly-rounded). That
+makes it **BIT-EXACT** vs the CPU rope → it rides **plain `--gpu`** and keeps the checkpoint
+byte-identical (a `--pos-kind rope --gpu` run reproduces the no-flag run byte-for-byte at default
+**and** preset, with the rotation on-device). One thread per `(row, head, pair)`; `dir` selects the
+forward `R` / backward `Rᵀ` sign pattern; `rows < 2` (decode) self-falls-back. New
+`tests/gpu_rope.cyr` (bit-exact fwd+bwd across default / preset / wide-head shapes + the rows=1
+fallback). The cos/sin (the real cost) stays host-side, so this is **coverage, not a speedup** —
+consistent with the M18/M19 honest-negative footing; an in-shader trig version is a future refinement.
+
+**Coverage findings (the honest part of "MoE / ternary / RoPE"):**
+- **Ternary already runs on the GPU.** `--ternary` quantizes `W → W_eff` into `g_qscratch` and then
+  takes the SAME `qlinear_fwd`/`qlinear_bwd` → `gpu_matmul_fwd`/`gpu_linear_bwd` path, so its matmuls
+  already dispatch on-device (verified: `--ternary --gpu` dispatches thousands of matmuls). No kernel
+  needed; the 1.6.1 i64-add collapse kernel is reference-only and slower than SIMD-f64 (X023), so
+  GPU-ing it has no execution-path consumer.
+- **MoE attention/projection matmuls already run on the GPU** (`--experts 4 --gpu` dispatches matmuls
+  + ln + head + Adam). The gap is the **routed expert MLPs** (`moe_fwd`/`moe_bwd`, ops.cyr), which are
+  **M=1 per-token-per-expert** matmuls — routing them to `gpu_matmul` would re-upload each expert's
+  weights `T·K` times per step (catastrophic), and the top-K routing + gate softmax are inherently
+  sequential. **Deferred** with rationale: a real MoE GPU path needs a batched-per-expert gather
+  (one big matmul per expert) — a separate restructuring, not a per-op increment.
+
+**Gate.** lint 0 warnings; **1056** grad-checks green x86_64 **and** aarch64/qemu (CPU math
+untouched); the **12-test** GPU suite passes (`gpu_rope` bit-exact fwd+bwd, rows=1 fallback clean);
+AGNOS main + tcyr build; fuzz + `make smoke` green. **No-flag run byte-identical** to 1.9.0
+(default / `--pos-kind rope` / preset / `--experts 4`, diffed vs the 1.9.0 binary); a plain `--gpu`
+`--pos-kind rope` run stays byte-identical to the CPU run (rope now on-device bit-exact). The
+adversarial review (2 dims, on-hardware verify) returned **0 findings**. cyrius pin stays **6.2.29**
+(installed cycc 6.2.34, benign drift); pin `mabda = 3.4.1`. `src/*.cyr` unchanged except
+`src/gpu.cyr` + `src/attn.cyr` (the RoPE seam) + `src/main.cyr` (CFG_VERSION + the rope count).
+**Next (1.9.2):** the first real perf lever — device-resident tensors + pipelined transfer.
+
 ## [1.9.0] - 2026-06-21
 
 **M19 1.9.0: preset-scale on-device — the full `--gpu-tc` training step now runs end-to-end at

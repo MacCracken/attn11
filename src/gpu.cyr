@@ -68,6 +68,7 @@ var _gpu_linbwd_count = 0; # linear backward ops actually dispatched on-device (
 var _gpu_headbwd_count = 0; # LM-head backward ops actually dispatched on-device (bit-exact)
 var _gpu_lnbwd_count = 0;  # layernorm backward ops actually dispatched on-device (bit-exact)
 var _gpu_attnbwd_count = 0; # attention backward cores actually dispatched on-device (tolerance)
+var _gpu_rope_count = 0;    # RoPE Q/K rotations actually dispatched on-device (bit-exact)
 
 # Counts of forward ops run on the GPU (vs CPU fallback). >0 proves the device ran.
 fn gpu_mm_count(): i64 { return _gpu_mm_count; }
@@ -80,6 +81,7 @@ fn gpu_linbwd_count(): i64 { return _gpu_linbwd_count; }
 fn gpu_headbwd_count(): i64 { return _gpu_headbwd_count; }
 fn gpu_lnbwd_count(): i64 { return _gpu_lnbwd_count; }
 fn gpu_attnbwd_count(): i64 { return _gpu_attnbwd_count; }
+fn gpu_rope_count(): i64 { return _gpu_rope_count; }
 
 # SPIR-V word emitters. op<wc> writes one <wc>-word instruction (word0 = (wc<<16)|op)
 # and returns the next byte offset. One instruction per source line → readable + ≤120c.
@@ -2204,6 +2206,100 @@ fn gpu_adam_step(params, grads, m, v, NP, lr, step): i64 {
     i = 0; while (i < NP) { store64(m + i*8, load64(_gpu_gm + i*8)); i = i + 1; }
     i = 0; while (i < NP) { store64(v + i*8, load64(_gpu_bbm + i*8)); i = i + 1; }
     _gpu_adam_count = _gpu_adam_count + 1;
+    return 0;
+}
+
+# ===========================================================================
+# 1.9.1 — RoPE Q/K rotation on GPU, BIT-EXACT (M19 remaining-op coverage). The rotation angles
+# (cos/sin) are a function of (position, channel-pair) ONLY — data-independent — so the host
+# precomputes the cos/sin TABLE bit-for-bit (the proven Maclaurin + binary-exponentiation path
+# stays on the CPU) and the GPU does ONLY the rotation (pure f64 mul/add/sub, correctly-rounded) →
+# bit-identical to rope_apply_fwd/bwd → rides PLAIN --gpu, keeps the checkpoint byte-identical.
+# One thread per (row, head, pair). dir 0 = forward R(angle), dir 1 = backward Rᵀ. The caller
+# (src/attn.cyr) builds the table; gpu.cyr stays self-contained (table passed as a buffer).
+# ===========================================================================
+
+# Rotate X(rows,width) in place by a precomputed cos/sin table. X=0(%12,io) cs=1(%13). grid
+# rows·NH·hdp; idx→(r,h,k). pair = X[r·width + h·hd + 2k]; (c,s) = cs[(r·hdp+k)·2]. dir picks the
+# fwd/bwd sign pattern. consts %14=0 %15=width %16=hd %17=hdp %18=HK(=NH·hdp) %19=1 %20=2.
+fn _gpu_build_rope(buf, width, hd, hdp, NH, dir): i64 {
+    var HK = NH * hdp;
+    var o = _gpu_pre(buf, 2, 21);
+    o=_gpu_op4(buf,o,0x0004002B,3,14,0); o=_gpu_op4(buf,o,0x0004002B,3,15,width);
+    o=_gpu_op4(buf,o,0x0004002B,3,16,hd); o=_gpu_op4(buf,o,0x0004002B,3,17,hdp);
+    o=_gpu_op4(buf,o,0x0004002B,3,18,HK); o=_gpu_op4(buf,o,0x0004002B,3,19,1);
+    o=_gpu_op4(buf,o,0x0004002B,3,20,2);
+    o=_gpu_op5(buf,o,0x00050036,1,21,0,2); o=_gpu_op2(buf,o,0x000200F8,22);
+    o=_gpu_op4(buf,o,0x0004003D,4,23,11); o=_gpu_op5(buf,o,0x00050051,3,24,23,0);   # idx
+    o=_gpu_op5(buf,o,0x00050086,3,25,24,18);                       # r = idx/HK
+    o=_gpu_op5(buf,o,0x00050084,3,26,25,18); o=_gpu_op5(buf,o,0x00050082,3,27,24,26);   # rem = idx - r*HK
+    o=_gpu_op5(buf,o,0x00050086,3,28,27,17);                       # h = rem/hdp
+    o=_gpu_op5(buf,o,0x00050084,3,29,28,17); o=_gpu_op5(buf,o,0x00050082,3,30,27,29);   # k = rem - h*hdp
+    o=_gpu_op5(buf,o,0x00050084,3,31,25,15);                       # r*width
+    o=_gpu_op5(buf,o,0x00050084,3,32,28,16);                       # h*hd
+    o=_gpu_op5(buf,o,0x00050084,3,33,30,20);                       # 2k
+    o=_gpu_op5(buf,o,0x00050080,3,34,31,32); o=_gpu_op5(buf,o,0x00050080,3,35,34,33);   # Xbase
+    o=_gpu_op5(buf,o,0x00050080,3,36,35,19);                       # Xbase+1
+    o=_gpu_op5(buf,o,0x00050084,3,37,25,17); o=_gpu_op5(buf,o,0x00050080,3,38,37,30);   # r*hdp+k
+    o=_gpu_op5(buf,o,0x00050084,3,39,38,20); o=_gpu_op5(buf,o,0x00050080,3,40,39,19);   # csbase, csbase+1
+    o=_gpu_acl6(buf,o,41,42,12,14,35);                            # x0 = X[Xbase]
+    o=_gpu_acl6(buf,o,43,44,12,14,36);                            # x1 = X[Xbase+1]
+    o=_gpu_acl6(buf,o,45,46,13,14,39);                            # c
+    o=_gpu_acl6(buf,o,47,48,13,14,40);                            # s
+    o=_gpu_op5(buf,o,0x00050085,6,49,42,46);                      # x0*c
+    o=_gpu_op5(buf,o,0x00050085,6,50,44,48);                      # x1*s
+    o=_gpu_op5(buf,o,0x00050085,6,52,42,48);                      # x0*s
+    o=_gpu_op5(buf,o,0x00050085,6,53,44,46);                      # x1*c
+    if (dir == 0) {
+        o=_gpu_op5(buf,o,0x00050083,6,51,49,50);                  # fwd y0 = x0c - x1s
+        o=_gpu_op5(buf,o,0x00050081,6,54,52,53);                  # fwd y1 = x0s + x1c
+    } else {
+        o=_gpu_op5(buf,o,0x00050081,6,51,49,50);                  # bwd y0 = d0c + d1s
+        o=_gpu_op5(buf,o,0x00050083,6,54,53,52);                  # bwd y1 = d1c - d0s
+    }
+    o=_gpu_op3(buf,o,0x0003003E,41,51);                           # X[Xbase] = y0
+    o=_gpu_op3(buf,o,0x0003003E,43,54);                           # X[Xbase+1] = y1
+    o=_gpu_op2(buf,o,0x000100FD,0x00010038); store32(buf+12,55); return o;
+}
+
+fn _gpu_get_rope(width, hd, hdp, NH, dir): i64 {
+    var key = (22 << 56) | (dir << 55) | (width << 40) | (hd << 28) | (hdp << 20) | NH;
+    var c = _gpu_cache_get(key); if (c == (0 - 1)) { return 0; } if (c != 0) { return c; }
+    var spv[8192]; var nb = _gpu_build_rope(&spv, width, hd, hdp, NH, dir);
+    var sh = gpu_shader_module_create_spirv(_gpu_ctx, &spv, nb);
+    if (sh == 0) { _gpu_cache_put(key, 0 - 1); return 0; }
+    _gpu_cache_put(key, sh); return sh;
+}
+
+# GPU RoPE: rotate X(rows,width) in place given the host-precomputed cos/sin table cs (layout
+# cs[(r·hdp+k)·2]=c, +1=s). dir 0 = forward, 1 = backward. Returns 0 = ran (X rotated), -1 = CPU.
+# BIT-EXACT vs rope_apply_fwd/bwd → plain --gpu. rows<2 (decode) self-falls-back (not worth a dispatch).
+fn gpu_rope_apply(X, cs, rows, width, num_heads, hdp, dir): i64 {
+    if (_gpu_init() == 0) { return 0 - 1; }
+    if (rows < 2) { return 0 - 1; }
+    if (num_heads <= 0) { return 0 - 1; }
+    if (width <= 0) { return 0 - 1; }
+    var hd = width / num_heads;
+    if ((hd % 2) != 0) { return 0 - 1; }
+    if (hdp != (hd / 2)) { return 0 - 1; }
+    if (hdp <= 0) { return 0 - 1; }
+    var grid = rows * num_heads * hdp;
+    if (grid <= 0) { return 0 - 1; }
+    if (grid > MABDA_MAX_DISPATCH_DIM) { return 0 - 1; }
+    var nx = rows * width; var ncs = rows * hdp * 2;
+    if ((nx * 8) > GPU_BO_MAX()) { return 0 - 1; }
+    if ((ncs * 8) > GPU_BO_MAX()) { return 0 - 1; }
+    var sh = _gpu_get_rope(width, hd, hdp, num_heads, dir);
+    if (sh == 0) { return 0 - 1; }
+    var i = 0;
+    while (i < nx) { store64(_gpu_xm + i*8, load64(X + i*8)); i = i + 1; }
+    i = 0; while (i < ncs) { store64(_gpu_wm + i*8, load64(cs + i*8)); i = i + 1; }
+    var bp[40]; store64(&bp+0, 2);
+    store64(&bp+8, _gpu_xh); store64(&bp+16, _GPU_XVA());
+    store64(&bp+24, _gpu_wh); store64(&bp+32, _GPU_WVA());
+    if (gpu_compute_dispatch(_gpu_ctx, sh, grid, 1, 1, &bp) != 0) { return 0 - 1; }
+    i = 0; while (i < nx) { store64(X + i*8, load64(_gpu_xm + i*8)); i = i + 1; }
+    _gpu_rope_count = _gpu_rope_count + 1;
     return 0;
 }
 

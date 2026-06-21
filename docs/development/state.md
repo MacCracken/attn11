@@ -5,7 +5,31 @@
 
 ## Version
 
-**1.9.0** — *M19 1.9.0: preset-scale on-device — the full `--gpu-tc` training step now runs
+**1.9.1** — *M19 1.9.1: RoPE Q/K rotation on the GPU — bit-exact — + the remaining-op coverage map*
+(E-infra; ADR 0016, X041). The roadmap's "remaining-op GPU coverage (MoE / ternary / RoPE)" cut,
+resolved against the code: **RoPE is the one genuine new kernel.** `gpu_rope_apply` at the
+`rope_apply_fwd`/`rope_apply_bwd` seam runs the Q/K rotation on the native-AMD f64 path **BIT-EXACT**
+→ plain `--gpu`, byte-identity preserved — because the rotation angles depend ONLY on
+`(channel-pair, position)` (data-independent), the host precomputes the cos/sin TABLE with the proven
+trig path (the transcendental stays on the CPU) and the GPU does ONLY the rotation (f64 mul/add/sub,
+correctly-rounded). A `--pos-kind rope --gpu` run reproduces the no-flag run byte-for-byte at default
+(1536 rope on-device) **and** preset (1024); `tests/gpu_rope.cyr` 0-bit-diff fwd+bwd at
+(rows,width,nh)∈{(16,32,4),(64,64,8),(16,64,1),(64,32,4)}, rows=1 (decode) self-falls-back. **Honest:
+the cos/sin (the real cost) stays host-side**, so this is coverage, not a speedup (in-shader trig is a
+future refinement). **The other two axes, resolved honestly:** *ternary* already runs on the GPU
+(`--ternary` quantizes `W→W_eff` then takes the SAME `qlinear→gpu_matmul` path; the i64-add collapse
+is reference-only + slower, X023 — no kernel needed); *MoE* attention/projection matmuls already run
+on-device, but the routed expert MLPs are **M=1 per-token-per-expert** matmuls (a poor GPU fit —
+re-uploading `C·F` weights `T·K`×/step) → **deferred** (a real MoE GPU path needs a batched-per-expert
+gather). **Gate:** lint 0 warn; **1056** grad-checks x86_64 **and** aarch64/qemu (CPU math untouched);
+**12-test** gpu suite; agnos main+tcyr; fuzz; smoke; adversarial review (2 dims + on-HW verify) = **0
+findings**. **No-flag run byte-identical** to 1.9.0 (default/rope/preset/experts vs the 1.9.0 binary);
+plain `--gpu` `--pos-kind rope` byte-identical to CPU. cyrius pin stays **6.2.29** (installed cycc
+6.2.34, benign drift); pin `mabda = 3.4.1`. `src/*.cyr` unchanged except `src/gpu.cyr` + `src/attn.cyr`
+(RoPE seam) + `src/main.cyr` (CFG_VERSION + rope count). **Next: 1.9.2** — device-resident tensors +
+pipelined transfer (the first real perf lever).
+
+(**1.9.0** — *M19 1.9.0: preset-scale on-device — the full `--gpu-tc` training step now runs
 end-to-end at preset (T=64) too* (E-infra; ADR 0016, X040). The first M19 (1.9.x) cut: M18 ran the
 whole step on-device only at *default* scale; 1.9.0 closes the two *preset* (T=64, byte vocab) gaps,
 so a `--preset --gpu-tc` step dispatches **every heavy op** (fwd+bwd+Adam) on the native-AMD f64 path.
@@ -28,7 +52,7 @@ byte-identical** to 1.8.11 (default/preset/bpe vs the HEAD binary); plain `--gpu
 CPU at default **and** preset; a `--preset --gpu-tc` step runs fwd+bwd+Adam on-device, no NaN. cyrius
 pin stays **6.2.29** (installed cycc 6.2.34, benign drift); pin `mabda = 3.4.1`. `src/*.cyr` unchanged
 except `src/gpu.cyr` + CFG_VERSION. **Next: 1.9.1** — MoE / ternary / RoPE GPU kernels (remaining-op
-coverage).
+coverage).)
 
 (**1.8.11** — *M18 1.8.11: the M18 close-out — the honest full-step perf X-entry + the P(-1)
 hardening pass* (E-infra; ADR 0016, X039). No code change; the measurement + audit + docs that

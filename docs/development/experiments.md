@@ -1710,3 +1710,42 @@ binary); plain `--gpu` byte-identical to CPU (default + preset). Reproduce: `mak
 `./build/attn11 --preset --gpu-tc --steps 2` (full step on-device); `./build/attn11 --gpu-tc --preset
 --heads 1 --steps 1` (hd=64 → clean fallback, no crash). Detail: ADR 0016. **Next (1.9.1):**
 MoE / ternary / RoPE GPU kernels (the remaining non-default model axes).
+
+## X041 — M19 1.9.1: RoPE rotation on GPU (bit-exact) + the remaining-op coverage map (M19, v1.9.1, 2026-06-21)
+
+**Result.** The roadmap's "remaining-op GPU coverage (MoE / ternary / RoPE)" cut, resolved against
+the code: only **RoPE** is a genuine new kernel; the other two were already covered or are a poor fit
+(below). `gpu_rope_apply` (src/gpu.cyr) at the `rope_apply_fwd`/`rope_apply_bwd` seam runs the Q/K
+rotation on the native-AMD f64 path **BIT-EXACT** → plain `--gpu`, byte-identity preserved. A
+`--pos-kind rope --gpu` run reproduces the no-flag run byte-for-byte at default (1536 rope rotations
+on-device) **and** preset (1024); `tests/gpu_rope.cyr` is 0-bit-diff fwd+bwd at (rows,width,nh) ∈
+{(16,32,4),(64,64,8),(16,64,1),(64,32,4)}.
+
+**Why RoPE can be bit-exact (the key realization).** The rotation angles cos/sin depend ONLY on
+`(channel-pair k, position pos0+r)` — **data-independent**. So the host precomputes the cos/sin
+**table** with the EXACT proven path (`_rope_unit_cossin` Maclaurin θ≤1 + `_rope_pow` binary
+exponentiation — the transcendental work stays on the CPU), and the GPU kernel does ONLY the rotation
+(`y0 = x0·c − x1·s`, `y1 = x0·s + x1·c`; bwd is the transpose) — pure f64 mul/add/sub, which mabda's
+GFX9 emitter rounds correctly. Same table + same op order = bit-identical to the CPU rope. One thread
+per `(r,h,k)` (disjoint pairs → in-place safe); `dir` picks the fwd/bwd sign pattern; `rows<2`
+(decode) self-falls-back. **Honest caveat:** the cos/sin (the real cost) stays host-side and only the
+trivial rotation moves on-device, so this is **coverage, not a speedup** (an in-shader-trig full rope
+— unrolled binary-exp with a per-row variable exponent — is a future refinement, higher risk).
+
+**The honest coverage findings for the other two axes.** (1) **Ternary already runs on the GPU:**
+`--ternary` quantizes `W→W_eff` into `g_qscratch` then takes the SAME `qlinear_fwd/bwd →
+gpu_matmul_fwd/gpu_linear_bwd` path, so its matmuls already dispatch on-device (verified: `--ternary
+--gpu` → thousands of matmuls). The 1.6.1 i64-add collapse kernel is reference-only + slower than
+SIMD-f64 (X023), so a GPU version has no execution-path consumer. (2) **MoE attention/projection
+matmuls already run on the GPU** (`--experts 4 --gpu` → matmuls + ln + head + Adam); the gap is the
+routed expert MLPs (`moe_fwd`/`moe_bwd`), which are **M=1 per-token-per-expert** matmuls — routing
+them to `gpu_matmul` re-uploads each expert's `C·F` weights `T·K` times/step (catastrophic), and the
+top-K routing + gate softmax are sequential. **Deferred:** a real MoE GPU path needs a
+batched-per-expert gather (one big matmul per expert), a separate restructuring.
+
+**Gate.** lint 0 warn; 1056 grad-checks x86_64 + aarch64/qemu (CPU math untouched); 12-test GPU suite;
+AGNOS main+tcyr; fuzz + smoke; no-flag byte-identical to 1.9.0 (default/rope/preset/experts vs the
+1.9.0 binary). Adversarial review (2 dims + on-hardware verify) = **0 findings**. Reproduce:
+`make gpu-test`; `./build/attn11 --pos-kind rope --gpu --steps 8` (rope on-device, byte-identical).
+Detail: ADR 0016. **Next (1.9.2):** device-resident tensors + pipelined transfer (the first real perf
+lever — X039 pinned per-op transfer as the dominant cost).
