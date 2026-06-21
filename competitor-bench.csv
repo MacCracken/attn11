@@ -4,3 +4,8 @@ micrograd,c911406,python,train-floor,NA,NA,1,cpython,NA,built; matched-run-NA(ML
 llama2.c,350e04f,c,decode,NA,NA,1,libc+libm,NA,built; matched-run-pending(needs a model .bin + config map to --preset),Linux_7.0.11-arch1-1_x86_64,2026-06-15T02:38:20Z
 llm.c,f1e2ace,c,train,NA,NA,OpenMP,libc+libm+OpenMP,NA,built; matched-run-pending(GPT-2 tokenizer/weights data-prep + tiny-config source edit),Linux_7.0.11-arch1-1_x86_64,2026-06-15T02:38:20Z
 nanoGPT,nostack,pytorch,train,NA,NA,MKL,pytorch(+cuda),NA,skip(PyTorch not installed on this host),Linux_7.0.11-arch1-1_x86_64,2026-06-15T02:38:20Z
+attn11,869d728,cyrius,train,4432,39488,1,none,1618216,ok,Linux_7.0.12-arch1-1_x86_64,2026-06-21T23:13:38Z
+micrograd,c911406,python,train-floor,NA,NA,1,cpython,NA,built; matched-run-NA(MLP-not-transformer; reference floor only),Linux_7.0.12-arch1-1_x86_64,2026-06-21T23:13:38Z
+llama2.c,350e04f,c,decode,NA,NA,1,libc+libm,NA,built; matched-run-pending(needs a model .bin + config map to --preset),Linux_7.0.12-arch1-1_x86_64,2026-06-21T23:13:38Z
+llm.c,f1e2ace,c,train,NA,NA,OpenMP,libc+libm+OpenMP,NA,built; matched-run-pending(GPT-2 tokenizer/weights data-prep + tiny-config source edit),Linux_7.0.12-arch1-1_x86_64,2026-06-21T23:13:38Z
+nanoGPT,nostack,pytorch,train,NA,NA,MKL,pytorch(+cuda),NA,skip(PyTorch not installed on this host),Linux_7.0.12-arch1-1_x86_64,2026-06-21T23:13:38Z

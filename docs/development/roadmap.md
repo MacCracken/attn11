@@ -543,15 +543,27 @@ for the native-AMD f64 route.
   **routed expert MLPs are M=1 per-token-per-expert** matmuls (re-uploading `C·F` weights `T·K`×/step
   — a poor GPU fit) → **deferred** (a real MoE GPU path needs a batched-per-expert gather). The
   adversarial review (2 dims + on-HW verify) returned 0 findings.
-- **1.9.2 — the first real perf lever: device-resident tensors + pipelined transfer.** X039 pinned
-  per-op host↔device transfer as the dominant cost. Keep the weights / Adam m,v / activations
-  **device-resident across the whole step** (no per-op upload/download) and overlap transfer with
-  compute. The first change that can actually move the perf needle (still likely a loss at attn11's
-  tiny scale, but the right structural fix). (Was the M18 "out-of-scope fusion project.")
-- **1.9.3 — fused multi-op kernels (the speedup project; the ceiling, not the next step).** Fuse op
-  chains (matmul + bias + GELU; the attention passes) into single dispatches to kill per-op launch +
-  transfer overhead — the honest path toward parity / a win at larger scale. Gated on what mabda
-  exposes (and ultimately matrix-core f64, a future mabda capability).
+- **1.9.2 — GPU scaling study → the perf-lever close-out (the honest negative; benchmarks B6).** The
+  device-resident / fused-kernel perf levers were premised on "transfer is the dominant cost and the
+  gap narrows with scale" (X039). A controlled **width sweep** (new `--d-model`/`--ctx` flags) **refuted
+  both** on this hardware: (1) the full-step gap is **flat at ~3.7×** across the on-device range (d_model
+  32→64), not narrowing — both the matmul FLOPs and the weight transfer scale ~C², so their ratio is
+  constant; (2) the GPU **can't even scale up cleanly** — on-device coverage *shrinks* above d_model 64
+  as the largest ops hit three hard ceilings (the **65535** 1-D dispatch cap on the MLP grids, the **4 MB**
+  per-BO cap on the Adam params, the **256-id** compile cap on the unrolled attention/head). So "scaling
+  up" makes the GPU run a *smaller* fraction on-device, not a faster one — and underneath it all is a
+  **scalar-VALU f64 floor** (Cezanne is an FP64-throttled mobile APU with no `V_MFMA_F64` matrix core; the
+  CPU runs 4-wide AVX f64). **Conclusion (the user's call): the GPU stays an oracle / coverage path on
+  this hardware; transfer-residency / fusion would not change that** (they touch transfer, not the f64
+  compute floor). A real speedup needs matrix-core f64 (a future mabda/hardware capability) or activation
+  quantization (an integer matmul) — neither a transfer optimization. The `--d-model`/`--ctx` flags + the
+  B6 scaling write-up ship; the per-op transfer-residency and fused-kernel work (former 1.9.2/1.9.3) are
+  **deprioritized as not-worth-it on Cezanne**, demand-gated on matrix-core f64.
+- **(deferred, demand-gated) device-resident tensors + fused multi-op kernels.** The original
+  transfer/fusion levers — only worth building once there is matrix-core f64 (so the full step is a win,
+  not a known loss) or a much larger always-on-device model. Ceiling-lifting (grid-tiling the dispatch,
+  BO-tiling params) would extend on-device *coverage* to larger models as an oracle, but is explicitly
+  **not a speedup** and is deferred unless a consumer needs the larger-scale oracle.
 - **Portable f32 / WGSL path (non-AMD GPUs) — deferred sub-track.** A wgpu/WGSL backend for non-AMD
   hardware: **f32-only** (no portable f64) and needs a **C launcher** (breaks the single-static-ELF
   charter), so it is a *someday*, demand-gated — not on the 1.9.x value path. The AMD-native f64

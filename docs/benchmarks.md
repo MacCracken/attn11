@@ -402,11 +402,47 @@ the harness there. Latest local run:
 | micrograd | `c911406` | train | built ✓; matched run N/A (an MLP, not a transformer — a from-scratch *floor* reference only) |
 | nanoGPT | — | train | skip (PyTorch not installed on this host) |
 
-So the **raw-throughput tables (B1/B2) are harness-ready, not yet populated**: faithful
-matched-config competitor numbers come from one `scripts/compete-bench.sh` run on a host
-with PyTorch + the GPT-2 data-prep installed (the harness asserts the param-count match
-before accepting each row). The **zero-deps story (B3) above is complete** — it needs no
-competitor run.
+## B1 — matched-config training throughput: attn11 vs llm.c (the truest peer)
+
+The deferred B1 (CPU training tok/s) is now **populated for llm.c** — Karpathy's from-scratch
+**C** GPT-2 trainer, the closest apples-to-apples peer (both train a GPT from scratch in a
+low-level language, no autodiff framework). The matched run needs no PyTorch / tokenizer / data
+files: a tiny **random-init** model + random token batches at attn11's config exercises the same
+FLOPs/step (`bench/llm.c/llm_tiny.c`, the `#define TESTING; #include "train_gpt2.c"` driver
+pattern llm.c's own tests use). tok/s = `B·T·steps / train_time`, steady-state (warmup dropped),
+same definition as attn11's self-bench. Single-thread first (the B-series rule), then llm.c's
+OpenMP multicore:
+
+| config | params | **attn11** (f64, Cyrius, 1-thr) | **nanoGPT** (PyTorch, 1-thr) | **llm.c** (C, 1-thr) | llm.c 16-thr |
+|--------|--------|---------------------------------|------------------------------|----------------------|--------------|
+| default (C32·T16·NH4·L3) | ~40–47 K | **4 388 tok/s** | 5 941 (**1.35×**) | 50 513 (11.5×) | 76 213 (17.4×) |
+| preset (C64·T64·NH8·L4)  | ~220–232 K | **1 003 tok/s** | — | 11 817 (11.8×) | 13 315 (13.3×) |
+
+**The surprise — attn11 nearly matches PyTorch at tiny scale.** nanoGPT (PyTorch CPU, 1-thread, same
+config) is only **1.35× faster** than attn11, because at small sizes PyTorch's *per-op Python dispatch
+overhead* dominates its optimized kernels — exactly the regime attn11 targets. The giant's advantage
+only materializes at scale (where kernel time >> overhead). So at the **edge / tiny scale**, attn11 is
+competitive with the dominant framework. (nanoGPT via a CPU PyTorch venv — `bench/.venv`, torch
+2.12.1+cpu; nanoGPT params 46 880, matched.) The big gap is to **llm.c** (~11×), and that is the
+**f64-vs-f32 + hand-SIMD-vs-`gcc -O3 -ffast-math`** gap — a precision + compiler choice, not a
+framework one.
+
+**The honest read.** At a matched tiny config, attn11 is **~11–12× slower than llm.c single-thread**,
+and ~13–17× behind its 16-thread multicore. The gap is **consistent across scales** (it is *not* an
+artifact of one size) and is dominated by two deliberate attn11 choices, not an implementation defect:
+(1) **f64 vs f32** — attn11 is double-precision *by design* (the hand-derived-backward / finite-diff
+grad-check correctness thesis); llm.c is f32, which is ~2× the throughput before any other factor;
+(2) **Cyrius hand-rolled SIMD vs C `-O3 -march=native -ffast-math`** — gcc auto-vectorizes + FMA-fuses
+llm.c's dense loops aggressively. Multithreading adds only ~1.2–1.5× for llm.c at these sizes (OpenMP
+overhead dominates tiny matmuls), so the gap is a **per-core compute** gap, not a parallelism one.
+
+This is the expected outcome and it *sharpens* attn11's actual thesis (B3): it does **not** compete on
+raw throughput — it competes on the **dependency-closure / sovereignty axis**, shipping as one
+**1.6 MB static ELF with zero runtime deps** (no libc, no libm, no OpenMP, no BLAS, no CUDA, no
+Python) while every peer carries a runtime stack. The ~11× is the honest price of f64 correctness +
+zero dependencies. (B2 decode vs llama2.c needs a matched model `.bin`; nanoGPT needs a PyTorch venv —
+both deferred.) Reproduce: `cd bench/llm.c && cc -O3 -march=native -ffast-math -fopenmp llm_tiny.c
+-lm -o llm_tiny && OMP_NUM_THREADS=1 ./llm_tiny 32 16 4 3 256 1 60` vs `./bench/attn11_bench`.
 
 ## B4 — GPU backend (M18): the honest negative, measured (X032)
 
@@ -475,3 +511,47 @@ speedup, and the CPU remains the production path. Reproduce:
 
 Reproduce: `scripts/compete-bench.sh` (records the upstream commit it builds; emits
 `competitor-bench.csv` + the table above).
+
+## B6 — GPU vs CPU as the model scales (M19 1.9.2 grounding)
+
+The 1.9.2 perf lever (device-resident tensors) is premised on the gap narrowing with scale. To ground
+it, the `--d-model N` / `--ctx N` flags (added here) enable a controlled **width sweep** at fixed depth
+(`--ctx 64 --layers 2 --heads 8`), `--gpu-tc` (full step) vs CPU. Two measurements:
+
+**(a) The clean per-step gap** (slope method — `(t@25 − t@5)/20`, isolating fixed setup; min of 2 warm
+reps), at the widths where the **whole step stays on-device**:
+
+| d_model | CPU ms/step | `--gpu-tc` ms/step | ratio |
+|---------|-------------|--------------------|-------|
+| 32      | 201.7       | 772.5              | **3.83×** |
+| 64      | 515.4       | 1854.2             | **3.60×** |
+
+The gap is **flat at ~3.7×**, *not* narrowing with width. (Both the matmul FLOPs and the weight
+transfer scale as ~C², so their ratio is constant with width — which is why the gap doesn't move.)
+This **corrects B5's "narrows with scale" reading**: that apparent narrowing was confounded by ops
+*falling back to the CPU* at preset scale, not the GPU getting relatively faster — see (b).
+
+**(b) On-device coverage SHRINKS as the model grows.** Deterministic engagement (which op-types
+dispatch on-device) vs width, at `--ctx 64 --layers 2 --heads 8 --gpu-tc`:
+
+| d_model | falls back to CPU | ceiling hit |
+|---------|-------------------|-------------|
+| ≤ 64    | nothing (full step on-device) | — |
+| 96–128  | fused attention fwd (+ LM head at C%16≠0) | per-kernel **256-id cap** (hd-unroll / head tiles C) |
+| 192     | + Adam, attn-bwd | **4 MB BO cap** (params > 524288 f64) + id-cap (hd) |
+| 256     | + linear-bwd, matmul (MLP) | **65535 dispatch-dim cap** (dW grid = 4C², fwd grid = T·4C) |
+
+So **the GPU does not scale cleanly on Cezanne**: a *full* on-device step only exists for `d_model ≤
+64`; above that, the largest ops silently fall back to the (faster, SIMD) CPU, so "scaling up" makes
+the GPU run a *smaller* fraction on-device, not a faster one. The three ceilings are the
+**65535 1-D dispatch-dim cap**, the **4 MB per-BO cap**, and the **per-kernel 256-id compile cap**
+(the unrolled hd dot / host-tiled reductions).
+
+**Implication for 1.9.2.** The transfer-residency premise is premature: there is no large on-device
+step to amortize transfer over until the **ceilings are lifted** (grid-tile the dispatch in 65535
+chunks — the proven Adam pattern; BO-tile / enlarge for params; tile the attention hd-unroll). And
+even with the full step kept on-device at scale, the gap is a flat ~3.7× — a **scalar-VALU f64 floor**
+(Cezanne has no `V_MFMA_F64` matrix core; the CPU runs 4-wide AVX f64). The honest read: the GPU stays
+an **oracle / coverage** path; a real speedup needs matrix-core f64 (a future mabda/hardware
+capability) or activation quantization (an integer matmul), not transfer optimization. Reproduce:
+`for C in 32 64; do for m in "" --gpu-tc; do time ./build/attn11 --d-model $C --ctx 64 --layers 2 --heads 8 --steps 25 $m; done; done`.
