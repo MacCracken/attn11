@@ -14,6 +14,8 @@
 #   attn11 --gen-only               skip training, just sample from the model
 #   attn11 --preset                 ctx 64 / d_model 64 / 8 heads / 4 layers
 #                                   (the scale preset; default stays ctx 16)
+#   attn11 --d-model N              override d_model / width (1..4096; divisible by heads)
+#   attn11 --ctx N                  override context length T (1..8192)
 #   attn11 --heads N                override attention heads (must divide d_model)
 #   attn11 --kv-heads N             override K/V heads (must divide heads;
 #                                   < heads = GQA, 1 = MQA; default = heads)
@@ -131,7 +133,7 @@ fn _atoi(s): i64 {
 }
 
 # Kept in sync with the VERSION file (CI's docs job gates the match).
-fn CFG_VERSION(): i64 { return "1.9.1"; }
+fn CFG_VERSION(): i64 { return "1.9.2"; }
 
 fn usage(): i64 {
     puts("attn11 — a from-scratch GPT-style transformer, trained, in Cyrius\n");

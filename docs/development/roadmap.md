@@ -13,7 +13,14 @@
 
 ## Where we are
 
-Current: **v1.9.1** — **M19 in progress.** 1.9.1 (X041) added **RoPE Q/K rotation on the GPU,
+Current: **v1.9.2** — **M19 in progress.** 1.9.2 (X042) is the **GPU perf-lever close-out**: a
+width-scaling study (new `--d-model`/`--ctx` flags) showed the f64 GPU gap is **flat ~3.7×** (not
+narrowing) and that on-device coverage *shrinks* with scale (dispatch / BO / id-cap ceilings) atop a
+scalar-f64 floor (Cezanne is an FP64-throttled mobile APU, no matrix core) — so **the f64 GPU stays the
+hardened bit-exact oracle**, transfer-residency/fusion are deferred (not-worth-it here), and the forward
+perf bet **pivots to the integer/edge lane**. It also filled the **B1 competitor benchmarks** (attn11
+4 388 tok/s ≈ **1.35× behind PyTorch/nanoGPT** at tiny scale — the giants are weakest at the edge — and
+~11× behind llm.c, the deliberate f64-vs-f32 gap). 1.9.1 (X041) added **RoPE Q/K rotation on the GPU,
 bit-exact** (plain `--gpu`, byte-identity preserved — the cos/sin table is host-precomputed, the GPU
 does only the rotation), and resolved the rest of the "remaining-op coverage" honestly: ternary
 already runs on the GPU (rides `qlinear→gpu_matmul`), and MoE's routed expert MLPs are deferred (M=1
@@ -556,9 +563,15 @@ for the native-AMD f64 route.
   CPU runs 4-wide AVX f64). **Conclusion (the user's call): the GPU stays an oracle / coverage path on
   this hardware; transfer-residency / fusion would not change that** (they touch transfer, not the f64
   compute floor). A real speedup needs matrix-core f64 (a future mabda/hardware capability) or activation
-  quantization (an integer matmul) — neither a transfer optimization. The `--d-model`/`--ctx` flags + the
-  B6 scaling write-up ship; the per-op transfer-residency and fused-kernel work (former 1.9.2/1.9.3) are
-  **deprioritized as not-worth-it on Cezanne**, demand-gated on matrix-core f64.
+  quantization (an integer matmul) — neither a transfer optimization. **The f64 GPU path is NOT
+  abandoned: it is RETAINED as the hardened, bit-exact correctness oracle + coverage path** (the CPU is
+  the better f64 player — confirmed by every benchmark — so the GPU's job is validation, not speed). The
+  `--d-model`/`--ctx` flags + the B6 scaling write-up + the **B1 competitor benchmarks** (below) ship; the
+  per-op transfer-residency + fused-kernel *speedups* (former 1.9.2/1.9.3) are **deferred as not-worth-it
+  on Cezanne**, demand-gated on matrix-core f64. **The forward perf bet pivots to the integer/edge lane**
+  (activation quantization → int8 matmul, where attn11's i64 substrate is an advantage and the int8 edge
+  hardware that ships actually rewards it) — see the framing closed out with the B1 numbers (B1: attn11
+  ≈ PyTorch at tiny scale; the giants are weakest at the edge attn11 targets).
 - **(deferred, demand-gated) device-resident tensors + fused multi-op kernels.** The original
   transfer/fusion levers — only worth building once there is matrix-core f64 (so the full step is a win,
   not a known loss) or a much larger always-on-device model. Ceiling-lifting (grid-tiling the dispatch,

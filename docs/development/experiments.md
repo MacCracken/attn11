@@ -1749,3 +1749,43 @@ AGNOS main+tcyr; fuzz + smoke; no-flag byte-identical to 1.9.0 (default/rope/pre
 `make gpu-test`; `./build/attn11 --pos-kind rope --gpu --steps 8` (rope on-device, byte-identical).
 Detail: ADR 0016. **Next (1.9.2):** device-resident tensors + pipelined transfer (the first real perf
 lever — X039 pinned per-op transfer as the dominant cost).
+
+## X042 — M19 1.9.2: the GPU perf-lever close-out (honest negative) + the B1 competitor benchmarks (M19, v1.9.2, 2026-06-21)
+
+**Result — the perf-lever question is resolved by measurement, not built.** 1.9.2's premise (device-
+resident tensors / fused kernels would close the gap, since "transfer dominates and the gap narrows
+with scale", X039) is **refuted on this hardware**, so the speedup work is deferred and the f64 GPU
+path is retained as the hardened correctness oracle. New `--d-model`/`--ctx` flags enabled the study;
+the no-flag run is byte-identical to 1.9.1 (parse-only flags).
+
+**The GPU scaling study (benchmarks B6).** A controlled width sweep at fixed depth (`--ctx 64 --layers
+2 --heads 8`, `--gpu-tc` vs CPU): **(1)** the clean per-step gap (slope method, setup isolated) is
+**flat ~3.7×** — d_model 32 → 3.83×, 64 → 3.60× — *not* narrowing; both the matmul FLOPs and the weight
+transfer scale ~C², so their ratio is constant with width (which is also why B5's apparent
+"narrows with scale" was an artifact of ops falling back to the CPU at preset). **(2)** On-device
+coverage **shrinks** as the model grows — a full step is on-device only at d_model ≤ 64; above that the
+biggest ops fall back at three hard ceilings: the **65535** 1-D dispatch-dim cap (MLP dW grid = 4C² at
+d_model≈128, fwd grid = T·4C at ≈256), the **4 MB** per-BO cap (Adam params > 524288 f64 at ≈192), the
+**256-id** compile cap (unrolled attention hd / head-tiles-C). So "scaling up" runs a *smaller* fraction
+on-device. Underneath is a **scalar-VALU f64 floor** — the Cezanne mobile APU is FP64-throttled with no
+`V_MFMA_F64` matrix core; CPU 4-wide AVX f64 is the better f64 player. **Decision (user's call): keep the
+f64 GPU as the bit-exact oracle/coverage path; defer transfer-residency + fusion (not-worth-it on
+Cezanne); pivot the forward perf bet to the integer/edge lane** (activation quantization → int8 matmul,
+where attn11's i64 substrate is an advantage). Reproduce: `for C in 32 64; do for m in "" --gpu-tc; do
+time ./build/attn11 --d-model $C --ctx 64 --layers 2 --heads 8 --steps 25 $m; done; done`.
+
+**The B1 competitor benchmarks — the long-deferred matched-config training throughput.** Populated for
+both from-scratch peers, PyTorch-free where possible. **llm.c** (Karpathy's C GPT-2 trainer, the truest
+apples-to-apples): a random-init tiny model + random tokens at attn11's config exercises the same
+FLOPs/step with no checkpoint/tokenizer/data — the `#define TESTING; #include "train_gpt2.c"` pattern
+its own tests use, folded into `scripts/compete-bench.sh`. **nanoGPT** (PyTorch): a minimal `model.py`
+driver via a CPU torch venv (`bench/.venv`, torch 2.12.1+cpu — the cp314 wheel exists). At the default
+config (C32·T16·NH4·L3, ~40–47 K params, 1-thread): **attn11 4 388 tok/s · nanoGPT 5 941 (1.35×) · llm.c
+50 513 (11.5×; 76 213 @16-thread)**; at preset, attn11 1 003 vs llm.c 11 817 (11.8×). **Two honest
+findings:** (a) the ~11× gap to llm.c is the **f64-vs-f32 + hand-SIMD-vs-`gcc -O3 -ffast-math`** gap
+(deliberate attn11 choices, consistent across scales — not an implementation defect); (b) the **surprise
+positive** — attn11 is only **1.35× behind PyTorch**, because at the tiny/edge scale it targets,
+PyTorch's per-op dispatch overhead swamps its kernels. The giants are weakest exactly where attn11 lives;
+the throughput numbers **sharpen** attn11's thesis (zero-deps sovereignty + the integer/edge path), they
+don't refute it. **Closes the perf-positioning question; opens the integer/edge lane as the forward perf
+bet.** Detail: benchmarks B1/B6; ADR 0016.

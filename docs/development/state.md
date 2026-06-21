@@ -5,7 +5,27 @@
 
 ## Version
 
-**1.9.1** — *M19 1.9.1: RoPE Q/K rotation on the GPU — bit-exact — + the remaining-op coverage map*
+**1.9.2** — *M19 1.9.2: the GPU perf-lever close-out (honest negative) + the B1 competitor benchmarks*
+(E-infra; ADR 0016, X042). A measurement/decision cut (no model-math change; no-flag run byte-identical
+to 1.9.1). New **`--d-model`/`--ctx`** flags (parse-only, additive) enabled a width-scaling study that
+**refuted the transfer-residency premise**: the full-step gap is **flat ~3.7×** across the on-device
+range (not narrowing — FLOPs and weight transfer both ~C²), and on-device coverage **shrinks** above
+d_model 64 (the largest ops fall back at the **65535** dispatch cap, the **4 MB** BO cap, and the
+**256-id** compile cap), atop a **scalar-VALU f64 floor** (Cezanne is an FP64-throttled mobile APU, no
+matrix core; CPU AVX f64 is the better f64 player). **Decision: keep the f64 GPU as the hardened bit-exact
+oracle/coverage path; defer transfer-residency + fusion (not-worth-it on Cezanne); pivot the forward perf
+bet to the integer/edge lane** (activation quantization → int8 matmul). Also populated the long-deferred
+**B1 competitor benchmarks** (matched-config training tok/s, default config, 1-thread): **attn11 4 388 ·
+nanoGPT(PyTorch) 5 941 (1.35×) · llm.c(C) 50 513 (11.5×)** — the ~11× gap to llm.c is the deliberate
+f64-vs-f32 + hand-SIMD-vs-`-O3` gap, but attn11 is only **1.35× behind PyTorch** (the giants are weakest
+at the tiny/edge scale attn11 targets). llm.c via a random-init driver folded into `compete-bench.sh`;
+nanoGPT via a CPU torch venv (`bench/.venv`). **Gate:** lint 0 warn; **1056** grad-checks x86_64 **and**
+aarch64/qemu; 12-test gpu suite; agnos main+tcyr; fuzz; smoke; no-flag byte-identical to 1.9.1. cyrius pin
+stays **6.2.29** (installed cycc 6.2.34, benign drift); pin `mabda = 3.4.1`. `src/*.cyr` unchanged except
+`src/main.cyr` (the two flags + CFG_VERSION). **Next:** the integer/edge lane (activation quantization →
+int8 matmul + a ternary memory-footprint / edge-crossover benchmark where attn11 can *win*).
+
+(**1.9.1** — *M19 1.9.1: RoPE Q/K rotation on the GPU — bit-exact — + the remaining-op coverage map*
 (E-infra; ADR 0016, X041). The roadmap's "remaining-op GPU coverage (MoE / ternary / RoPE)" cut,
 resolved against the code: **RoPE is the one genuine new kernel.** `gpu_rope_apply` at the
 `rope_apply_fwd`/`rope_apply_bwd` seam runs the Q/K rotation on the native-AMD f64 path **BIT-EXACT**
@@ -27,7 +47,7 @@ findings**. **No-flag run byte-identical** to 1.9.0 (default/rope/preset/experts
 plain `--gpu` `--pos-kind rope` byte-identical to CPU. cyrius pin stays **6.2.29** (installed cycc
 6.2.34, benign drift); pin `mabda = 3.4.1`. `src/*.cyr` unchanged except `src/gpu.cyr` + `src/attn.cyr`
 (RoPE seam) + `src/main.cyr` (CFG_VERSION + rope count). **Next: 1.9.2** — device-resident tensors +
-pipelined transfer (the first real perf lever).
+pipelined transfer (the first real perf lever).)
 
 (**1.9.0** — *M19 1.9.0: preset-scale on-device — the full `--gpu-tc` training step now runs
 end-to-end at preset (T=64) too* (E-infra; ADR 0016, X040). The first M19 (1.9.x) cut: M18 ran the

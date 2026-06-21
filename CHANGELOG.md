@@ -4,6 +4,54 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.9.2] - 2026-06-21
+
+**M19 1.9.2: the GPU perf-lever close-out (honest negative) + the B1 competitor benchmarks
+(E-infra; ADR 0016, X042).** A measurement/decision cut: it resolves whether the 1.9.x perf levers
+(device-resident tensors / fused kernels) are worth building — they are not, on this hardware — and
+fills in the long-deferred B-series competitor numbers. No model-math change; the no-flag CPU run is
+byte-identical to 1.9.1.
+
+**Added — `--d-model N` / `--ctx N` flags.** Override `d_model` / context length on a fresh model
+(resolved post-parse like `--heads`, so `--preset --d-model 128` works). Additive; the default run is
+byte-identical. They exist to enable the width-scaling study below.
+
+**The GPU scaling study (benchmarks B6).** A controlled width sweep (full `--gpu-tc` step vs CPU)
+**refuted both premises** the transfer-residency lever rested on: (1) the gap is **flat at ~3.7×**
+across the on-device range (d_model 32→64), *not* narrowing with scale — the matmul FLOPs and the
+weight transfer both scale ~C², so their ratio is constant; (2) the GPU **can't scale up cleanly** —
+on-device coverage *shrinks* above d_model 64 as the largest ops fall back at three hard ceilings (the
+**65535** 1-D dispatch cap on the MLP grids, the **4 MB** per-BO cap on the Adam params, the **256-id**
+compile cap on the unrolled attention/head). Underneath is a **scalar-VALU f64 floor** — Cezanne is an
+FP64-throttled mobile APU with no `V_MFMA_F64` matrix core; the CPU's 4-wide AVX f64 is simply the
+better f64 player (confirmed by every benchmark). **The f64 GPU path is RETAINED as the hardened,
+bit-exact correctness oracle + coverage path** (not abandoned); the per-op transfer-residency + fused
+multi-op *speedups* are **deferred as not-worth-it on Cezanne**, demand-gated on matrix-core f64. The
+forward perf bet pivots to the **integer/edge lane** (activation quantization → int8 matmul).
+
+**The B1 competitor benchmarks (matched-config training throughput).** The long-deferred B1 is now
+populated for the two from-scratch peers, PyTorch-free where possible: a random-init tiny model + random
+token batches at attn11's config (`#define TESTING; #include "train_gpt2.c"` for llm.c — folded into
+`scripts/compete-bench.sh`; a minimal `model.py` driver for nanoGPT via a CPU PyTorch venv,
+`bench/.venv`). At the **default config** (C32·T16·NH4·L3, ~40–47 K params), single-thread:
+
+| | attn11 (f64, zero-deps) | nanoGPT (PyTorch) | llm.c (C, `-O3 -ffast-math`) |
+|---|---|---|---|
+| tok/s | **4 388** | 5 941 (**1.35×**) | 50 513 (11.5×); 76 213 @16-thread |
+
+The honest read: attn11 is **~11× behind llm.c** (the **f64-vs-f32 + hand-SIMD-vs-`gcc -O3`** gap — both
+deliberate choices) but **only 1.35× behind PyTorch** — because at the tiny/edge scale attn11 targets,
+PyTorch's per-op dispatch overhead swamps its kernels. The giants are weakest exactly where attn11 lives;
+the throughput story sharpens attn11's real axes (zero-deps sovereignty + the integer/edge path), it does
+not refute them. (B2 decode vs llama2.c needs a matched `.bin`, deferred.)
+
+**Gate.** lint 0 warnings; **1056** grad-checks green x86_64 **and** aarch64/qemu (CPU math untouched);
+the 12-test GPU suite passes; AGNOS main + tcyr build; fuzz + `make smoke` green. **No-flag run
+byte-identical** to 1.9.1 (the `--d-model`/`--ctx` flags are parse-only, additive). cyrius pin stays
+**6.2.29** (installed cycc 6.2.34, benign drift); pin `mabda = 3.4.1`. `src/*.cyr` unchanged except
+`src/main.cyr` (the two flags + CFG_VERSION). **Next:** the integer/edge lane — activation quantization
+→ int8 matmul + a ternary memory-footprint / edge-crossover benchmark (where attn11 can *win*).
+
 ## [1.9.1] - 2026-06-21
 
 **M19 1.9.1: RoPE Q/K rotation on the GPU — BIT-EXACT — + the remaining-op coverage map (E-infra;
