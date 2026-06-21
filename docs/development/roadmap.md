@@ -45,15 +45,15 @@ E1–E9 have all graduated. For *what* shipped, see [`CHANGELOG.md`](../../CHANG
 **v1.7.2 shipped the B-series competitor benchmarks** (B0–B3, the honest CPU + zero-deps
 story, no GPU dependency); the toolchain then realigned through **v1.7.4 (cyrius 6.2.29)**,
 which also **verified M18's unblock** (mabda 3.4.1 clears the real gate, GPU online — X026).
-Next is the **v1.8.x mini-arc — the M18 GPU compute backend** on **mabda** (1.8.0 plumbing +
-matmul → 1.8.1 forward → 1.8.2 backward + Adam), now unblocked. The original
-recon framed this as **f32-only on the GPU** (portable wgpu/WGSL has no f64). That still
-holds for the *portable* path — but the 2026-06-19 proof changes the f64 story: **bit-exact
-f64 GPU compute is real on AMD** (mabda's own SPIR-V→GFX9 emitter, landed mabda 3.2.12) and
-**runs on the dev box's Cezanne today** (fma + a real layernorm, bit-exact, launcher-free —
-X025). So the f64 oracle *can* follow attn11 to the GPU on AMD; only
-portable f64 is impossible. The arc unblocks B4 (the GPU competitor row). Detail on both is
-below. This file is the plan ahead only.
+**M18 (the v1.8.x GPU compute backend) is now COMPLETE** (1.8.0 matmul → 1.8.11 close-out): the
+full training step — forward + hand-derived backward + Adam — runs **end-to-end on the native-AMD
+f64 SPIR-V path**, validated bit-exact (matmul/ln/Adam/head-bwd/ln-bwd) or to ~1e-13 (the
+transcendental / SIMD-tree ops) against the CPU oracle (X027–X038), with the honest perf X-entry
+closing it out (X039 / B5: a 4–7× loss — the sovereign-stack / oracle milestone, not a speedup). The
+2026-06-19 proof (X025) bore out: bit-exact f64 GPU compute is real on AMD (mabda's own SPIR-V→GFX9
+emitter); only *portable* f64 (wgpu/WGSL) is impossible. **Next is M19 — the 1.9.x line** (the GPU
+follow-ups: preset-scale tiling, remaining-op coverage, and the transfer / fusion perf levers — see
+M19 below). The arc unblocked B4 (the GPU competitor row). This file is the plan ahead only.
 
 > **Beyond attn11's own tracks — the ecosystem ML-paradigm map.** The wider
 > sovereign-ML horizon (the *other* generative paradigms that come online as
@@ -325,9 +325,10 @@ the mabda 3.x dependency below). See [ADR 0016](../adr/0016-gpu-backend-layered-
   init (`gpu_context_*`), buffer create / upload / synchronous readback
   (`gpu_buffer_*`, 256 MB cap), and a compute pipeline — WGSL source → shader module →
   bind-group layout → pipeline → `compute_dispatch` (workgroup dims), with shader /
-  pipeline / bind-group caches and a ping-pong buffer. The portable **wgpu** backend
-  (Vulkan/Metal/DX12) works today; the **native-AMD** (DRM/PM4) backend's compute
-  dispatch is deferred upstream (a later increment / M19). **No matmul / BLAS / softmax
+  pipeline / bind-group caches and a ping-pong buffer. **Update (post-M18):** the **native-AMD**
+  (DRM/PM4) compute dispatch **landed** (mabda 3.2.12) and is the path **M18 shipped on
+  end-to-end** (X025–X038); the portable **wgpu** f32 backend (Vulkan/Metal/DX12) is the deferred
+  **M19** non-AMD sub-track. **No matmul / BLAS / softmax
   / attention kernels are vendored** — every kernel is hand-written **WGSL** (the
   shading language; not SPIR-V, not a Cyrius DSL).
 - **PRECISION — the f32 wall is WebGPU's, not AMD's (research, 2026-06-14).**
@@ -486,21 +487,49 @@ for the native-AMD f64 route.
     complete** — the full training step runs on the sovereign stack, validated against the CPU oracle.
     (Out of scope this arc: device-resident m/v + fwd→bwd P-residency — a separate fusion project;
     tiling attn-bwd + head for preset-scale on-device coverage — a post-M18 follow-up.)
-- **f64 track (gate now OPEN — re-sequenceable to first-class, 2026-06-19):** the f64
-  oracle no longer waits on an unshipped capability — mabda's native SPIR-V→GFX9 f64 path
-  is proven on the dev Cezanne (X025). Re-run the op set on the
-  **native-AMD** path (`gpu_context_new_native` → `gpu_shader_module_create_spirv` →
-  `gpu_compute_dispatch`) to restore the bit-exact f64 oracle on-device. **Sequencing note:**
-  the native-AMD f64 path actually fits attn11's charter *better* than the portable f32 path
-  — it is launcher-free + pure-Cyrius + keeps bit-exact f64, whereas portable wgpu needs a C
-  launcher (breaking the dependency-free single-ELF charter) **and** loses f64 (see the
-  launcher caveat under 1.8.0). So on AMD hardware the f64 track is a viable *first* target,
-  not a deferred follow-on; the portable f32 track is the one for non-AMD GPUs. Full-rate f64
-  (native CDNA `V_MFMA_F64`) stays a future win once mabda adds matrix-core support — on
-  Cezanne the f64 path is scalar and oracle-only, never faster than the CPU at attn11's scale.
-- **Follow-ons (additive, not gating the arc):** MoE / ternary / RoPE GPU kernels;
-  pipelined host↔device transfer. **The arc unblocks benchmark phase B4** (the GPU
-  competitor comparison).
+- **f64 track — ✅ DONE (it was the whole arc).** The entire 1.8.x arc ran **f64-native** on the
+  AMD SPIR-V→GFX9 path — the bit-exact f64 oracle followed attn11 to the GPU, exactly as the
+  2026-06-19 proof (X025) promised. Full-rate f64 (`V_MFMA_F64`) stays a future win once mabda adds
+  matrix-core support; on Cezanne the f64 path is scalar / oracle-only.
+- **Follow-ons → M19 (the 1.9.x line) below.** The post-M18 GPU work (preset-scale tiling,
+  remaining-op coverage, the transfer + fusion perf levers, the portable f32 path) is scheduled
+  there — pushed out of the M18 arc into the next release line.
+
+## M19 — GPU follow-ups (the 1.9.x line) — E-infra
+
+> M18 (1.8.0–1.8.11) landed the **full training step on the GPU at default scale** (T=16),
+> bit-exact (matmul/ln/Adam/head-bwd/ln-bwd) or tolerance (the transcendental / SIMD-tree ops) vs
+> the CPU oracle, and measured the honest perf (X039 / benchmarks B5: a **4–7× loss** — the
+> sovereign-stack / oracle milestone, **not** a speedup). M19 is the post-M18 GPU work: **broaden
+> coverage** (preset scale + the remaining ops) and **attack the perf** (the per-op host↔device
+> transfer X039 pinned as the dominant cost). value÷risk-ordered + re-orderable; additive-only;
+> each a logged X-entry. The CPU stays the oracle + production path and every op keeps its
+> per-shape self-fall-back, so nothing here can regress the default/CPU paths.
+
+- **1.9.0 — preset-scale on-device: tile `attn_core_bwd` + GPU the head for any vocab.** Today the
+  full step runs on-device only at **default** (attn-bwd is untiled → gated `T ≤ 20`; head fwd/bwd
+  need `V % 16 == 0`, so byte / `--bpe 256` vocabs fall back). Tile the attention backward over its
+  reduced dim (the proven matmul/ln tiled-reduction + RMW pattern) so it fits the 256-id cap at any
+  T, and handle the head's V-tail (a tail tile or vocab pad) so any vocab engages. **Result: the
+  full `--gpu-tc` step runs end-to-end at preset (T=64) too** — closing the milestone's scale gap.
+  Tolerance; rides `--gpu-tc`. Highest value / lowest risk (the tiling pattern is proven).
+- **1.9.1 — remaining-op GPU coverage: MoE / ternary / RoPE kernels.** The non-default model axes —
+  `--experts` routing + expert MLPs, the `--ternary` i64-add matmul, RoPE Q/K rotation — still fall
+  back to the CPU. Add their GPU kernels so those configs also run on-device. Additive breadth, not
+  a perf bet.
+- **1.9.2 — the first real perf lever: device-resident tensors + pipelined transfer.** X039 pinned
+  per-op host↔device transfer as the dominant cost. Keep the weights / Adam m,v / activations
+  **device-resident across the whole step** (no per-op upload/download) and overlap transfer with
+  compute. The first change that can actually move the perf needle (still likely a loss at attn11's
+  tiny scale, but the right structural fix). (Was the M18 "out-of-scope fusion project.")
+- **1.9.3 — fused multi-op kernels (the speedup project; the ceiling, not the next step).** Fuse op
+  chains (matmul + bias + GELU; the attention passes) into single dispatches to kill per-op launch +
+  transfer overhead — the honest path toward parity / a win at larger scale. Gated on what mabda
+  exposes (and ultimately matrix-core f64, a future mabda capability).
+- **Portable f32 / WGSL path (non-AMD GPUs) — deferred sub-track.** A wgpu/WGSL backend for non-AMD
+  hardware: **f32-only** (no portable f64) and needs a **C launcher** (breaks the single-static-ELF
+  charter), so it is a *someday*, demand-gated — not on the 1.9.x value path. The AMD-native f64
+  path stays attn11's primary GPU target.
 
 ## Competitor benchmarking (B-series)
 
@@ -610,13 +639,17 @@ two infra tracks, both scoped (mabda recon, 2026-06-14):**
 1. **v1.7.2 — the B-series competitor benchmarks (B0–B3)**: the honest CPU throughput +
    zero-deps story vs llm.c / nanoGPT / llama2.c / micrograd; binary-unchanged tooling,
    run local/release-machine (not CI). The natural next cut (no GPU dependency).
-2. **v1.8.x — the M18 GPU compute backend (mini-arc)**: 1.8.0 plumbing + matmul → 1.8.1
-   full forward → 1.8.2 backward + Adam + the honest perf X-entry, on the **mabda** wgpu
-   path. The recon's defining finding reshapes the gate: mabda/WGSL is **f32-only**, so the
-   GPU runs f32 against the CPU f64 reference and the milestone validates at **f32
-   tolerance** (not the f64-exact oracle of M12–M17). It unblocks **B4** (the GPU competitor
-   row). At attn11's tiny scale this is "the sovereign GPU path works + is validated," not a
-   speed claim (an honest negative until model scale grows).
+2. **v1.8.x — the M18 GPU compute backend (mini-arc) — ✅ COMPLETE (1.8.0→1.8.11)**: matmul →
+   forward → Adam → the full hand-derived backward → the honest perf close-out, on the **mabda
+   native-AMD SPIR-V→GFX9** path. The recon's f32/WGSL framing was **superseded by the 2026-06-19
+   on-hardware proof**: the path is **f64-native + bit-exact** (not f32-tolerance), launcher-free,
+   single-ELF — it fits the charter better than portable wgpu. Validated bit-exact / ~1e-13 vs the
+   CPU oracle (X027–X038); honest perf X039 (a 4–7× loss — sovereign/oracle milestone, not a speed
+   claim). Unblocked **B4**.
+3. **v1.9.x — M19, the GPU follow-ups**: preset-scale tiling (attn-bwd + head for any vocab) →
+   remaining-op coverage (MoE / ternary / RoPE kernels) → the perf levers (device-resident tensors +
+   pipelined transfer → fused multi-op kernels). value÷risk-ordered; the portable f32/WGSL path
+   (non-AMD) stays a deferred sub-track. See **M19** above.
 The E-series is informed by the
 June-2026 frontier survey (`ai-ml-frontier-2026-expanded.docx`, repo root) —
 data quality > volume, the KV cache as the central inference object, SSM/attention

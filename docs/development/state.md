@@ -20,8 +20,10 @@ the 4 bugs the bit-exact tests caught+fixed in-arc + the lesson (run `make gpu-t
 gpu.cyr change). **Gate (re-verified):** lint 0 warn; 1056 grad-checks x86_64 **and** aarch64/qemu;
 11-test gpu suite; agnos main+tcyr; fuzz; smoke; plain `--gpu` byte-identical. **THE M18 GPU ARC
 (1.8.0→1.8.11) IS COMPLETE** — the full training step (fwd+bwd+Adam) runs end-to-end on the sovereign
-native-AMD f64 GPU stack, validated against the CPU oracle. **Future (post-M18):** tile attn-bwd +
-head for preset on-device; device-resident + fused kernels for a real speedup (later mabda). cyrius
+native-AMD f64 GPU stack, validated against the CPU oracle. **Next: M19 — the 1.9.x line** (roadmap):
+1.9.0 tile attn-bwd + head for preset on-device → 1.9.1 MoE/ternary/RoPE GPU kernels → 1.9.2
+device-resident tensors + pipelined transfer → 1.9.3 fused multi-op kernels (the speedup project);
+portable f32/WGSL (non-AMD) is a deferred sub-track. cyrius
 pin stays **6.2.29** (installed cycc 6.2.31, benign drift); pin `mabda = 3.4.1`. `src/*.cyr` unchanged
 except CFG_VERSION + the additive `--gpu-tc` usage comment.
 
