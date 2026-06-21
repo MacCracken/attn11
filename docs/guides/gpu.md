@@ -35,8 +35,8 @@ no-flag run, *including the optimizer state*):
 - **the Adam step** (`model_adam_step`) — the per-parameter optimizer update, the first
   backward-arc op; in-shader f64 `sqrt`/`div` are correctly-rounded so it is bit-exact — 1.8.5.
 - **the LM-head backward** (`head_bwd`) — the tied-embedding gradients (D_f + gemb); the CPU
-  head_bwd is pure-scalar sequential so the GPU tiles match bit-for-bit — 1.8.8 (engages when the
-  vocab is a multiple of 16, e.g. `--bpe 7`; else CPU fallback).
+  head_bwd is pure-scalar sequential so the GPU tiles match bit-for-bit — 1.8.8 (engages for **any
+  vocab** since 1.9.0 tail-tiled the D_f V-contraction; only `T%16≠0` still falls back).
 - **the layernorm backward** (`ln_bwd`) — dx + dgamma/dbeta from the saved mean/rstd; rstd is a
   precomputed input so the reductions are sequential (no transcendental) → bit-exact — 1.8.9.
 
@@ -49,20 +49,21 @@ are behind this **separate** gate: a `--gpu-tc` run tracks the CPU run to ~1e-13
 bits/byte match to print precision, never NaN) but is **not** byte-identical. It also runs the
 **GELU / linear / attention backward** (1.8.6 / 1.8.7 / 1.8.10) at tolerance.
 
-**The full training step runs end-to-end on the GPU (M18 milestone, 1.8.10).** With the attention
-backward, every heavy op of a step — forward + backward + Adam — can execute on-device: a
+**The full training step runs end-to-end on the GPU (M18 milestone, 1.8.10) — at default AND preset
+(1.9.0).** Every heavy op of a step — forward + backward + Adam — executes on-device: a
 `--bpe 7 --gpu-tc` step dispatches matmuls + layernorms + Adam + head-bwd + ln-bwd (bit-exact) and
-GELU + head + attention + linear-bwd + attn-bwd (tolerance), all on the GPU, no NaN. (The attention
-backward is untiled, so it engages for `T ≤ 20` — default T=16 — and falls back to CPU at preset
-T=64 until tiled.)
+GELU + head + attention + linear-bwd + attn-bwd (tolerance), all on the GPU, no NaN. **1.9.0** tiled
+the attention backward over T (`TK=16` RMW chunks → the old `T ≤ 20` gate is gone) and tail-tiled the
+head's vocab, so a `--preset --gpu-tc` step (T=64) now runs end-to-end on-device too.
 
 The attention core (`gpu_attn_core` at the `attn_core_fwd` seam) is **4 host-orchestrated
 passes** — scores (`nh·T·T`) → rowmax → exp+sum → PV — because a single fused per-(head,query)
 kernel exceeds the 256-id compile cap; it covers **causal MHA** (`nkv==nh`, `g_bidir==0`).
 
 What stays on CPU: **GQA / bidirectional (diffusion) attention** (fall back to the CPU core) and
-the **preset-scale attention backward** (untiled `attn_core_bwd` → `T ≤ 20`, so T=64 falls back
-until tiled). Everything else of a training step runs on the GPU as of 1.8.10. Each op
+**very wide heads** (`hd > 32` — the untiled `dp` pass would exceed the build budget, so the
+attention backward self-falls-back; `--preset --heads 1` is the corner case). Everything else of a
+training step runs on the GPU at default and preset (as of 1.9.0). Each op
 self-falls-back to CPU if the device is absent, the contraction
 dimension isn't a multiple of `GPU_TK` (16) / the tile `TK` (4), or a buffer/dispatch limit is
 exceeded — all of attn11's default/preset shapes (matmul K ∈ {32,64,128,256}; ln C ∈ {32,64};

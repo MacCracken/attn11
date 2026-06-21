@@ -3,9 +3,10 @@
 # Validates `gpu_head_bwd` (src/gpu.cyr) against an inline CPU replica identical to src/model.cyr
 # head_bwd: D_f[t,c]=Σ_v D_logits[t,v]·emb[v,c], gemb[v,c]+=Σ_t D_logits[t,v]·A_f[t,c]. The CPU
 # head_bwd is PURE-SCALAR sequential (unlike the SIMD-tree forward head), so the GPU's sequential
-# tiles match it BIT-FOR-BIT → it rides plain --gpu, keeping the checkpoint byte-identical. Tests
-# the >byte-vocab (V%16==0) path bit-exact + the byte-vocab (V%16≠0) CPU fallback. Engagement
-# proven. Device-dependent → SKIPS cleanly (exit 0) where no AMD f64 GPU.
+# tiles match it BIT-FOR-BIT → it rides plain --gpu, keeping the checkpoint byte-identical. 1.9.0:
+# the D_f phase (contracts the vocab V) tail-tiles V, so ANY vocab runs on-device bit-exact (byte
+# V=25, preset byte V=65 incl.); only T%16≠0 (gemb tiles T) still falls back. Engagement proven.
+# Device-dependent → SKIPS cleanly (exit 0) where no AMD f64 GPU.
 #
 # Build:  cyrius build tests/gpu_head_bwd.cyr build/gpu_head_bwd && ./build/gpu_head_bwd
 # Exit:   0 = bit-exact (or cleanly skipped); 1 = any bit difference / unexpected fallback.
@@ -80,14 +81,16 @@ fn main(): i64 {
         print_cstr("no native AMD GPU — SKIPPED (CPU oracle unaffected; build verified)\n");
         return 0;
     }
-    print_cstr("native AMD f64 GPU online — validating bit-exactness + the byte-vocab fallback:\n");
+    print_cstr("native AMD f64 GPU online — validating bit-exactness across any vocab (V-tail) + the T%16 fallback:\n");
     var ok = 1;
     if (run_shape(64, 256, 64, 1) == 0) { ok = 0; }     # preset BPE-256
     if (run_shape(64, 768, 64, 1) == 0) { ok = 0; }     # max BPE vocab
-    if (run_shape(16, 25, 32, 0) == 0) { ok = 0; }      # default byte vocab (V%16≠0) → CPU fallback
+    if (run_shape(16, 25, 32, 1) == 0) { ok = 0; }      # 1.9.0: byte vocab (V%16≠0) now on-device (V-tail)
+    if (run_shape(64, 65, 64, 1) == 0) { ok = 0; }      # 1.9.0: preset byte vocab (V=65, tail tile)
+    if (run_shape(8, 64, 32, 0) == 0) { ok = 0; }       # T%16≠0 (gemb tiles T) → CPU fallback (self-falls-back)
     print_cstr("GPU head-bwd ops dispatched on-device: "); print_i64(gpu_headbwd_count()); print_cstr("\n");
     if (ok == 0) { print_cstr("\nFAIL: GPU head_bwd diverged from the CPU oracle\n"); return 1; }
-    print_cstr("\nOK — gpu_head_bwd BIT-EXACT to head_bwd (V%16==0); clean CPU fallback otherwise\n");
+    print_cstr("\nOK — gpu_head_bwd BIT-EXACT to head_bwd for any vocab (V-tail); clean CPU fallback on T%16≠0\n");
     return 0;
 }
 

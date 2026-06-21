@@ -467,6 +467,23 @@ fn _gpu_get_tile(K, N, k0): i64 {
     return shmod;
 }
 
+# 1.9.0: forward tile with an explicit unroll length `tk` (≤ GPU_TK) so a contraction dim that
+# isn't a multiple of GPU_TK finishes with a short final tile — lets the LM-head backward's D_f
+# (contracts the vocab V) run on-device for ANY vocab. Kind-tagged key (kind 21, incl. k0,tk) so it
+# never collides with the full-tile / matmul cache. 0 = unavailable (CPU fallback).
+fn _gpu_get_tile_n(K, N, k0, tk): i64 {
+    var key = (21 << 56) | (K << 34) | (N << 19) | (k0 << 5) | tk;
+    var c = _gpu_cache_get(key);
+    if (c == (0 - 1)) { return 0; }
+    if (c != 0) { return c; }
+    var spv[8192];
+    var nbytes = _gpu_build_tile(&spv, K, N, k0, tk);
+    var shmod = gpu_shader_module_create_spirv(_gpu_ctx, &spv, nbytes);
+    if (shmod == 0) { _gpu_cache_put(key, 0 - 1); return 0; }
+    _gpu_cache_put(key, shmod);
+    return shmod;
+}
+
 # Allocate one GTT buffer + map it at `va`; write {handle, host_map} into out[16].
 # 0 = ok; -1 = fail (the BO is released on a map failure). GTT is CPU-visible.
 fn _gpu_alloc1(fd, va, sz, out): i64 {
@@ -1152,8 +1169,7 @@ fn gpu_head_bwd(D_logits, emb, A_f, D_f, gemb, T, V, C): i64 {
     if (_gpu_init() == 0) { return 0 - 1; }
     var TK = GPU_TK();
     if (V <= 0) { return 0 - 1; }
-    if ((V % TK) != 0) { return 0 - 1; }            # D_f tiles over V (byte vocab V=25 → CPU)
-    if ((T % TK) != 0) { return 0 - 1; }            # gemb tiles over T
+    if ((T % TK) != 0) { return 0 - 1; }            # gemb tiles over T (1.9.0: D_f tail-tiles V for any vocab)
     if ((T * C) > MABDA_MAX_DISPATCH_DIM) { return 0 - 1; }
     if ((V * C) > MABDA_MAX_DISPATCH_DIM) { return 0 - 1; }
     var tv = T * V; var vc = V * C; var tc = T * C;
@@ -1167,14 +1183,16 @@ fn gpu_head_bwd(D_logits, emb, A_f, D_f, gemb, T, V, C): i64 {
     i = 0; while (i < tc) { store64(_gpu_ym + i*8, f64_from(0)); i = i + 1; }
     var k0 = 0;
     while (k0 < V) {
-        var sh = _gpu_get_tile(V, C, k0);
+        var tkv = TK; if (V - k0 < TK) { tkv = V - k0; }   # short final tile when V%16≠0
+        var sh = 0;
+        if (tkv == TK) { sh = _gpu_get_tile(V, C, k0); } else { sh = _gpu_get_tile_n(V, C, k0, tkv); }
         if (sh == 0) { return 0 - 1; }
         var bp[56]; store64(&bp+0, 3);
         store64(&bp+8, _gpu_xh); store64(&bp+16, _GPU_XVA());
         store64(&bp+24, _gpu_wh); store64(&bp+32, _GPU_WVA());
         store64(&bp+40, _gpu_yh); store64(&bp+48, _GPU_YVA());
         if (gpu_compute_dispatch(_gpu_ctx, sh, tc, 1, 1, &bp) != 0) { return 0 - 1; }
-        k0 = k0 + TK;
+        k0 = k0 + tkv;
     }
     i = 0; while (i < tc) { store64(D_f + i*8, load64(_gpu_ym + i*8)); i = i + 1; }
     # ---- gemb += D_logitsᵀ·A_f (tile_dw, K=V N=C, grid V·C). CPU head_bwd does gemb = seed +
@@ -1513,23 +1531,27 @@ fn _gpu_build_abwd_dp(buf, T, C, hd): i64 {
     o=_gpu_op2(buf,o,0x000100FD,0x00010038); store32(buf+12,nid); return o;
 }
 
-# B dotPdP[h,i] = Σ_{j<T} P[prow+j]·dP[prow+j]. P=0(%12) dP=1(%13) dotPdP=2(%14). grid nh·T.
-fn _gpu_build_abwd_dot(buf, T): i64 {
-    var o = _gpu_pre(buf, 3, 18);
+# B dotPdP[h,i] += Σ_{j∈[t0,t0+tk)} P[prow+j]·dP[prow+j]. P=0(%12) dP=1(%13) dotPdP=2(%14). grid nh·T.
+# 1.9.0 TILED over j (RMW onto a pre-zeroed dotPdP), so T>20 fits the 256-id cap. consts %18=t0.
+fn _gpu_build_abwd_dot_t(buf, T, t0, tk): i64 {
+    var o = _gpu_pre(buf, 3, 19);
     o=_gpu_op4(buf,o,0x0004002B,3,15,0); o=_gpu_op4(buf,o,0x0004002B,3,16,T); o=_gpu_op4(buf,o,0x0004002B,3,17,1);
-    o=_gpu_op5(buf,o,0x00050036,1,18,0,2); o=_gpu_op2(buf,o,0x000200F8,19);
-    o=_gpu_op4(buf,o,0x0004003D,4,20,11); o=_gpu_op5(buf,o,0x00050051,3,21,20,0);   # idx
-    o=_gpu_op5(buf,o,0x00050084,3,22,21,16);                       # prow = idx*T
-    var pj=22; var nid=23; var acc=0; var j=0;
-    while (j < T) {
+    o=_gpu_op4(buf,o,0x0004002B,3,18,t0);
+    o=_gpu_op5(buf,o,0x00050036,1,19,0,2); o=_gpu_op2(buf,o,0x000200F8,20);
+    o=_gpu_op4(buf,o,0x0004003D,4,21,11); o=_gpu_op5(buf,o,0x00050051,3,22,21,0);   # idx
+    o=_gpu_op5(buf,o,0x00050084,3,23,22,16);                       # prow = idx*T
+    o=_gpu_op5(buf,o,0x00050080,3,24,23,18);                       # pj0 = prow + t0
+    o=_gpu_op6(buf,o,0x00060041,10,25,14,15,22); o=_gpu_op4(buf,o,0x0004003D,6,26,25);  # acc = dotPdP[idx] (RMW)
+    var pj=24; var acc=26; var nid=27; var j=0;
+    while (j < tk) {
         var pp=nid; var pv=nid+1; o=_gpu_acl6(buf,o,pp,pv,12,15,pj); nid=nid+2;
         var qp=nid; var qv=nid+1; o=_gpu_acl6(buf,o,qp,qv,13,15,pj); nid=nid+2;
         var pr=nid; nid=nid+1; o=_gpu_op5(buf,o,0x00050085,6,pr,pv,qv);
-        if (j==0) { acc=pr; } else { var an=nid; nid=nid+1; o=_gpu_op5(buf,o,0x00050081,6,an,acc,pr); acc=an; }
-        if (j<T-1) { var pn=nid; nid=nid+1; o=_gpu_op5(buf,o,0x00050080,3,pn,pj,17); pj=pn; }
+        var an=nid; nid=nid+1; o=_gpu_op5(buf,o,0x00050081,6,an,acc,pr); acc=an;
+        if (j<tk-1) { var pn=nid; nid=nid+1; o=_gpu_op5(buf,o,0x00050080,3,pn,pj,17); pj=pn; }
         j=j+1;
     }
-    var op=nid; nid=nid+1; o=_gpu_op6(buf,o,0x00060041,10,op,14,15,21); o=_gpu_op3(buf,o,0x0003003E,op,acc);
+    o=_gpu_op3(buf,o,0x0003003E,25,acc);
     o=_gpu_op2(buf,o,0x000100FD,0x00010038); store32(buf+12,nid); return o;
 }
 
@@ -1550,35 +1572,38 @@ fn _gpu_build_abwd_sds(buf, T, scale): i64 {
     o=_gpu_op2(buf,o,0x000100FD,0x00010038); store32(buf+12,33); return o;
 }
 
-# D dQ[i,base+d] = Σ_{j<T} sds[prow+j]·K[j*C+base+d]. sds=0(%12) K=1(%13) dQ=2(%14). grid nh·T·hd.
-fn _gpu_build_abwd_dq(buf, T, C, hd): i64 {
-    var o = _gpu_pre(buf, 3, 20);
+# D dQ[i,base+d] += Σ_{j∈[t0,t0+tk)} sds[prow+j]·K[j*C+base+d]. sds=0(%12) K=1(%13) dQ=2(%14). grid nh·T·hd.
+# 1.9.0 TILED over j (RMW onto a pre-zeroed dQ). consts %20=t0; sj0=prow+t0, ki0=kb0+t0*C.
+fn _gpu_build_abwd_dq_t(buf, T, C, hd, t0, tk): i64 {
+    var o = _gpu_pre(buf, 3, 21);
     o=_gpu_op4(buf,o,0x0004002B,3,15,0); o=_gpu_op4(buf,o,0x0004002B,3,16,T);
     o=_gpu_op4(buf,o,0x0004002B,3,17,C); o=_gpu_op4(buf,o,0x0004002B,3,18,hd); o=_gpu_op4(buf,o,0x0004002B,3,19,1);
-    o=_gpu_op5(buf,o,0x00050036,1,20,0,2); o=_gpu_op2(buf,o,0x000200F8,21);
-    o=_gpu_op4(buf,o,0x0004003D,4,22,11); o=_gpu_op5(buf,o,0x00050051,3,23,22,0);   # idx
-    o=_gpu_op5(buf,o,0x00050086,3,24,23,18);
-    o=_gpu_op5(buf,o,0x00050084,3,25,24,18);
-    o=_gpu_op5(buf,o,0x00050082,3,26,23,25);
-    # d;
-    o=_gpu_op5(buf,o,0x00050086,3,27,24,16);
-    o=_gpu_op5(buf,o,0x00050084,3,28,27,16);
-    o=_gpu_op5(buf,o,0x00050082,3,29,24,28);
-    # i;
-    o=_gpu_op5(buf,o,0x00050084,3,30,27,18);                       # base = h*hd
-    o=_gpu_op5(buf,o,0x00050084,3,31,24,16);                       # prow = t2*T
-    o=_gpu_op5(buf,o,0x00050084,3,32,29,17);
-    o=_gpu_op5(buf,o,0x00050080,3,33,32,30);
-    o=_gpu_op5(buf,o,0x00050080,3,34,33,26);
-    # dqo = i*C+base+d;
-    o=_gpu_op5(buf,o,0x00050080,3,35,30,26);                       # kb0 = base+d
-    var sj=31; var ki=35; var nid=36; var acc=0; var j=0;
-    while (j < T) {
+    o=_gpu_op4(buf,o,0x0004002B,3,20,t0);
+    o=_gpu_op5(buf,o,0x00050036,1,21,0,2); o=_gpu_op2(buf,o,0x000200F8,22);
+    o=_gpu_op4(buf,o,0x0004003D,4,23,11); o=_gpu_op5(buf,o,0x00050051,3,24,23,0);   # idx
+    o=_gpu_op5(buf,o,0x00050086,3,25,24,18);                       # q = idx/hd
+    o=_gpu_op5(buf,o,0x00050084,3,26,25,18);
+    o=_gpu_op5(buf,o,0x00050082,3,27,24,26);                       # d = idx - q*hd
+    o=_gpu_op5(buf,o,0x00050086,3,28,25,16);                       # t2 = q/T
+    o=_gpu_op5(buf,o,0x00050084,3,29,28,16);
+    o=_gpu_op5(buf,o,0x00050082,3,30,25,29);                       # i = q - t2*T
+    o=_gpu_op5(buf,o,0x00050084,3,31,28,18);                       # base = t2*hd
+    o=_gpu_op5(buf,o,0x00050084,3,32,25,16);                       # prow = q*T
+    o=_gpu_op5(buf,o,0x00050084,3,33,30,17);                       # i*C
+    o=_gpu_op5(buf,o,0x00050080,3,34,33,31);                       # i*C+base
+    o=_gpu_op5(buf,o,0x00050080,3,35,34,27);                       # dqo = i*C+base+d
+    o=_gpu_op5(buf,o,0x00050080,3,36,31,27);                       # kb0 = base+d
+    o=_gpu_op5(buf,o,0x00050080,3,37,32,20);                       # sj0 = prow + t0
+    o=_gpu_op5(buf,o,0x00050084,3,38,20,17);                       # t0*C
+    o=_gpu_op5(buf,o,0x00050080,3,39,36,38);                       # ki0 = kb0 + t0*C
+    o=_gpu_op6(buf,o,0x00060041,10,40,14,15,35); o=_gpu_op4(buf,o,0x0004003D,6,41,40);  # acc = dQ[dqo] (RMW)
+    var sj=37; var ki=39; var acc=41; var nid=42; var j=0;
+    while (j < tk) {
         var sp=nid; var sv=nid+1; o=_gpu_acl6(buf,o,sp,sv,12,15,sj); nid=nid+2;
         var kp=nid; var kv=nid+1; o=_gpu_acl6(buf,o,kp,kv,13,15,ki); nid=nid+2;
         var pr=nid; nid=nid+1; o=_gpu_op5(buf,o,0x00050085,6,pr,sv,kv);
-        if (j==0) { acc=pr; } else { var an=nid; nid=nid+1; o=_gpu_op5(buf,o,0x00050081,6,an,acc,pr); acc=an; }
-        if (j<T-1) {
+        var an=nid; nid=nid+1; o=_gpu_op5(buf,o,0x00050081,6,an,acc,pr); acc=an;
+        if (j<tk-1) {
             var sn=nid;
             nid=nid+1;
             o=_gpu_op5(buf,o,0x00050080,3,sn,sj,19);
@@ -1590,40 +1615,44 @@ fn _gpu_build_abwd_dq(buf, T, C, hd): i64 {
         }
         j=j+1;
     }
-    var op=nid; nid=nid+1; o=_gpu_op6(buf,o,0x00060041,10,op,14,15,34); o=_gpu_op3(buf,o,0x0003003E,op,acc);
+    o=_gpu_op3(buf,o,0x0003003E,40,acc);
     o=_gpu_op2(buf,o,0x000100FD,0x00010038); store32(buf+12,nid); return o;
 }
 
-# G gather: out[j,base+d] = Σ_{i<T} A[h*TT + i*T + j]·B[i*C + base+d]. A=0(%12) B=1(%13) out=2(%14).
-# grid nh·T·hd. Used for dV (A=P,B=dconcat) and dK (A=sds,B=Q).
-fn _gpu_build_abwd_gather(buf, T, C, hd): i64 {
+# G gather: out[j,base+d] += Σ_{i∈[t0,t0+tk)} A[h*TT + i*T + j]·B[i*C + base+d]. A=0(%12) B=1(%13)
+# out=2(%14). grid nh·T·hd. Used for dV (A=P,B=dconcat) and dK (A=sds,B=Q). 1.9.0 TILED over i (RMW
+# onto a pre-zeroed out). consts %20=t0; ai0=Ab0+t0*T, bi0=Bb0+t0*C.
+fn _gpu_build_abwd_gather_t(buf, T, C, hd, t0, tk): i64 {
     var o = _gpu_pre(buf, 3, 21);
     o=_gpu_op4(buf,o,0x0004002B,3,15,0); o=_gpu_op4(buf,o,0x0004002B,3,16,T);
     o=_gpu_op4(buf,o,0x0004002B,3,17,C); o=_gpu_op4(buf,o,0x0004002B,3,18,hd); o=_gpu_op4(buf,o,0x0004002B,3,19,T*T);
+    o=_gpu_op4(buf,o,0x0004002B,3,20,t0);
     o=_gpu_op5(buf,o,0x00050036,1,21,0,2); o=_gpu_op2(buf,o,0x000200F8,22);
     o=_gpu_op4(buf,o,0x0004003D,4,23,11); o=_gpu_op5(buf,o,0x00050051,3,24,23,0);   # idx
-    o=_gpu_op5(buf,o,0x00050086,3,25,24,18);
+    o=_gpu_op5(buf,o,0x00050086,3,25,24,18);                       # q = idx/hd
     o=_gpu_op5(buf,o,0x00050084,3,26,25,18);
-    o=_gpu_op5(buf,o,0x00050082,3,27,24,26);
-    # d;
-    o=_gpu_op5(buf,o,0x00050086,3,28,25,16);
+    o=_gpu_op5(buf,o,0x00050082,3,27,24,26);                       # d
+    o=_gpu_op5(buf,o,0x00050086,3,28,25,16);                       # h = q/T
     o=_gpu_op5(buf,o,0x00050084,3,29,28,16);
-    o=_gpu_op5(buf,o,0x00050082,3,30,25,29);
-    # j;
+    o=_gpu_op5(buf,o,0x00050082,3,30,25,29);                       # j
     o=_gpu_op5(buf,o,0x00050084,3,31,28,18);                       # base = h*hd
     o=_gpu_op5(buf,o,0x00050084,3,32,28,19); o=_gpu_op5(buf,o,0x00050080,3,33,32,30);  # Ab0 = h*TT + j
     o=_gpu_op5(buf,o,0x00050084,3,34,30,17);
     o=_gpu_op5(buf,o,0x00050080,3,35,34,31);
-    o=_gpu_op5(buf,o,0x00050080,3,36,35,27);
-    # outo = j*C+base+d;
+    o=_gpu_op5(buf,o,0x00050080,3,36,35,27);                       # outo = j*C+base+d
     o=_gpu_op5(buf,o,0x00050080,3,37,31,27);                       # Bb0 = base+d
-    var ai=33; var bi=37; var nid=38; var acc=0; var i=0;
-    while (i < T) {
+    o=_gpu_op5(buf,o,0x00050084,3,38,20,16);                       # t0*T
+    o=_gpu_op5(buf,o,0x00050080,3,39,33,38);                       # ai0 = Ab0 + t0*T
+    o=_gpu_op5(buf,o,0x00050084,3,40,20,17);                       # t0*C
+    o=_gpu_op5(buf,o,0x00050080,3,41,37,40);                       # bi0 = Bb0 + t0*C
+    o=_gpu_op6(buf,o,0x00060041,10,42,14,15,36); o=_gpu_op4(buf,o,0x0004003D,6,43,42);  # acc = out[outo] (RMW)
+    var ai=39; var bi=41; var acc=43; var nid=44; var i=0;
+    while (i < tk) {
         var ap=nid; var av=nid+1; o=_gpu_acl6(buf,o,ap,av,12,15,ai); nid=nid+2;
         var bp=nid; var bv=nid+1; o=_gpu_acl6(buf,o,bp,bv,13,15,bi); nid=nid+2;
         var pr=nid; nid=nid+1; o=_gpu_op5(buf,o,0x00050085,6,pr,av,bv);
-        if (i==0) { acc=pr; } else { var an=nid; nid=nid+1; o=_gpu_op5(buf,o,0x00050081,6,an,acc,pr); acc=an; }
-        if (i<T-1) {
+        var an=nid; nid=nid+1; o=_gpu_op5(buf,o,0x00050081,6,an,acc,pr); acc=an;
+        if (i<tk-1) {
             var aN=nid;
             nid=nid+1;
             o=_gpu_op5(buf,o,0x00050080,3,aN,ai,16);
@@ -1635,19 +1664,33 @@ fn _gpu_build_abwd_gather(buf, T, C, hd): i64 {
         }
         i=i+1;
     }
-    var op=nid; nid=nid+1; o=_gpu_op6(buf,o,0x00060041,10,op,14,15,36); o=_gpu_op3(buf,o,0x0003003E,op,acc);
+    o=_gpu_op3(buf,o,0x0003003E,42,acc);
     o=_gpu_op2(buf,o,0x000100FD,0x00010038); store32(buf+12,nid); return o;
 }
 
+# Non-tiled abwd kernels (dp loops hd, sds is elementwise — neither loops T, so both fit the cap).
+# hd is in the key: the dp kernel (kind 16) BAKES hd (dot length + per-head base) into its SPIR-V, so
+# two shapes sharing (C,T) but differing in nh (→ hd=C/nh) must not collide on a stale cached shader.
 fn _gpu_get_abwd(kind, T, C, hd, scale): i64 {
-    var key = (kind << 56) | (C << 14) | T;
+    var key = (kind << 56) | (hd << 28) | (C << 14) | T;
     var c = _gpu_cache_get(key); if (c == (0 - 1)) { return 0; } if (c != 0) { return c; }
     var spv[8192]; var nb = 0;
     if (kind == 16) { nb = _gpu_build_abwd_dp(&spv, T, C, hd); }
-    elif (kind == 17) { nb = _gpu_build_abwd_dot(&spv, T); }
-    elif (kind == 18) { nb = _gpu_build_abwd_sds(&spv, T, scale); }
-    elif (kind == 19) { nb = _gpu_build_abwd_dq(&spv, T, C, hd); }
-    else { nb = _gpu_build_abwd_gather(&spv, T, C, hd); }
+    else { nb = _gpu_build_abwd_sds(&spv, T, scale); }
+    var sh = gpu_shader_module_create_spirv(_gpu_ctx, &spv, nb);
+    if (sh == 0) { _gpu_cache_put(key, 0 - 1); return 0; }
+    _gpu_cache_put(key, sh); return sh;
+}
+
+# Tiled abwd kernels (dot/dq/gather loop T → tiled over [t0,t0+tk), RMW). Keyed incl. t0,tk so each
+# tile's distinct kernel caches independently. kind 17=dot, 19=dq, 20=gather.
+fn _gpu_get_abwd_t(kind, T, C, hd, t0, tk): i64 {
+    var key = (kind << 56) | (C << 34) | (hd << 27) | (T << 16) | (t0 << 5) | tk;
+    var c = _gpu_cache_get(key); if (c == (0 - 1)) { return 0; } if (c != 0) { return c; }
+    var spv[8192]; var nb = 0;
+    if (kind == 17) { nb = _gpu_build_abwd_dot_t(&spv, T, t0, tk); }
+    elif (kind == 19) { nb = _gpu_build_abwd_dq_t(&spv, T, C, hd, t0, tk); }
+    else { nb = _gpu_build_abwd_gather_t(&spv, T, C, hd, t0, tk); }
     var sh = gpu_shader_module_create_spirv(_gpu_ctx, &spv, nb);
     if (sh == 0) { _gpu_cache_put(key, 0 - 1); return 0; }
     _gpu_cache_put(key, sh); return sh;
@@ -1663,49 +1706,86 @@ fn _gpu_abwd_disp(sh, h0,v0, h1,v1, h2,v2, grid): i64 {
 
 # GPU attention backward (causal MHA, TOLERANCE). dQ/dK/dV from Qc/Kc/Vc/Pc/dconcat. Returns 0 = ran,
 # -1 = CPU. dprow unused (GPU keeps dP in the y-buf). Buffers: x=dconcat→P, y=dP/sds, W cycles
-# (V/K/dconcat/Q), gamma=dQ/dV/dK out, beta=dotPdP. T≤32 (untiled loops T).
+# (V/K/dconcat/Q), gamma=dQ/dV/dK out, beta=dotPdP. 1.9.0: the T-reductions (B dotPdP, D dQ, E dV,
+# F dK) are TILED over T in TK chunks (RMW onto a pre-zeroed output, serialized dispatches → no race),
+# so any T fits the 256-id cap — preset T=64 now runs on-device (the cap/BO checks alone gate fallback).
 fn gpu_attn_core_bwd(Qc, Kc, Vc, Pc, dconcat, dQ, dK, dV, dprow, T, C, nh, nkv): i64 {
     if (_gpu_init() == 0) { return 0 - 1; }
     if (nkv != nh) { return 0 - 1; }            # GQA → CPU
-    if (T > 20) { return 0 - 1; }               # untiled reductions loop T (D/G + 2 UDiv synth < 256-id cap)
+    if (T <= 0) { return 0 - 1; }
     var hd = C / nh; var Ckv = C;
+    if (hd <= 0) { return 0 - 1; }
+    if (hd > 32) { return 0 - 1; }              # pass A (dp) is UNTILED — unrolls hd into spv[8192];
+                                                # hd>32 would overflow the build buffer → CPU (never a crash)
+    var TK = 16;
     var PN = nh * T * T;
     if ((PN * 8) > GPU_BO_MAX()) { return 0 - 1; }
     if (PN > MABDA_MAX_DISPATCH_DIM) { return 0 - 1; }
     if ((nh * T * hd) > MABDA_MAX_DISPATCH_DIM) { return 0 - 1; }
+    if ((T * C * 8) > GPU_BO_MAX()) { return 0 - 1; }
     var scale = f64_div(f64_from(1), f64_sqrt(f64_from(hd)));
     var tc = T * C;
     var i = 0;
-    # ---- A: dP = Σ_d dconcat·V → y. (dconcat→x, V→W) ----
+    # ---- A: dP = Σ_d dconcat·V → y (untiled, loops hd). (dconcat→x, V→W) ----
     while (i < tc) { store64(_gpu_xm + i*8, load64(dconcat + i*8)); i = i + 1; }
     i = 0; while (i < tc) { store64(_gpu_wm + i*8, load64(Vc + i*8)); i = i + 1; }
     var sa = _gpu_get_abwd(16, T, C, hd, scale);
     if (sa == 0) { return 0 - 1; }
     if (_gpu_abwd_disp(sa, _gpu_xh,_GPU_XVA(), _gpu_wh,_GPU_WVA(), _gpu_yh,_GPU_YVA(), PN) != 0) { return 0 - 1; }
-    # ---- B: dotPdP = Σ_j P·dP → beta. (P→x, dP in y) ----
+    # ---- B: dotPdP = Σ_j P·dP → beta (TILED over j, RMW). (P→x, dP in y) ----
     i = 0; while (i < PN) { store64(_gpu_xm + i*8, load64(Pc + i*8)); i = i + 1; }
-    var sb = _gpu_get_abwd(17, T, C, hd, scale);
-    if (sb == 0) { return 0 - 1; }
-    if (_gpu_abwd_disp(sb, _gpu_xh,_GPU_XVA(), _gpu_yh,_GPU_YVA(), _gpu_bbh,_GPU_BVA(), nh*T) != 0) { return 0 - 1; }
-    # ---- C: sds = scale·P·(dP − dotPdP) → y (in-place). (P in x, dPsds in y, dotPdP in beta) ----
+    i = 0; while (i < nh*T) { store64(_gpu_bbm + i*8, f64_from(0)); i = i + 1; }
+    var t0 = 0;
+    while (t0 < T) {
+        var tkb = TK; if (T - t0 < TK) { tkb = T - t0; }
+        var sb = _gpu_get_abwd_t(17, T, C, hd, t0, tkb);
+        if (sb == 0) { return 0 - 1; }
+        var rb = _gpu_abwd_disp(sb, _gpu_xh,_GPU_XVA(), _gpu_yh,_GPU_YVA(), _gpu_bbh,_GPU_BVA(), nh*T);
+        if (rb != 0) { return 0 - 1; }
+        t0 = t0 + tkb;
+    }
+    # ---- C: sds = scale·P·(dP − dotPdP) → y (in-place, elementwise). (P in x, dPsds in y, dotPdP in beta) ----
     var sc = _gpu_get_abwd(18, T, C, hd, scale);
     if (sc == 0) { return 0 - 1; }
     if (_gpu_abwd_disp(sc, _gpu_xh,_GPU_XVA(), _gpu_yh,_GPU_YVA(), _gpu_bbh,_GPU_BVA(), PN) != 0) { return 0 - 1; }
-    # ---- D: dQ = Σ_j sds·K → gamma. (sds in y, K→W) ----
+    # ---- D: dQ = Σ_j sds·K → gamma (TILED over j, RMW). (sds in y, K→W) ----
     i = 0; while (i < tc) { store64(_gpu_wm + i*8, load64(Kc + i*8)); i = i + 1; }
-    var sd = _gpu_get_abwd(19, T, C, hd, scale);
-    if (sd == 0) { return 0 - 1; }
-    if (_gpu_abwd_disp(sd, _gpu_yh,_GPU_YVA(), _gpu_wh,_GPU_WVA(), _gpu_gh,_GPU_GVA(), nh*T*hd) != 0) { return 0 - 1; }
+    i = 0; while (i < tc) { store64(_gpu_gm + i*8, f64_from(0)); i = i + 1; }
+    t0 = 0;
+    while (t0 < T) {
+        var tkd = TK; if (T - t0 < TK) { tkd = T - t0; }
+        var sd = _gpu_get_abwd_t(19, T, C, hd, t0, tkd);
+        if (sd == 0) { return 0 - 1; }
+        var rd = _gpu_abwd_disp(sd, _gpu_yh,_GPU_YVA(), _gpu_wh,_GPU_WVA(), _gpu_gh,_GPU_GVA(), nh*T*hd);
+        if (rd != 0) { return 0 - 1; }
+        t0 = t0 + tkd;
+    }
     i = 0; while (i < tc) { store64(dQ + i*8, load64(_gpu_gm + i*8)); i = i + 1; }
-    # ---- E: dV = Σ_i P·dconcat → gamma. (P in x, dconcat→W) ----
+    # ---- E: dV = Σ_i P·dconcat → gamma (TILED over i, RMW). (P in x, dconcat→W) ----
     i = 0; while (i < tc) { store64(_gpu_wm + i*8, load64(dconcat + i*8)); i = i + 1; }
-    var sg = _gpu_get_abwd(20, T, C, hd, scale);
-    if (sg == 0) { return 0 - 1; }
-    if (_gpu_abwd_disp(sg, _gpu_xh,_GPU_XVA(), _gpu_wh,_GPU_WVA(), _gpu_gh,_GPU_GVA(), nh*T*hd) != 0) { return 0 - 1; }
+    i = 0; while (i < tc) { store64(_gpu_gm + i*8, f64_from(0)); i = i + 1; }
+    t0 = 0;
+    while (t0 < T) {
+        var tke = TK; if (T - t0 < TK) { tke = T - t0; }
+        var se = _gpu_get_abwd_t(20, T, C, hd, t0, tke);
+        if (se == 0) { return 0 - 1; }
+        var re = _gpu_abwd_disp(se, _gpu_xh,_GPU_XVA(), _gpu_wh,_GPU_WVA(), _gpu_gh,_GPU_GVA(), nh*T*hd);
+        if (re != 0) { return 0 - 1; }
+        t0 = t0 + tke;
+    }
     i = 0; while (i < tc) { store64(dV + i*8, load64(_gpu_gm + i*8)); i = i + 1; }
-    # ---- F: dK = Σ_i sds·Q → gamma. (sds in y, Q→W) — reuses the gather kernel (A=sds,B=Q) ----
+    # ---- F: dK = Σ_i sds·Q → gamma (TILED over i, RMW; reuses the gather kernel A=sds,B=Q). (sds in y, Q→W) ----
     i = 0; while (i < tc) { store64(_gpu_wm + i*8, load64(Qc + i*8)); i = i + 1; }
-    if (_gpu_abwd_disp(sg, _gpu_yh,_GPU_YVA(), _gpu_wh,_GPU_WVA(), _gpu_gh,_GPU_GVA(), nh*T*hd) != 0) { return 0 - 1; }
+    i = 0; while (i < tc) { store64(_gpu_gm + i*8, f64_from(0)); i = i + 1; }
+    t0 = 0;
+    while (t0 < T) {
+        var tkf = TK; if (T - t0 < TK) { tkf = T - t0; }
+        var sf = _gpu_get_abwd_t(20, T, C, hd, t0, tkf);
+        if (sf == 0) { return 0 - 1; }
+        var rf = _gpu_abwd_disp(sf, _gpu_yh,_GPU_YVA(), _gpu_wh,_GPU_WVA(), _gpu_gh,_GPU_GVA(), nh*T*hd);
+        if (rf != 0) { return 0 - 1; }
+        t0 = t0 + tkf;
+    }
     i = 0; while (i < tc) { store64(dK + i*8, load64(_gpu_gm + i*8)); i = i + 1; }
     _gpu_attnbwd_count = _gpu_attnbwd_count + 1;
     return 0;

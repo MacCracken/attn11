@@ -5,7 +5,32 @@
 
 ## Version
 
-**1.8.11** — *M18 1.8.11: the M18 close-out — the honest full-step perf X-entry + the P(-1)
+**1.9.0** — *M19 1.9.0: preset-scale on-device — the full `--gpu-tc` training step now runs
+end-to-end at preset (T=64) too* (E-infra; ADR 0016, X040). The first M19 (1.9.x) cut: M18 ran the
+whole step on-device only at *default* scale; 1.9.0 closes the two *preset* (T=64, byte vocab) gaps,
+so a `--preset --gpu-tc` step dispatches **every heavy op** (fwd+bwd+Adam) on the native-AMD f64 path.
+**(1) `attn_core_bwd` TILED over T** (was untiled, gated `T ≤ 20`): the three T-reductions (B dotPdP,
+D dQ, E dV, F dK) split into `TK=16` RMW chunks over a pre-zeroed output across serialized dispatches
+(the proven matmul/ln-bwd tiling pattern) — order-preserving, so **0 bit-diff** vs the sequential
+replica at T∈{8,16,20,64} incl. the `T%16≠0` tail; pass A (dP) loops hd=8, stays untiled; tolerance →
+`--gpu-tc`. **(2) `gpu_head_bwd` on ANY vocab** (was `V%16==0`): D_f (contracts V) finishes with a
+tail tile (`_gpu_get_tile_n`) → byte vocab (V=25) + odd BPE vocabs run on-device **bit-exact**, so the
+plain `--gpu` checkpoint stays byte-identical (head_fwd already handled any V — it tiles C). **Two
+latent bugs caught by the adversarial review (both pre-existing, surfaced as the on-device envelope
+widened, both fixed + regression-tested):** `_gpu_get_abwd`'s cache key omitted `hd` (the dp kernel
+bakes hd → stale-kernel corruption when two shapes share (C,T) with different nh — reproduced on the
+dev GPU, fix adds hd to the key), and the untiled dp unroll overflowed its `spv[8192]` build buffer at
+`hd ≥ ~46` *before* the id-cap could reject it (`--gpu-tc --preset --heads 1`, hd=64 → crash; fix =
+`hd > 32` guard → clean fallback). **Gate:** lint 0 warn; **1056** grad-checks x86_64 **and**
+aarch64/qemu (CPU math untouched); 11-test gpu suite (attn-bwd bit-exact at T=64 + tail; head-bwd
+bit-exact any vocab; hd∈{32,64} clean fallback); agnos main+tcyr; fuzz; smoke. **No-flag run
+byte-identical** to 1.8.11 (default/preset/bpe vs the HEAD binary); plain `--gpu` byte-identical to
+CPU at default **and** preset; a `--preset --gpu-tc` step runs fwd+bwd+Adam on-device, no NaN. cyrius
+pin stays **6.2.29** (installed cycc 6.2.34, benign drift); pin `mabda = 3.4.1`. `src/*.cyr` unchanged
+except `src/gpu.cyr` + CFG_VERSION. **Next: 1.9.1** — MoE / ternary / RoPE GPU kernels (remaining-op
+coverage).
+
+(**1.8.11** — *M18 1.8.11: the M18 close-out — the honest full-step perf X-entry + the P(-1)
 hardening pass* (E-infra; ADR 0016, X039). No code change; the measurement + audit + docs that
 complete the M18 GPU arc. **Full-step perf (X039 / benchmarks B5):** the GPU full step is **4–7×
 slower** than the CPU (default `--bpe 7` T16, 40 steps: CPU 2.37s vs `--gpu` 10.55s /4.5× vs
@@ -25,7 +50,7 @@ native-AMD f64 GPU stack, validated against the CPU oracle. **Next: M19 — the 
 device-resident tensors + pipelined transfer → 1.9.3 fused multi-op kernels (the speedup project);
 portable f32/WGSL (non-AMD) is a deferred sub-track. cyrius
 pin stays **6.2.29** (installed cycc 6.2.31, benign drift); pin `mabda = 3.4.1`. `src/*.cyr` unchanged
-except CFG_VERSION + the additive `--gpu-tc` usage comment.
+except CFG_VERSION + the additive `--gpu-tc` usage comment.)
 
 (**1.8.10** — *M18 1.8.10: attention backward on the GPU — the last op; THE FULL TRAINING STEP NOW
 RUNS END-TO-END ON THE GPU* (E-infra; ADR 0016, X038 — the M18 sovereign milestone). Adds

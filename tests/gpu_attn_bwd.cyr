@@ -122,6 +122,19 @@ fn run_shape(T, C, nh, atol, rtol): i64 {
     print_cstr("  FAIL\n"); return 0;
 }
 
+# 1.9.0 Finding 2: the untiled dp kernel (pass A) unrolls hd into the build buffer; hd>32 must
+# self-fall-back (return -1), never overflow/crash. Asserts a clean CPU fallback for a wide head.
+fn expect_fb(T, C, nh): i64 {
+    var Qc = alloc(T*C*8); var Kc = alloc(T*C*8); var Vc = alloc(T*C*8);
+    var Pc = alloc(nh*T*T*8); var dc = alloc(T*C*8);
+    var dQ = alloc(T*C*8); var dK = alloc(T*C*8); var dV = alloc(T*C*8); var dpr = alloc(T*8);
+    var rc = gpu_attn_core_bwd(Qc, Kc, Vc, Pc, dc, dQ, dK, dV, dpr, T, C, nh, nh);
+    print_cstr("  T="); print_i64(T); print_cstr(" C="); print_i64(C); print_cstr(" nh="); print_i64(nh);
+    print_cstr(" hd="); print_i64(C/nh); print_cstr(": ");
+    if (rc != 0) { print_cstr("CPU fallback (correct — no build-buffer overflow)\n"); return 1; }
+    print_cstr("UNEXPECTED on-device (hd>32 should fall back)\n"); return 0;
+}
+
 fn main(): i64 {
     alloc_init();
     print_cstr("attn11 GPU attention-backward validation (M18 1.8.10) — gpu_attn_core_bwd vs attn_core_bwd, TOLERANCE\n");
@@ -135,7 +148,13 @@ fn main(): i64 {
     var ok = 1;
     if (run_shape(16, 32, 4, atol, rtol) == 0) { ok = 0; }    # default
     if (run_shape(8, 32, 4, atol, rtol) == 0) { ok = 0; }     # small T
-    if (run_shape(16, 64, 4, atol, rtol) == 0) { ok = 0; }    # wider head (hd=16)
+    if (run_shape(16, 64, 8, atol, rtol) == 0) { ok = 0; }    # 1.9.0 Finding 1: same (T,C) as next, hd=8 ...
+    if (run_shape(16, 64, 4, atol, rtol) == 0) { ok = 0; }    # ... diff nh (hd=16) — pins the dp hd-in-key fix
+    if (run_shape(64, 64, 8, atol, rtol) == 0) { ok = 0; }    # 1.9.0: preset (T=64 → tiled over T)
+    if (run_shape(64, 32, 4, atol, rtol) == 0) { ok = 0; }    # 1.9.0: T=64, hd=8, 4 j-tiles
+    if (run_shape(20, 32, 4, atol, rtol) == 0) { ok = 0; }    # 1.9.0: T%16≠0 (tiles 16 + tail 4)
+    if (expect_fb(16, 64, 2) == 0) { ok = 0; }                # 1.9.0: hd=32 → dp exceeds 256-id cap → clean fallback
+    if (expect_fb(16, 64, 1) == 0) { ok = 0; }                # 1.9.0 Finding 2: hd=64 > 32 guard → clean fallback (no overflow)
     print_cstr("GPU attn-bwd cores dispatched on-device: "); print_i64(gpu_attnbwd_count()); print_cstr("\n");
     if (ok == 0) { print_cstr("\nFAIL: GPU attn_core_bwd exceeds tolerance vs the CPU oracle\n"); return 1; }
     print_cstr("\nOK — gpu_attn_core_bwd allclose(1e-9) to attn_core_bwd across causal-MHA shapes\n");

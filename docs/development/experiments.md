@@ -1666,3 +1666,47 @@ production path. A real win needs batched, device-resident tensors kept across t
 multi-op kernels + matrix-core f64 — a later mabda capability + a fusion project, NOT this per-op
 M18 pattern. Reproduce: `for m in "" --gpu --gpu-tc; do time ./build/attn11 --bpe 7 $m --steps 40; done`.
 Detail: `docs/benchmarks.md` B5; security audit `docs/audit/2026-06-20-gpu-backward-audit.md`.
+
+## X040 — M19 1.9.0: preset-scale on-device — the full GPU step at T=64 + the V-tail head (M19, v1.9.0, 2026-06-21)
+
+**Result — the milestone's scale gap is closed.** M18 ran the full training step on-device only at
+*default* scale; 1.9.0 tiles the two ops that fell back at *preset* (T=64), so a `--preset --gpu-tc`
+step now dispatches **every heavy op** (forward + backward + Adam) on the native-AMD f64 path — proven
+on the dev Cezanne: a 2-step `--preset --gpu-tc` run dispatches matmuls + ln + Adam + **head-bwd**
+(now bit-exact at byte vocab) + ln-bwd and GELU + heads + attention + linear-bwd + **attn-bwd** (now
+tiled at T=64), all on-device, no NaN, no fallback. Two infra changes, no new training science.
+
+**(1) `attn_core_bwd` tiled over T (was untiled → `T ≤ 20`).** The three T-reductions (B `dotPdP`, D
+`dQ`, E `dV`, F `dK`) split into `TK=16` chunks that **RMW a pre-zeroed output across serialized
+dispatches** — the proven matmul / ln-bwd / linear-bwd tiling pattern. The accumulation stays
+left-to-right (`0 + a₀ + a₁ + …`, and `0+a₀ = a₀` exactly), so the tiled kernels are **bit-identical**
+(0 bit-diff, not just within tolerance) to the sequential CPU replica at T ∈ {8,16,20,64} incl. the
+`T%16≠0` tail (16 + 4). New kernels `_gpu_build_abwd_{dot,dq,gather}_t` (take `t0,tk`; RMW seed =
+load-output-before-loop) + dispatcher `_gpu_get_abwd_t` (keyed on kind/C/hd/T/t0/tk). Pass A (`dP`)
+loops `hd` (=8 at preset) and stays untiled. Tolerance → `--gpu-tc`.
+
+**(2) `gpu_head_bwd` runs on any vocab (was `V%16==0`).** D_f (`= D_logits·emb`, contracts V) finishes
+with a short tail tile (`_gpu_get_tile_n`, explicit unroll length `tk = V%16`), so byte vocab (V=25)
+and odd BPE vocabs run on-device **bit-exact** — the sequential order is preserved, so the plain
+`--gpu` checkpoint stays byte-identical (verified default **and** preset: head-bwd now dispatches
+on-device for byte vocab where it used to fall back). head_fwd already handled any V (tiles C, not V),
+so the roadmap's "fwd/bwd need V%16" was imprecise — only the backward's V-contraction was the gap.
+
+**Two latent bugs caught by the adversarial review (3-dim read-only + on-hardware verify; both
+PRE-EXISTING, surfaced as 1.9.0 widened the on-device envelope).** (a) **`_gpu_get_abwd` cache key
+omitted `hd`** — the `dp` kernel bakes `hd` (dot length + per-head base) into its SPIR-V but was keyed
+`(kind,C,T)`; two shapes sharing `(C,T)` with different `nh` reuse a stale kernel → corrupt dQ/dK
+(reproduced on the dev GPU: `(17,64,8)` then `(17,64,4)` → dotPdP err ~62, dQ/dK ~40; fix = add hd to
+key → 0 bit-diff). (b) **`dp` stack overflow at `hd ≥ ~46`** — pass A unrolls full `hd` into a fixed
+`spv[8192]` *before* the id-cap rejects it, so `--gpu-tc --preset --heads 1` (hd=64) smashed the stack;
+fix = `hd > 32` guard → clean CPU fallback. **Lesson: a cache key MUST include every shape value the
+kernel bakes into its SPIR-V; an UNTILED unroll needs an explicit upper-bound guard, because the
+256-id cap only rejects AFTER the (overflowing) build.** Both got regression tests (`run_shape`
+collision pair + `expect_fb` at hd∈{32,64}).
+
+**Gate.** lint 0 warn; 1056 grad-checks x86_64 + aarch64/qemu (CPU math untouched); 11-test GPU suite;
+AGNOS main+tcyr; fuzz + smoke; no-flag byte-identical to 1.8.11 (default/preset/bpe vs the HEAD
+binary); plain `--gpu` byte-identical to CPU (default + preset). Reproduce: `make gpu-test`;
+`./build/attn11 --preset --gpu-tc --steps 2` (full step on-device); `./build/attn11 --gpu-tc --preset
+--heads 1 --steps 1` (hd=64 → clean fallback, no crash). Detail: ADR 0016. **Next (1.9.1):**
+MoE / ternary / RoPE GPU kernels (the remaining non-default model axes).

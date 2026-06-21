@@ -13,15 +13,20 @@
 
 ## Where we are
 
-Current: **v1.8.11** — **M18 COMPLETE: the full training step runs end-to-end on the GPU (the
+Current: **v1.9.0** — **M19 STARTED: the full `--gpu-tc` step now runs end-to-end at PRESET (T=64)
+too (X040)** — `attn_core_bwd` tiled over T (the old `T ≤ 20` gate gone) + the LM-head backward's
+V-contraction tail-tiled so any vocab engages bit-exact; the adversarial review caught + fixed two
+pre-existing latent GPU bugs (a cache key missing `hd`, an untiled-`dp` build-buffer overflow at
+large `hd`). **M18 was COMPLETE: the full training step runs end-to-end on the GPU (the
 sovereign milestone, X038); the honest full-step perf + P(-1) audit closed it out (1.8.11, X039).** `--gpu` runs **matmul** (1.8.0) **+ layernorm** (1.8.1) **+ Adam** (1.8.5) **+ the
 LM-head backward** (1.8.8) **+ the layernorm backward** (1.8.9) all bit-exact (a `--gpu` checkpoint is
 byte-identical to the CPU's — incl. optimizer state + the bit-exact gradients); **`--gpu-tc`** adds
 **GELU** (1.8.2) + the **LM head** (1.8.3) + the **fused attention forward** (1.8.4) + the **GELU /
 linear / attention backward** (1.8.6 / 1.8.7 / 1.8.10) at a *tolerance* (transcendental /
 SIMD-tree-order — a separate gate keeps plain `--gpu` byte-identical). So a `--bpe 7 --gpu-tc` step
-runs **every heavy op (forward + backward + Adam) on-device** (attn-bwd untiled → default T=16
-engages; preset T=64 → CPU, tiling is a follow-up). The **honest perf X-entry is done (X032):** the GPU forward is
+runs **every heavy op (forward + backward + Adam) on-device** at default — and, since **1.9.0 tiled
+attn-bwd over T + tail-tiled the head's vocab**, at **preset (T=64) too** (the M18 `T ≤ 20` /
+`V%16` gaps are closed). The **honest perf X-entry is done (X032):** the GPU forward is
 **2–4× slower** than the CPU at attn11's scale (per-op host↔device transfer + scalar-VALU f64
 dominate; gap narrows with scale) — a validated sovereign-stack / oracle milestone, **not** a
 speedup; the CPU stays the production path. Remaining: the backward ops (1.8.6+) → the *full training
@@ -506,13 +511,21 @@ for the native-AMD f64 route.
 > each a logged X-entry. The CPU stays the oracle + production path and every op keeps its
 > per-shape self-fall-back, so nothing here can regress the default/CPU paths.
 
-- **1.9.0 — preset-scale on-device: tile `attn_core_bwd` + GPU the head for any vocab.** Today the
-  full step runs on-device only at **default** (attn-bwd is untiled → gated `T ≤ 20`; head fwd/bwd
-  need `V % 16 == 0`, so byte / `--bpe 256` vocabs fall back). Tile the attention backward over its
-  reduced dim (the proven matmul/ln tiled-reduction + RMW pattern) so it fits the 256-id cap at any
-  T, and handle the head's V-tail (a tail tile or vocab pad) so any vocab engages. **Result: the
-  full `--gpu-tc` step runs end-to-end at preset (T=64) too** — closing the milestone's scale gap.
-  Tolerance; rides `--gpu-tc`. Highest value / lowest risk (the tiling pattern is proven).
+- **1.9.0 — preset-scale on-device: tile `attn_core_bwd` + GPU the head for any vocab — ✅ SHIPPED
+  (X040).** M18 ran the full step on-device only at **default**; 1.9.0 closed the two preset (T=64,
+  byte vocab) gaps. **(1)** `attn_core_bwd`'s three T-reductions (B dotPdP, D dQ, E dV, F dK) are now
+  **tiled over T in `TK=16` RMW chunks** over a pre-zeroed output (the proven matmul/ln-bwd pattern),
+  order-preserving → **0 bit-diff** vs the sequential replica at T∈{8,16,20,64} incl. the `T%16≠0`
+  tail; the old `T ≤ 20` gate is gone (pass A `dP` loops hd=8, stays untiled). **(2)** `gpu_head_bwd`'s
+  D_f phase (contracts V) finishes with a **tail tile** (`_gpu_get_tile_n`) → byte vocab (V=25) + odd
+  BPE vocabs run on-device **bit-exact** (head_fwd already handled any V — it tiles C, not V, so the
+  "fwd/bwd need V%16" framing was imprecise; only the backward was the gap). **Result: a `--preset
+  --gpu-tc` step runs the full step (fwd+bwd+Adam) end-to-end on-device** — scale gap closed.
+  Tolerance (attn-bwd) / bit-exact (head-bwd, plain `--gpu` byte-identity preserved). **The adversarial
+  review caught two pre-existing latent bugs** (now fixed + regression-tested): the `_gpu_get_abwd`
+  cache key omitted `hd` (stale-kernel corruption when two shapes share (C,T) with different nh), and
+  the untiled `dp` unroll overflowed its `spv[8192]` build buffer at `hd ≥ ~46` (`--heads 1` crash →
+  `hd > 32` guard forces clean fallback).
 - **1.9.1 — remaining-op GPU coverage: MoE / ternary / RoPE kernels.** The non-default model axes —
   `--experts` routing + expert MLPs, the `--ternary` i64-add matmul, RoPE Q/K rotation — still fall
   back to the CPU. Add their GPU kernels so those configs also run on-device. Additive breadth, not

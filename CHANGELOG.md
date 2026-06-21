@@ -4,6 +4,50 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.9.0] - 2026-06-21
+
+**M19 1.9.0: preset-scale on-device — the full `--gpu-tc` training step now runs end-to-end at
+preset (T=64) too (E-infra; ADR 0016, X040).** M18 ran the whole step on-device only at *default*
+scale; two coverage gaps kept *preset* (T=64, byte vocab) partly on the CPU. 1.9.0 closes both, so a
+`--preset --gpu-tc` step dispatches **every heavy op** (forward + backward + Adam) on the native-AMD
+f64 path — the milestone's scale gap is closed. Additive, GPU-only; CPU stays the oracle.
+
+**Changed — `attn_core_bwd` is now TILED over T (was untiled, gated `T ≤ 20`).** The three
+T-reductions — B `dotPdP`, D `dQ`, E `dV`, F `dK` — are split into `TK=16` chunks that
+read-modify-write a pre-zeroed output across serialized dispatches (the proven matmul / ln-bwd /
+linear-bwd tiling + RMW pattern), so any T fits the gfx9 256-id cap. The accumulation order is
+preserved exactly (`0 + a₀ + a₁ + …`), so the tiled kernels stay **bit-identical** to the sequential
+replica (0 bit-diff at T ∈ {8,16,20,64}, incl. the `T%16≠0` tail). Pass A (`dP`) loops `hd` (=8 at
+preset) and stays untiled. Tolerance (rides `--gpu-tc`).
+
+**Changed — `gpu_head_bwd` runs on ANY vocab (was gated `V%16==0`).** The D_f phase (`D_f =
+D_logits·emb`, contracts the vocab V) now finishes with a short tail tile (`_gpu_get_tile_n`, explicit
+unroll length), so byte vocabs (V=25) and odd BPE vocabs engage on-device **bit-exact** (sequential
+order preserved → keeps the plain `--gpu` checkpoint byte-identical). head_fwd already handled any V
+(it tiles C, not V). Only `T%16≠0` (gemb tiles T) still self-falls-back.
+
+**Fixed — two latent GPU bugs surfaced by the adversarial review (both pre-existing, now live as the
+on-device envelope widened):**
+- **`_gpu_get_abwd` cache key omitted `hd`** — the untiled `dp` kernel bakes `hd` into its SPIR-V but
+  was keyed only by `(kind,C,T)`; two attention shapes sharing `(C,T)` with different `nh` (→ hd)
+  would reuse a stale kernel and corrupt dQ/dK. Added `hd` to the key (reproduced on the dev GPU +
+  fix verified bit-exact; new collision-pair regression `run_shape(16,64,8)` then `(16,64,4)`).
+- **`dp` kernel stack overflow for `hd ≥ ~46`** — pass A unrolls the full `hd` into a fixed
+  `spv[8192]` build buffer *before* the id-cap can force fallback, so `--gpu-tc --preset --heads 1`
+  (hd=64) smashed the stack. Added an `hd > 32` guard → clean CPU fallback (new `expect_fb`
+  regression at hd ∈ {32 (id-cap), 64 (guard)}); restores the "never crash for any shape" contract.
+
+**Gate.** lint 0 warnings; **1056** grad-checks green x86_64 **and** aarch64/qemu (CPU math
+untouched); the 11-test GPU suite passes (attn-bwd bit-exact at T=64 + the T-tail; head-bwd bit-exact
+at any vocab; both new fallbacks clean); AGNOS main + tcyr build; fuzz + `make smoke` green. The
+**no-flag run is byte-identical** to 1.8.11 (default / preset / `--bpe 7`, diffed vs the HEAD binary),
+and a plain `--gpu` run stays byte-identical to the CPU run at default **and** preset (head-bwd now
+on-device bit-exact for byte vocab). End-to-end: a `--preset --gpu-tc` step dispatches matmuls + ln +
+Adam + head-bwd + ln-bwd (bit-exact) and GELU + head + attention + linear-bwd + **attn-bwd**
+(tolerance) — all on-device, no NaN. cyrius pin stays **6.2.29** (installed cycc 6.2.34, benign
+drift); pin `mabda = 3.4.1`. `src/*.cyr` unchanged except `src/gpu.cyr` + CFG_VERSION. **Next
+(1.9.1):** MoE / ternary / RoPE GPU kernels (remaining-op coverage).
+
 ## [1.8.11] - 2026-06-20
 
 **M18 1.8.11: the M18 close-out — the honest full-step perf X-entry + the P(-1) hardening pass
