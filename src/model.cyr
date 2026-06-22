@@ -271,6 +271,16 @@ fn _o_mtp(j): i64 {
 }
 fn P_mtp(j): i64 { return g_params + _o_mtp(j) * 8; }
 fn G_mtp(j): i64 { return g_grads + _o_mtp(j) * 8; }
+# MTP forward scratch (allocated only when g_mtp > 1). Per aux head a (0..g_mtp-2):
+# h_a = A_f @ W_mtp_a (g_mtp_h), logits→probs (g_mtp_probs cached for bwd), shifted
+# target row + in-corpus mask (g_mtp_tgt / g_mtp_mask, filled by sample_window).
+var g_mtp_h = 0;       # (g_mtp-1) × T*C
+var g_mtp_probs = 0;   # (g_mtp-1) × T*V   (cached for the backward)
+var g_mtp_logits = 0;  # T*V              (scratch, reused per aux head)
+var g_mtp_tgt = 0;     # (g_mtp-1) × T    (shifted targets t+2+a)
+var g_mtp_mask = 0;    # (g_mtp-1) × T    (1 where the target is in-corpus)
+var g_mtp_lambda = 0;  # f64: aux-loss weight (default 0.3)
+var g_mtp_aux_loss = 0;# f64: last forward's (λ/(N-1))·Σ aux CE (for the eval subtract)
 
 # ---- shared activation caches ----------------------------------------------
 var A_tokens = 0; var A_targets = 0;  # T (integer ids)
@@ -748,6 +758,14 @@ attn_kind, d_c, pos_kind, d_rope, num_experts, topk, hybrid_kinds, objective): i
     A_tokens = t_alloc(T); A_targets = t_alloc(T); A_mask = t_alloc(T);
     A_attn = t_alloc(TC); A_mlp = t_alloc(TC); A_f = t_alloc(TC);
     A_logits = t_alloc(TV); A_probs = t_alloc(TV);
+    # X043 MTP scratch — only under --mtp N>1 (allocator untouched for AR/N=1).
+    g_mtp_lambda = f64_div(f64_from(3), f64_from(10));   # 0.3 default aux weight
+    if (g_mtp > 1) {
+        var na = g_mtp - 1;
+        g_mtp_h = t_alloc(na * TC); g_mtp_probs = t_alloc(na * TV);
+        g_mtp_logits = t_alloc(TV);
+        g_mtp_tgt = t_alloc(na * T); g_mtp_mask = t_alloc(na * T);
+    }
     A_meanf = t_alloc(T); A_rstdf = t_alloc(T);
 
     # per-layer cache arrays
@@ -987,6 +1005,29 @@ fn head_fwd_n(n): i64 {
     return 0;
 }
 fn head_fwd(): i64 { return head_fwd_n(g_T); }
+
+# X043: the MTP auxiliary loss = (λ/(N-1)) · Σ_a CE(head_a, target t+2+a). Aux head
+# a projects the trunk output A_f through W_mtp_a (qlinear is a plain matmul off the
+# ternary path) then the shared tied unembed (head_fwd_row); the MASKED CE skips the
+# out-of-corpus tail. probs_a is cached (g_mtp_probs) for the backward. Stores the
+# scaled term in g_mtp_aux_loss so eval can subtract it (like the MoE aux). Caller
+# gates on g_mtp>1 && g_training.
+fn mtp_aux_loss(): i64 {
+    var T = g_T; var C = g_C; var V = g_V;
+    var aux = f64_from(0);
+    var a = 0;
+    while (a < g_mtp - 1) {
+        var ha = g_mtp_h + a * T * C * 8;
+        qlinear_fwd(A_f, P_mtp(a), 0, ha, T, C, C);     # h_a = A_f @ W_mtp_a (no bias)
+        var t = 0;
+        while (t < T) { head_fwd_row(ha + t * C * 8, g_mtp_logits + t * V * 8); t = t + 1; }
+        aux = f64_add(aux, softmax_xent_masked_fwd(g_mtp_logits, g_mtp_tgt + a * T * 8,
+        g_mtp_probs + a * T * V * 8, g_mtp_mask + a * T * 8, T, V));
+        a = a + 1;
+    }
+    g_mtp_aux_loss = f64_mul(f64_div(g_mtp_lambda, f64_from(g_mtp - 1)), aux);
+    return g_mtp_aux_loss;
+}
 
 # dlogits(T,V) -> df(T,C); accumulate dtokemb (head part)
 fn head_bwd(): i64 {
@@ -1279,7 +1320,13 @@ fn model_forward(): i64 {
     }
     # AR training objective = cross-entropy + Σ_blocks load-balance aux loss
     # (g_aux_loss is exactly 0 in the dense path, so a no-flag run is unchanged).
-    return f64_add(softmax_xent_fwd(A_logits, A_targets, A_probs, T, V), g_aux_loss);
+    g_mtp_aux_loss = f64_from(0);
+    var main_loss = softmax_xent_fwd(A_logits, A_targets, A_probs, T, V);
+    # X043: add the MTP aux loss only while TRAINING (g_training) — eval reports the
+    # pure main-head CE (t+1), the deployable model's metric. The aux heads sharpen
+    # the trunk via their gradient; they're not part of the eval objective.
+    if ((g_mtp > 1) && (g_training == 1)) { main_loss = f64_add(main_loss, mtp_aux_loss()); }
+    return f64_add(main_loss, g_aux_loss);
 }
 
 # ---- cached single-row forward (inference, E1) ------------------------------

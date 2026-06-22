@@ -572,6 +572,7 @@ fn main(): i64 {
     # serialized), so it can't combine with --load; bound it like the other dims.
     if ((cfg_mtp < 1) || (cfg_mtp > 8)) { puts("attn11: --mtp must be in [1, 8]\n"); return 1; }
     if ((cfg_mtp > 1) && (load_path != 0)) { puts("attn11: --mtp applies to fresh training only (not with --load)\n"); return 1; }
+    if ((cfg_mtp > 1) && ((cfg_objective != 0) || (cfg_rl != 0))) { puts("attn11: --mtp requires the AR objective (not --objective diffusion/rl)\n"); return 1; }
     g_mtp = cfg_mtp;
     if (load_path != 0) {
         # ckpt_load_file hard-rejects (code -15) if a loaded corpus's vocab
