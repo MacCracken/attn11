@@ -255,6 +255,22 @@ fn G_lnfb(): i64 { return G_lnfg() + g_C * 8; }
 fn _o_maskemb(): i64 { return _emb_end() + g_NL * _blk() + 2 * g_C; }
 fn P_maskemb(): i64 { return g_params + _o_maskemb() * 8; }
 fn G_maskemb(): i64 { return g_grads + _o_maskemb() * 8; }
+# ---- MTP auxiliary heads (X043) --------------------------------------------
+# --mtp N adds (N-1) per-head C×C transforms, appended AFTER the maskemb slot so
+# the AR (and diffusion) layout / draw order / checkpoints stay byte-identical;
+# present ONLY when g_mtp > 1. Aux head j (0..g_mtp-2) predicts token t+2+j via
+# logits_j = (A_f @ W_mtp_j) @ tok_emb^T (the shared, weight-tied unembed). The
+# heads ride g_params (Adam / grad-clip / zero-grads iterate g_NP, so they are
+# handled for free). TRAIN-TIME ONLY — not serialized; the deployable model is the
+# bare main head, structurally unchanged.
+var g_mtp = 1;        # number of predicted offsets (1 = AR baseline; N>1 = MTP)
+fn _o_mtp(j): i64 {
+    var base = _o_maskemb();
+    if (g_objective == 1) { base = base + g_C; }   # MTP rides after the maskemb slot
+    return base + j * g_C * g_C;
+}
+fn P_mtp(j): i64 { return g_params + _o_mtp(j) * 8; }
+fn G_mtp(j): i64 { return g_grads + _o_mtp(j) * 8; }
 
 # ---- shared activation caches ----------------------------------------------
 var A_tokens = 0; var A_targets = 0;  # T (integer ids)
@@ -615,6 +631,9 @@ attn_kind, d_c, pos_kind, d_rope, num_experts, topk, hybrid_kinds, objective): i
     # checkpoints are byte-identical. It rides g_params, so Adam / grad-clip /
     # zero-grads / serialize (all of which iterate g_NP) handle it for free.
     if (objective == 1) { g_NP = g_NP + C; }
+    # X043: (g_mtp-1) aux-head C×C transforms ride g_params after the maskemb slot,
+    # present only under --mtp N>1 (so an N=1 run's g_NP / layout is byte-identical).
+    if (g_mtp > 1) { g_NP = g_NP + (g_mtp - 1) * C * C; }
 
     # Pre-allocation cap, mirroring the checkpoint loader's -18 (model_config_ok
     # has already bounded the dims, so this product cannot overflow): a
@@ -712,6 +731,17 @@ attn_kind, d_c, pos_kind, d_rope, num_experts, topk, hybrid_kinds, objective): i
     # AFTER every other param draw, so an AR run (objective 0, skipped) keeps its
     # exact RNG draw order — byte-identical.
     if (objective == 1) { t_randn(P_maskemb(), C, std); }
+    # X043: init the MTP aux-head transforms from an INDEPENDENT derived stream,
+    # restoring _rng_state after — so --mtp 2's base weights, dropout, and sampling
+    # RNG are byte-identical to --mtp 1, and the ONLY difference in the A/B is the
+    # auxiliary loss (not a confounding seed shift from the extra init draws).
+    if (g_mtp > 1) {
+        var _rng_save = _rng_state;
+        rng_seed(seed ^ 5198739);
+        var mj = 0;
+        while (mj < g_mtp - 1) { t_randn(P_mtp(mj), C * C, std); mj = mj + 1; }
+        _rng_state = _rng_save;
+    }
 
     # shared caches
     var TC = T * C; var TV = T * V;
