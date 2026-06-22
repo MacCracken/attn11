@@ -45,3 +45,33 @@ Not decisions (those live in [`../adr/`](../adr/)) and not guides (those live in
   BPE tables) stays i64 — the asymmetry is deliberate. This removed the 8×/4× bloat
   and raised `MAX_CORPUS_BYTES` 4 MB → 64 MB. **Affects**: `src/train.cyr` (`g_data`,
   `corpus_set`, `bpe_learn`, `tok_encode`, the window samplers). Shipped 1.5.3 (X018).
+- [007 — Streaming token shards](007-streaming-token-shards.md) — the RAM-independent
+  large-corpus path: `--stream-corpus` samples windows by **lseek+read at offset** through a
+  single 64 K-token chunk cache inside `gd_ld` (not `mmap` — the lib wrapper is x86_64-only and
+  agnos has no file-backed mmap). Because `gd_ld` is the only corpus-token reader, the model /
+  samplers are untouched and stream-vs-in-memory byte-identity is structural. **Affects**:
+  `src/stream.cyr`, `src/train.cyr` (`gd_ld`). Shipped 1.6.2.
+
+> **The GPU backend notes (008–011) describe rosnet's `[lib.gpu]` backend** (`dist/rosnet-gpu.cyr`),
+> **extracted whole from attn11 at 1.10.0** (ADR 0017). They were written M18/M19 when the backend was
+> attn11-local, so they say `src/gpu.cyr` for that historical path — the SPIR-V / tiling / precision
+> constraints they record are unchanged by the relocation. Future GPU-kernel work lands in rosnet.
+
+- [008 — GPU matmul in SPIR-V](008-gpu-matmul-spirv.md) — what the generated-SPIR-V matmul
+  kernel must obey: `gfx9_compile` takes **straight-line only** (no loops / phi) and caps at
+  **256 ids**, so the dot is unrolled + **host-tiled** (`GPU_TK=16` RMW over `k`); the reserved-VA
+  buffer layout; why the result is **bit-exact** vs CPU `linear_fwd`; the AGNOS dead-code gating.
+  **Affects**: rosnet's GPU backend, `src/ops.cyr` (`qlinear_fwd` seam). M18 1.8.0.
+- [009 — GPU layernorm and the transcendental wall](009-gpu-layernorm-and-the-transcendental-wall.md)
+  — why `ln_fwd` is GPU-**bit-exact** (sequential reductions + sqrt/div only) but softmax / GELU /
+  head are not (f64 `exp` has no bit-exact SPIR-V form; SIMD tree-reduction order differs) — the
+  finding that split plain `--gpu` (bit-exact) from `--gpu-tc` (tolerance). M18 1.8.1.
+- [010 — GPU transcendentals](010-gpu-transcendentals.md) — the hand-rolled in-shader f64 `exp`
+  (`_gpu_emit_exp`: Cody-Waite + Taylor-Horner + `ldexp`, ~2.3e-13 vs CPU), GELU over it, and the
+  `--gpu-tc` **tolerance gate** (`allclose atol=rtol=1e-10` + the statistical loss-tracks check)
+  that protects the byte-identical `--gpu` invariant. M18 1.8.2–1.8.3.
+- [011 — GPU attention](011-gpu-attention.md) — the fused causal-MHA core as **4 host-orchestrated
+  passes** (a single per-(head,query) kernel exceeds the 256-id cap): the causal mask via
+  float-compare + `OpSelect` (gfx9 lowers no integer compares), the finite **−1e8** −∞ sentinel,
+  and the synth-id budget that forces the tiling. **Affects**: rosnet's GPU backend, `src/attn.cyr`
+  (`attn_core_fwd` seam). M18 1.8.4.

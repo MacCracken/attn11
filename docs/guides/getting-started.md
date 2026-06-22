@@ -23,6 +23,8 @@ attn11 --save PATH           write a crash-atomic checkpoint after training
 attn11 --load PATH           resume from a checkpoint (+ --corpus to continue training)
 attn11 --gen-only            skip training, just sample
 attn11 --preset              ctx 64 / d_model 64 / 8 heads / 4 layers (default: ctx 16)
+attn11 --d-model N           override d_model / width (1..4096; divisible by heads)
+attn11 --ctx N               override context length T (1..8192)
 attn11 --heads N             override attention heads (must divide d_model)
 attn11 --kv-heads N          override K/V heads (< heads = GQA, 1 = MQA)
 attn11 --layers N            override transformer blocks
@@ -36,11 +38,20 @@ attn11 --expert-topk K       active experts per token (default 2; 1..N)
 attn11 --bpe K               learn K BPE merges first (1..512; default is byte-level)
 attn11 --eval                print CE/token + bits-per-byte after training/save
 attn11 --eval-corpus P       held-out eval on a disjoint corpus via the loaded tokenizer
-attn11 --objective O         training objective: ar (default) or diffusion (masked, bidirectional)
+attn11 --encode-shard PATH   pre-encode the corpus to a token-shard file, then exit
+attn11 --stream-corpus PATH  train/eval from a token-shard without loading it into RAM (GB-scale)
+attn11 --stream-encode       with --corpus + --encode-shard: stream-encode a large file in bounded RAM
+attn11 --objective O         training objective: ar (default), diffusion (masked, bidirectional), or rl (REINFORCE)
+attn11 --rl-target C         REINFORCE reward = count of char C per rollout (default space; needs --objective rl)
 attn11 --ternary             BitNet-style ternary weights {-1,0,+1} (mha + dense + ar; STE backward)
 attn11 --decode-steps N      diffusion decode iterations (default = ctx)
 attn11 --decode-schedule S   diffusion unmask schedule: cosine (default) or linear
+attn11 --gpu                 run matmul + layernorm + Adam on the GPU (Linux/AMD; bit-exact; auto CPU fallback)
+attn11 --gpu-tc              also GELU + LM-head + attention (+ their backward) on GPU (implies --gpu; tolerance)
 ```
+
+The GPU flags are an opt-in **execution target** (Linux / AMD GFX9), not a different model — a `--gpu`
+run is byte-identical to the default. See [`gpu.md`](gpu.md).
 
 Config flags (`--preset`/`--heads`/`--kv-heads`/`--layers`/`--attn-kind`/
 `--latent-dim`/`--attn-every`/`--pos-kind`/`--rope-dim`/`--experts`/`--expert-topk`/

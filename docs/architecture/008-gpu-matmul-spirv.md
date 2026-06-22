@@ -1,6 +1,10 @@
 # 008 — The GPU matmul: generated SPIR-V, host-tiled, on mabda's native-AMD f64 path
 
-*What's true about `src/gpu.cyr` (M18, v1.8.0). Non-obvious constraints a future
+> **Location (1.10.0):** this backend was extracted whole to **rosnet** (`dist/rosnet-gpu.cyr`, the
+> `[lib.gpu]` profile, ADR 0017); `src/gpu.cyr` below is its historical attn11-local path. The
+> constraints are unchanged by the relocation.
+
+*What's true about the GPU matmul kernel (M18, v1.8.0). Non-obvious constraints a future
 change must not violate.*
 
 ## The working compute path is the LOW-LEVEL native one, not portable wgpu

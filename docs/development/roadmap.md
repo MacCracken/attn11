@@ -587,6 +587,50 @@ for the native-AMD f64 route.
   charter), so it is a *someday*, demand-gated — not on the 1.9.x value path. The AMD-native f64
   path stays attn11's primary GPU target.
 
+## M20 — The integer / edge lane (the 1.10.x line) — E-infra / E10
+
+> The forward-perf pivot **1.9.2 (B6) earned**: on a scalar-f64 mobile APU the GPU is an *oracle*, not
+> a speedup, and transfer/fusion tuning can't change that — the f64 *compute floor* is the wall. A real
+> win needs a different number system, not a different schedule. So the bet moves to where attn11's
+> substrate is an **advantage** rather than a tax: **everything-is-i64 + integer matmul on the int8 edge
+> hardware that actually ships and rewards it.** M16 ternary already proved integer-native *weights* in
+> the i64 thesis (E6); this lane closes the other half and chases the crossover where attn11 can *win*.
+>
+> **1.10.0 was the platform move that unblocks it cleanly** — the GPU backend extracted whole to
+> **rosnet** (ADR 0017), so the integer kernels land in rosnet's GPU backend next to the f64 oracle that
+> validates them, reusable by every consumer (and ready for mabda's Nvidia/int8 bring-up to land *once*,
+> there). 1.10.1+ is the exploration. **Exploratory, not a committed sequence** — value÷risk-ordered,
+> re-orderable, each rung a logged X-entry, each validated **against the f64 oracle** (the cornerstone
+> 1.9.2 kept) and gated like every other op (the no-flag run byte-identical; grad-checked where the
+> quant is differentiable; honest-negative discipline — measure it straight, a slower/worse result is a
+> result). The candidate integer paths to explore:
+
+- **Activation quantization → a genuine integer matmul.** The missing half of ternary X023: there, the
+  *weights* were {−1,0,+1} but the *activations* stayed f64, so the i64-add collapse was reference-only
+  and ~3× slower (the f64 path is 4-wide FMA; the collapse was scalar). Quantize the **activations** too
+  (int8 / int16, per-tensor or per-row scale) → an honest int8×int8→int32-accumulate matmul, the form
+  edge hardware accelerates. The deliverable is the **quant-error study vs the f64 oracle** (how much
+  bits/byte the activation quant costs at attn11's scales) + the grad-checked fake-quant STE — "it
+  learns + is grad-checked + measured," ternary-X022-style, not a claimed win at reference scale.
+- **The int8 matmul kernel — CPU first, then int8-tensor-core GPU.** A SIMD int8 dot on the i64
+  substrate (CPU), measured head-to-head vs the SIMD-f64 path — this time with *both* operands integer,
+  so the add/accumulate collapse can actually pay (unlike X023). Then the GPU int8 path once mabda adds
+  an int8/DP4A dispatch: **consumer int8 tensor cores** (the dev box's incoming RTX 3060 has them; f64
+  is throttled 1/32–1/64 on the same part, so int8 is exactly where consumer Nvidia *rewards* the work)
+  — the reward the f64 GPU lane structurally couldn't reach on Cezanne. Lands in **rosnet's** GPU
+  backend (the 1.10.0 extraction's payoff).
+- **The 1.58-bit / int8 memory-footprint win (the real, unmeasured one).** X023 flagged it: the ternary
+  *memory* win (weights at ~1.58 bits vs f64's 64) is real and was never measured. Quantify the
+  static-footprint + working-set reduction (int8/ternary weights, quantized activations) — the axis
+  where a tiny zero-deps static ELF + integer weights is a structural edge on a **memory-constrained
+  device**, independent of throughput.
+- **The edge-crossover benchmark (the B-series row where attn11 can win).** The honest-negative arc
+  (ternary X023, GPU B5/B6) measured where attn11 *loses* to 4-wide FMA and matrix-core hardware. This
+  is the inverse: the matched-config int8/memory comparison on **edge hardware** (low-power int8, tight
+  RAM, no runtime to ship), where the giants' f32/GPU advantage inverts — the "giants are weakest at the
+  edge" thesis the B1 numbers opened (attn11 ≈ PyTorch at tiny scale). A new **B7** row, same
+  fairness/param-match discipline as B0–B6, reported straight either way.
+
 ## Competitor benchmarking (B-series)
 
 > The existing `scripts/bench-history.sh` + `bench-history.csv` track is

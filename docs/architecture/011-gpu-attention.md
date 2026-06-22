@@ -1,5 +1,8 @@
 # 011 — GPU fused attention (the full forward on-device)
 
+> **Location (1.10.0):** this backend was extracted whole to **rosnet** (`dist/rosnet-gpu.cyr`, ADR
+> 0017); `src/gpu.cyr` below is its historical attn11-local path. The constraints are unchanged.
+
 **Status:** current (M18 1.8.4). Builds on
 [008 (matmul / the 256-id cap + host-tiling)](008-gpu-matmul-spirv.md),
 [009 (layernorm / tiled reductions)](009-gpu-layernorm-and-the-transcendental-wall.md),
@@ -84,7 +87,9 @@ bits/byte (expected — it is not a reproducible/checkpoint path, by constructio
 ## Pointers
 
 - Kernels + host orchestration: `gpu_attn_core`, `_gpu_attn_scores/_rowmax/_expsum/_pv`,
-  `_gpu_pre_a` in [`src/gpu.cyr`](../../src/gpu.cyr).
+  `_gpu_pre_a` in rosnet's
+  [`src/gpu.cyr`](https://github.com/MacCracken/rosnet/blob/main/src/gpu.cyr) → `dist/rosnet-gpu.cyr`
+  (extracted at 1.10.0, ADR 0017; vendored into attn11 as `lib/rosnet-gpu.cyr`).
 - Validation: [`tests/gpu_attn.cyr`](../../tests/gpu_attn.cyr) (`make gpu-test`).
 - On-hardware proof + the bug trail (causal mask, synth overflow, 3-D dead end): experiment
   **X031** in [`docs/development/experiments.md`](../development/experiments.md).

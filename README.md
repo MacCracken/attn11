@@ -29,6 +29,11 @@ an embedded corpus, then samples from it:
   (`--ternary`, BitNet-style fake-quant with a straight-through estimator)
 - **Training** — hand-written backprop + **Adam**; loss printed as it descends
 - **Generation** — autoregressive (or diffusion) sampling from the trained weights
+- **Execution** — CPU by default (the reference oracle); opt-in **GPU** (`--gpu`, Linux / AMD GFX9)
+  runs the f64 tensor ops on-device **bit-exact** via the **[rosnet](https://github.com/MacCracken/rosnet)**
+  GPU backend layered on [mabda](https://github.com/MacCracken/mabda)'s native-AMD f64 SPIR-V — an
+  execution *target*, not a different model (a `--gpu` checkpoint is byte-identical). See
+  [`docs/guides/gpu.md`](docs/guides/gpu.md).
 
 Correctness of the hand-derived gradients is gated by **finite-difference
 gradient checks** (see `tests/`), the standard tool for verifying backprop.

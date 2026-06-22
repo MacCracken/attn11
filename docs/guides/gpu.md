@@ -5,13 +5,20 @@ reference oracle, and the GPU result is **bit-exact** vs the CPU — so a `--gpu
 the same numbers (and the same checkpoint) as the default run. The GPU is an *execution
 target*, not a different model.
 
+> **Where the backend lives (1.10.0, ADR 0017):** the whole GPU backend was extracted to
+> **[rosnet](https://github.com/MacCracken/rosnet)** as a mabda-gated `[lib.gpu]` profile
+> (`dist/rosnet-gpu.cyr`) — attn11 consumes it via `[deps.rosnet]`; there is **no `src/gpu.cyr` in
+> attn11 anymore**. Future GPU-kernel work (int8, the Nvidia bring-up) lands in rosnet, once, for every
+> consumer. The `--gpu` surface and its byte-identity are unchanged — the move was a pure relocation.
+
 ## Requirements
 
 - An **AMD GFX9 GPU** reachable as a DRM render node (`/dev/dri/renderD128`, no root needed
   if the node is mode 0666). The dev reference is an **AMD Cezanne (gfx90c)** APU.
-- The toolchain resolves **mabda 3.4.1** (`cyrius deps`), mabda's native SPIR-V→GFX9 f64
-  emitter is what runs the kernel — launcher-free, pure-Cyrius, no ROCm / Vulkan loader /
-  vendor BLAS.
+- The toolchain resolves **rosnet 0.2.0** (the GPU backend bundle `dist/rosnet-gpu.cyr`) **+ mabda
+  3.4.1** (`cyrius deps`); mabda's native SPIR-V→GFX9 f64 emitter is what runs the kernel —
+  launcher-free, pure-Cyrius, no ROCm / Vulkan loader / vendor BLAS. (mabda's symbols ship unresolved in
+  the rosnet bundle; attn11's `[deps.mabda]` supplies them — both auto-prepend on Linux targets.)
 
 No GPU? `--gpu` prints that no device was found and runs entirely on the CPU. Everything
 still works; nothing crashes.
@@ -115,7 +122,11 @@ larger model and/or matrix-core f64 hardware (a future mabda capability).
 
 ## How it works (pointers)
 
-- Backend + kernel generator: [`src/gpu.cyr`](../../src/gpu.cyr).
+- Backend + kernel generator: rosnet's
+  [`src/gpu.cyr`](https://github.com/MacCracken/rosnet/blob/main/src/gpu.cyr) → `dist/rosnet-gpu.cyr`
+  (the `[lib.gpu]` profile, ADR 0017; vendored into attn11 as `lib/rosnet-gpu.cyr`). The architecture
+  notes below describe this backend; they say `src/gpu.cyr` for its historical attn11-local path
+  (M18/M19) — the constraints are unchanged by the relocation.
 - The non-obvious constraints (no SPIR-V loops/phi, the 256-id compile cap → host-tiling,
   the reserved-VA layout, why matmul is bit-exact):
   [`../architecture/008-gpu-matmul-spirv.md`](../architecture/008-gpu-matmul-spirv.md).
