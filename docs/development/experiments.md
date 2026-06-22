@@ -1790,7 +1790,7 @@ the throughput numbers **sharpen** attn11's thesis (zero-deps sovereignty + the 
 don't refute it. **Closes the perf-positioning question; opens the integer/edge lane as the forward perf
 bet.** Detail: benchmarks B1/B6; ADR 0016.
 
-## X043 — multi-token prediction at tiny scale: the aux loss competes for capacity (honest negative) (training-science, v1.10.1, 2026-06-22)
+## X043 — multi-token prediction at tiny scale: the aux loss competes for capacity (honest negative) (training-science, v1.10.2, 2026-06-22)
 
 **Result — MTP HURTS at 52 K params.** With the t+2..t+N auxiliary heads training the shared trunk
 (1.10.1's `--mtp N` mechanism — grad-checked; `--mtp 1` byte-identical to AR), the held-out t+1 CE gets

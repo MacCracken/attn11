@@ -5,7 +5,21 @@
 
 ## Version
 
-**1.10.1** — *Multi-token prediction (MTP) — the `--mtp N` objective (the X043 mechanism)*
+**1.10.2** — *X043: multi-token prediction doesn't help at tiny scale (honest negative) — experiment/docs
+cut* (no code change; binary byte-identical to 1.10.1 modulo `CFG_VERSION`). Ran the matched A/B (`--mtp
+1/2/3`, X021 protocol: `c4-24-trainA`, BPE 256, 4000 steps, held-out `c4-24-heldB`): MTP **HURTS** the
+held-out t+1 CE at 52 K params — `--mtp 2` +2.5 %, `--mtp 3` +1.9 % bits/byte vs the AR baseline 2.837. The
+aux loss is pure capacity competition ~5 orders of magnitude below Meta's MTP crossover (gains ≥~3B,
+regress below); N=3 is gentler than N=2 (same total λ spread over two heads). Mechanism unchanged (stays
+behind `--mtp`, default off, AR byte-identical). Written up as **experiments.md X043**; roadmap gained the
+**Training-science explorations (parked — for a future attn11 agent)** backlog (#1–#4 lanes, the MTP
+follow-ups, #3→#1 sequencing, f64-oracle framing). Gate inherited from 1.10.1 unchanged (**1060**
+grad-checks x86_64 + aarch64/qemu; `--mtp 1` byte-identical). **Next in the #3 objective lane:** curriculum
+/ a deeper RL pass, then **#1 (training dynamics)** at the f64 oracle, informing the #2 / #4 bets; the
+integer/edge (int8) and NVIDIA-GPU lanes stay parked. **Parked MTP follow-up:** the preset (~229 K)
+scale-bracket (~hours/run).
+
+(**1.10.1** — *Multi-token prediction (MTP) — the `--mtp N` objective (the X043 mechanism)*
 (training-science; a flagged objective add). N-1 auxiliary heads predict t+2..t+N off the shared
 trunk: each is a lightweight **C×C transform → shared tied unembed** (`logits_a = (A_f @ W_mtp_a) @
 tok_embᵀ`, V-independent, DeepSeek-flavoured), the aux loss `(λ/(N-1))·Σ CE(head_a, t+2+a)` (λ=0.3)
@@ -17,14 +31,7 @@ after the maskemb slot, gated on N>1). Forward `mtp_aux_loss` (shifted+masked ta
 aux grad → `dW_mtp_a` + tied-unembed `G_tokemb` + trunk `D_f` via `dA_f`). **Gate:** lint 0 warn; **1060**
 grad-checks x86_64 **and** aarch64/qemu (+4 MTP: the aux transform, the tied unembed's TRIPLE path, and a
 trunk weight reached ONLY via the aux dA_f, FD 1e-4); fmt clean; fuzz; smoke; agnos main builds (MTP
-dead-code-gated). cyrius pin **6.2.29** (cycc 6.2.36, benign drift); rosnet 0.2.0; mabda 3.4.1.
-**X043 done — honest negative: MTP HURTS at 52 K (held-out bits/byte +2.5 % / +1.9 % for N=2 / N=3 vs the
-AR baseline 2.837); the aux loss is pure capacity competition ~5 orders of magnitude below Meta's MTP
-crossover (experiments.md X043). MTP stays behind `--mtp` (default off, AR byte-identical) for the scale
-where it pays + the VAR-#4 shape; the preset (~229 K) scale-bracket is deferred (~hours/run).** Next in
-the **#3 objective lane**: curriculum / a deeper RL pass, then **#1 (training dynamics)** — at the f64
-oracle, informing the #2 architecture + #4 VAR bets. The integer/edge lane (int8 vs the f64 oracle) and
-mabda's Nvidia GPU bring-up stay **parked** (the precision push and the hardware respectively).
+dead-code-gated). cyrius pin **6.2.29** (cycc 6.2.36, benign drift); rosnet 0.2.0; mabda 3.4.1.)
 
 (**1.10.0** — *Extract the GPU backend to rosnet (whole-backend)* (E-infra; ADR 0017, rosnet ADR 0001).
 A structural **minor**: `src/gpu.cyr` (~2300 lines — GPU foundation + generic tensor ops + the

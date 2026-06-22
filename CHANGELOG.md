@@ -4,6 +4,31 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.10.2] - 2026-06-22
+
+**X043 — multi-token prediction does NOT help at tiny scale (honest negative).** An experiment + docs cut:
+**no model-math change** — the `--mtp` mechanism is unchanged from 1.10.1, the binary is byte-identical
+modulo `CFG_VERSION`. Ran the matched-compute A/B (`--mtp 1/2/3`, `c4-24-trainA`, BPE 256, 4000 steps,
+held-out `c4-24-heldB`, X021 protocol): MTP **hurts** the held-out t+1 CE at 52 K params — `--mtp 2`
++2.5 %, `--mtp 3` +1.9 % bits/byte vs the AR baseline (2.837). The aux loss competes for capacity ~5
+orders of magnitude below Meta's MTP crossover (gains ≥~3B, regress below). The mechanism stays behind
+`--mtp` (default off, AR byte-identical) for the scale where it pays + the shared-trunk/multi-prediction
+shape VAR (#4) reuses.
+
+### Added
+- **experiments.md → X043** — the matched A/B table, protocol, interpretation (capacity competition, the
+  N=3-gentler-than-N=2 read), and the reproduce line.
+- **roadmap.md → "Training-science explorations (parked — for a future attn11 agent)"** — the four lanes
+  (#1 dynamics / #2 architecture / #3 objective / #4 VAR), MTP marked done with X043's result + its parked
+  follow-ups (preset ~229 K scale-bracket, λ sweep, sequential MTP, self-speculative decode), the #3→#1
+  sequencing, and the f64-oracle framing (the integer/edge + NVIDIA-GPU lanes parked).
+- **state.md** "Next" updated — X043 answered.
+
+### Notes
+- **No code change** beyond the version stamp. Gate is therefore inherited from 1.10.1 unchanged: **1060**
+  grad-checks x86_64 + aarch64/qemu; `--mtp 1` byte-identical to no-flag; fmt/lint/fuzz/smoke green; agnos
+  builds. cyrius pin 6.2.29; rosnet 0.2.0; mabda 3.4.1.
+
 ## [1.10.1] - 2026-06-22
 
 **Multi-token prediction (MTP) — the `--mtp N` objective: N-1 auxiliary heads predict
