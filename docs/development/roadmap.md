@@ -631,6 +631,46 @@ for the native-AMD f64 route.
   edge" thesis the B1 numbers opened (attn11 ≈ PyTorch at tiny scale). A new **B7** row, same
   fairness/param-match discipline as B0–B6, reported straight either way.
 
+## Training-science explorations (parked — for a future attn11 agent)
+
+> Opened after the GPU backend extracted to rosnet (1.10.0): with the infra arc
+> closed, the live work is **model/training science at the f64 oracle**. Two
+> adjacent lanes are deliberately **parked** — the **integer/edge** lane (M20, int8:
+> the *precision* push, validated against the f64 oracle) and **mabda's NVIDIA GPU**
+> bring-up (blocked on hardware). f64 is the **graduated oracle** (the high-precision
+> reference everything cheaper is checked against), not a ceiling. A future agent
+> picks any thread below; all are **matched-A/B at the f64 oracle**, X021 protocol
+> (`c4-24-trainA`/`heldB`, held-out bits/byte = the honest metric). Sequencing intent
+> (user, 2026-06-22): **#3 → #1**, which then inform the **#2 / #4** bets with data.
+
+### #3 — Objective / curriculum
+- **Multi-token prediction — DONE (X043; mechanism shipped at 1.10.1).** `--mtp N`:
+  grad-checked, AR byte-identical at N=1. **Honest negative at 52 K** — the aux loss
+  competes for capacity (held-out +2.5 % / +1.9 % for N=2 / 3). Kept behind the flag
+  for the scale where it pays + the shared-trunk shape #4 reuses.
+  - **MTP follow-ups (parked):** the **preset (~229 K) scale-bracket** — does the harm
+    shrink toward Meta's crossover? (~hours/run); a **λ sweep** (0.1–0.5); **sequential
+    MTP** (DeepSeek-style per-head transformer module vs the current parallel C×C heads);
+    **self-speculative decoding** from the trained aux heads.
+- **Curriculum** — easy→hard ordering on the curated corpus (reuse the X016–X021 curation
+  infra); does ordered exposure beat the random window at tiny scale?
+- **Deeper RL** — X024 was one REINFORCE cut; better baselines / reward-shaping, a PPO-lite
+  step, multi-target rewards.
+
+### #1 — Training dynamics (cheap, high signal-per-token; do early)
+- **Optimizer** beyond Adam — Muon (winning at small scale), Lion, schedule-free.
+- **LR schedule / warmup**; **init** (the 0.02 / GPT-2 residual-scale choices); **grad-clip**
+  threshold. All pure-f64, no new infra.
+
+### #2 — Architecture variants (matched compute; #1/#3 results inform the picks)
+- GQA/MQA (flag-driven via `--kv-heads`), sliding-window attention, SwiGLU vs GELU MLP,
+  tied vs untied embeddings, depth-vs-width at fixed params.
+
+### #4 — VAR / next-scale image generation (the big lift)
+- Reuse the i64/f64 thesis on a new modality: predict the next *scale* (vs next token) —
+  the shared-trunk / multi-prediction shape the MTP heads dry-ran. Ecosystem statement:
+  "the sovereign stack does images." Needs a new corpus/eval harness; largest scope here.
+
 ## Competitor benchmarking (B-series)
 
 > The existing `scripts/bench-history.sh` + `bench-history.csv` track is
