@@ -69,8 +69,8 @@ fn ssm_fwd(a, Wdt, bdt, A, WB, WC, D, Wo, bo, out, Dlt, Bm, Cm, h, y, T, C, N): 
 # dWC/dD/dWo/dbo. Scratch (caller-owned): dy(T,C), dDlt(T,C), dBm(T,N), dCm(T,N),
 # dhc(C*N reverse-scan carry), sc(T,C). Caches Dlt/Bm/Cm/h/y from ssm_fwd.
 fn ssm_bwd(a, Wdt, A, WB, WC, D, Wo, dout, da,
-           dWdt, dbdt, dA, dWB, dWC, dD, dWo, dbo,
-           Dlt, Bm, Cm, h, y, dy, dDlt, dBm, dCm, dhc, sc, T, C, N): i64 {
+dWdt, dbdt, dA, dWB, dWC, dD, dWo, dbo,
+Dlt, Bm, Cm, h, y, dy, dDlt, dBm, dCm, dhc, sc, T, C, N): i64 {
     var TC = T * C; var TN = T * N; var CN = C * N;
     linear_bwd(y, Wo, dout, dy, dWo, dbo, T, C, C);        # out = y·Wo + bo -> dy
     var z = 0;

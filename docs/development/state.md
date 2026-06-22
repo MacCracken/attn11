@@ -5,7 +5,24 @@
 
 ## Version
 
-**1.9.2** — *M19 1.9.2: the GPU perf-lever close-out (honest negative) + the B1 competitor benchmarks*
+**1.10.0** — *Extract the GPU backend to rosnet (whole-backend)* (E-infra; ADR 0017, rosnet ADR 0001).
+A structural **minor**: `src/gpu.cyr` (~2300 lines — GPU foundation + generic tensor ops + the
+transformer ops attention/head/rope) moved **whole** into **rosnet 0.2.0** as a mabda-gated
+**`[lib.gpu]` profile** (`dist/rosnet-gpu.cyr`), auto-prepended from `[deps.rosnet]`; attn11 consumes
+it (`src/gpu.cyr` deleted; the `gpu_*` CALL sites + AGNOS gating unchanged). **Pure relocation —
+kernels byte-for-byte unchanged:** the no-flag run is byte-identical, a `--gpu` run still reproduces it
+byte-for-byte (matmul/ln/Adam/head-bwd/ln-bwd bit-exact; `--gpu-tc` ops at tolerance). Whole-backend
+over the cleaner generic/transformer split (ADR 0017: simplicity + lower risk; boundary refinable
+later). `cyrius.cyml` [deps.rosnet] → 0.2.0 + `modules += dist/rosnet-gpu.cyr` (CPU bundle unchanged;
+[deps.mabda] supplies the unresolved symbols). **Gate:** lint 0 warn; **1056** grad-checks x86_64 **and**
+aarch64/qemu; **12-test GPU suite** passes from the rosnet bundle; agnos main+tcyr; fuzz; smoke; bench
+harness builds. cyrius pin stays **6.2.29** (installed cycc 6.2.34, benign drift); rosnet **0.2.0**;
+mabda **3.4.1**. *(Dep on local `path = "../rosnet"` during the extraction; flip to `git`+`tag = "0.2.0"`
+once rosnet 0.2.0 is pushed — identical `lib/`.)* **Next:** the integer/edge lane (activation
+quantization → int8 matmul, validated against the f64 oracle); mabda's Nvidia bring-up lands in rosnet's
+GPU backend.
+
+(**1.9.2** — *M19 1.9.2: the GPU perf-lever close-out (honest negative) + the B1 competitor benchmarks*
 (E-infra; ADR 0016, X042). A measurement/decision cut (no model-math change; no-flag run byte-identical
 to 1.9.1). New **`--d-model`/`--ctx`** flags (parse-only, additive) enabled a width-scaling study that
 **refuted the transfer-residency premise**: the full-step gap is **flat ~3.7×** across the on-device
@@ -23,7 +40,7 @@ nanoGPT via a CPU torch venv (`bench/.venv`). **Gate:** lint 0 warn; **1056** gr
 aarch64/qemu; 12-test gpu suite; agnos main+tcyr; fuzz; smoke; no-flag byte-identical to 1.9.1. cyrius pin
 stays **6.2.29** (installed cycc 6.2.34, benign drift); pin `mabda = 3.4.1`. `src/*.cyr` unchanged except
 `src/main.cyr` (the two flags + CFG_VERSION). **Next:** the integer/edge lane (activation quantization →
-int8 matmul + a ternary memory-footprint / edge-crossover benchmark where attn11 can *win*).
+int8 matmul + a ternary memory-footprint / edge-crossover benchmark where attn11 can *win*).)
 
 (**1.9.1** — *M19 1.9.1: RoPE Q/K rotation on the GPU — bit-exact — + the remaining-op coverage map*
 (E-infra; ADR 0016, X041). The roadmap's "remaining-op GPU coverage (MoE / ternary / RoPE)" cut,

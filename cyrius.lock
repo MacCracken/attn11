@@ -1,5 +1,4 @@
 commit	ef54068c7ee4ee9478b7fa3046ed0a211b474e8b	tyche	https://github.com/MacCracken/tyche	0.1.1
-commit	e15cb35a2f12608840a6c2530c7e7a071d9d5158	rosnet	https://github.com/MacCracken/rosnet	0.1.1
 commit	a5a97ea9ad2157c17a396a32b3b7148b2815a7b4	mabda	https://github.com/MacCracken/mabda	3.4.1
 commit	35beb1b3d785ab3760bfda61c17d81c3827ba23e	samvada	https://github.com/MacCracken/samvada.git	0.4.1
 commit	c61651ffe183a72689cc1d2fd0c04e59b2db2366	chitra	https://github.com/MacCracken/chitra.git	0.1.0
@@ -18,7 +17,7 @@ e87e39f4d6a93c40d8843d55c521eed71a83678f526013d0e9bbc75e1252e2d5  lib/samvada.cy
 7b045871f231519e65f28a4b7abfbae6dd8e586ce03053fd367b3a119e8303c9  lib/atomic.cyr
 ff14f0d7999956754937f612c0aa60719c138f0967a81019cf99e08aae088087  lib/string.cyr
 0d1dc162866327cdea376c2177090cfdfc4779227c15d2da0d04fffc058e738d  lib/alloc.cyr
-77e036c83e52b0c8b7e5679f9325b3a068f8f2db2eda6a0784a5e1ec869c8b35  lib/rosnet.cyr
+9d4b7562f75c6fd44380976844421e7621a4baa67f0a8f68a4e578f230cb1af4  lib/rosnet.cyr
 e1a1fc06a604cf14c5bd2b5d21dec1e459897f3a8dceb03bcc66de6d178c01a2  lib/syscalls_x86_64_linux.cyr
 2b6d57f5abaa411292634812382373a60cebbd6bf3ab56f875505997d740d8c4  lib/syscalls_x86_64_agnos.cyr
 150bb9efad587ae139d8df81d62c7578c8ab20d3c6964004908929657b597c12  lib/fmt.cyr
@@ -33,6 +32,7 @@ f7b9d52f29de6d3d633962ccc765a76637091a7256eebc1da5547530eed2c44b  lib/args_win.c
 f6563cc78843147905c8a7e957da1d182d696a371ba392347d1e1522f42a993c  lib/syscalls_aarch64_linux.cyr
 8af62caaa9cdd96bca338a5587526a275a0e36dbfc33066febf81498321f9bb1  lib/bench.cyr
 c4d6feec81b720c3a8b31380058e8b6a88061355a1f23575bac007f608502803  lib/sankoch.cyr
+d6fe8b7ae9eb87c3ccdea637a3be192a801e6047df14bbda3c819d3ada933ac3  lib/rosnet-gpu.cyr
 19bcb006802c5d158ce1b9e0090a07da7e4d1092236f9850c61ebcbf294021c4  lib/vec.cyr
 027273e908cc6e27047f2d10c7e71d8fb43cb0c8d86ae164aab56dbfd7a17209  lib/io.cyr
 9fd6444e8cfcf7950837e955473adc5bab6d7bf4fa2c15f8ce2578360c4100eb  lib/hashmap.cyr

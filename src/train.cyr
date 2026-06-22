@@ -26,18 +26,18 @@ fn corpus_build(buf): i64 {
 
 # ---- tokenizer (byte-level) ------------------------------------------------
 var g_vocab = 0;     # id -> BASE byte value (<= 256 entries; BPE ids >= base
-                     # resolve through g_tok_bytes/g_tok_len instead)
+# resolve through g_tok_bytes/g_tok_len instead)
 var g_char2id = 0;   # byte value -> BASE id (256 entries, -1 if absent)
 var g_data = 0;      # encoded corpus (ids), length g_datalen
 var g_datalen = 0;
 var g_data_w = 1;    # bytes per token in the PACKED g_data store (1.5.3): 1 = u8
-                     # (byte-level, vocab <= 256), 2 = u16 (BPE, vocab <= 768). The
-                     # corpus is the one buffer that scales with input size, so only
-                     # it is packed; A_tokens/A_targets/G_win/g_enc_buf stay i64. Set
-                     # by the caller BEFORE corpus_set (main: 1 byte-level / 2 BPE or
-                     # --load); corpus_set reads it, bpe_learn requires 2.
+# (byte-level, vocab <= 256), 2 = u16 (BPE, vocab <= 768). The
+# corpus is the one buffer that scales with input size, so only
+# it is packed; A_tokens/A_targets/G_win/g_enc_buf stay i64. Set
+# by the caller BEFORE corpus_set (main: 1 byte-level / 2 BPE or
+# --load); corpus_set reads it, bpe_learn requires 2.
 var g_corpus_vlen = 0;  # BYTE vocab size of the loaded corpus (the BPE base;
-                        # NOT g_V, which is the model's)
+# NOT g_V, which is the model's)
 
 # BPE state (see the BPE section below; all zero in byte-level mode)
 var g_bpe_on = 0;       # 0 = byte-level (default, ADR 0002), 1 = BPE active
@@ -70,8 +70,8 @@ var g_stream_clen = 0;     # tokens currently cached (0 = empty)
 fn STREAM_CHUNK(): i64 { return 65536; }   # tokens per chunk read (> the 8192 ctx cap)
 
 fn MAX_CORPUS_BYTES(): i64 { return 67108864; }  # 64 MB cap on loaded corpora
-                                                 # (1.5.3: u16 g_data = 128 MB < the
-                                                 # 256 MB single-alloc cap, margin)
+# (1.5.3: u16 g_data = 128 MB < the
+# 256 MB single-alloc cap, margin)
 
 # ---- packed token-store accessors (1.5.3) ----------------------------------
 # Width-generic token load/store into a byte buffer: w = 1 (u8), 2 (u16), or 8

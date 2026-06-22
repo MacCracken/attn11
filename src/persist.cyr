@@ -107,7 +107,7 @@ fn ckpt_expected_np_arch(V, C, T, nh, NL, bias, nkv, attn_kind, d_c, pos_kind, d
 # the -10 NP gate pin them). topk does not affect the parameter count.
 fn ckpt_expected_np_moe(V, C, T, nh, NL, bias, nkv, attn_kind, d_c, pos_kind, d_rope, num_experts, topk): i64 {
     return ckpt_expected_np_kvw(V, C, T, nh, NL, bias, nkv,
-                                _kvw(C, nh, nkv, attn_kind, d_c, pos_kind, d_rope), num_experts);
+    _kvw(C, nh, nkv, attn_kind, d_c, pos_kind, d_rope), num_experts);
 }
 # np for a given per-block K/V-region size kvw_blk — the form a per-layer HYBRID
 # needs (M14 rung d): its block K/V region is PADDED to the max _kvw over the
@@ -371,7 +371,7 @@ fn ckpt_load_buf(buf, len): i64 {
     # np) and the 4 parameter vectors must also fit the allocator. Reject any
     # config whose model_init total would exceed the cap — BEFORE allocating.
     var abytes = model_alloc_bytes_hyb(V, C, T, nh, nkv, NL, np, attn_kind, d_c, pos_kind, d_rope,
-                                       num_experts, topk, kinds);
+    num_experts, topk, kinds);
     if (abytes > CKPT_MAX_MODEL_BYTES()) { return 0 - 18; }
     var need = (hdr + pl + Vb + 2 * K + 3 * np) * 8;
     if (len != need) { return 0 - 11; }
@@ -465,12 +465,12 @@ fn ckpt_load_buf(buf, len): i64 {
     g_ternary = ternary;
     if (pl > 0) {
         model_init_full(V, C, T, nh, nkv, NL, bias, drop, 1, attn_kind, d_c, pos_kind, d_rope,
-                        num_experts, topk, buf + CKPT_HDR() * 8, 0);
+        num_experts, topk, buf + CKPT_HDR() * 8, 0);
     } elif (objective == 1) {
         # M15 diffusion (v7): uniform MHA; model_init_full sets g_objective/g_bidir
         # and allocates the mask_emb (so the +C param region the loader counted exists).
         model_init_full(V, C, T, nh, nkv, NL, bias, drop, 1, attn_kind, d_c, pos_kind, d_rope,
-                        num_experts, topk, 0, 1);
+        num_experts, topk, 0, 1);
     } else {
         model_init_moe(V, C, T, nh, nkv, NL, bias, drop, 1, attn_kind, d_c, pos_kind, d_rope, num_experts, topk);
     }

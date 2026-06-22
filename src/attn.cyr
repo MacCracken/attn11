@@ -57,7 +57,7 @@ fn _at_lindS(ar, T, C, nh, Ckv): i64 { return _at_linS(ar, T, C, nh, Ckv) + (C /
 # nkv = nh / Ckv = C over up-projected full K/V, so the kernel never diverges
 # (docs/architecture/003).
 fn attn_core_fwd(Qc, Kc, Vc, Pc, concat, T, C, nh, nkv): i64 {
-#ifndef CYRIUS_TARGET_AGNOS
+    #ifndef CYRIUS_TARGET_AGNOS
     # GPU fused attention (causal MHA) under --gpu-tc; self-falls-back to CPU (GQA,
     # non-tileable T, or no device → -1). Causal only (g_bidir==0). TOLERANCE: in-shader exp.
     if (g_gpu_tc == 1) {
@@ -65,7 +65,7 @@ fn attn_core_fwd(Qc, Kc, Vc, Pc, concat, T, C, nh, nkv): i64 {
             if (gpu_attn_core(Qc, Kc, Vc, Pc, concat, T, C, nh, nkv) == 0) { return 0; }
         }
     }
-#endif
+    #endif
     var hd = C / nh;
     var Ckv = nkv * hd;
     var gsz = nh / nkv;             # query heads per K/V head (GQA group size)
@@ -104,7 +104,7 @@ fn attn_core_fwd(Qc, Kc, Vc, Pc, concat, T, C, nh, nkv): i64 {
                     d = d + 4;
                 }
                 var dot = f64_add(f64_add(load64(&acc), load64(&acc + 8)),
-                                  f64_add(load64(&acc + 16), load64(&acc + 24)));
+                f64_add(load64(&acc + 16), load64(&acc + 24)));
                 while (d < hd) {
                     dot = f64_add(dot, f64_mul(load64(qbase + d * 8), load64(kbase + d * 8)));
                     d = d + 1;
@@ -149,7 +149,7 @@ fn attn_core_fwd(Qc, Kc, Vc, Pc, concat, T, C, nh, nkv): i64 {
                 }
                 while (d < hd) {
                     store64(cbase + d * 8, f64_add(load64(cbase + d * 8),
-                                                   f64_mul(pij, load64(vbase + d * 8))));
+                    f64_mul(pij, load64(vbase + d * 8))));
                     d = d + 1;
                 }
                 j = j + 1;
@@ -269,7 +269,7 @@ fn _rope_fill_table(cs, rows, pos0, hd, hdp): i64 {
 # Try the GPU rotation (dir 0 = fwd R, 1 = bwd Rᵀ). 0 = ran on device, -1 = use the CPU path below.
 # BIT-EXACT, so a --gpu run stays byte-identical. rows<2 (decode) / oversized shapes self-fall-back.
 fn _rope_gpu(X, rows, pos0, width, num_heads, dir): i64 {
-#ifndef CYRIUS_TARGET_AGNOS
+    #ifndef CYRIUS_TARGET_AGNOS
     if (g_gpu == 0) { return 0 - 1; }
     if (rows < 2) { return 0 - 1; }
     var hd = width / num_heads;
@@ -281,7 +281,7 @@ fn _rope_gpu(X, rows, pos0, width, num_heads, dir): i64 {
     if (cs == 0) { return 0 - 1; }
     _rope_fill_table(cs, rows, pos0, hd, hdp);
     return gpu_rope_apply(X, cs, rows, width, num_heads, hdp, dir);
-#endif
+    #endif
     return 0 - 1;
 }
 
@@ -412,7 +412,7 @@ fn attn_core_fwd_row(q_row, Kc, Vc, prow, concat_row, pos, C, nh, nkv): i64 {
                 d = d + 4;
             }
             var dot = f64_add(f64_add(load64(&acc), load64(&acc + 8)),
-                              f64_add(load64(&acc + 16), load64(&acc + 24)));
+            f64_add(load64(&acc + 16), load64(&acc + 24)));
             while (d < hd) {
                 dot = f64_add(dot, f64_mul(load64(qbase + d * 8), load64(kbase + d * 8)));
                 d = d + 1;
@@ -456,7 +456,7 @@ fn attn_core_fwd_row(q_row, Kc, Vc, prow, concat_row, pos, C, nh, nkv): i64 {
             }
             while (d < hd) {
                 store64(cbase + d * 8, f64_add(load64(cbase + d * 8),
-                                               f64_mul(pij, load64(vbase + d * 8))));
+                f64_mul(pij, load64(vbase + d * 8))));
                 d = d + 1;
             }
             j = j + 1;
@@ -482,7 +482,7 @@ fn attn_core_fwd_row(q_row, Kc, Vc, prow, concat_row, pos, C, nh, nkv): i64 {
 # uncached path's per-row rotation. Pinned by the cached-vs-uncached generation
 # tests in tests/attn11.tcyr.
 fn attn_fwd_row(Wq, bq, Wk, bk, Wv, bv, Wo, bo, x_row, out_row,
-                Kc, Vc, prow, concat_row, q_row, pos, C, nh, nkv, pos_kind): i64 {
+Kc, Vc, prow, concat_row, q_row, pos, C, nh, nkv, pos_kind): i64 {
     var Ckv = nkv * (C / nh);
     qlinear_fwd(x_row, Wq, bq, q_row, 1, C, C);
     qlinear_fwd(x_row, Wk, bk, Kc + pos * Ckv * 8, 1, C, Ckv);
@@ -512,7 +512,7 @@ fn attn_fwd_row(Wq, bq, Wk, bk, Wv, bv, Wo, bo, x_row, out_row,
 # bit, and the core mirrors attn_core_fwd. Pinned by the MLA cached-vs-uncached
 # generation tests in tests/attn11.tcyr.
 fn attn_mla_fwd_row(Wq, bq, Wdkv, Wuk, buk, Wuv, buv, Wo, bo, x_row, out_row,
-                    c_cache, Kc, Vc, prow, concat_row, q_row, pos, C, nh, d_c): i64 {
+c_cache, Kc, Vc, prow, concat_row, q_row, pos, C, nh, d_c): i64 {
     var n = pos + 1;
     linear_fwd(x_row, Wq, bq, q_row, 1, C, C);                    # Q = x @ Wq
     linear_fwd(x_row, Wdkv, 0, c_cache + pos * d_c * 8, 1, C, d_c); # c = x @ W_DKV (append)
@@ -530,7 +530,7 @@ fn attn_mla_fwd_row(Wq, bq, Wdkv, Wuk, buk, Wuv, buv, Wo, bo, x_row, out_row,
 # sequential, so the accumulation order is deterministic. Shared by attn_bwd
 # (MHA/GQA) and the MLA backward.
 fn attn_core_bwd(Qc, Kc, Vc, Pc, dconcat, dQ, dK, dV, dprow, T, C, nh, nkv): i64 {
-#ifndef CYRIUS_TARGET_AGNOS
+    #ifndef CYRIUS_TARGET_AGNOS
     # GPU attention backward (causal MHA) under --gpu-tc; self-falls-back (GQA, T>32, bidir, no
     # device). TOLERANCE (P carries the in-shader-exp tolerance + sequential vs tree dots).
     if (g_gpu_tc == 1) {
@@ -538,7 +538,7 @@ fn attn_core_bwd(Qc, Kc, Vc, Pc, dconcat, dQ, dK, dV, dprow, T, C, nh, nkv): i64
             if (gpu_attn_core_bwd(Qc, Kc, Vc, Pc, dconcat, dQ, dK, dV, dprow, T, C, nh, nkv) == 0) { return 0; }
         }
     }
-#endif
+    #endif
     var hd = C / nh;
     var Ckv = nkv * hd;
     var gsz = nh / nkv;
@@ -583,7 +583,7 @@ fn attn_core_bwd(Qc, Kc, Vc, Pc, dconcat, dQ, dK, dV, dprow, T, C, nh, nkv): i64
                     d = d + 4;
                 }
                 var dpj = f64_add(f64_add(load64(&dacc), load64(&dacc + 8)),
-                                  f64_add(load64(&dacc + 16), load64(&dacc + 24)));
+                f64_add(load64(&dacc + 16), load64(&dacc + 24)));
                 while (d < hd) {
                     var dc = load64(dcbase + d * 8);
                     dpj = f64_add(dpj, f64_mul(dc, load64(vbase + d * 8)));
@@ -619,9 +619,9 @@ fn attn_core_bwd(Qc, Kc, Vc, Pc, dconcat, dQ, dK, dV, dprow, T, C, nh, nkv): i64
                 }
                 while (d < hd) {
                     store64(dqbase + d * 8, f64_add(load64(dqbase + d * 8),
-                                                    f64_mul(sds, load64(kbase + d * 8))));
+                    f64_mul(sds, load64(kbase + d * 8))));
                     store64(dkbase + d * 8, f64_add(load64(dkbase + d * 8),
-                                                    f64_mul(sds, load64(qbase2 + d * 8))));
+                    f64_mul(sds, load64(qbase2 + d * 8))));
                     d = d + 1;
                 }
                 j = j + 1;
@@ -638,7 +638,7 @@ fn attn_core_bwd(Qc, Kc, Vc, Pc, dconcat, dQ, dK, dV, dprow, T, C, nh, nkv): i64
 # dout(T,C) -> dx(T,C); accumulate dWq..dWo and (if non-0) dbq..dbo. Back through
 # Wo, the shared core, then the Q/K/V projections. Uses caches from attn_fwd.
 fn attn_bwd(Wq, Wk, Wv, Wo, x, dout, dx,
-            dWq, dbq, dWk, dbk, dWv, dbv, dWo, dbo, ar, T, C, nh, nkv, pos_kind): i64 {
+dWq, dbq, dWk, dbk, dWv, dbv, dWo, dbo, ar, T, C, nh, nkv, pos_kind): i64 {
     var Ckv = nkv * (C / nh);
     var Qc = _at_Qc(ar);
     var Kc = _at_Kc(ar, T, C);
@@ -670,7 +670,7 @@ fn attn_bwd(Wq, Wk, Wv, Wo, x, dout, dx,
     var idx = 0;
     while (idx < T * C) {
         store64(dx + idx * 8, f64_add(f64_add(load64(dxq + idx * 8), load64(dxk + idx * 8)),
-                                      load64(dxv + idx * 8)));
+        load64(dxv + idx * 8)));
         idx = idx + 1;
     }
     return 0;
@@ -705,8 +705,8 @@ fn attn_mla_fwd(Wq, bq, Wdkv, Wuk, buk, Wuv, buv, Wo, bo, x, out, ar, c, T, C, n
 # (linear_bwd) over the same caches, so the new gradient composes from already
 # grad-checked ops (no novel hand-derived math).
 fn attn_mla_bwd(Wq, Wdkv, Wuk, Wuv, Wo, x, dout, dx,
-                dWq, dbq, dWdkv, dWuk, dbuk, dWuv, dbuv, dWo, dbo,
-                ar, c, dlat1, dlat2, T, C, nh, d_c): i64 {
+dWq, dbq, dWdkv, dWuk, dbuk, dWuv, dbuv, dWo, dbo,
+ar, c, dlat1, dlat2, T, C, nh, d_c): i64 {
     var Qc = _at_Qc(ar);
     var Kc = _at_Kc(ar, T, C);
     var Vc = _at_Vc(ar, T, C, C);
@@ -901,7 +901,7 @@ fn attn_dec_core_bwd(Qc, Kc, Vc, Qr, Kr, Pc, dconcat, dQc, dKc, dVc, dQr, dKr, d
 # Kr = RoPE(x @ W_KR)  (C -> d_rope) computed from x directly. W_QR/W_KR are
 # bias-free. c (latent) and kr (rope key) are the caller-owned cache buffers.
 fn attn_mla_dec_fwd(Wq, bq, Wdkv, Wuk, buk, Wuv, buv, Wqr, Wkr, Wo, bo,
-                    x, out, ar, c, qr, kr, T, C, nh, d_c, d_rope): i64 {
+x, out, ar, c, qr, kr, T, C, nh, d_c, d_rope): i64 {
     var Qc = _at_Qc(ar);
     var Kc = _at_Kc(ar, T, C);
     var Vc = _at_Vc(ar, T, C, C);
@@ -925,8 +925,8 @@ fn attn_mla_dec_fwd(Wq, bq, Wdkv, Wuk, buk, Wuv, buv, Wqr, Wkr, Wo, bo,
 # T*d_rope. dx = dx_q + dx_c + dx_qr + dx_kr. Every step is matmul-backward over
 # the caches; the only hand-derived piece is attn_dec_core_bwd.
 fn attn_mla_dec_bwd(Wq, Wdkv, Wuk, Wuv, Wqr, Wkr, Wo, x, dout, dx,
-                    dWq, dbq, dWdkv, dWuk, dbuk, dWuv, dbuv, dWqr, dWkr, dWo, dbo,
-                    ar, c, qr, kr, dlat1, dlat2, dqr, dkr, T, C, nh, d_c, d_rope): i64 {
+dWq, dbq, dWdkv, dWuk, dbuk, dWuv, dbuv, dWqr, dWkr, dWo, dbo,
+ar, c, qr, kr, dlat1, dlat2, dqr, dkr, T, C, nh, d_c, d_rope): i64 {
     var Qc = _at_Qc(ar);
     var Kc = _at_Kc(ar, T, C);
     var Vc = _at_Vc(ar, T, C, C);
@@ -1042,7 +1042,7 @@ fn attn_dec_core_fwd_row(q_row, Kc, Vc, qr_row, Kr, prow, concat_row, pos, C, nh
 # rotation is computed DIRECTLY from the absolute position, so a decoded row is
 # bit-identical to the uncached reference (docs/architecture/003, /005).
 fn attn_mla_dec_fwd_row(Wq, bq, Wdkv, Wuk, buk, Wuv, buv, Wqr, Wkr, Wo, bo, x_row, out_row,
-                        c_cache, kr_cache, Kc, Vc, qr_row, prow, concat_row, q_row, pos, C, nh, d_c, d_rope): i64 {
+c_cache, kr_cache, Kc, Vc, qr_row, prow, concat_row, q_row, pos, C, nh, d_c, d_rope): i64 {
     var n = pos + 1;
     var dr = nh * d_rope;
     linear_fwd(x_row, Wq, bq, q_row, 1, C, C);                       # content query

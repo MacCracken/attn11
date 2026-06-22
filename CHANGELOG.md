@@ -4,6 +4,45 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.10.0] - 2026-06-21
+
+**Extract the GPU backend to rosnet (whole-backend) — ADR 0017.** ADR 0016's extraction promise comes
+due now that M18+M19 proved the backend: `src/gpu.cyr` (~2300 lines — the GPU foundation + the generic
+tensor ops + the transformer ops attention/head/rope) moves **whole** into **rosnet 0.2.0** as a
+mabda-gated **`[lib.gpu]` profile** (`dist/rosnet-gpu.cyr`), and attn11 consumes it. Pure relocation:
+the kernels are byte-for-byte unchanged — the gate is that `--gpu` stays **byte-identical** and the
+`--gpu-tc`/tolerance behaviour is preserved. A **minor** bump (the surface is unchanged; the move is
+internal). See [ADR 0017](docs/adr/0017-extract-gpu-backend-to-rosnet.md) for why whole-backend over
+the cleaner generic/transformer split (simplicity + lower risk; boundary refinable later).
+
+### Changed
+- **`src/gpu.cyr` deleted** — the backend now lives in rosnet (`dist/rosnet-gpu.cyr`), auto-prepended
+  from `[deps.rosnet]` on every target. `src/main.cyr` (and the `tcyr`/`fcyr`/`bcyr` harnesses) drop
+  the `include "src/gpu.cyr"`; the `gpu_*` CALL sites in `ops.cyr`/`model.cyr`/`attn.cyr` are unchanged
+  (still AGNOS-`#ifndef`-guarded). The 12 `tests/gpu_*.cyr` include `lib/rosnet-gpu.cyr` instead.
+- **`cyrius.cyml`**: `[deps.rosnet]` → **0.2.0**, `modules = ["dist/rosnet.cyr", "dist/rosnet-gpu.cyr"]`
+  (the CPU bundle is unchanged; the new GPU bundle adds the backend). `[deps.mabda]` stays (it supplies
+  the symbols `dist/rosnet-gpu.cyr` leaves unresolved). *(The dep is on a local `path = "../rosnet"`
+  during the extraction; switch to `git`+`tag = "0.2.0"` once rosnet 0.2.0 is pushed — the resolved
+  `lib/` is identical either way.)*
+
+### Notes
+- **Shared format gate.** Added a `cyrius fmt --check` step to CI (`.github/workflows/ci.yml`) + a
+  `make fmt` target wired into `check`/`release`, matching rosnet's CI — so both repos enforce the same
+  format gate (the GPU backend now lives in rosnet, which already gated it; code moving attn11→rosnet
+  must be fmt-clean first). The source is now `cyrius fmt`-clean: 9 hand-written files were normalized
+  (comment indentation only — **byte-identical** compiled output, the default checkpoint unchanged).
+- **No model-math change; the CPU path is untouched.** The no-flag run is byte-identical (the move is
+  GPU-only, dead-code-gated). A `--gpu` run still reproduces the no-flag run byte-for-byte (the extracted
+  matmul/ln/Adam/head-bwd/ln-bwd are bit-exact; the `--gpu-tc` ops at tolerance). The AGNOS build still
+  compiles the (now rosnet-provided) GPU bundle as dead code via the `SYS_IOCTL` stub.
+- **Gate:** lint 0 warnings; **1056** grad-checks green x86_64 **and** aarch64/qemu; the **12-test GPU
+  suite** passes from the rosnet bundle; AGNOS main + tcyr build; fuzz + `make smoke` green; the bench
+  harness builds. cyrius pin stays **6.2.29** (installed cycc 6.2.34, benign drift); rosnet **0.2.0**;
+  mabda **3.4.1**. **Mirror:** [rosnet ADR 0001](https://github.com/MacCracken/rosnet/blob/main/docs/adr/0001-adopt-gpu-backend.md)
+  + rosnet 0.2.0's CHANGELOG. **Next:** the integer/edge lane (activation quantization → int8 matmul),
+  validated against the f64 oracle — and mabda's Nvidia bring-up lands once, in rosnet's GPU backend.
+
 ## [1.9.2] - 2026-06-21
 
 **M19 1.9.2: the GPU perf-lever close-out (honest negative) + the B1 competitor benchmarks

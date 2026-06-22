@@ -12,7 +12,7 @@
 
 include "lib/mabda.cyr"
 include "lib/rosnet.cyr"
-include "src/gpu.cyr"
+include "lib/rosnet-gpu.cyr"
 
 fn print_cstr(s): i64 { syscall(1, 1, s, strlen(s)); return 0; }
 fn print_i64(n): i64 { var b[32]; memset(&b, 0, 32); var l = fmt_int_buf(n, &b); syscall(1, 1, &b, l); return 0; }

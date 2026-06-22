@@ -9,14 +9,13 @@ include "lib/tyche.cyr"          # extracted PRNG (rng_*, _rng_state)
 include "lib/rosnet.cyr"         # extracted tensor/BLAS-1/matmul (+ gradient)
 # mabda (Linux-only GPU dep) auto-prepends from [deps.mabda] on all targets; on AGNOS it is
 # dead code but still references SYS_IOCTL (absent from the agnos syscall peer) — define it so
-# the auto-prepended dep compiles. The GPU backend (src/gpu.cyr) that consumes it is Linux-gated
-# (g_gpu==0 here regardless → the CPU oracle path, byte-identical).
+# the auto-prepended dep compiles. The GPU backend (rosnet's [lib.gpu] bundle, also auto-prepended)
+# consumes it; g_gpu==0 here regardless → the CPU oracle path, byte-identical.
 #ifdef CYRIUS_TARGET_AGNOS
 var SYS_IOCTL = 16;
 #endif
-#ifndef CYRIUS_TARGET_AGNOS
-include "src/gpu.cyr"            # M18: --gpu matmul backend (qlinear_fwd hook; CPU here)
-#endif
+# 1.10.0 (ADR 0017): the GPU backend is rosnet's dist/rosnet-gpu.cyr, auto-prepended from
+# [deps.rosnet]; no manual include. The gpu_* CALLS stay AGNOS-gated in src/.
 include "src/tensor.cyr"
 include "src/fileio.cyr"
 include "src/ops.cyr"
@@ -43,7 +42,7 @@ fn maxrel(analytic, numeric, n): i64 {
     while (i < n) {
         var a = load64(analytic + i * 8); var b = load64(numeric + i * 8);
         var rel = f64_div(f64_abs(f64_sub(a, b)),
-                          f64_add(f64_add(f64_abs(a), f64_abs(b)), tiny));
+        f64_add(f64_add(f64_abs(a), f64_abs(b)), tiny));
         if (f64_gt(rel, mr) == 1) { mr = rel; }
         i = i + 1;
     }
@@ -297,7 +296,7 @@ fn _attn_check_pos(T, C, nh, nkv, pk): i64 {
         }
         print("attn dbk |max|=", 16); f_print(mxbk, 12); _putc(10);
         assert(f64_lt(mxbk, f64_div(f64_from(1), f64_from(10000000000))) == 1,
-               "attn dbk ~ 0 (softmax shift-invariance)");
+        "attn dbk ~ 0 (softmax shift-invariance)");
     } else {
         # Under RoPE the K bias is ROTATED per position (R_j·bk varies with j),
         # so the shift-invariance no longer holds and dbk is a REAL gradient —
@@ -346,7 +345,7 @@ fn test_attn_bidir(): i64 {
     store64(x + last, f64_add(load64(x + last), f64_from(1)));   # bump x[T-1,0]
     attn_fwd(Wq, 0, Wk, 0, Wv, 0, Wo, 0, x, out, ar, T, C, nh, nkv, 0);
     assert(f64_gt(f64_abs(f64_sub(load64(out), o0a)), f64_div(f64_from(1), f64_from(1000000))) == 1,
-           "bidir: out[0] depends on future x[T-1]");
+    "bidir: out[0] depends on future x[T-1]");
     g_bidir = 0;   # reset so subsequent tests run the causal path
     return 0;
 }
@@ -598,7 +597,7 @@ fn _attn_mla_check(T, C, nh, d_c): i64 {
     }
     print("mla attn dbuk |max|=", 20); f_print(mxbk, 12); _putc(10);
     assert(f64_lt(mxbk, f64_div(f64_from(1), f64_from(10000000000))) == 1,
-           "mla attn dbuk ~ 0 (softmax shift-invariance)");
+    "mla attn dbuk ~ 0 (softmax shift-invariance)");
     return 0;
 }
 fn test_attention_mla(): i64 {
@@ -679,7 +678,7 @@ fn _attn_mla_dec_check(T, C, nh, d_c, dR): i64 {
     }
     print("mla-dec dbuk |max|=", 20); f_print(mxbk, 12); _putc(10);
     assert(f64_lt(mxbk, f64_div(f64_from(1), f64_from(10000000000))) == 1,
-           "mla-dec dbuk ~ 0 (softmax shift-invariance)");
+    "mla-dec dbuk ~ 0 (softmax shift-invariance)");
     return 0;
 }
 fn test_attention_mla_dec(): i64 {
@@ -769,7 +768,7 @@ fn _ssm_check(T, C, N): i64 {
     var dhc = t_alloc(CN); var sc = t_alloc(TC);
     ssm_fwd(a, Wdt, bdt, A, WB, WC, D, Wo, bo, out, Dlt, Bm, Cm, h, y, T, C, N);
     ssm_bwd(a, Wdt, A, WB, WC, D, Wo, dout, da, dWdt, dbdt, dA, dWB, dWC, dD, dWo, dbo,
-            Dlt, Bm, Cm, h, y, dy, dDlt, dBm, dCm, dhc, sc, T, C, N);
+    Dlt, Bm, Cm, h, y, dy, dDlt, dBm, dCm, dhc, sc, T, C, N);
     var nWdt = t_alloc(CC); ssm_ng(Wdt, nWdt, CC, a, Wdt, bdt, A, WB, WC, D, Wo, bo, out, Dlt, Bm, Cm, h, y, dout, T, C, N);
     var nA = t_alloc(CN); ssm_ng(A, nA, CN, a, Wdt, bdt, A, WB, WC, D, Wo, bo, out, Dlt, Bm, Cm, h, y, dout, T, C, N);
     var nWB = t_alloc(CN); ssm_ng(WB, nWB, CN, a, Wdt, bdt, A, WB, WC, D, Wo, bo, out, Dlt, Bm, Cm, h, y, dout, T, C, N);
@@ -1284,7 +1283,7 @@ fn test_head_tail(): i64 {
             var c = 0;
             while (c < C) {
                 acc = f64_add(acc, f64_mul(load64(A_f + (t * C + c) * 8),
-                                           load64(emb + (v * C + c) * 8)));
+                load64(emb + (v * C + c) * 8)));
                 c = c + 1;
             }
             store64(ref + (t * V + v) * 8, acc);

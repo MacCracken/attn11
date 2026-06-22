@@ -69,13 +69,13 @@ fn ln_fwd(x, gamma, beta, y, mean, rstd, M, C): i64 {
 
 # dy(M,C) -> dx(M,C); accumulate dgamma(C), dbeta(C).
 fn ln_bwd(x, gamma, dy, mean, rstd, dx, dgamma, dbeta, M, C): i64 {
-#ifndef CYRIUS_TARGET_AGNOS
+    #ifndef CYRIUS_TARGET_AGNOS
     # GPU layernorm backward (BIT-EXACT: sequential reductions + sqrt/div) → keeps the --gpu
     # checkpoint byte-identical. Plain g_gpu gate; self-falls-back to CPU (C/M not %8, etc.).
     if (g_gpu == 1) {
         if (gpu_ln_bwd(x, gamma, dy, mean, rstd, dx, dgamma, dbeta, M, C) == 0) { return 0; }
     }
-#endif
+    #endif
     var invC = f64_div(f64_from(1), f64_from(C));
     var m = 0;
     while (m < M) {
@@ -144,12 +144,12 @@ fn gelu_fwd(x, y, n): i64 {
 
 # dy -> dx (length n). Needs the original x.
 fn gelu_bwd(x, dy, dx, n): i64 {
-#ifndef CYRIUS_TARGET_AGNOS
+    #ifndef CYRIUS_TARGET_AGNOS
     # GPU GELU backward (tolerance: in-shader exp) under --gpu-tc; self-falls-back to CPU.
     if (g_gpu_tc == 1) {
         if (gpu_gelu_bwd(x, dy, dx, n) == 0) { return 0; }
     }
-#endif
+    #endif
     var c = _gelu_c();
     var a = _gelu_a();
     var half = f64_div(f64_from(1), f64_from(2));
@@ -731,20 +731,20 @@ fn qlinear_fwd(x, W, b, y, M, K, N): i64 {
 }
 fn qlinear_bwd(x, W, dy, dx, dW, db, M, K, N): i64 {
     if (g_ternary == 0) {
-#ifndef CYRIUS_TARGET_AGNOS
+        #ifndef CYRIUS_TARGET_AGNOS
         # GPU linear backward (tolerance: dx's sequential reduction) under --gpu-tc; CPU fallback.
         if (g_gpu_tc == 1) {
             if (gpu_linear_bwd(x, W, dy, dx, dW, db, M, K, N) == 0) { return 0; }
         }
-#endif
+        #endif
         return linear_bwd(x, W, dy, dx, dW, db, M, K, N);
     }
     ternary_quant(W, g_qscratch, K, N);
-#ifndef CYRIUS_TARGET_AGNOS
+    #ifndef CYRIUS_TARGET_AGNOS
     if (g_gpu_tc == 1) {
         if (gpu_linear_bwd(x, g_qscratch, dy, dx, dW, db, M, K, N) == 0) { return 0; }
     }
-#endif
+    #endif
     return linear_bwd(x, g_qscratch, dy, dx, dW, db, M, K, N);
 }
 

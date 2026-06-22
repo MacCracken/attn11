@@ -68,24 +68,22 @@
 # (heads not dividing d_model, kv-heads not dividing heads) abort cleanly in
 # model_init.
 
-# M18 GPU backend rides mabda's native-AMD DRM path — Linux-only. cyrius auto-prepends a
-# declared dep's `modules` on EVERY target (incl. --agnos), and mabda references SYS_IOCTL
-# (DRM ioctls) which the AGNOS ring-3 syscall peer omits. On AGNOS the whole GPU path is
-# #ifndef-guarded out (no `--gpu` flag, src/gpu.cyr not included, g_gpu unsettable), so
-# mabda's ioctl functions are DEAD CODE there — they only need to *compile*. Provide the
-# one missing constant for AGNOS so the auto-prepended dep type-checks; it is never invoked.
-# (On Linux the stdlib syscalls peer owns SYS_IOCTL — this #ifdef avoids a duplicate def.)
+# The GPU backend (rosnet's [lib.gpu] bundle, 1.10.0 / ADR 0017) rides mabda's native-AMD DRM path —
+# Linux-only. cyrius auto-prepends a declared dep's `modules` on EVERY target (incl. --agnos), so on
+# AGNOS BOTH rosnet-gpu and mabda are prepended (a dep module can't be #ifndef-guarded out). The GPU
+# path is still DEAD on AGNOS — no `--gpu` flag, `g_gpu` unsettable, every `gpu_*` CALL #ifndef-guarded
+# in src/ — but the prepended bundles must still *compile*. mabda references SYS_IOCTL (DRM ioctls)
+# which the AGNOS ring-3 syscall peer omits, so provide the one missing constant for AGNOS to let the
+# dead code type-check. (On Linux the stdlib syscalls peer owns SYS_IOCTL — this #ifdef avoids a dup.)
 #ifdef CYRIUS_TARGET_AGNOS
 var SYS_IOCTL = 16;
 #endif
 
 include "lib/tyche.cyr"          # extracted PRNG (rng_*, _rng_state)
 include "lib/rosnet.cyr"         # extracted tensor/BLAS-1/matmul (+ gradient)
-# mabda itself is auto-prepended from [deps.mabda] on all targets (see above); only the
-# attn11-local GPU backend that consumes it is gated — AGNOS keeps qlinear_fwd pure CPU.
-#ifndef CYRIUS_TARGET_AGNOS
-include "src/gpu.cyr"            # M18: --gpu matmul backend on mabda (ADR 0016)
-#endif
+# M19 1.10.0 (ADR 0017): the GPU backend was extracted whole to rosnet's [lib.gpu] profile
+# (dist/rosnet-gpu.cyr) — it + mabda are auto-prepended from [deps] on all targets; AGNOS keeps the
+# gpu_* CALLS #ifndef-guarded so the bundle type-checks as dead code there (the SYS_IOCTL stub above).
 include "src/tensor.cyr"
 include "src/fileio.cyr"
 include "src/ops.cyr"
@@ -133,7 +131,7 @@ fn _atoi(s): i64 {
 }
 
 # Kept in sync with the VERSION file (CI's docs job gates the match).
-fn CFG_VERSION(): i64 { return "1.9.2"; }
+fn CFG_VERSION(): i64 { return "1.10.0"; }
 
 fn usage(): i64 {
     puts("attn11 — a from-scratch GPT-style transformer, trained, in Cyrius\n");
@@ -576,19 +574,19 @@ fn main(): i64 {
     } elif (cfg_objective == 1) {
         # M15 masked-diffusion (uniform MHA + learned-abs + dense; bidirectional)
         model_init_full(V, cfg_c, cfg_t, cfg_nh, cfg_nkv, cfg_nl,
-                        CFG_ATTN_BIAS(), CFG_DROPOUT(), CFG_SEED(),
-                        cfg_attn_kind, cfg_latent_dim, cfg_pos_kind, cfg_rope_dim,
-                        cfg_num_experts, cfg_expert_topk, 0, 1);
+        CFG_ATTN_BIAS(), CFG_DROPOUT(), CFG_SEED(),
+        cfg_attn_kind, cfg_latent_dim, cfg_pos_kind, cfg_rope_dim,
+        cfg_num_experts, cfg_expert_topk, 0, 1);
     } elif (cfg_hybrid == 1) {
         model_init_full(V, cfg_c, cfg_t, cfg_nh, cfg_nkv, cfg_nl,
-                        CFG_ATTN_BIAS(), CFG_DROPOUT(), CFG_SEED(),
-                        cfg_attn_kind, cfg_latent_dim, cfg_pos_kind, cfg_rope_dim,
-                        cfg_num_experts, cfg_expert_topk, &lkinds, 0);
+        CFG_ATTN_BIAS(), CFG_DROPOUT(), CFG_SEED(),
+        cfg_attn_kind, cfg_latent_dim, cfg_pos_kind, cfg_rope_dim,
+        cfg_num_experts, cfg_expert_topk, &lkinds, 0);
     } else {
         model_init_moe(V, cfg_c, cfg_t, cfg_nh, cfg_nkv, cfg_nl,
-                       CFG_ATTN_BIAS(), CFG_DROPOUT(), CFG_SEED(),
-                       cfg_attn_kind, cfg_latent_dim, cfg_pos_kind, cfg_rope_dim,
-                       cfg_num_experts, cfg_expert_topk);
+        CFG_ATTN_BIAS(), CFG_DROPOUT(), CFG_SEED(),
+        cfg_attn_kind, cfg_latent_dim, cfg_pos_kind, cfg_rope_dim,
+        cfg_num_experts, cfg_expert_topk);
     }
 
     puts("attn11 — transformer training in Cyrius\n");
@@ -758,9 +756,9 @@ fn main(): i64 {
     #ifndef CYRIUS_TARGET_AGNOS
     if (g_gpu == 1) {
         if ((gpu_mm_count() > 0) || (gpu_ln_count() > 0) || (gpu_gelu_count() > 0) ||
-            (gpu_head_count() > 0) || (gpu_attn_count() > 0) || (gpu_adam_count() > 0) ||
-            (gpu_linbwd_count() > 0) || (gpu_headbwd_count() > 0) || (gpu_lnbwd_count() > 0) ||
-            (gpu_attnbwd_count() > 0) || (gpu_rope_count() > 0)) {
+        (gpu_head_count() > 0) || (gpu_attn_count() > 0) || (gpu_adam_count() > 0) ||
+        (gpu_linbwd_count() > 0) || (gpu_headbwd_count() > 0) || (gpu_lnbwd_count() > 0) ||
+        (gpu_attnbwd_count() > 0) || (gpu_rope_count() > 0)) {
             puts("GPU: dispatched "); fmt_int(gpu_mm_count()); puts(" matmuls + ");
             fmt_int(gpu_ln_count()); puts(" layernorms");
             if (gpu_adam_count() > 0) { puts(" + "); fmt_int(gpu_adam_count()); puts(" adam steps"); }
@@ -774,7 +772,7 @@ fn main(): i64 {
             if (gpu_linbwd_count() > 0) { puts(" + "); fmt_int(gpu_linbwd_count()); puts(" linear-bwd"); }
             if (gpu_attnbwd_count() > 0) { puts(" + "); fmt_int(gpu_attnbwd_count()); puts(" attn-bwd"); }
             if ((gpu_gelu_count() > 0) || (gpu_head_count() > 0) || (gpu_attn_count() > 0) ||
-                (gpu_linbwd_count() > 0) || (gpu_attnbwd_count() > 0)) { puts(" (tolerance)"); }
+            (gpu_linbwd_count() > 0) || (gpu_attnbwd_count() > 0)) { puts(" (tolerance)"); }
             puts(" on-device\n");
         } else {
             puts("GPU: requested but nothing ran on-device — CPU fallback was used throughout\n");

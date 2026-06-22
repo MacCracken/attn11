@@ -13,9 +13,14 @@
 
 ## Where we are
 
-Current: **v1.9.2** — **M19 in progress.** 1.9.2 (X042) is the **GPU perf-lever close-out**: a
-width-scaling study (new `--d-model`/`--ctx` flags) showed the f64 GPU gap is **flat ~3.7×** (not
-narrowing) and that on-device coverage *shrinks* with scale (dispatch / BO / id-cap ceilings) atop a
+Current: **v1.10.0** — **the GPU backend extracted to rosnet (ADR 0017).** ADR 0016's extraction
+promise came due now that M18+M19 proved the backend: `src/gpu.cyr` moved **whole** into **rosnet
+0.2.0** as a mabda-gated `[lib.gpu]` profile (`dist/rosnet-gpu.cyr`); attn11 consumes it, pure
+relocation, `--gpu` byte-identical. (Whole-backend over the cleaner generic/transformer split for
+simplicity + lower risk; the boundary is refinable later.) Before that, 1.9.2 (X042) was the **GPU
+perf-lever close-out**: a width-scaling study (new `--d-model`/`--ctx` flags) showed the f64 GPU gap is
+**flat ~3.7×** (not narrowing) and that on-device coverage *shrinks* with scale (dispatch / BO / id-cap
+ceilings) atop a
 scalar-f64 floor (Cezanne is an FP64-throttled mobile APU, no matrix core) — so **the f64 GPU stays the
 hardened bit-exact oracle**, transfer-residency/fusion are deferred (not-worth-it here), and the forward
 perf bet **pivots to the integer/edge lane**. It also filled the **B1 competitor benchmarks** (attn11

@@ -1,11 +1,20 @@
-.PHONY: check release lint test fuzz bench compete-bench gpu-test build aarch64 smoke clean
+.PHONY: check release fmt lint test fuzz bench compete-bench gpu-test build aarch64 smoke clean
 
-check: lint test            # the local CI gate (lint + x86 grad-checks)
+check: fmt lint test        # the local CI gate (fmt-check + lint + x86 grad-checks)
 
 # Full release-cut gate: everything CI gates, locally, before tagging.
 # (aarch64 needs qemu; bench appends to bench-history.csv.)
-release: lint test aarch64 build fuzz smoke
-	@echo "release gate: lint + x86 test + aarch64/qemu + DCE build + fuzz + smoke all green"
+release: fmt lint test aarch64 build fuzz smoke
+	@echo "release gate: fmt + lint + x86 test + aarch64/qemu + DCE build + fuzz + smoke all green"
+
+# Format gate (mirrors the Format-check step in .github/workflows/ci.yml): `cyrius fmt
+# --check` exits non-zero on an unformatted file. Same gate rosnet enforces — added at
+# 1.10.0 so the two repos share it (the GPU backend now lives in rosnet; code moving
+# attn11 -> rosnet must be fmt-clean first). Keep the file glob in lockstep with ci.yml.
+fmt:
+	@for f in src/*.cyr tests/*.tcyr tests/*.bcyr tests/*.fcyr tests/*.cyr; do \
+	  cyrius fmt "$$f" --check || { echo "fmt: $$f is not formatted (run: cyrius fmt $$f)"; exit 1; }; \
+	done; echo "fmt: all files clean"
 
 # Hard gate (mirrors ci.yml): `cyrius lint` exits 0 even WITH warnings, so the
 # loop must fail the build itself on any `warn ` line — otherwise a lint warning
