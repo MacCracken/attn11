@@ -390,6 +390,42 @@ fn test_model_diffusion(): i64 {
     g_objective = 0; g_bidir = 0;   # reset for any later AR-building tests
     return 0;
 }
+
+# X043 — MTP backward. One aux head (g_mtp=2, predicts t+2). Verifies, in one FD:
+#  - dW_mtp_0 : the aux-head transform's gradient,
+#  - dtokemb  : the TIED unembed's TRIPLE path (input lookup + main head + aux head)
+#               — a mis-routed aux contribution fails here, and
+#  - L0 dWq / dlnf_g : the trunk, reached ONLY through the aux head's dA_f (a dropped
+#               or unscaled aux→trunk path fails). g_training=1 + dropout 0 keeps the
+#               aux loss in BOTH the analytic gradient and the central FD.
+fn test_model_mtp(): i64 {
+    var V = 5; var C = 4; var T = 3; var nh = 2; var NL = 2;
+    g_mtp = 2;
+    model_init(V, C, T, nh, nh, NL, 1, f64_from(0), 1);
+    g_training = 1;
+    store64(A_tokens + 0, 1); store64(A_tokens + 8, 3); store64(A_tokens + 16, 0);
+    store64(A_targets + 0, 3); store64(A_targets + 8, 0); store64(A_targets + 16, 4);
+    # aux head 0 (t+2): supervise positions 0,1; position 2 has no t+2 in-window → masked.
+    store64(g_mtp_tgt + 0, 2); store64(g_mtp_tgt + 8, 4); store64(g_mtp_tgt + 16, 0);
+    store64(g_mtp_mask + 0, 1); store64(g_mtp_mask + 8, 1); store64(g_mtp_mask + 16, 0);
+    model_forward(); model_zero_grads(); model_backward();
+    var Cc = C * C; var n_tok = V * C;
+    var aMtp = t_alloc(Cc); t_copy(aMtp, G_mtp(0), Cc);
+    var aTok = t_alloc(n_tok); t_copy(aTok, G_tokemb(), n_tok);
+    var aWq0 = t_alloc(Cc); t_copy(aWq0, GL(0, _o_Wq()), Cc);
+    var aLnf = t_alloc(C); t_copy(aLnf, G_lnfg(), C);
+    var nMtp = t_alloc(Cc); model_ng(P_mtp(0), nMtp, Cc);
+    var nTok = t_alloc(n_tok); model_ng(P_tokemb(), nTok, n_tok);
+    var nWq0 = t_alloc(Cc); model_ng(PL(0, _o_Wq()), nWq0, Cc);
+    var nLnf = t_alloc(C); model_ng(P_lnfg(), nLnf, C);
+    var atol = 10000;   # 1e-4 full-model FD tier
+    check("mtp dW_mtp_0", aMtp, nMtp, Cc, atol);
+    check("mtp dtokemb (tied +aux)", aTok, nTok, n_tok, atol);
+    check("mtp L0 dWq (trunk via aux dA_f)", aWq0, nWq0, Cc, atol);
+    check("mtp dlnf_g", aLnf, nLnf, C, atol);
+    g_mtp = 1; g_training = 0;
+    return 0;
+}
 # M15: the confidence-ordered diffusion decoder. It uses NO RNG (greedy + frozen
 # lowest-index tie-break), so a second run with the same model/prompt/steps must be
 # bit-identical. Also pins that every position is resolved (A_mask all 0) and the
@@ -3537,6 +3573,7 @@ fn main(): i64 {
     test_masked_ce();
     test_attn_bidir();
     test_model_diffusion();
+    test_model_mtp();
     test_diffusion_decode_determinism();
     test_ckpt_diffusion();
     # RNG-neutral, so dead-last is safe and keeps the diffusion group's stream intact

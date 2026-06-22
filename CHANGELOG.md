@@ -4,6 +4,46 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.10.1] - 2026-06-22
+
+**Multi-token prediction (MTP) — the `--mtp N` objective: N-1 auxiliary heads predict
+t+2..t+N off the shared trunk (the X043 mechanism).** Each aux head is a lightweight C×C
+transform feeding the **shared tied unembed** (`logits_a = (A_f @ W_mtp_a) @ tok_embᵀ`) —
+V-independent (cheap at any BPE vocab), the DeepSeek-flavoured shared-readout shape (vs Meta's
+untied C×V heads). The aux loss `(λ/(N-1))·Σ_a CE(head_a, t+2+a)` (λ=0.3) sharpens the trunk
+via its gradient; eval reports the **pure main-head CE** (the deployable metric). The aux heads
+are **train-time scaffolding** — not serialized, so a checkpoint is byte-identical to an AR
+checkpoint and the deployable model is the bare main head. A minor objective add behind a flag;
+`--mtp 1` is the AR baseline, byte-identical to no-flag.
+
+### Added
+- **`--mtp N` flag** (1..8; `N=1` = AR baseline). `g_mtp` rides the param layout: (N-1) C×C head
+  transforms append after the maskemb slot (`_o_mtp`/`P_mtp`/`G_mtp`), so an AR/diffusion model's
+  `g_NP`, draw order, and checkpoints stay byte-identical (gated on `N>1`). Init from an independent
+  derived RNG stream + `_rng_state` restore → `--mtp 2`'s base weights/dropout/sampling match
+  `--mtp 1` exactly (a clean A/B where only the aux loss differs).
+- **Forward** (`mtp_aux_loss`): shifted targets `t+2+a` with out-of-corpus tail masking
+  (`mtp_fill_targets`), per-head `qlinear` + tied-head + masked-CE, probs cached for the backward;
+  gated on `g_training` so eval is pure main-CE.
+- **Backward** (`mtp_aux_backward`): per aux head, `dlogits_a` (scaled λ/(N-1)) → `head_bwd_into`
+  → `dh_a` + the shared-unembed grad accumulated into `G_tokemb`; then `linear_bwd` → `dW_mtp_a`
+  + `dA_f` accumulated into the trunk gradient `D_f`. `head_bwd` was refactored into a reusable
+  `head_bwd_into` so the aux heads run the EXACT main-head math.
+- **Grad-check** (`test_model_mtp`, +4 FD checks → **1060** total): the aux transform `dW_mtp_0`,
+  the tied unembed's **triple path** (input lookup + main head + aux head), and a trunk weight +
+  `dlnf_g` reached ONLY via the aux `dA_f` — so a dropped/mis-scaled aux→trunk path fails.
+- `--mtp` rejects `--load` (fresh-training config) and non-AR objectives (`diffusion` / `rl`).
+
+### Notes
+- **No CPU-path change for AR.** `--mtp 1` / no-flag is byte-identical (the MTP layout/forward/backward
+  are dead at `N=1`). The experiment — *does the aux loss help the t+1 objective at attn11's tiny/edge
+  scale, or compete for capacity?* (X043) — is the **next** cut; this lands the grad-checked mechanism.
+
+### Gate
+- lint 0 warn; **1060** grad-checks green **x86_64 AND aarch64/qemu** (+4 MTP, FD 1e-4); fmt clean;
+  fuzz; smoke; AGNOS main builds (MTP dead-code-gated, 1,597,912 B); `--mtp 1` byte-identical to no-flag.
+- cyrius pin stays **6.2.29** (installed cycc 6.2.36, benign drift); rosnet 0.2.0; mabda 3.4.1.
+
 ## [1.10.0] - 2026-06-21
 
 **Extract the GPU backend to rosnet (whole-backend) — ADR 0017.** ADR 0016's extraction promise comes

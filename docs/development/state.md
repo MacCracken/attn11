@@ -5,7 +5,25 @@
 
 ## Version
 
-**1.10.0** — *Extract the GPU backend to rosnet (whole-backend)* (E-infra; ADR 0017, rosnet ADR 0001).
+**1.10.1** — *Multi-token prediction (MTP) — the `--mtp N` objective (the X043 mechanism)*
+(training-science; a flagged objective add). N-1 auxiliary heads predict t+2..t+N off the shared
+trunk: each is a lightweight **C×C transform → shared tied unembed** (`logits_a = (A_f @ W_mtp_a) @
+tok_embᵀ`, V-independent, DeepSeek-flavoured), the aux loss `(λ/(N-1))·Σ CE(head_a, t+2+a)` (λ=0.3)
+sharpening the trunk via its gradient. **Train-time scaffolding only** — not serialized, so the
+deployable model is the bare main head and a checkpoint is byte-identical to AR. `--mtp 1` / no-flag
+is **byte-identical** (MTP layout/forward/backward dead at N=1; the layout appends (N-1) C×C transforms
+after the maskemb slot, gated on N>1). Forward `mtp_aux_loss` (shifted+masked targets, `g_training`-gated
+→ eval is pure main-CE); backward `mtp_aux_backward` (`head_bwd` refactored to a reusable `head_bwd_into`;
+aux grad → `dW_mtp_a` + tied-unembed `G_tokemb` + trunk `D_f` via `dA_f`). **Gate:** lint 0 warn; **1060**
+grad-checks x86_64 **and** aarch64/qemu (+4 MTP: the aux transform, the tied unembed's TRIPLE path, and a
+trunk weight reached ONLY via the aux dA_f, FD 1e-4); fmt clean; fuzz; smoke; agnos main builds (MTP
+dead-code-gated). cyrius pin **6.2.29** (cycc 6.2.36, benign drift); rosnet 0.2.0; mabda 3.4.1.
+**Next: X043 — does the aux loss help the t+1 objective at attn11's tiny/edge scale, or compete for
+capacity?** (train `--mtp 2/3` vs baseline at matched compute — the honest experiment). The integer/edge
+lane (int8 vs the f64 oracle) and mabda's Nvidia GPU bring-up are **parked** (the precision push and the
+hardware respectively); the live lane is training-science at the f64 oracle.
+
+(**1.10.0** — *Extract the GPU backend to rosnet (whole-backend)* (E-infra; ADR 0017, rosnet ADR 0001).
 A structural **minor**: `src/gpu.cyr` (~2300 lines — GPU foundation + generic tensor ops + the
 transformer ops attention/head/rope) moved **whole** into **rosnet 0.2.0** as a mabda-gated
 **`[lib.gpu]` profile** (`dist/rosnet-gpu.cyr`), auto-prepended from `[deps.rosnet]`; attn11 consumes
@@ -20,7 +38,7 @@ harness builds. cyrius pin stays **6.2.29** (installed cycc 6.2.34, benign drift
 mabda **3.4.1**. *(Dep on local `path = "../rosnet"` during the extraction; flip to `git`+`tag = "0.2.0"`
 once rosnet 0.2.0 is pushed — identical `lib/`.)* **Next:** the integer/edge lane (activation
 quantization → int8 matmul, validated against the f64 oracle); mabda's Nvidia bring-up lands in rosnet's
-GPU backend.
+GPU backend.)
 
 (**1.9.2** — *M19 1.9.2: the GPU perf-lever close-out (honest negative) + the B1 competitor benchmarks*
 (E-infra; ADR 0016, X042). A measurement/decision cut (no model-math change; no-flag run byte-identical

@@ -281,6 +281,9 @@ var g_mtp_tgt = 0;     # (g_mtp-1) × T    (shifted targets t+2+a)
 var g_mtp_mask = 0;    # (g_mtp-1) × T    (1 where the target is in-corpus)
 var g_mtp_lambda = 0;  # f64: aux-loss weight (default 0.3)
 var g_mtp_aux_loss = 0;# f64: last forward's (λ/(N-1))·Σ aux CE (for the eval subtract)
+var g_mtp_dlogits = 0; # T*V   backward scratch (per-head aux dlogits, reused)
+var g_mtp_dh = 0;      # T*C   backward scratch (per-head dh_a, reused)
+var g_mtp_dfa = 0;     # T*C   backward scratch (per-head dA_f, reused → += D_f)
 
 # ---- shared activation caches ----------------------------------------------
 var A_tokens = 0; var A_targets = 0;  # T (integer ids)
@@ -765,6 +768,7 @@ attn_kind, d_c, pos_kind, d_rope, num_experts, topk, hybrid_kinds, objective): i
         g_mtp_h = t_alloc(na * TC); g_mtp_probs = t_alloc(na * TV);
         g_mtp_logits = t_alloc(TV);
         g_mtp_tgt = t_alloc(na * T); g_mtp_mask = t_alloc(na * T);
+        g_mtp_dlogits = t_alloc(TV); g_mtp_dh = t_alloc(TC); g_mtp_dfa = t_alloc(TC);
     }
     A_meanf = t_alloc(T); A_rstdf = t_alloc(T);
 
@@ -1030,16 +1034,11 @@ fn mtp_aux_loss(): i64 {
 }
 
 # dlogits(T,V) -> df(T,C); accumulate dtokemb (head part)
-fn head_bwd(): i64 {
+# LM-head backward into caller-supplied buffers: df_out = dlog @ emb (OVERWRITE);
+# gemb += dlog^T @ f_in (ACCUMULATE — the tied unembed). Extracted from head_bwd so
+# the MTP aux heads reuse the EXACT same math (X043) and share the tied-unembed grad.
+fn head_bwd_into(dlog, f_in, df_out, emb, gemb): i64 {
     var T = g_T; var C = g_C; var V = g_V;
-    var emb = P_tokemb(); var gemb = G_tokemb();
-    #ifndef CYRIUS_TARGET_AGNOS
-    # GPU LM-head backward (BIT-EXACT: pure-scalar CPU ref → sequential GPU AXPY matches) → keeps
-    # the --gpu checkpoint byte-identical. Plain g_gpu gate; CPU fallback (byte vocab V%16≠0, etc.).
-    if (g_gpu == 1) {
-        if (gpu_head_bwd(D_logits, emb, A_f, D_f, gemb, T, V, C) == 0) { return 0; }
-    }
-    #endif
     var t = 0;
     while (t < T) {
         var c = 0;
@@ -1047,11 +1046,11 @@ fn head_bwd(): i64 {
             var acc = f64_from(0);
             var v = 0;
             while (v < V) {
-                acc = f64_add(acc, f64_mul(load64(D_logits + (t * V + v) * 8),
+                acc = f64_add(acc, f64_mul(load64(dlog + (t * V + v) * 8),
                 load64(emb + (v * C + c) * 8)));
                 v = v + 1;
             }
-            store64(D_f + (t * C + c) * 8, acc);
+            store64(df_out + (t * C + c) * 8, acc);
             c = c + 1;
         }
         t = t + 1;
@@ -1063,8 +1062,8 @@ fn head_bwd(): i64 {
             var acc = f64_from(0);
             var tt = 0;
             while (tt < T) {
-                acc = f64_add(acc, f64_mul(load64(D_logits + (tt * V + v2) * 8),
-                load64(A_f + (tt * C + c) * 8)));
+                acc = f64_add(acc, f64_mul(load64(dlog + (tt * V + v2) * 8),
+                load64(f_in + (tt * C + c) * 8)));
                 tt = tt + 1;
             }
             var gi = gemb + (v2 * C + c) * 8;
@@ -1072,6 +1071,40 @@ fn head_bwd(): i64 {
             c = c + 1;
         }
         v2 = v2 + 1;
+    }
+    return 0;
+}
+fn head_bwd(): i64 {
+    var T = g_T; var C = g_C; var V = g_V;
+    var emb = P_tokemb(); var gemb = G_tokemb();
+    #ifndef CYRIUS_TARGET_AGNOS
+    # GPU LM-head backward (BIT-EXACT: pure-scalar CPU ref → sequential GPU AXPY matches) → keeps
+    # the --gpu checkpoint byte-identical. Plain g_gpu gate; CPU fallback (byte vocab V%16≠0, etc.).
+    if (g_gpu == 1) {
+        if (gpu_head_bwd(D_logits, emb, A_f, D_f, gemb, T, V, C) == 0) { return 0; }
+    }
+    #endif
+    return head_bwd_into(D_logits, A_f, D_f, emb, gemb);
+}
+
+# X043: MTP aux backward. For each aux head a, dlogits_a (masked-CE grad, scaled by
+# λ/(N-1)) → head_bwd_into → dh_a (+ shared-unembed grad accumulated into G_tokemb);
+# then linear_bwd (h_a = A_f @ W_mtp_a) → grad W_mtp_a (G_mtp(a), +=, pre-zeroed) +
+# dA_f, accumulated into the trunk gradient D_f. Scaling dlogits_a by λ/(N-1) carries
+# through every downstream term (all linear). Runs after head_bwd, before the trunk.
+fn mtp_aux_backward(): i64 {
+    var T = g_T; var C = g_C; var V = g_V;
+    var sc = f64_div(g_mtp_lambda, f64_from(g_mtp - 1));
+    var a = 0;
+    while (a < g_mtp - 1) {
+        var ha = g_mtp_h + a * T * C * 8;
+        softmax_xent_masked_bwd(g_mtp_probs + a * T * V * 8, g_mtp_tgt + a * T * 8,
+        g_mtp_mask + a * T * 8, g_mtp_dlogits, T, V);
+        t_scale(g_mtp_dlogits, T * V, sc);
+        head_bwd_into(g_mtp_dlogits, ha, g_mtp_dh, P_tokemb(), G_tokemb());
+        qlinear_bwd(A_f, P_mtp(a), g_mtp_dh, g_mtp_dfa, G_mtp(a), 0, T, C, C);
+        t_add_into(D_f, g_mtp_dfa, T * C);
+        a = a + 1;
     }
     return 0;
 }
@@ -1443,6 +1476,7 @@ fn model_backward(): i64 {
     # diffusion training never touches this and stays byte-identical.
     if (g_rl != 0) { t_scale(D_logits, T * V, g_reinforce_scale); }
     head_bwd();                                   # -> D_f ; accum G_tokemb (head)
+    if ((g_mtp > 1) && (g_training == 1)) { mtp_aux_backward(); }   # X043: aux heads -> D_f, G_mtp, G_tokemb
     # through final LN: D_f -> D_resid (= d resid[NL])
     ln_bwd(La(LA_resid, g_NL), P_lnfg(), D_f, A_meanf, A_rstdf, D_resid, G_lnfg(), G_lnfb(), T, C);
     var L = g_NL - 1;
