@@ -18,10 +18,13 @@ aux grad → `dW_mtp_a` + tied-unembed `G_tokemb` + trunk `D_f` via `dA_f`). **G
 grad-checks x86_64 **and** aarch64/qemu (+4 MTP: the aux transform, the tied unembed's TRIPLE path, and a
 trunk weight reached ONLY via the aux dA_f, FD 1e-4); fmt clean; fuzz; smoke; agnos main builds (MTP
 dead-code-gated). cyrius pin **6.2.29** (cycc 6.2.36, benign drift); rosnet 0.2.0; mabda 3.4.1.
-**Next: X043 — does the aux loss help the t+1 objective at attn11's tiny/edge scale, or compete for
-capacity?** (train `--mtp 2/3` vs baseline at matched compute — the honest experiment). The integer/edge
-lane (int8 vs the f64 oracle) and mabda's Nvidia GPU bring-up are **parked** (the precision push and the
-hardware respectively); the live lane is training-science at the f64 oracle.
+**X043 done — honest negative: MTP HURTS at 52 K (held-out bits/byte +2.5 % / +1.9 % for N=2 / N=3 vs the
+AR baseline 2.837); the aux loss is pure capacity competition ~5 orders of magnitude below Meta's MTP
+crossover (experiments.md X043). MTP stays behind `--mtp` (default off, AR byte-identical) for the scale
+where it pays + the VAR-#4 shape; the preset (~229 K) scale-bracket is deferred (~hours/run).** Next in
+the **#3 objective lane**: curriculum / a deeper RL pass, then **#1 (training dynamics)** — at the f64
+oracle, informing the #2 architecture + #4 VAR bets. The integer/edge lane (int8 vs the f64 oracle) and
+mabda's Nvidia GPU bring-up stay **parked** (the precision push and the hardware respectively).
 
 (**1.10.0** — *Extract the GPU backend to rosnet (whole-backend)* (E-infra; ADR 0017, rosnet ADR 0001).
 A structural **minor**: `src/gpu.cyr` (~2300 lines — GPU foundation + generic tensor ops + the

@@ -1789,3 +1789,40 @@ PyTorch's per-op dispatch overhead swamps its kernels. The giants are weakest ex
 the throughput numbers **sharpen** attn11's thesis (zero-deps sovereignty + the integer/edge path), they
 don't refute it. **Closes the perf-positioning question; opens the integer/edge lane as the forward perf
 bet.** Detail: benchmarks B1/B6; ADR 0016.
+
+## X043 — multi-token prediction at tiny scale: the aux loss competes for capacity (honest negative) (training-science, v1.10.1, 2026-06-22)
+
+**Result — MTP HURTS at 52 K params.** With the t+2..t+N auxiliary heads training the shared trunk
+(1.10.1's `--mtp N` mechanism — grad-checked; `--mtp 1` byte-identical to AR), the held-out t+1 CE gets
+**worse**, not better: every MTP variant trails the AR baseline. This reproduces Meta's MTP curve
+(Gloeckle et al. 2024 — gains appear at ≥~3B params and *regress* below) from the far-small end: attn11
+is ~5 orders of magnitude under the crossover, so the aux loss is pure capacity competition here. The
+mechanism stands as a capability (and a clean VAR-#4 / head-architecture-#2 dry run); it just doesn't pay
+at this scale.
+
+**The matched A/B (X021 protocol).** `--corpus c4-24-trainA --bpe 256 --steps 4000`, held-out eval on the
+disjoint `c4-24-heldB` (4 MB each, ~1.97 M BPE tokens — a 52 K model can't memorize, so held-out
+bits/byte is honest generalization, not overfit). The MTP init draws from a derived RNG stream + restores
+`_rng_state`, so `--mtp 1/2/3` share **identical base weights, dropout, and data order** — the ONLY
+difference is the auxiliary loss. λ = 0.3 (total aux weight, split λ/(N-1) per head).
+
+| config | params | own bits/byte | held-out bits/byte | Δ held |
+|---|---|---|---|---|
+| `--mtp 1` (AR baseline) | 52 768 | 2.80388 | **2.83681** | — |
+| `--mtp 2` (t+1, t+2)    | 53 792 | 2.87887 | 2.90786 | **+0.071 (+2.5 %)** |
+| `--mtp 3` (t+1..t+3)    | 54 816 | 2.86235 | 2.89194 | **+0.055 (+1.9 %)** |
+
+**Reading it.** (1) The harm is small (~2 %), not catastrophic — consistent with "MTP needs scale": the
+gap should shrink and eventually cross as d_model grows. (2) N=3 is *less* harmful than N=2 (held 2.892 vs
+2.908) — same total aux weight (0.3) spread over t+2,t+3 vs concentrated on t+2; a lighter per-head pull
+is gentler on the tiny trunk (or single-seed noise). (3) The aux heads add only ~1 K params each (the C×C
+transform), so this is NOT a parameter-count effect — it is the auxiliary GRADIENT pulling the shared
+trunk off the t+1 optimum.
+
+**Decision.** Honest negative recorded; **MTP stays behind `--mtp` (default off, AR byte-identical)** — a
+correct, grad-checked mechanism worth keeping for (a) the scale where it pays and (b) the
+shared-trunk/multi-prediction shape that VAR (#4) reuses. **Deferred:** the preset (~229 K, 4.4×) scale-
+bracket — would test whether the harm shrinks toward the Meta crossover, but preset compute is ~hours/run
+(ctx 64 → ~16× the attention FLOPs) and the 52 K result is decisive on its own. Reproduce: `for M in 1 2
+3; do ./build/attn11 --corpus data/c4-24-trainA.txt --bpe 256 --steps 4000 --mtp $M --eval --eval-corpus
+data/c4-24-heldB.txt; done`.
