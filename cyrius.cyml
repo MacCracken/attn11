@@ -39,7 +39,8 @@ modules = ["dist/tyche.cyr"]
 # below supplies them. (Local `path` during the extraction; switch to git+tag = "0.2.0" once rosnet
 # 0.2.0 is pushed — the resolved lib/ is identical either way.)
 [deps.rosnet]
-path = "../rosnet"
+git = "https://github.com/MacCracken/rosnet"
+tag = "0.2.0"
 modules = ["dist/rosnet.cyr", "dist/rosnet-gpu.cyr"]
 
 # M18 (the v1.8.x GPU arc): mabda is the GPU *foundation* — device/context init,
