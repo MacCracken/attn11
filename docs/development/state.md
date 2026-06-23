@@ -5,7 +5,19 @@
 
 ## Version
 
-**1.10.2** — *X043: multi-token prediction doesn't help at tiny scale (honest negative) — experiment/docs
+**1.11.0** — *Tokenizer extraction — the sovereign `akshara` lib (M1).* The corpus +
+tokenizer data layer (byte vocab + opt-in BPE + packed store + streaming read) carved out
+of `src/train.cyr` into the standalone [`akshara`](https://github.com/MacCracken/akshara)
+library — the **third attn11 extraction** after `rosnet` / `tyche`. attn11 is now a thin
+consumer (`[deps.akshara] git+tag=0.1.0` + `include "lib/akshara.cyr"`); `train.cyr` owns
+only training/eval/gen/RL. The same tokenizer backs both attn11 and the new RL/reasoning
+reference [`tarka`](https://github.com/MacCracken/tarka) — one tokenizer, two consumers.
+**No model-math change** — byte-identical relocation + dep swap; full suite **1060/1060
+grad-checks green** (x86_64 + aarch64/qemu), fuzz + bench compile. `bpe_learn(K)` and all
+signatures unchanged. (NOTE: the `rl_*` REINFORCE surface migrates OUT to `tarka` in a later
+bite, de-featuring `--objective rl`.)
+
+(**1.10.2** — *X043: multi-token prediction doesn't help at tiny scale (honest negative) — experiment/docs
 cut* (no code change; binary byte-identical to 1.10.1 modulo `CFG_VERSION`). Ran the matched A/B (`--mtp
 1/2/3`, X021 protocol: `c4-24-trainA`, BPE 256, 4000 steps, held-out `c4-24-heldB`): MTP **HURTS** the
 held-out t+1 CE at 52 K params — `--mtp 2` +2.5 %, `--mtp 3` +1.9 % bits/byte vs the AR baseline 2.837. The
@@ -17,7 +29,7 @@ follow-ups, #3→#1 sequencing, f64-oracle framing). Gate inherited from 1.10.1 
 grad-checks x86_64 + aarch64/qemu; `--mtp 1` byte-identical). **Next in the #3 objective lane:** curriculum
 / a deeper RL pass, then **#1 (training dynamics)** at the f64 oracle, informing the #2 / #4 bets; the
 integer/edge (int8) and NVIDIA-GPU lanes stay parked. **Parked MTP follow-up:** the preset (~229 K)
-scale-bracket (~hours/run).
+scale-bracket (~hours/run).)
 
 (**1.10.1** — *Multi-token prediction (MTP) — the `--mtp N` objective (the X043 mechanism)*
 (training-science; a flagged objective add). N-1 auxiliary heads predict t+2..t+N off the shared

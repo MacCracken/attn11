@@ -4,6 +4,17 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.11.0] - 2026-06-22
+
+**Tokenizer extraction — the sovereign `akshara` lib (M1).** attn11's corpus +
+tokenizer data layer is carved out into a standalone, shared library — the **third
+attn11 extraction** after `rosnet` (tensors) and `tyche` (PRNG). attn11 becomes a
+thin consumer (`[deps.akshara]` + `include "lib/akshara.cyr"`); the same tokenizer
+now backs both attn11 and the new RL/reasoning reference
+[tarka](https://github.com/MacCracken/tarka) — one tokenizer, two consumers. **No
+model-math change**: a byte-identical relocation + dependency swap, gated by the
+full suite (**1060/1060 grad-checks green, fuzz + bench compile**).
+
 ### Changed
 - **Tokenizer extracted to the `akshara` lib (M1; no behavior change).** The corpus
   + tokenizer data layer (embedded/loaded corpus, packed token store + width-generic
@@ -17,7 +28,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   by `[deps.rosnet]`). `train.cyr` now owns only training/eval/generation/RL;
   `bpe_learn(K)` and all signatures unchanged. **Byte-identical: full suite 1060/1060
   green, fuzz + bench compile.** Shared with [tarka](https://github.com/MacCracken/tarka)
-  (one tokenizer, two consumers). (No version bump — refactor + dependency swap.)
+  (one tokenizer, two consumers).
 
 ## [1.10.2] - 2026-06-22
 
