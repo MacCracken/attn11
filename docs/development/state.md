@@ -5,7 +5,16 @@
 
 ## Version
 
-**1.11.0** — *Tokenizer extraction — the sovereign `akshara` lib (M1).* The corpus +
+**1.11.1** — *RL de-featured — REINFORCE migrated to the `tarka` repo (closes the M1 arc).*
+The `--objective rl` / `--rl-target` flags and the entire REINFORCE path (`rl_*`, the
+`g_rl`/`g_reinforce_scale` backward gate, the M17 grad-checks, `scripts/m17-rl.sh`) are
+**removed**; attn11 is now a pure **SFT + masked-diffusion** training reference. RL lives in
+[`tarka`](https://github.com/MacCracken/tarka), re-expressed on `rosnet`. AR/diffusion stay
+**byte-identical** (the `g_rl` gate was a no-op for them); suite **1060 → 1049** grad-checks
+green (x86_64 + aarch64/qemu), default training descends loss, fuzz/bench compile,
+`--objective rl` rejected. ADR 0015 marked superseded. Completes the rosnet/tyche/akshara/tarka split.
+
+(**1.11.0** — *Tokenizer extraction — the sovereign `akshara` lib (M1).* The corpus +
 tokenizer data layer (byte vocab + opt-in BPE + packed store + streaming read) carved out
 of `src/train.cyr` into the standalone [`akshara`](https://github.com/MacCracken/akshara)
 library — the **third attn11 extraction** after `rosnet` / `tyche`. attn11 is now a thin
@@ -14,8 +23,7 @@ only training/eval/gen/RL. The same tokenizer backs both attn11 and the new RL/r
 reference [`tarka`](https://github.com/MacCracken/tarka) — one tokenizer, two consumers.
 **No model-math change** — byte-identical relocation + dep swap; full suite **1060/1060
 grad-checks green** (x86_64 + aarch64/qemu), fuzz + bench compile. `bpe_learn(K)` and all
-signatures unchanged. (NOTE: the `rl_*` REINFORCE surface migrates OUT to `tarka` in a later
-bite, de-featuring `--objective rl`.)
+signatures unchanged. [The `rl_*` REINFORCE surface was since removed at 1.11.1 → `tarka`.])
 
 (**1.10.2** — *X043: multi-token prediction doesn't help at tiny scale (honest negative) — experiment/docs
 cut* (no code change; binary byte-identical to 1.10.1 modulo `CFG_VERSION`). Ran the matched A/B (`--mtp
@@ -475,7 +483,7 @@ unchanged, green x86_64 + aarch64/qemu; lint + fuzz + `make smoke` + `--agnos` b
 `make release` exit 0. `src/*.cyr` unchanged except CFG_VERSION.)
 
 (**1.7.0** — *M17: Reinforcement learning (REINFORCE)* (E9; ADR 0015, X024; the last
-milestone in the chain). `--objective rl` trains the policy toward a **reward** via
+milestone in the chain) — **[feature removed at 1.11.1 → migrated to `tarka`]**. `--objective rl` trains the policy toward a **reward** via
 on-policy REINFORCE (Williams 1992): sample `batch` rollouts at temperature 1, score each
 with a deterministic reward, weight its log-prob gradient by the advantage `(R − b)`
 (`b` = EMA of past mean rewards). Because `∇log π(a) = −∇CE(a)` for a softmax policy, the
@@ -1196,7 +1204,9 @@ checkpoint vs Linux at fixed CPU — `scripts/agnos-smoke.sh`):
   encode is **byte-identical** to a whole-corpus encode). `ntokens` patched via `lseek`
   before the atomic rename. Byte-level works too (no carry). `test_stream_bpe_encode`,
   +6 checks; default run unchanged.
-- **Reinforcement learning** (1.7.0, `--objective rl`, M17/E9, ADR 0015): on-policy
+- **Reinforcement learning** (1.7.0–1.11.0, `--objective rl`, M17/E9, ADR 0015) —
+  **REMOVED at 1.11.1, migrated to [`tarka`](https://github.com/MacCracken/tarka)**;
+  historical record: on-policy
   **REINFORCE** over the plain AR model — sample rollouts, reward = count of a target char
   (`--rl-target C`, default space), weight the log-prob gradient by the advantage `(R − b)`
   (`b` = EMA baseline). Since `∇log π(a) = −∇CE(a)`, the policy gradient is the existing
@@ -1209,11 +1219,11 @@ checkpoint vs Linux at fixed CPU — `scripts/agnos-smoke.sh`):
 - CLI: `--corpus --stdin --load --save --steps --gen-only --preset --heads
   --kv-heads --layers --attn-kind --latent-dim --attn-every --pos-kind --rope-dim
   --experts --expert-topk --bpe --eval --eval-corpus --encode-shard --stream-encode
-  --stream-corpus --objective --decode-steps --decode-schedule --ternary --rl-target`
+  --stream-corpus --objective --decode-steps --decode-schedule --ternary`
   (`--attn-kind` takes `mha`/`mla`/`lin`/`ssm`; `--latent-dim` is the MLA latent /
   SSM state size; `--attn-every K` builds the per-layer hybrid over the `--attn-kind`
-  base; `--objective` takes `ar`/`diffusion`/`rl` — `diffusion` adds `--decode-steps` /
-  `--decode-schedule {cosine,linear}`, `rl` adds `--rl-target C` (REINFORCE reward char);
+  base; `--objective` takes `ar`/`diffusion` — `diffusion` adds `--decode-steps` /
+  `--decode-schedule {cosine,linear}`;
   `--ternary` is M16 BitNet-style ternary weights on mha + dense + AR; `--encode-shard`
   writes a token-shard + exits, `--stream-encode` does so for a GB-scale file in bounded
   RAM, `--stream-corpus` trains from one in bounded RAM; `--load` + `--stream-corpus`

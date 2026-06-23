@@ -56,7 +56,9 @@ the architecture axes (M12 attention/KV + RoPE, M13 MoE, M14 the `lin`/`ssm` mix
 **data-ingestion & curation 1.5.x arc** (X016→X020), **M16** ternary/BitNet (v1.6.0–1.6.1),
 the **1.6.x streaming/data group** (v1.6.2 token-shard streaming + v1.6.3 resume-from-stream
 + v1.6.4 BPE GB shards + v1.6.5 the X021 data-volume held-out win), **M17** REINFORCE
-(v1.7.0, X024), and the v1.7.1 toolchain realign (cyrius 6.2.5). The frontier experiments
+(v1.7.0, X024 — **removed at v1.11.1 and migrated to the
+[tarka](https://github.com/MacCracken/tarka) repo**; attn11 is now SFT + masked-diffusion
+only), and the v1.7.1 toolchain realign (cyrius 6.2.5). The frontier experiments
 E1–E9 have all graduated. For *what* shipped, see [`CHANGELOG.md`](../../CHANGELOG.md)
 (release narrative), [`experiments.md`](experiments.md) (the X-series), and
 [`state.md`](state.md) (the live snapshot — flags, counts, perf).
@@ -295,9 +297,19 @@ fast-follows (mla/ssm/lin/MoE/rope/diffusion) and activation quantization are ad
 > and BPE GB-scale shards (✅ v1.6.4) as the fast-follows — and the **data-volume held-out
 > win (X021)** — **✅ v1.6.5** (an honest win: more clean data generalizes −14.2% better on
 > held-out at capacity; the overfit regime shows own-corpus bits/byte inverts above it).
-> **The 1.6.x group is complete; M16 and its group are closed. Next is M17 (RL).**
+> **The 1.6.x group is complete; M16 and its group are closed. M17 (RL) shipped next at
+> 1.7.0, then was extracted to [tarka](https://github.com/MacCracken/tarka) at 1.11.1 — see M17 below.**
 
-### M17 — Reinforcement learning (REINFORCE) — ✅ shipped (v1.7.0)
+### M17 — Reinforcement learning (REINFORCE) — ✅ shipped (v1.7.0), then **extracted to [tarka](https://github.com/MacCracken/tarka) at v1.11.1**
+
+> **Migration marker (v1.11.1):** the RL surface below — `--objective rl` / `--rl-target`,
+> the REINFORCE training path, the `g_rl` model gate, and the M17 grad-check tests — was
+> **removed from attn11 at v1.11.1** and **migrated to the [tarka](https://github.com/MacCracken/tarka)
+> repo** (the sovereign RL / reasoning counterpoint, where REINFORCE is re-expressed on the
+> [rosnet](https://github.com/MacCracken/rosnet) tensor lib). attn11 is now a **pure supervised
+> (SFT) + masked-diffusion training reference**; RL is **no longer an attn11 capability or
+> roadmap item**. The record below is preserved as the history of the M17 cut that shipped
+> in attn11 1.7.0 before the extraction.
 
 **Last in the milestone chain, by design** — an orthogonal *training-objective* layer
 over the finished AR trunk. `--objective rl`: on-policy **REINFORCE** (Williams 1992) —
@@ -313,8 +325,8 @@ run byte-identical). **Gate met** (X024, an honest win): grad-checked three ways
 zero limits) + the RL-vs-SFT comparison — the policy moves decisively toward the reward
 (target-char freq 9–19% → ~99.7%) with the documented SFT→RL alignment tax (corpus
 bits/byte 0.24 → ~13, naive reward hacking). ADR 0015; runner `scripts/m17-rl.sh`.
-**PPO/GRPO + richer rewards (valid text, length/format targets)** are the documented
-heavier follow-on — REINFORCE earns the question, not yet the heavier machinery.
+**PPO/GRPO + richer rewards** were the documented heavier follow-on at the time — that
+heavier machinery now lives in **tarka**, not attn11.
 
 ### M18 — GPU compute backend (the 1.8.x mini-arc) — E-infra
 
@@ -654,8 +666,11 @@ for the native-AMD f64 route.
     **self-speculative decoding** from the trained aux heads.
 - **Curriculum** — easy→hard ordering on the curated corpus (reuse the X016–X021 curation
   infra); does ordered exposure beat the random window at tiny scale?
-- **Deeper RL** — X024 was one REINFORCE cut; better baselines / reward-shaping, a PPO-lite
-  step, multi-target rewards.
+
+> **RL is no longer an attn11 lane.** The "deeper RL" thread (better baselines /
+> reward-shaping, PPO-lite, multi-target rewards) moved with the M17 surface to the
+> [tarka](https://github.com/MacCracken/tarka) repo when RL was extracted from attn11 at
+> v1.11.1. attn11 stays a pure SFT + masked-diffusion reference; RL work belongs in tarka.
 
 ### #1 — Training dynamics (cheap, high signal-per-token; do early)
 - **Optimizer** beyond Adam — Muon (winning at small scale), Lion, schedule-free.
@@ -773,7 +788,9 @@ shards (v1.6.4) as the fast-follows, and the **data-volume held-out win (X021, v
 an honest win (more clean data generalizes −14.2% better on held-out at capacity). With
 M16 + its group closed, **RL (M17, E9, v1.7.0)** — the last milestone in the chain —
 **shipped** (REINFORCE as reward-weighted softmax-CE; the policy moves toward the reward,
-X024). **The full M12–M17 milestone chain is now complete** — the architecture / objective
+X024), then was **removed at v1.11.1 and migrated to the
+[tarka](https://github.com/MacCracken/tarka) repo** (attn11 is now SFT + masked-diffusion
+only; RL lives in tarka). **The full M12–M17 milestone chain is now complete** — the architecture / objective
 / precision / RL frontier experiments (E1–E9) have all graduated. **The forward path is now
 two infra tracks, both scoped (mabda recon, 2026-06-14):**
 1. **v1.7.2 — the B-series competitor benchmarks (B0–B3)**: the honest CPU throughput +

@@ -4,6 +4,39 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.11.1] - 2026-06-22
+
+**RL de-featured — REINFORCE migrated to the `tarka` repo (closes the M1 arc).** attn11
+reverts to a **pure supervised (SFT) + masked-diffusion training reference**; reinforcement
+learning now lives in [tarka](https://github.com/MacCracken/tarka) (the RL/reasoning
+counterpoint), where REINFORCE is re-expressed on the `rosnet` tensor lib. This completes
+the rosnet/tyche/akshara/tarka split — each repo carries one clean thesis.
+
+### Removed
+- **The `--objective rl` and `--rl-target` CLI flags** and the entire REINFORCE training
+  path: `rl_prompt` / `rl_rollout` / `rl_reward` / `rl_train` / `rl_eval` and the
+  `RL_BETA` / `g_rl_baseline` / `g_rl_target` state (`src/train.cyr`); the `g_rl` /
+  `g_reinforce_scale` advantage gate in `model_backward` (`src/model.cyr`); the M17 CLI
+  parsing, guards, and reward report (`src/main.cyr`); the `test_rl_op` / `test_rl_rollout`
+  grad-checks (`tests/attn11.tcyr`); `scripts/m17-rl.sh` (the X024 runner).
+- Net: the suite goes **1060 → 1049 checks** (only the 11 RL grad-checks removed).
+
+### Breaking
+- `attn11 --objective rl` / `--rl-target C` are gone (`--objective` now accepts only
+  `ar` | `diffusion`; the removed flags are rejected with that message). **Migration:**
+  RL training moves to **tarka** — see its `--help` and `docs/development/roadmap.md` (M1).
+  The transformer, SFT/diffusion objectives, checkpoints, and the no-flag run are
+  unaffected (the `g_rl` gate was a no-op for them — AR/diffusion stay **byte-identical**).
+
+### Changed
+- `src/train.cyr` header + the `--objective` help/usage now describe SFT/diffusion only.
+- [ADR 0015](docs/adr/0015-reinforcement-learning.md) marked **Superseded** (RL → tarka);
+  experiments.md X024 and the Williams-1992 source annotated as migrated.
+
+### Verified
+- **1049/1049 grad-checks green** (x86_64 + aarch64/qemu); default AR training descends
+  loss normally; fuzz + bench compile; `--objective rl` correctly rejected.
+
 ## [1.11.0] - 2026-06-22
 
 **Tokenizer extraction — the sovereign `akshara` lib (M1).** attn11's corpus +

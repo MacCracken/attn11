@@ -1,10 +1,10 @@
-# attn11 — training loop, evaluation, generation, and RL.
+# attn11 — training loop, evaluation, and generation (SFT + diffusion).
 #
 # The corpus + tokenizer data layer was extracted to the `akshara` lib (2026-06-22;
-# `include "lib/akshara.cyr"`, see [deps.akshara]). This file now owns: batch
-# sampling, the train/eval/generate loops, and the REINFORCE RL path (rl_*).
-# NOTE (M1): the rl_* surface migrates OUT to `tarka`; that is a separate,
-# user-confirmed bite that de-features attn11's --objective rl.
+# `include "lib/akshara.cyr"`, see [deps.akshara]). This file owns batch sampling and
+# the train/eval/generate loops. The REINFORCE RL path was REMOVED at 1.11.1 — RL now
+# lives in the `tarka` repo (the agency counterpoint); attn11 is a pure supervised /
+# diffusion training reference.
 
 # ---- batch sampling --------------------------------------------------------
 # X043: fill the (g_mtp-1) shifted target rows for the window starting at `s` — aux
@@ -515,138 +515,6 @@ fn generate(prompt, plen, ngen, temp): i64 {
     gen_decode(ngen, temp, 1, 0, 1);
     _putc(10);
     return 0;
-}
-
-# ---- REINFORCE policy-gradient training (M17, E9; ADR 0015) -----------------
-# The policy is the plain AR transformer; RL only changes the training loss. Each
-# step samples `batch` on-policy rollouts, scores each with a deterministic reward,
-# and weights its log-prob gradient by the advantage (R - b). Because
-# grad log pi(a) = -grad CE(a) for the softmax head, that weighted gradient IS the
-# existing softmax-CE backward over the sampled rollout scaled by (R - b) — wired
-# via g_rl + g_reinforce_scale in model_backward (no new backward math). The model,
-# the forward, and the checkpoint stay plain AR. Sources: Williams 1992 (REINFORCE);
-# baseline = a moving average of past mean rewards (variance reduction). See
-# docs/sources.md, docs/adr/0015-reinforcement-learning.md.
-fn RL_BETA(): i64 { return f64_div(f64_from(9), f64_from(10)); }   # baseline EMA decay (0.9)
-var g_rl_baseline = 0;   # f64: moving-average reward baseline b
-var g_rl_rsum = 0;       # f64: reward accumulator over the current batch
-var g_rl_target = 0;     # token id whose count in a rollout is the reward (set by main)
-
-# A rollout's start state: one random token drawn from the corpus (diverse
-# contexts; the token itself is the given prefix, not a scored action).
-fn rl_prompt(): i64 {
-    if (g_datalen < 1) { return 0; }
-    var idx = (rng_u64() & 0x7FFFFFFFFFFFFFFF) % g_datalen;
-    return gd_ld(idx);
-}
-
-# Sample an on-policy rollout of g_T actions and lay it out exactly as AR training
-# expects: A_tokens[t] = x_t (the state), A_targets[t] = x_{t+1} (the sampled
-# action). x_0 = prompt_tok; x_1..x_T are sampled autoregressively from the policy
-# at `temp` via the cached single-row forward (positions 0..T-1 fit the cache, so
-# no window slide). So softmax-CE over (A_tokens, A_targets) is exactly -log pi
-# of the rollout, and its backward is grad(-log pi) — the policy gradient (up to
-# the advantage scale). On-policy ⇒ sample at temp 1 so the sampling distribution
-# equals the one the gradient differentiates.
-fn rl_rollout(prompt_tok, temp): i64 {
-    var T = g_T;
-    var x = prompt_tok;
-    store64(A_tokens, x);
-    var t = 0;
-    while (t < T) {
-        model_fwd_row(x, t);                          # logits for pos t -> R_logits; append K/V[t]
-        var nxt = sample_logits_row(R_logits, g_V, temp);
-        store64(A_targets + t * 8, nxt);
-        if (t + 1 < T) { store64(A_tokens + (t + 1) * 8, nxt); }
-        x = nxt;
-        t = t + 1;
-    }
-    return 0;
-}
-
-# Deterministic reward: how many of the rollout's sampled actions equal the target
-# token. A simple, monotone, demonstrable signal — RL should raise the target's
-# frequency in samples (the X024 metric). Returns an f64 (the count).
-fn rl_reward(target_id): i64 {
-    var T = g_T;
-    var c = 0;
-    var t = 0;
-    while (t < T) { if (load64(A_targets + t * 8) == target_id) { c = c + 1; } t = t + 1; }
-    return f64_from(c);
-}
-
-# REINFORCE training loop. Mirrors train() but replaces the corpus-window sample
-# with an on-policy rollout + reward + advantage. Runs with dropout OFF (on-policy:
-# the sampling and gradient distributions must match) and g_rl = 1 (so model_backward
-# scales the seeded logit gradient by g_reinforce_scale = R - b). The baseline is an
-# EMA of past mean rewards, updated AFTER each step (so a step's advantages use the
-# average of PRIOR rewards). lr schedule / g_step / RNG are checkpointed exactly as
-# AR, so a resumed RL run is bit-for-bit. g_rl is cleared on return so eval / sample
-# / save are plain AR.
-fn rl_train(run_until, total, batch, base_lr, min_lr, warmup, clip, log_every): i64 {
-    g_training = 0;                          # on-policy: no dropout
-    g_rl = 1;
-    g_rl_baseline = f64_from(0);
-    var invB = f64_div(f64_from(1), f64_from(batch));
-    var one = f64_from(1);
-    while (g_step < run_until) {
-        g_step = g_step + 1;
-        model_zero_grads();
-        var loss = f64_from(0);
-        g_rl_rsum = f64_from(0);
-        var bi = 0;
-        while (bi < batch) {
-            rl_rollout(rl_prompt(), one);                    # on-policy sample (temp 1)
-            var R = rl_reward(g_rl_target);
-            g_reinforce_scale = f64_sub(R, g_rl_baseline);   # advantage; model_backward scales by it
-            g_rl_rsum = f64_add(g_rl_rsum, R);
-            loss = f64_add(loss, model_forward());           # rollout -log pi (for logging)
-            model_backward();                                # accumulate (R-b)*grad CE into g_grads
-            bi = bi + 1;
-        }
-        t_scale(g_grads, g_NP, invB);                        # mean policy gradient over the batch
-        loss = f64_mul(loss, invB);
-        var meanR = f64_mul(g_rl_rsum, invB);
-        var gnorm = model_clip_grads(clip);
-        if ((f64_is_finite(loss) == 0) || (f64_is_finite(gnorm) == 0)) {
-            puts("attn11: non-finite loss/grad at step "); fmt_int(g_step);
-            puts(" -- stopping\n");
-            g_step = g_step - 1;
-            g_rl = 0;
-            return 0 - 1;
-        }
-        var lr = lr_at(g_step, total, warmup, base_lr, min_lr);
-        model_adam_step(lr, g_step);
-        # EMA baseline update (after the step; next step's advantages use it)
-        g_rl_baseline = f64_add(f64_mul(RL_BETA(), g_rl_baseline), f64_mul(f64_sub(one, RL_BETA()), meanR));
-        if ((g_step % log_every) == 0) {
-            print("step ", 5); fmt_int(g_step);
-            print("  meanR ", 8); f_print(meanR, 4);
-            print("  base ", 7); f_print(g_rl_baseline, 4);
-            print("  -logpi ", 9); f_print(loss, 4);
-            print("  |g| ", 6); f_print(gnorm, 4); _putc(10);
-        }
-    }
-    g_rl = 0;
-    return 0;
-}
-
-# Mean reward (target-token count) over `nroll` fresh on-policy rollouts — the
-# policy's current target-token frequency, the X024 metric. No gradient (g_rl
-# forced 0; no model_backward), so it never perturbs g_grads; it DOES draw the RNG
-# (rollout sampling), so main runs it AFTER --save. Returns the mean reward (f64).
-fn rl_eval(nroll): i64 {
-    g_training = 0;
-    var sv = g_rl; g_rl = 0;
-    var sum = f64_from(0);
-    var k = 0;
-    while (k < nroll) {
-        rl_rollout(rl_prompt(), f64_from(1));
-        sum = f64_add(sum, rl_reward(g_rl_target));
-        k = k + 1;
-    }
-    g_rl = sv;
-    return f64_div(sum, f64_from(nroll));
 }
 
 # ---- masked-diffusion decode (M15, E5) -------------------------------------

@@ -41,8 +41,7 @@ attn11 --eval-corpus P       held-out eval on a disjoint corpus via the loaded t
 attn11 --encode-shard PATH   pre-encode the corpus to a token-shard file, then exit
 attn11 --stream-corpus PATH  train/eval from a token-shard without loading it into RAM (GB-scale)
 attn11 --stream-encode       with --corpus + --encode-shard: stream-encode a large file in bounded RAM
-attn11 --objective O         training objective: ar (default), diffusion (masked, bidirectional), or rl (REINFORCE)
-attn11 --rl-target C         REINFORCE reward = count of char C per rollout (default space; needs --objective rl)
+attn11 --objective O         training objective: ar (default) or diffusion (masked, bidirectional)
 attn11 --ternary             BitNet-style ternary weights {-1,0,+1} (mha + dense + ar; STE backward)
 attn11 --decode-steps N      diffusion decode iterations (default = ctx)
 attn11 --decode-schedule S   diffusion unmask schedule: cosine (default) or linear
@@ -52,6 +51,10 @@ attn11 --gpu-tc              also GELU + LM-head + attention (+ their backward) 
 
 The GPU flags are an opt-in **execution target** (Linux / AMD GFX9), not a different model — a `--gpu`
 run is byte-identical to the default. See [`gpu.md`](gpu.md).
+
+attn11 is a pure supervised (SFT) + masked-diffusion training reference. The reinforcement-learning
+objective (`--objective rl` / `--rl-target`, REINFORCE) was removed at 1.11.1 and migrated to the separate
+[`tarka`](https://github.com/MacCracken/tarka) repo, where it is re-expressed on the `rosnet` tensor lib.
 
 Config flags (`--preset`/`--heads`/`--kv-heads`/`--layers`/`--attn-kind`/
 `--latent-dim`/`--attn-every`/`--pos-kind`/`--rope-dim`/`--experts`/`--expert-topk`/

@@ -3403,88 +3403,6 @@ fn test_stream_bpe_encode(): i64 {
     return 0;
 }
 
-# REINFORCE policy-gradient backward (M17). The RL gradient is the softmax-CE
-# backward over a FIXED rollout SCALED by the advantage (R - b) = g_reinforce_scale,
-# injected at D_logits in model_backward (gated on g_rl). Pins: (a) the RL gradient
-# equals advantage * the AR gradient element-wise (to rounding) — the scale is exact
-# and linear; (b) the full chain finite-difference-checks against the numeric
-# gradient of (advantage * CE); (c) a negative advantage flips the sign and a zero
-# advantage gives a zero gradient. Dense model (no MoE aux), fixed A_tokens/A_targets.
-fn test_rl_op(): i64 {
-    var V = 5; var C = 4; var T = 3; var nh = 2; var NL = 2;
-    model_init(V, C, T, nh, nh, NL, 1, f64_from(0), 1);   # mha + dense + uniform + AR
-    g_training = 0;
-    store64(A_tokens + 0, 1); store64(A_tokens + 8, 3); store64(A_tokens + 16, 0);
-    store64(A_targets + 0, 3); store64(A_targets + 8, 0); store64(A_targets + 16, 4);
-    var nTok = V * C;
-    var c = f64_div(f64_from(3), f64_from(2));            # advantage +1.5
-
-    # (a) RL gradient == advantage * AR gradient (one forward, two backwards)
-    model_forward();
-    g_rl = 0; model_zero_grads(); model_backward();
-    var arTok = t_alloc(nTok); t_copy(arTok, G_tokemb(), nTok);
-    var arLnf = t_alloc(C); t_copy(arLnf, G_lnfg(), C);
-    g_rl = 1; g_reinforce_scale = c; model_zero_grads(); model_backward();
-    var expTok = t_alloc(nTok); t_copy(expTok, arTok, nTok); t_scale(expTok, nTok, c);
-    var expLnf = t_alloc(C); t_copy(expLnf, arLnf, C); t_scale(expLnf, C, c);
-    check("rl grad == adv*AR (dtokemb)", G_tokemb(), expTok, nTok, 1000000);
-    check("rl grad == adv*AR (dlnf_g)", G_lnfg(), expLnf, C, 1000000);
-
-    # (b) FD: RL gradient == numeric gradient of (advantage * CE)
-    g_rl = 1; g_reinforce_scale = c;
-    model_forward(); model_zero_grads(); model_backward();
-    var aTok = t_alloc(nTok); t_copy(aTok, G_tokemb(), nTok);
-    var aLnf = t_alloc(C); t_copy(aLnf, G_lnfg(), C);
-    g_rl = 0;                                             # model_ng FDs the raw CE; scale by c
-    var nTokn = t_alloc(nTok); model_ng(P_tokemb(), nTokn, nTok); t_scale(nTokn, nTok, c);
-    var nLnfn = t_alloc(C); model_ng(P_lnfg(), nLnfn, C); t_scale(nLnfn, C, c);
-    check("rl grad FD (dtokemb)", aTok, nTokn, nTok, 10000);
-    check("rl grad FD (dlnf_g)", aLnf, nLnfn, C, 10000);
-
-    # (c) negative advantage negates the gradient (IEEE negation of the seed is
-    # exact + linear, so -adv gives the exact negation of the +adv gradient aTok)
-    g_rl = 1; g_reinforce_scale = f64_neg(c);
-    model_forward(); model_zero_grads(); model_backward();
-    var negTok = t_alloc(nTok); t_copy(negTok, aTok, nTok); t_scale(negTok, nTok, f64_neg(f64_from(1)));
-    check("rl grad: -adv negates (dtokemb)", G_tokemb(), negTok, nTok, 1000000);
-    # zero advantage -> zero gradient
-    g_rl = 1; g_reinforce_scale = f64_from(0);
-    model_forward(); model_zero_grads(); model_backward();
-    var zsum = f64_from(0); var zi = 0;
-    while (zi < nTok) { zsum = f64_add(zsum, f64_abs(load64(G_tokemb() + zi * 8))); zi = zi + 1; }
-    assert(zsum == f64_from(0), "rl: zero advantage -> zero gradient");
-    g_rl = 0; g_reinforce_scale = f64_from(0);
-    return 0;
-}
-
-# REINFORCE rollout sampler (M17): rl_rollout autoregressively samples T actions
-# and lays them out as AR (A_tokens[t]=x_t, A_targets[t]=x_{t+1}) so softmax-CE over
-# them is -log pi of the rollout. Pins the layout consistency, that actions are
-# in-vocab, and that rl_reward / rl_prompt behave. RNG-consuming (sampling).
-fn test_rl_rollout(): i64 {
-    g_stream = 0; g_data_w = 1;
-    var V = build_corpus();
-    model_init(V, 8, 6, 2, 2, 2, 1, f64_from(0), 5);     # small AR model, ctx 6
-    g_training = 0;
-    rl_rollout(1, f64_from(1));                           # prompt token 1 (in vocab)
-    var T = g_T;
-    assert(load64(A_tokens) == 1, "rl_rollout: A_tokens[0] == prompt");
-    var consist = 1; var t = 0;
-    while (t < T - 1) { if (load64(A_tokens + (t + 1) * 8) != load64(A_targets + t * 8)) { consist = 0; } t = t + 1; }
-    assert(consist == 1, "rl_rollout: A_tokens[t+1] == A_targets[t]");
-    var oor = 0; t = 0;
-    while (t < T) { var a = load64(A_targets + t * 8); if ((a < 0) || (a >= V)) { oor = oor + 1; } t = t + 1; }
-    assert(oor == 0, "rl_rollout: all sampled actions in [0,V)");
-    var tgt = load64(A_targets);
-    var manual = 0; t = 0;
-    while (t < T) { if (load64(A_targets + t * 8) == tgt) { manual = manual + 1; } t = t + 1; }
-    assert(rl_reward(tgt) == f64_from(manual), "rl_reward: counts target occurrences");
-    var p = rl_prompt();
-    assert((p >= 0) && (p < V), "rl_prompt: returns a valid corpus token id");
-    g_data_w = 1;
-    return 0;
-}
-
 fn main(): i64 {
     alloc_init();
     rng_seed(123);
@@ -3601,10 +3519,6 @@ fn main(): i64 {
     test_resume_stream();
     # streaming BPE encode (1.6.4) — RNG-neutral (tokenizer only), dead-last by convention.
     test_stream_bpe_encode();
-    # REINFORCE policy gradient (M17, E9) — RNG-consuming + model_init-reseeding, dead-last.
-    test_group("reinforcement learning (M17)");
-    test_rl_op();
-    test_rl_rollout();
     return assert_summary();
 }
 

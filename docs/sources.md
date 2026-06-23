@@ -191,15 +191,22 @@ a cosine schedule (attn11's greedy, lowest-index-tie-break, deterministic varian
 Used in: `src/train.cyr` (`gen_diffusion`, `_diff_keep`). See ADR 0013.
 
 ### REINFORCE (policy-gradient reinforcement learning, M17)
+> **Migrated out of attn11 at 1.11.1.** The REINFORCE training path was removed
+> from attn11 and re-expressed on the `rosnet` tensor lib in the **tarka** repo
+> (<https://github.com/MacCracken/tarka>), the sovereign RL/reasoning counterpoint.
+> attn11 is now a pure supervised (SFT) + masked-diffusion training reference; the
+> citation stays here because the implementation history references it (see ADR 0015).
+
 **Williams, R.J. (1992).** "Simple statistical gradient-following algorithms for
 connectionist reinforcement learning." *Machine Learning*, 8(3–4), 229–256.
 doi:[10.1007/BF00992696](https://doi.org/10.1007/BF00992696) — the score-function
 estimator `∇ E[R] = E[(R − b)·∇ log π(a)]` with a baseline `b` for variance
-reduction. attn11 realizes it as the reward-weighted softmax-CE backward over an
-on-policy rollout (since `∇ log π(a) = −∇ CE(a)`), with `b` an EMA of past mean
-rewards. Used in: `src/train.cyr` (`rl_train`, `rl_rollout`, `rl_reward`),
-`src/model.cyr` (the `g_rl` / `g_reinforce_scale` advantage scale in
-`model_backward`). See ADR 0015.
+reduction. The original attn11 RL feature realized it as the reward-weighted
+softmax-CE backward over an on-policy rollout (since `∇ log π(a) = −∇ CE(a)`), with
+`b` an EMA of past mean rewards. Was used in: `src/train.cyr` (`rl_train`,
+`rl_rollout`, `rl_reward`), `src/model.cyr` (the `g_rl` / `g_reinforce_scale`
+advantage scale in `model_backward`) — all removed at 1.11.1; now lives in tarka.
+See ADR 0015.
 
 ## Weight precision / quantization
 

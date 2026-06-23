@@ -1080,6 +1080,13 @@ checks). They are benched **head-to-head** against the 1.6.0 SIMD-f64 path
 
 ## X024 — REINFORCE vs SFT: the policy moves toward the reward (M17, v1.7.0) (2026-06-14)
 
+> **Migration marker (1.11.1):** the RL feature this entry validated — `--objective rl`,
+> the `--rl-target` flag, the REINFORCE training path, and the `test_rl_op` (M17) grad-check
+> — was **removed from attn11 at 1.11.1** and migrated to the separate **[`tarka`](https://github.com/MacCracken/tarka)**
+> repo, where REINFORCE is re-expressed on the `rosnet` tensor lib. attn11 is now a pure
+> supervised (SFT) + masked-diffusion training reference. This record is kept as history; the
+> numbers below were produced by the then-current `--objective rl` path and reproduce in tarka.
+
 **Setup**: 1.7.0, the first **reinforcement-learning** run — `--objective rl` (REINFORCE,
 E9, ADR 0015). The M17 gate: *does the policy move toward a reward?* Train the SAME default
 model (C=32, ctx 16, 3 layers, 39 488 params, byte-level, seed 1337) two ways on one

@@ -1,7 +1,20 @@
 # 0015 — REINFORCE policy-gradient training as reward-weighted softmax-CE
 
-**Status**: Accepted
+**Status**: Superseded — RL removed from attn11 and migrated to the tarka repo at 1.11.1 (see tarka ADR 0001)
 **Date**: 2026-06-14
+
+## Superseded (1.11.1)
+
+This decision held while attn11 owned the reinforcement-learning objective. At
+**1.11.1** RL was **removed from attn11** — the `--objective rl` / `--rl-target`
+flags, the `rl_rollout`/`rl_reward`/`rl_train`/`rl_eval` path, the
+`g_rl` / `g_reinforce_scale` gradient gate, and the M17 grad-check tests
+(`test_rl_op` / `test_rl_rollout`) are all gone. RL migrated to a separate repo,
+**tarka** (https://github.com/MacCracken/tarka), the sovereign RL/reasoning
+counterpoint, where REINFORCE is re-expressed on the `rosnet` tensor lib. attn11
+is now a pure supervised (SFT) + masked-diffusion training reference. The decision
+record below is preserved verbatim as the original rationale; see tarka ADR 0001
+for the continuation.
 
 ## Context
 
