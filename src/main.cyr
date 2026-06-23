@@ -86,6 +86,7 @@ include "lib/rosnet.cyr"         # extracted tensor/BLAS-1/matmul (+ gradient)
 # gpu_* CALLS #ifndef-guarded so the bundle type-checks as dead code there (the SYS_IOCTL stub above).
 include "src/tensor.cyr"
 include "src/fileio.cyr"
+include "src/tok.cyr"           # corpus + tokenizer data layer (split from train.cyr; akshara seam)
 include "src/ops.cyr"
 include "src/attn.cyr"
 include "src/attn_linear.cyr"

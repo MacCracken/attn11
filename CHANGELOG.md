@@ -4,7 +4,18 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-## [1.10.2] - 2026-06-22
+### Changed
+- **Module split (no behavior change): the corpus + tokenizer data layer moved
+  from `src/train.cyr` into a new `src/tok.cyr`** — embedded/loaded corpus, packed
+  token store (+ width-generic accessors + streaming read path), adaptive byte
+  vocab, and the opt-in BPE tokenizer (learn / encode / decode). `train.cyr` now
+  owns only training / eval / generation / RL. Byte-identical relocation;
+  `bpe_learn(K)` and all other signatures unchanged. `tok.cyr` is included before
+  `train.cyr` in `main.cyr` + the three test units. **Full suite green (1060/1060
+  checks, fuzz + bench compile, lint clean).** This is the seam for the **`akshara`
+  shared-lib extraction** (M1) — the tokenizer carves out to a repo consumed by
+  both attn11 and [tarka](https://github.com/MacCracken/tarka); the repo lift +
+  `[deps.akshara]` re-point is the next bite. (No version bump — internal refactor.)
 
 **X043 — multi-token prediction does NOT help at tiny scale (honest negative).** An experiment + docs cut:
 **no model-math change** — the `--mtp` mechanism is unchanged from 1.10.1, the binary is byte-identical
