@@ -1,9 +1,10 @@
 # attn11 — training loop, evaluation, generation, and RL.
 #
-# The corpus + tokenizer data layer moved to src/tok.cyr (2026-06-22). This file
-# now owns: batch sampling, the train/eval/generate loops, and the REINFORCE RL
-# path (rl_*). NOTE (M1): the rl_* surface migrates OUT to `tarka`; that is a
-# separate, user-confirmed bite that de-features attn11's --objective rl.
+# The corpus + tokenizer data layer was extracted to the `akshara` lib (2026-06-22;
+# `include "lib/akshara.cyr"`, see [deps.akshara]). This file now owns: batch
+# sampling, the train/eval/generate loops, and the REINFORCE RL path (rl_*).
+# NOTE (M1): the rl_* surface migrates OUT to `tarka`; that is a separate,
+# user-confirmed bite that de-features attn11's --objective rl.
 
 # ---- batch sampling --------------------------------------------------------
 # X043: fill the (g_mtp-1) shifted target rows for the window starting at `s` — aux

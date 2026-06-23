@@ -15,6 +15,16 @@ output = "build/attn11"
 [deps]
 stdlib = ["string", "fmt", "alloc", "io", "vec", "str", "syscalls", "assert", "bench", "math", "ganita", "args", "hashmap", "tagged", "fnptr", "mmap", "dynlib", "sakshi", "thread", "sankoch"]
 
+# The corpus + tokenizer data layer (byte-level + BPE), extracted from src/train.cyr
+# at M1 (was src/tok.cyr). attn11 supplies the consumer symbols the bundle leaves
+# unresolved — `puts`/`_putc` (src/tensor.cyr) + `secure_read_file`/`read_stdin`/
+# `file_seek` (src/fileio.cyr); `t_alloc`/`t_zero` come from [deps.rosnet] above.
+# LOCAL path during the extraction (akshara not yet pushed); switch to git+tag once
+# it is — the resolved lib/akshara.cyr is byte-identical either way.
+[deps.akshara]
+path = "/home/macro/Repos/akshara"
+modules = ["dist/akshara.cyr"]
+
 # M18 (v1.8.x GPU arc) — LANDED in v1.8.0 (X027). mabda 3.4.1 is consumed by
 # src/gpu.cyr (`include "lib/mabda.cyr"` in src/main.cyr + the test/fuzz/bench
 # harnesses); the 8 stdlib needs above (hashmap/tagged/fnptr/mmap/dynlib/sakshi/

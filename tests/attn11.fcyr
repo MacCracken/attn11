@@ -27,7 +27,7 @@ var SYS_IOCTL = 16;
 # [deps.rosnet]; no manual include. The gpu_* CALLS stay AGNOS-gated in src/.
 include "src/tensor.cyr"
 include "src/fileio.cyr"
-include "src/tok.cyr"
+include "lib/akshara.cyr"
 include "src/ops.cyr"
 include "src/attn.cyr"
 include "src/attn_linear.cyr"
