@@ -19,6 +19,8 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   green, fuzz + bench compile.** Shared with [tarka](https://github.com/MacCracken/tarka)
   (one tokenizer, two consumers). (No version bump — refactor + dependency swap.)
 
+## [1.10.2] - 2026-06-22
+
 **X043 — multi-token prediction does NOT help at tiny scale (honest negative).** An experiment + docs cut:
 **no model-math change** — the `--mtp` mechanism is unchanged from 1.10.1, the binary is byte-identical
 modulo `CFG_VERSION`. Ran the matched-compute A/B (`--mtp 1/2/3`, `c4-24-trainA`, BPE 256, 4000 steps,

@@ -19,10 +19,11 @@ stdlib = ["string", "fmt", "alloc", "io", "vec", "str", "syscalls", "assert", "b
 # at M1 (was src/tok.cyr). attn11 supplies the consumer symbols the bundle leaves
 # unresolved — `puts`/`_putc` (src/tensor.cyr) + `secure_read_file`/`read_stdin`/
 # `file_seek` (src/fileio.cyr); `t_alloc`/`t_zero` come from [deps.rosnet] above.
-# LOCAL path during the extraction (akshara not yet pushed); switch to git+tag once
-# it is — the resolved lib/akshara.cyr is byte-identical either way.
+# Pinned to akshara's 0.1.0 release tag (the resolved lib/akshara.cyr is byte-identical
+# to the local dist bundle the extraction was validated against).
 [deps.akshara]
-path = "/home/macro/Repos/akshara"
+git = "https://github.com/MacCracken/akshara"
+tag = "0.1.0"
 modules = ["dist/akshara.cyr"]
 
 # M18 (v1.8.x GPU arc) — LANDED in v1.8.0 (X027). mabda 3.4.1 is consumed by
