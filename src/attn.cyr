@@ -66,6 +66,13 @@ fn attn_core_fwd(Qc, Kc, Vc, Pc, concat, T, C, nh, nkv): i64 {
         }
     }
     #endif
+    # CPU forward, CAUSAL path (g_bidir == 0) delegated to rupantara (ru_attn_core_fwd)
+    # — the single source of truth for the per-head softmax/PV leaf math (bit-identical:
+    # same scale 1/√hd, GQA head-sharing, 4-lane fmadd dot + log-sum-exp softmax + PV
+    # axpy, writes the same Pc probabilities the backward consumes). The bidirectional-
+    # diffusion path (g_bidir == 1, M15) stays attn11-local below (rupantara is causal-
+    # only); the backward + arena sizing remain attn11's.
+    if (g_bidir == 0) { return ru_attn_core_fwd(Qc, Kc, Vc, Pc, concat, T, C, nh, nkv); }
     var hd = C / nh;
     var Ckv = nkv * hd;
     var gsz = nh / nkv;             # query heads per K/V head (GQA group size)

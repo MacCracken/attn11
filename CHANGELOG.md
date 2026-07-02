@@ -4,6 +4,27 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.12.0] — 2026-07-02
+
+**Re-fold — consume the extracted `rupantara` forward lib (single source of truth).**
+
+### Changed
+- **Re-fold: consume `rupantara` 0.3.0 for the CPU leaf forward ops** (single source
+  of truth; kills the CPU-forward divergence with the extracted lib). Added
+  `[deps.rupantara]` (git + `tag = "0.3.0"`; local `path = "../rupantara"` override
+  for dev, git+tag for CI) + `include "lib/rupantara.cyr"` (in `src/main.cyr` and the
+  three test entries), and
+  routed three leaf-op CPU bodies to rupantara: `ln_fwd` → `ru_ln_fwd`,
+  `gelu_fwd` → `ru_gelu_fwd`, and `attn_core_fwd` (causal, `g_bidir==0`) →
+  `ru_attn_core_fwd`. The GPU (`--gpu`/`--gpu-tc`) and bidirectional-diffusion
+  (`g_bidir==1`) branches, the backward, and its own (larger, fwd+bwd)
+  `attn_arena_size` stay attn11-local. **No behavior change** — the full
+  grad-check suite is **1049 passed, 0 failed** in one binary with the delegation
+  (the live parity proof; no offline compare). Composition/embed/head + row/MLA/
+  SSM/MoE/MTP CPU paths are *not* delegated (rupantara has no peer / incompatible
+  signatures) and remain attn11-local by design. See
+  `docs/development/rupantara-refold.md`.
+
 ## [1.11.1] - 2026-06-22
 
 **RL de-featured — REINFORCE migrated to the `tarka` repo (closes the M1 arc).** attn11

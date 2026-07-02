@@ -7,6 +7,7 @@
 
 include "lib/tyche.cyr"          # extracted PRNG (rng_*, _rng_state)
 include "lib/rosnet.cyr"         # extracted tensor/BLAS-1/matmul (+ gradient)
+include "lib/rupantara.cyr"      # ru_* forward leaf ops (M1 re-fold)
 # mabda (Linux-only GPU dep) auto-prepends from [deps.mabda] on all targets; on AGNOS it is
 # dead code but still references SYS_IOCTL (absent from the agnos syscall peer) — define it so
 # the auto-prepended dep compiles. The GPU backend (rosnet's [lib.gpu] bundle, also auto-prepended)

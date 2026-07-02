@@ -77,6 +77,7 @@ var SYS_IOCTL = 16;
 
 include "lib/tyche.cyr"          # extracted PRNG (rng_*, _rng_state)
 include "lib/rosnet.cyr"         # extracted tensor/BLAS-1/matmul (+ gradient)
+include "lib/rupantara.cyr"      # ru_* forward leaf ops — attn11 delegates CPU bodies here (M1 re-fold)
 # M19 1.10.0 (ADR 0017): the GPU backend was extracted whole to rosnet's [lib.gpu] profile
 # (dist/rosnet-gpu.cyr) — it + mabda are auto-prepended from [deps] on all targets; AGNOS keeps the
 # gpu_* CALLS #ifndef-guarded so the bundle type-checks as dead code there (the SYS_IOCTL stub above).

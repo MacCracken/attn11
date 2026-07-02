@@ -35,36 +35,10 @@ fn ln_fwd(x, gamma, beta, y, mean, rstd, M, C): i64 {
     #ifndef CYRIUS_TARGET_AGNOS
     if (g_gpu == 1) { if (gpu_ln_fwd(x, gamma, beta, y, mean, rstd, M, C) == 0) { return 0; } }
     #endif
-    var eps = _eps_ln();
-    var invC = f64_div(f64_from(1), f64_from(C));
-    var m = 0;
-    while (m < M) {
-        var row = x + m * C * 8;
-        var mu = f64_from(0);
-        var i = 0;
-        while (i < C) { mu = f64_add(mu, load64(row + i * 8)); i = i + 1; }
-        mu = f64_mul(mu, invC);
-        var v = f64_from(0);
-        i = 0;
-        while (i < C) {
-            var d = f64_sub(load64(row + i * 8), mu);
-            v = f64_add(v, f64_mul(d, d));
-            i = i + 1;
-        }
-        v = f64_mul(v, invC);
-        var rs = f64_div(f64_from(1), f64_sqrt(f64_add(v, eps)));
-        store64(mean + m * 8, mu);
-        store64(rstd + m * 8, rs);
-        i = 0;
-        while (i < C) {
-            var xhat = f64_mul(f64_sub(load64(row + i * 8), mu), rs);
-            var o = f64_add(f64_mul(xhat, load64(gamma + i * 8)), load64(beta + i * 8));
-            store64(y + (m * C + i) * 8, o);
-            i = i + 1;
-        }
-        m = m + 1;
-    }
-    return 0;
+    # CPU forward delegated to rupantara (ru_ln_fwd) — the single source of truth
+    # for the leaf math. Bit-identical: same eps=1e-5, mean/var/rstd, and it writes
+    # the SAME mean(M)/rstd(M) caches ln_bwd (below) consumes. The --gpu path is above.
+    return ru_ln_fwd(x, gamma, beta, y, mean, rstd, M, C);
 }
 
 # dy(M,C) -> dx(M,C); accumulate dgamma(C), dbeta(C).
@@ -126,20 +100,9 @@ fn gelu_fwd(x, y, n): i64 {
     #ifndef CYRIUS_TARGET_AGNOS
     if (g_gpu_tc == 1) { if (gpu_gelu_fwd(x, y, n) == 0) { return 0; } }
     #endif
-    var c = _gelu_c();
-    var a = _gelu_a();
-    var half = f64_div(f64_from(1), f64_from(2));
-    var one = f64_from(1);
-    var i = 0;
-    while (i < n) {
-        var xv = load64(x + i * 8);
-        var x3 = f64_mul(f64_mul(xv, xv), xv);
-        var inner = f64_mul(c, f64_add(xv, f64_mul(a, x3)));
-        var t = f64_tanh(inner);
-        store64(y + i * 8, f64_mul(f64_mul(half, xv), f64_add(one, t)));
-        i = i + 1;
-    }
-    return 0;
+    # CPU forward delegated to rupantara (ru_gelu_fwd) — single source of truth for
+    # the leaf math (tanh-approx GELU, c=√(2/π), a=0.044715). The --gpu-tc path is above.
+    return ru_gelu_fwd(x, y, n);
 }
 
 # dy -> dx (length n). Needs the original x.

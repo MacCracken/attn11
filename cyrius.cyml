@@ -54,6 +54,21 @@ git = "https://github.com/MacCracken/rosnet"
 tag = "0.2.0"
 modules = ["dist/rosnet.cyr", "dist/rosnet-gpu.cyr"]
 
+# The transformer FORWARD leaf-op CPU math, extracted to rupantara so there is ONE
+# source of truth: attn11 delegates its ln_fwd / gelu_fwd / attn_core_fwd (causal)
+# CPU bodies to rupantara's ru_* ops. The GPU (--gpu / --gpu-tc) and bidirectional-
+# diffusion (g_bidir) branches stay attn11-local, as does ALL backward. rupantara
+# consumes the same rosnet 0.2.0, so the matmul under the delegated forward is
+# bit-identical (the parity contract); attn11's full grad-check suite is the live
+# parity proof (one binary, no offline compare). Local `path` override during the
+# re-fold (the ru_* rename is unreleased); switch to git+tag once rupantara cuts the
+# release — the resolved lib/ is identical either way.
+[deps.rupantara]
+git = "https://github.com/MacCracken/rupantara"
+path = "../rupantara"
+tag = "0.3.0"
+modules = ["dist/rupantara.cyr"]
+
 # M18 (the v1.8.x GPU arc): mabda is the GPU *foundation* — device/context init,
 # buffers, compute-pipeline + dispatch. attn11 consumes the native-AMD SPIR-V f64
 # compute path (proven bit-exact on Cezanne, X025), launcher-free + pure-Cyrius, so
