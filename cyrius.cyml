@@ -44,14 +44,13 @@ git = "https://github.com/MacCracken/tyche"
 tag = "0.1.1"
 modules = ["dist/tyche.cyr"]
 
-# rosnet 0.2.0 adds the GPU backend as a separate [lib.gpu] profile (dist/rosnet-gpu.cyr) —
-# the M18/M19 backend extracted whole from attn11 (ADR 0017 / rosnet ADR 0001). The CPU bundle
-# (dist/rosnet.cyr) is unchanged. dist/rosnet-gpu.cyr leaves mabda's symbols unresolved; [deps.mabda]
-# below supplies them. (Local `path` during the extraction; switch to git+tag = "0.2.0" once rosnet
-# 0.2.0 is pushed — the resolved lib/ is identical either way.)
+# rosnet 1.1.0: the frozen 1.0 surface attn11 already exercised (identical to the 0.2.0
+# code) + conv2d/conv1d fwd+bwd (NCHW, per-axis stride/pad, FD-gated) — pulled in for the
+# vision lane (src/vision.cyr, the sight proof). The GPU [lib.gpu] profile rides along
+# unchanged (dist/rosnet-gpu.cyr leaves mabda's symbols unresolved; [deps.mabda] supplies them).
 [deps.rosnet]
 git = "https://github.com/MacCracken/rosnet"
-tag = "0.2.0"
+tag = "1.1.0"
 modules = ["dist/rosnet.cyr", "dist/rosnet-gpu.cyr"]
 
 # The transformer FORWARD leaf-op CPU math, extracted to rupantara so there is ONE

@@ -4,6 +4,46 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.13.0] — 2026-07-05
+
+### Added — the VISION lane (the modality-axis "sight proof-of-life")
+- **`src/vision.cyr` + `--vision`** — a small CNN classifier assembled from
+  FD-gated primitives: **rosnet 1.1.0 `conv2d`** (fwd+bwd, NCHW, strided-conv
+  downsampling — no pooling needed) + the existing `gelu` / `softmax_xent`
+  ops + a local Adam + global-norm grad clip. Trained on a **synthetic,
+  fully-sovereign shape set** (4 classes — square/plus/X/stripes — jittered
+  + gaussian-noised, deterministic via tyche; no downloads, no fixtures).
+  **PROOF PASS: loss 1.377 → 0.0012, held-out accuracy 1000/1000** (16×16,
+  5,348 params, 600 steps, ~47 s). The exact sibling of attn11's first
+  char-LM loss curve, on pixels — per
+  `agnosticos planning/multimodal-substrate.md` § Sight.
+- **`--vision-fd`** + suite gates (`tests/attn11.tcyr` 1049→**1060**): the
+  assembled end-to-end backward carries its own central-difference gate
+  (23/23 within 1e-5 — fwd/bwd chain: xent → linear_bwd → gelu_bwd →
+  conv2d_bwd ×2), plus a micro-train gate (G=12, loss descends + held-out
+  well above chance).
+- **`[deps.rosnet]` 0.2.0 → 1.1.0** — the frozen 1.0 surface attn11 already
+  exercised (code-identical) + conv2d/conv1d; full suite green on the new pin
+  before the lane landed.
+
+### Porting gotcha (recorded)
+- **`rng_u64() % n` goes NEGATIVE on negative draws** (Cyrius i64 remainder)
+  — produced negative class labels → out-of-bounds prob reads (intermittent
+  `inf` loss) and mislabeled shapes (chance-level accuracy) while the FD gate
+  still PASSED (consistent fwd/bwd garbage differentiates consistently).
+  Mask first: `(rng_u64() & 0x7FFFFFFFFFFFFFFF) % n` (tarka's convention).
+
+### Added
+- **`test_rupantara_parity` — whole-forward parity vs rupantara** (grad-check
+  suite). Proves rupantara's composition forward `ru_model_fwd` (embed → pre-norm
+  blocks → final LN → weight-tied head) is **bit-identical** to attn11's own
+  `model_forward` on the SAME `g_params`, in one binary (attn11 links
+  `lib/rupantara.cyr`) — a strict `diffs==0` bit compare + maxrel, no offline dump.
+  4 configs (MHA dense ±bias, GQA `nkv<nh`, MQA `nkv=1`, 1–3 blocks) all
+  `maxrel=0.000000000`. Extends the re-fold beyond the delegated leaf ops:
+  rupantara's *whole* forward now matches attn11's, cross-validating the ops attn11
+  does not itself delegate. Suite total 1049 → **1057**.
+
 ## [1.12.0] — 2026-07-02
 
 **Re-fold — consume the extracted `rupantara` forward lib (single source of truth).**

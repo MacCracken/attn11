@@ -1,6 +1,6 @@
 commit	b40d00cf3be25e2b4fb3e69d5828044a0635b537	akshara	https://github.com/MacCracken/akshara	0.1.0
 commit	ef54068c7ee4ee9478b7fa3046ed0a211b474e8b	tyche	https://github.com/MacCracken/tyche	0.1.1
-commit	2ef15e8de36cd81fb2c9e72f139af62f0b2c184a	rosnet	https://github.com/MacCracken/rosnet	0.2.0
+commit	14e56de061c6d9a78fc325364c47e7b7731706e8	rosnet	https://github.com/MacCracken/rosnet	1.1.0
 commit	a5a97ea9ad2157c17a396a32b3b7148b2815a7b4	mabda	https://github.com/MacCracken/mabda	3.4.1
 commit	35beb1b3d785ab3760bfda61c17d81c3827ba23e	samvada	https://github.com/MacCracken/samvada.git	0.4.1
 commit	c61651ffe183a72689cc1d2fd0c04e59b2db2366	chitra	https://github.com/MacCracken/chitra.git	0.1.0
@@ -47,7 +47,7 @@ ff14f0d7999956754937f612c0aa60719c138f0967a81019cf99e08aae088087  lib/string.cyr
 0d1dc162866327cdea376c2177090cfdfc4779227c15d2da0d04fffc058e738d  lib/alloc.cyr
 22e00794654b2aeb6dc88bfa66f5036945df3478141a1172237cde5954ab7b96  lib/sigil.cyr
 012b8eedaad8d3e6f32324af1c0f5028be23d1ea4365aa27cb942162078bac02  lib/sandhi.cyr
-9d4b7562f75c6fd44380976844421e7621a4baa67f0a8f68a4e578f230cb1af4  lib/rosnet.cyr
+dce2915bb429f599b7de714b8b5788484d538964a70dc5b3125db56a262b6ee1  lib/rosnet.cyr
 639aa6feb170319f983df4b39b827f29b26391b55de241c25e711f3880bce0a0  lib/flags.cyr
 e1a1fc06a604cf14c5bd2b5d21dec1e459897f3a8dceb03bcc66de6d178c01a2  lib/syscalls_x86_64_linux.cyr
 27de12bbfa56c7dd7f8db2620f7a458d0ed2b3acf3470e7c86eb568784d4ea8e  lib/syscalls_x86_64_agnos.cyr
@@ -84,7 +84,7 @@ f6563cc78843147905c8a7e957da1d182d696a371ba392347d1e1522f42a993c  lib/syscalls_a
 c4d6feec81b720c3a8b31380058e8b6a88061355a1f23575bac007f608502803  lib/sankoch.cyr
 bb642e72aa8b7b471b0fc0f8f7cb31a906619f785b212a08fbf09ab2a170993b  lib/audit_walk.cyr
 ccfad90df061416eec7b8eafe729110d099810731c4a9fcd5477448095eb9ed2  lib/ws.cyr
-d6fe8b7ae9eb87c3ccdea637a3be192a801e6047df14bbda3c819d3ada933ac3  lib/rosnet-gpu.cyr
+b635ed0a9c950c2e8da647c02eb0c4ff36961a39a5bdbd9b5890ca8c3734fdec  lib/rosnet-gpu.cyr
 aea2383e6fd828de155879b55ab954732f0e45eb6febaebdc03650e952c4d093  lib/async_agnos.cyr
 543be460c6d2a9922e47f4dafb4fae981802f74827b935d4ec9dadb35870cb43  lib/keccak.cyr
 b64c3fa9d44761957460676297f6f54bfe15c1ff566a0d98a529b1ac60c04693  lib/yantra.cyr
@@ -106,7 +106,7 @@ efd5e32a3ff24466ccdf85928d884369255d2b87733f410d3b5918d5a8177709  lib/unicode/no
 af30844628c715c51cad83addf05c9de4fb12d4b84f97801322448b2df1091b1  lib/fnptr.cyr
 39fe97dbac447954aa0db7846d0236514dc083b3e3aa93b13484dab682f5abc1  lib/syscalls_windows.cyr
 38750346c6b2b97445c25aa3cc85df572379209d86c260499518fdeb3897ccb6  lib/tls_native_hs13.cyr
-78382f7be691f60bd9a42b4cbab7d77ee4d62465cbb8e5d9afe62210b10bdf83  lib/rupantara.cyr
+033fda0d23e50137482e1e18aa496b010d4f3d1a3a493d298235d0e2a6929c10  lib/rupantara.cyr
 de4598e4862fdc8d02195688b9aacc91e888d5f6b85d9fac08f4b7af9daaca19  lib/random.cyr
 927f8e674a5acb648b536d54744bb74b595e3376202f702412015228d3f7056d  lib/bounds.cyr
 15d2527da5f533b0a96bdc5c10cb894836f1c95f4b9d88342a6ce9dc4f61acc8  lib/tls_native_conn.cyr

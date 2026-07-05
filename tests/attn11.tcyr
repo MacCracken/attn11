@@ -28,6 +28,7 @@ include "src/model.cyr"
 include "src/train.cyr"
 include "src/persist.cyr"
 include "src/stream.cyr"
+include "src/vision.cyr"     # the vision lane (sight proof)
 
 fn _eps(): i64 { return f64_div(f64_from(1), f64_from(10000)); }     # 1e-4
 fn dotsum(a, b, n): i64 {
@@ -3404,6 +3405,94 @@ fn test_stream_bpe_encode(): i64 {
     return 0;
 }
 
+# ---- rupantara re-fold parity: ru_model_fwd == attn11 model_forward ----------
+# The re-fold delegates attn11's LEAF ops (ln/gelu/attn-core) to rupantara. This
+# closes the honest gap: it proves rupantara's WHOLE composition forward
+# (ru_model_fwd — embed -> pre-norm blocks -> final LN -> weight-tied head) is
+# BIT-IDENTICAL to attn11's own model_forward on the SAME packed g_params. Both
+# forwards live in THIS binary (attn11 includes lib/rupantara.cyr), so it is a
+# live in-binary comparison, never an offline dump/compare. rupantara's packed
+# layout is byte-identical to attn11's (blocks.cyr §PACKED PARAMETER LAYOUT), so
+# attn11's g_params feeds ru_model_fwd directly.
+fn _ru_parity(V, C, T, nh, nkv, NL, bias, seed, name): i64 {
+    model_init(V, C, T, nh, nkv, NL, bias, f64_from(0), seed);
+    var i = 0;
+    while (i < T) {
+        store64(A_tokens + i * 8, (i * 2 + 1) % V);
+        store64(A_targets + i * 8, (i + 1) % V);
+        i = i + 1;
+    }
+    model_forward();                        # attn11 forward -> A_logits (T x V)
+    var TV = T * V;
+    var a_log = t_alloc(TV);
+    t_copy(a_log, A_logits, TV);            # snapshot attn11's logits
+    var cfg = t_alloc(8);                   # ru cfg descriptor (8 i64)
+    ru_cfg_init(cfg, V, C, T, nh, nkv, NL, g_F, bias);
+    var ru_log = t_alloc(TV);
+    ru_model_fwd(cfg, g_params, A_tokens, ru_log, 0);   # rupantara on the SAME g_params
+    var diffs = 0;
+    i = 0;
+    while (i < TV) {
+        if (load64(a_log + i * 8) != load64(ru_log + i * 8)) { diffs = diffs + 1; }
+        i = i + 1;
+    }
+    assert(diffs == 0, name);               # bit-identical is the strong claim
+    check(name, a_log, ru_log, TV, 1000000000000);   # + report maxrel (< 1e-12)
+    return 0;
+}
+
+fn test_rupantara_parity(): i64 {
+    _ru_parity(11, 8, 4, 2, 2, 2, 0, 101, "ru_model_fwd==attn11 mha-dense-nobias");
+    _ru_parity(11, 8, 4, 2, 2, 2, 1, 102, "ru_model_fwd==attn11 mha-dense-bias");
+    _ru_parity(7, 12, 5, 4, 2, 3, 0, 103, "ru_model_fwd==attn11 gqa-3blocks");
+    _ru_parity(9, 8, 4, 4, 1, 2, 0, 104, "ru_model_fwd==attn11 mqa-nkv1");
+    return 0;
+}
+
+# ---- vision lane (sight proof): end-to-end FD gate + a micro-train gate -------
+fn test_vision_fd(): i64 {
+    assert_eq(vis_grad_check(), 0, "vision assembled backward FD-gated (rel < 1e-5)");
+    return 0;
+}
+
+fn test_vision_train(): i64 {
+    # small dims so the suite stays fast: G=12 (8x8 + the ±3 jitter pushes
+    # glyphs off-canvas — label noise, not a model problem), 4 classes,
+    # 150 steps — the gate is loss-descends + accuracy well above chance (250)
+    var G = 12;
+    var c1 = 4;
+    var c2 = 8;
+    var ncls = 4;
+    var B = 16;
+    vis_init(G, c1, c2, ncls, 20260705);
+    var X = t_alloc(B * G * G);
+    var Y = alloc(B * 8);
+    rng_seed(99);
+    var lr = f64_div(ff(1), ff(1000));
+    var loss0 = ff(0);
+    var loss = ff(0);
+    var st = 0;
+    while (st < 150) {
+        vis_make_batch(X, Y, B, G);
+        t_zero(vis_Gr, vis_NP);
+        loss = vis_fwd(X, Y, B, G, c1, c2, ncls);
+        if (st == 0) { loss0 = loss; }
+        vis_bwd(X, Y, B, G, c1, c2, ncls);
+        vis_clip(ff(1));
+        vis_adam(lr, st + 1);
+        st = st + 1;
+    }
+    assert(f64_lt(loss, loss0) == 1, "vision micro-train: loss descends");
+    var EB = 64;
+    var Xe = t_alloc(EB * G * G);
+    var Ye = alloc(EB * 8);
+    vis_make_batch(Xe, Ye, EB, G);
+    vis_fwd(Xe, Ye, EB, G, c1, c2, ncls);
+    var acc = vis_acc_x1000(Ye, EB, ncls);
+    assert_gt(acc, 600, "vision micro-train: held-out well above chance (>600/1000)");
+    return 0;
+}
+
 fn main(): i64 {
     alloc_init();
     rng_seed(123);
@@ -3437,6 +3526,8 @@ fn main(): i64 {
     test_model_hybrid_ssm();
     test_model_hybrid_mla();
     test_head_tail();
+    test_group("rupantara re-fold parity");
+    test_rupantara_parity();
     test_group("persistence");
     test_resume_determinism();
     test_resume_dropout();
@@ -3520,6 +3611,10 @@ fn main(): i64 {
     test_resume_stream();
     # streaming BPE encode (1.6.4) — RNG-neutral (tokenizer only), dead-last by convention.
     test_stream_bpe_encode();
+    test_group("vision lane (sight proof)");
+    test_vision_fd();
+    test_vision_train();
+
     return assert_summary();
 }
 

@@ -92,6 +92,7 @@ include "src/model.cyr"
 include "src/train.cyr"
 include "src/persist.cyr"
 include "src/stream.cyr"
+include "src/vision.cyr"   # the VISION lane — the modality-axis sight proof (rosnet conv2d)
 
 # ---- hyperparameters -------------------------------------------------------
 fn CFG_C(): i64 { return 32; }       # d_model
@@ -129,7 +130,7 @@ fn _atoi(s): i64 {
 }
 
 # Kept in sync with the VERSION file (CI's docs job gates the match).
-fn CFG_VERSION(): i64 { return "1.12.0"; }
+fn CFG_VERSION(): i64 { return "1.13.0"; }
 
 fn usage(): i64 {
     puts("attn11 — a from-scratch GPT-style transformer, trained, in Cyrius\n");
@@ -140,6 +141,8 @@ fn usage(): i64 {
     puts("  --save PATH     write a crash-atomic checkpoint after training\n");
     puts("  --load PATH     resume from a checkpoint (+ --corpus or --stream-corpus to continue)\n");
     puts("  --gen-only      skip training, just sample\n");
+    puts("  --vision        the sight proof: tiny CNN on synthetic shapes (rosnet conv2d)\n");
+    puts("  --vision-fd     the vision lane's end-to-end finite-difference gate only\n");
     puts("  --preset        ctx 64 / d_model 64 / 8 heads / 4 layers\n");
     puts("  --d-model N     override d_model (width; 1..4096; must be divisible by heads)\n");
     puts("  --ctx N         override context length T (1..8192)\n");
@@ -217,6 +220,8 @@ fn main(): i64 {
         elif (streq(a, "--save") == 1) { i = i + 1; save_path = _av(i, a); }
         elif (streq(a, "--steps") == 1) { i = i + 1; steps = _atoi(_av(i, a)); }
         elif (streq(a, "--gen-only") == 1) { gen_only = 1; }
+        elif (streq(a, "--vision") == 1) { return vision_demo(600, 32, 1337); }
+        elif (streq(a, "--vision-fd") == 1) { return vis_grad_check(); }
         #ifndef CYRIUS_TARGET_AGNOS
         elif (streq(a, "--gpu") == 1) { g_gpu = 1; }
         elif (streq(a, "--gpu-tc") == 1) { g_gpu = 1; g_gpu_tc = 1; }

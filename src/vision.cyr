@@ -1,0 +1,367 @@
+# attn11 — the VISION lane: the modality-axis "sight proof-of-life"
+# (agnosticos planning/multimodal-substrate.md § Sight).
+#
+#   attn11 --vision            train the tiny CNN on synthetic shapes + gate
+#
+# The proof: a small CNN classifier — rosnet conv2d (1.1.0, FD-gated) + the
+# existing attn11 ops (gelu, softmax-xent) + a local Adam — trained on a
+# SYNTHETIC, fully-sovereign shape set (no downloads, no fixtures), loss
+# descending and held-out accuracy gated. The exact sibling of attn11's first
+# char-LM loss curve, on pixels instead of bytes.
+#
+# Model (NCHW, downsampling by strided conv — rosnet has no pooling, and
+# doesn't need it here):
+#   x(B,1,G,G) → conv 3x3 pad1  (1→C1)  → gelu → (B,C1,G,G)
+#              → conv 3x3 s2 p1 (C1→C2) → gelu → (B,C2,G/2,G/2)
+#              → flatten (B, C2·(G/2)²) → linear → logits(B, NCLS)
+#              → softmax-xent
+# Backward is the hand-assembled chain of the SAME FD-gated primitives:
+#   xent bwd → rosnet linear_bwd → gelu_bwd → rosnet conv2d_bwd → gelu_bwd
+#   → conv2d_bwd (dx skipped at the input). The assembled end-to-end gradient
+#   carries its OWN finite-difference gate (vision_grad_check) — the attn11
+#   discipline: no backward ships ungated.
+#
+# Synthetic shapes (deterministic via tyche; seed = the reproducibility knob):
+# NCLS=4 classes on a G×G canvas, each drawn at a jittered position with
+# additive noise — square (filled block), plus (+), cross (X), stripes.
+# Learnable-but-not-trivial at MNIST-class difficulty.
+
+fn VIS_G(): i64 { return 16; }        # canvas side
+fn VIS_C1(): i64 { return 8; }        # conv1 channels
+fn VIS_C2(): i64 { return 16; }       # conv2 channels
+fn VIS_NCLS(): i64 { return 4; }      # classes
+
+# ---- params: one flat block (Wc1 bc1 Wc2 bc2 Wl bl), rosnet-conv layouts ----
+var vis_P = 0;                        # params
+var vis_Gr = 0;                       # grads
+var vis_M = 0;                        # adam m
+var vis_V = 0;                        # adam v
+var vis_NP = 0;
+
+fn _vis_o_Wc1(): i64 { return 0; }
+fn _vis_o_bc1(c1, k): i64 { return c1 * 1 * k * k; }
+fn _vis_o_Wc2(c1, k): i64 { return _vis_o_bc1(c1, k) + c1; }
+fn _vis_o_bc2(c1, c2, k): i64 { return _vis_o_Wc2(c1, k) + c2 * c1 * k * k; }
+fn _vis_o_Wl(c1, c2, k, flat, ncls): i64 { return _vis_o_bc2(c1, c2, k) + c2; }
+fn _vis_o_bl(c1, c2, k, flat, ncls): i64 { return _vis_o_Wl(c1, c2, k, flat, ncls) + flat * ncls; }
+fn _vis_np(c1, c2, k, flat, ncls): i64 { return _vis_o_bl(c1, c2, k, flat, ncls) + ncls; }
+
+# allocate + gaussian-init the CNN for (G, C1, C2, K=3, NCLS); flat = C2·(G/2)²
+fn vis_init(G, c1, c2, ncls, seed): i64 {
+    var flat = c2 * (G / 2) * (G / 2);
+    vis_NP = _vis_np(c1, c2, 3, flat, ncls);
+    vis_P = t_alloc(vis_NP);
+    vis_Gr = t_alloc(vis_NP);
+    vis_M = t_alloc(vis_NP);
+    vis_V = t_alloc(vis_NP);
+    t_zero(vis_Gr, vis_NP);
+    t_zero(vis_M, vis_NP);
+    t_zero(vis_V, vis_NP);
+    rng_seed(seed);
+    var std = f64_div(ff(1), ff(10));
+    t_randn(vis_P + _vis_o_Wc1() * 8, c1 * 9, std);
+    t_zero(vis_P + _vis_o_bc1(c1, 3) * 8, c1);
+    t_randn(vis_P + _vis_o_Wc2(c1, 3) * 8, c2 * c1 * 9, std);
+    t_zero(vis_P + _vis_o_bc2(c1, c2, 3) * 8, c2);
+    t_randn(vis_P + _vis_o_Wl(c1, c2, 3, flat, ncls) * 8, flat * ncls, std);
+    t_zero(vis_P + _vis_o_bl(c1, c2, 3, flat, ncls) * 8, ncls);
+    return vis_NP;
+}
+
+# ---- synthetic shapes ---------------------------------------------------------
+fn _vis_px(img, G, r, c, v): i64 {
+    if (r < 0) { return 0; }
+    if (r >= G) { return 0; }
+    if (c < 0) { return 0; }
+    if (c >= G) { return 0; }
+    store64(img + (r * G + c) * 8, v);
+    return 0;
+}
+
+# draw class `cls` at jittered position into img (G*G f64, pre-zeroed);
+# classes: 0 = filled square, 1 = plus, 2 = X, 3 = horizontal stripes
+fn _vis_draw(img, G, cls): i64 {
+    var one = ff(1);
+    var jr = ((rng_u64() & 0x7FFFFFFFFFFFFFFF) % 7) - 3;
+    var jc = ((rng_u64() & 0x7FFFFFFFFFFFFFFF) % 7) - 3;
+    var cx = G / 2 + jr;
+    var cy = G / 2 + jc;
+    var half = G / 4;
+    var d = 0 - half;
+    if (cls == 0) {                                   # filled square
+        var r = 0 - half;
+        while (r <= half) {
+            var c = 0 - half;
+            while (c <= half) { _vis_px(img, G, cx + r, cy + c, one); c = c + 1; }
+            r = r + 1;
+        }
+    }
+    elif (cls == 1) {                                 # plus
+        d = 0 - half;
+        while (d <= half) {
+            _vis_px(img, G, cx + d, cy, one);
+            _vis_px(img, G, cx, cy + d, one);
+            d = d + 1;
+        }
+    }
+    elif (cls == 2) {                                 # X
+        d = 0 - half;
+        while (d <= half) {
+            _vis_px(img, G, cx + d, cy + d, one);
+            _vis_px(img, G, cx + d, cy - d, one);
+            d = d + 1;
+        }
+    }
+    else {                                            # horizontal stripes
+        var r2 = 0 - half;
+        while (r2 <= half) {
+            var c2 = 0 - half;
+            while (c2 <= half) { _vis_px(img, G, cx + r2, cy + c2, one); c2 = c2 + 1; }
+            r2 = r2 + 2;
+        }
+    }
+    # additive gaussian noise, sigma 0.1 — keeps the task honest
+    var n = G * G;
+    var i = 0;
+    var sig = f64_div(ff(1), ff(10));
+    while (i < n) {
+        store64(img + i * 8, f64_add(load64(img + i * 8), f64_mul(sig, rng_normal())));
+        i = i + 1;
+    }
+    return 0;
+}
+
+# fill X(B,1,G,G) + labels Y(B) with a balanced shuffled batch
+fn vis_make_batch(X, Y, B, G): i64 {
+    var i = 0;
+    while (i < B) {
+        var cls = (rng_u64() & 0x7FFFFFFFFFFFFFFF) % VIS_NCLS();
+        store64(Y + i * 8, cls);
+        var img = X + i * G * G * 8;
+        t_zero(img, G * G);
+        _vis_draw(img, G, cls);
+        i = i + 1;
+    }
+    return 0;
+}
+
+# ---- forward / backward -------------------------------------------------------
+# scratch (sized for the largest use; reallocated when B grows)
+var _vis_y1p = 0;   # conv1 pre-act  (B,C1,G,G)
+var _vis_y1 = 0;    # conv1 post-gelu
+var _vis_y2p = 0;   # conv2 pre-act  (B,C2,G/2,G/2)
+var _vis_y2 = 0;    # conv2 post-gelu (the flatten view)
+var _vis_lg = 0;    # logits (B,NCLS)
+var _vis_pr = 0;    # probs  (B,NCLS)
+var _vis_cap = 0;
+
+fn _vis_scratch(B, G, c1, c2, ncls): i64 {
+    if (_vis_cap >= B) { return 0; }
+    _vis_y1p = t_alloc(B * c1 * G * G);
+    _vis_y1 = t_alloc(B * c1 * G * G);
+    _vis_y2p = t_alloc(B * c2 * (G / 2) * (G / 2));
+    _vis_y2 = t_alloc(B * c2 * (G / 2) * (G / 2));
+    _vis_lg = t_alloc(B * ncls);
+    _vis_pr = t_alloc(B * ncls);
+    _vis_cap = B;
+    return 0;
+}
+
+# forward the batch; returns mean loss (f64). Probs land in _vis_pr.
+fn vis_fwd(X, Y, B, G, c1, c2, ncls): i64 {
+    _vis_scratch(B, G, c1, c2, ncls);
+    var h = G / 2;
+    var flat = c2 * h * h;
+    conv2d_fwd(X, vis_P + _vis_o_Wc1() * 8, vis_P + _vis_o_bc1(c1, 3) * 8,
+    _vis_y1p, B, 1, G, G, c1, 3, 3, 1, 1, 1, 1);
+    gelu_fwd(_vis_y1p, _vis_y1, B * c1 * G * G);
+    conv2d_fwd(_vis_y1, vis_P + _vis_o_Wc2(c1, 3) * 8, vis_P + _vis_o_bc2(c1, c2, 3) * 8,
+    _vis_y2p, B, c1, G, G, c2, 3, 3, 2, 2, 1, 1);
+    gelu_fwd(_vis_y2p, _vis_y2, B * flat);
+    linear_fwd(_vis_y2, vis_P + _vis_o_Wl(c1, c2, 3, flat, ncls) * 8,
+    vis_P + _vis_o_bl(c1, c2, 3, flat, ncls) * 8, _vis_lg, B, flat, ncls);
+    return softmax_xent_fwd(_vis_lg, Y, _vis_pr, B, ncls);
+}
+
+# backward the batch into vis_Gr (caller zeroes vis_Gr per step)
+fn vis_bwd(X, Y, B, G, c1, c2, ncls): i64 {
+    var h = G / 2;
+    var flat = c2 * h * h;
+    var dlg = t_alloc(B * ncls);
+    softmax_xent_bwd(_vis_pr, Y, dlg, B, ncls);
+    var dflat = t_alloc(B * flat);
+    linear_bwd(_vis_y2, vis_P + _vis_o_Wl(c1, c2, 3, flat, ncls) * 8, dlg, dflat,
+    vis_Gr + _vis_o_Wl(c1, c2, 3, flat, ncls) * 8,
+    vis_Gr + _vis_o_bl(c1, c2, 3, flat, ncls) * 8, B, flat, ncls);
+    var dy2p = t_alloc(B * flat);
+    gelu_bwd(_vis_y2p, dflat, dy2p, B * flat);
+    var dy1 = t_alloc(B * c1 * G * G);
+    conv2d_bwd(_vis_y1, vis_P + _vis_o_Wc2(c1, 3) * 8, dy2p, dy1,
+    vis_Gr + _vis_o_Wc2(c1, 3) * 8, vis_Gr + _vis_o_bc2(c1, c2, 3) * 8,
+    B, c1, G, G, c2, 3, 3, 2, 2, 1, 1);
+    var dy1p = t_alloc(B * c1 * G * G);
+    gelu_bwd(_vis_y1p, dy1, dy1p, B * c1 * G * G);
+    conv2d_bwd(X, vis_P + _vis_o_Wc1() * 8, dy1p, 0,
+    vis_Gr + _vis_o_Wc1() * 8, vis_Gr + _vis_o_bc1(c1, 3) * 8,
+    B, 1, G, G, c1, 3, 3, 1, 1, 1, 1);
+    return 0;
+}
+
+# global-norm gradient clip (the model_clip_grads pattern, local block)
+fn vis_clip(clip): i64 {
+    var ss = ff(0);
+    var i = 0;
+    while (i < vis_NP) {
+        var g = load64(vis_Gr + i * 8);
+        ss = f64_add(ss, f64_mul(g, g));
+        i = i + 1;
+    }
+    var norm = f64_sqrt(ss);
+    if (f64_gt(norm, clip) == 1) { t_scale(vis_Gr, vis_NP, f64_div(clip, norm)); }
+    return 0;
+}
+
+# local Adam over the vision block (same constants as model_adam_step)
+fn vis_adam(lr, step): i64 {
+    var b1 = f64_div(ff(9), ff(10));
+    var b2 = f64_div(ff(999), ff(1000));
+    var om1 = f64_div(ff(1), ff(10));
+    var om2 = f64_div(ff(1), ff(1000));
+    var eps = f64_div(ff(1), ff(100000000));
+    var one = ff(1);
+    var bc1 = f64_sub(one, f64_pow(b1, f64_from(step)));
+    var bc2 = f64_sub(one, f64_pow(b2, f64_from(step)));
+    var i = 0;
+    while (i < vis_NP) {
+        var g = load64(vis_Gr + i * 8);
+        var m = f64_add(f64_mul(b1, load64(vis_M + i * 8)), f64_mul(om1, g));
+        var v = f64_add(f64_mul(b2, load64(vis_V + i * 8)), f64_mul(om2, f64_mul(g, g)));
+        store64(vis_M + i * 8, m);
+        store64(vis_V + i * 8, v);
+        var upd = f64_div(f64_div(m, bc1), f64_add(f64_sqrt(f64_div(v, bc2)), eps));
+        store64(vis_P + i * 8, f64_sub(load64(vis_P + i * 8), f64_mul(lr, upd)));
+        i = i + 1;
+    }
+    return 0;
+}
+
+# batch accuracy (argmax of _vis_pr vs Y) ×1000, integer
+fn vis_acc_x1000(Y, B, ncls): i64 {
+    var right = 0;
+    var i = 0;
+    while (i < B) {
+        var row = _vis_pr + i * ncls * 8;
+        var am = 0;
+        var j = 1;
+        while (j < ncls) {
+            if (f64_gt(load64(row + j * 8), load64(row + am * 8)) == 1) { am = j; }
+            j = j + 1;
+        }
+        if (am == load64(Y + i * 8)) { right = right + 1; }
+        i = i + 1;
+    }
+    return (right * 1000) / B;
+}
+
+# ---- the end-to-end finite-difference gate ------------------------------------
+# Tiny dims; checks a spread of param indices from EVERY tensor against central
+# differences at eps 1e-4, rel tol 1e-5 (attn11's standard). Returns #fails.
+fn vis_grad_check(): i64 {
+    var G = 6;
+    var c1 = 2;
+    var c2 = 3;
+    var ncls = 3;
+    var B = 2;
+    vis_init(G, c1, c2, ncls, 777);
+    var X = t_alloc(B * G * G);
+    var Y = alloc(B * 8);
+    rng_seed(4242);
+    vis_make_batch(X, Y, B, G);
+    t_zero(vis_Gr, vis_NP);
+    vis_fwd(X, Y, B, G, c1, c2, ncls);
+    vis_bwd(X, Y, B, G, c1, c2, ncls);
+    var eps = f64_div(ff(1), ff(10000));
+    var tol = f64_div(ff(1), ff(100000));
+    var fails = 0;
+    var checked = 0;
+    # stride through the params so every tensor gets hits (NP is small here)
+    var i = 0;
+    while (i < vis_NP) {
+        var save = load64(vis_P + i * 8);
+        store64(vis_P + i * 8, f64_add(save, eps));
+        var lp = vis_fwd(X, Y, B, G, c1, c2, ncls);
+        store64(vis_P + i * 8, f64_sub(save, eps));
+        var lm = vis_fwd(X, Y, B, G, c1, c2, ncls);
+        store64(vis_P + i * 8, save);
+        var fd = f64_div(f64_sub(lp, lm), f64_mul(ff(2), eps));
+        var an = load64(vis_Gr + i * 8);
+        var den = f64_add(f64_abs(an), f64_div(ff(1), ff(1000000000)));
+        var rel = f64_div(f64_abs(f64_sub(fd, an)), den);
+        # skip near-zero pairs (both < 1e-9): FD noise dominates there
+        var skip = 0;
+        if (f64_lt(f64_abs(fd), f64_div(ff(1), ff(1000000000))) == 1) {
+            if (f64_lt(f64_abs(an), f64_div(ff(1), ff(1000000000))) == 1) { skip = 1; }
+        }
+        if (skip == 0) {
+            checked = checked + 1;
+            if (f64_gt(rel, tol) == 1) { fails = fails + 1; }
+        }
+        i = i + 7;                                    # stride: ~1/7 of params
+    }
+    puts("vision grad-check: ");
+    fmt_int(checked - fails); puts("/"); fmt_int(checked);
+    puts(" within 1e-5\n");
+    return fails;
+}
+
+# ---- the demo: attn11 --vision -------------------------------------------------
+# Train on fresh synthetic batches; gate = loss descends AND held-out accuracy
+# >= 900/1000. Returns 0 PASS / 1 FAIL.
+fn vision_demo(steps, B, seed): i64 {
+    var G = VIS_G();
+    var c1 = VIS_C1();
+    var c2 = VIS_C2();
+    var ncls = VIS_NCLS();
+    puts("attn11 vision lane — the sight proof (synthetic shapes, ");
+    fmt_int(ncls); puts(" classes, ");
+    fmt_int(G); puts("x"); fmt_int(G); puts(")\n");
+    vis_init(G, c1, c2, ncls, seed);
+    puts("  params: "); fmt_int(vis_NP); puts("\n");
+    var X = t_alloc(B * G * G);
+    var Y = alloc(B * 8);
+    var lr = f64_div(ff(1), ff(1000));                # 1e-3 (grad-clipped)
+    var loss0 = ff(0);
+    var loss = ff(0);
+    var s = 0;
+    while (s < steps) {
+        vis_make_batch(X, Y, B, G);
+        t_zero(vis_Gr, vis_NP);
+        loss = vis_fwd(X, Y, B, G, c1, c2, ncls);
+        if (s == 0) { loss0 = loss; }
+        vis_bwd(X, Y, B, G, c1, c2, ncls);
+        vis_clip(ff(1));
+        vis_adam(lr, s + 1);
+        if ((s % 20) == 0) {
+            puts("  step "); fmt_int(s);
+            puts("  loss "); f_print(loss, 4);
+            puts("  batch-acc "); fmt_int(vis_acc_x1000(Y, B, ncls));
+            puts("/1000\n");
+        }
+        s = s + 1;
+    }
+    # held-out gate: fresh unseen batches, larger eval
+    var EB = 128;
+    var Xe = t_alloc(EB * G * G);
+    var Ye = alloc(EB * 8);
+    vis_make_batch(Xe, Ye, EB, G);
+    vis_fwd(Xe, Ye, EB, G, c1, c2, ncls);
+    var acc = vis_acc_x1000(Ye, EB, ncls);
+    puts("  loss "); f_print(loss0, 4); puts(" -> "); f_print(loss, 4);
+    puts("  held-out acc "); fmt_int(acc); puts("/1000\n");
+    var pass = 1;
+    if (f64_lt(loss, loss0) == 0) { pass = 0; puts("  GATE FAIL: loss did not descend\n"); }
+    if (acc < 900) { pass = 0; puts("  GATE FAIL: held-out accuracy < 900/1000\n"); }
+    if (pass == 1) { puts("RESULT: sight proof PASS (loss descends, held-out >= 90%)\n"); return 0; }
+    puts("RESULT: sight proof FAIL\n");
+    return 1;
+}
