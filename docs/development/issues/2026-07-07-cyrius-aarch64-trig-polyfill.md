@@ -49,3 +49,7 @@ When the polyfill lands: drop `target = "x86_64"` from attn11's `[deps.hisab]`,
 remove the three `#ifndef CYRIUS_ARCH_AARCH64` gates (src/main.cyr ×3,
 tests/attn11.tcyr ×3), and the hearing suite group runs under qemu-aarch64 like
 the rest.
+
+---
+*Mirrored cyrius-side at
+`cyrius/docs/development/issues/2026-07-07-aarch64-no-trig-polyfill.md`.*
