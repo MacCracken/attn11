@@ -1,0 +1,500 @@
+# attn11 — the HEARING lane: the modality-axis "hearing proof-of-life"
+# (agnosticos planning/multimodal-substrate.md § Hearing).
+#
+#   attn11 --hearing           train the keyword-classifier on synthetic audio + gate
+#   attn11 --hearing-fd        the assembled-backward FD gate only
+#
+# The plan's reduction, made literal (AST, arXiv:2104.01778): a mel-spectrogram
+# IS an image. The STFT is sized 16 frames x 16 mel bands — exactly the vision
+# lane's 16x16 canvas — so the CNN, the assembled FD-gated backward, and the
+# train/eval gates are the vision pattern verbatim, applied to sound.
+#
+# Frontend (FIXED — not trained, no backprop through it; the plan's key
+# simplification): Hann-windowed STFT via hisab's num_fft (sovereign radix-2,
+# lib/hisab.cyr) → magnitude → a 16-band triangular MEL filterbank (centers
+# equally spaced in mel m(f) = ln(1 + f/700) between 100 Hz and 3800 Hz at the
+# nominal 8 kHz rate) → log-compression ln(1 + e). Precomputed once.
+#
+# Synthetic sovereign audio set (no downloads; tyche-jittered like the vision
+# shapes), 4 keyword-spotting-like classes with genuine TIME-frequency structure:
+#   0 = rising chirp    (f sweeps low -> high; the peak band CLIMBS over frames)
+#   1 = falling chirp   (high -> low)
+#   2 = two-tone "syllable pair" (low tone, brief gap, high tone — segmentation)
+#   3 = harmonic stack  (f0 + 2f0 + 3f0 — vowel-like, static but multi-band)
+# Jitter: base/sweep frequencies, amplitude, phase; additive gaussian noise.
+#
+# Model (identical shape to vision.cyr):
+#   x(B,1,16,16) → conv 3x3 p1 (1→C1) → gelu → conv 3x3 s2 p1 (C1→C2) → gelu
+#                → flatten → linear → logits → softmax-xent
+# Backward = the same hand-assembled chain of FD-gated primitives, carrying its
+# OWN end-to-end finite-difference gate (hear_grad_check) — no backward ships
+# ungated. The frontend contributes no gradient, so the FD gate drives the CNN
+# with random feature maps (t_randn) at tiny dims, exactly as valid.
+
+fn HEAR_SR(): i64 { return 8000; }    # nominal sample rate (Hz)
+fn HEAR_W(): i64 { return 256; }      # STFT window (power of 2 for num_fft)
+fn HEAR_H(): i64 { return 128; }      # hop
+fn HEAR_T(): i64 { return 16; }       # frames  = the feature map's rows
+fn HEAR_M(): i64 { return 16; }       # mel bands = the feature map's cols
+fn HEAR_NSAMP(): i64 { return 2176; } # W + (T-1)*H
+fn HEAR_C1(): i64 { return 8; }
+fn HEAR_C2(): i64 { return 16; }
+fn HEAR_NCLS(): i64 { return 4; }
+
+fn _hear_2pi(): i64 { return f64_div(f64_from(6283185307179586), f64_from(1000000000000000)); }
+
+# ---- the fixed frontend: Hann window + mel filterbank (built once) -------------
+var hear_hann = 0;                    # W f64
+var hear_mel = 0;                     # M x NBINS filter weights (NBINS = W/2)
+var hear_cfreq = 0;                   # M band-center frequencies (f64, for probes)
+var hear_cbuf = 0;                    # W complex slots (2W f64) — num_fft scratch
+var hear_mag = 0;                     # NBINS f64 — magnitude scratch
+var hear_wave = 0;                    # NSAMP f64 — waveform scratch
+var hear_front_ready = 0;
+
+fn _hear_melof(f): i64 { return f64_ln(f64_add(f64_from(1), f64_div(f, f64_from(700)))); }
+fn _hear_freqof(m): i64 { return f64_mul(f64_from(700), f64_sub(f64_exp(m), f64_from(1))); }
+
+fn hear_front_init(): i64 {
+    if (hear_front_ready == 1) { return 0; }
+    var W = HEAR_W();
+    var M = HEAR_M();
+    var NB = W / 2;
+    hear_hann = t_alloc(W);
+    hear_mel = t_alloc(M * NB);
+    hear_cfreq = t_alloc(M);
+    hear_cbuf = t_alloc(2 * W);
+    hear_mag = t_alloc(NB);
+    hear_wave = t_alloc(HEAR_NSAMP());
+    # Hann: 0.5 * (1 - cos(2*pi*i / (W-1)))
+    var i = 0;
+    while (i < W) {
+        var ph = f64_div(f64_mul(_hear_2pi(), f64_from(i)), f64_from(W - 1));
+        store64(hear_hann + i * 8, f64_mul(f64_div(f64_from(1), f64_from(2)),
+                                           f64_sub(f64_from(1), f64_cos(ph))));
+        i = i + 1;
+    }
+    # M+2 mel-grid points from 100 Hz to 3800 Hz -> triangular filters
+    var mlo = _hear_melof(f64_from(100));
+    var mhi = _hear_melof(f64_from(3800));
+    var grid = t_alloc(M + 2);                        # edge/center freqs (Hz)
+    var g = 0;
+    while (g < M + 2) {
+        var mg = f64_add(mlo, f64_div(f64_mul(f64_sub(mhi, mlo), f64_from(g)), f64_from(M + 1)));
+        store64(grid + g * 8, _hear_freqof(mg));
+        g = g + 1;
+    }
+    t_zero(hear_mel, M * NB);
+    var binhz = f64_div(f64_from(HEAR_SR()), f64_from(W));   # 31.25 Hz/bin
+    var j = 0;
+    while (j < M) {
+        var fl = load64(grid + j * 8);
+        var fc = load64(grid + (j + 1) * 8);
+        var fr = load64(grid + (j + 2) * 8);
+        store64(hear_cfreq + j * 8, fc);
+        var k = 1;                                    # skip DC
+        while (k < NB) {
+            var fk = f64_mul(binhz, f64_from(k));
+            var w = f64_from(0);
+            if (f64_gt(fk, fl) == 1) {
+                if (f64_lt(fk, fc) == 1) { w = f64_div(f64_sub(fk, fl), f64_sub(fc, fl)); }
+                elif (f64_lt(fk, fr) == 1) { w = f64_div(f64_sub(fr, fk), f64_sub(fr, fc)); }
+            }
+            store64(hear_mel + (j * NB + k) * 8, w);
+            k = k + 1;
+        }
+        j = j + 1;
+    }
+    hear_front_ready = 1;
+    return 0;
+}
+
+# wave (NSAMP f64) -> out (T*M f64): Hann STFT -> |FFT| -> mel -> ln(1+e)
+fn hear_features(wave, out): i64 {
+    hear_front_init();
+    var W = HEAR_W();
+    var NB = W / 2;
+    var M = HEAR_M();
+    var t = 0;
+    while (t < HEAR_T()) {
+        var base = t * HEAR_H();
+        var i = 0;
+        while (i < W) {                               # windowed frame -> complex buf
+            store64(hear_cbuf + i * 16,
+                    f64_mul(load64(wave + (base + i) * 8), load64(hear_hann + i * 8)));
+            store64(hear_cbuf + i * 16 + 8, f64_from(0));
+            i = i + 1;
+        }
+        num_fft(hear_cbuf, W);
+        var k = 0;
+        while (k < NB) {
+            var re = load64(hear_cbuf + k * 16);
+            var im = load64(hear_cbuf + k * 16 + 8);
+            store64(hear_mag + k * 8, f64_sqrt(f64_add(f64_mul(re, re), f64_mul(im, im))));
+            k = k + 1;
+        }
+        var j = 0;
+        while (j < M) {
+            var e = f64_from(0);
+            k = 1;
+            while (k < NB) {
+                var w = load64(hear_mel + (j * NB + k) * 8);
+                if (w != f64_from(0)) { e = f64_add(e, f64_mul(w, load64(hear_mag + k * 8))); }
+                k = k + 1;
+            }
+            store64(out + (t * M + j) * 8, f64_ln(f64_add(f64_from(1), e)));
+            j = j + 1;
+        }
+        t = t + 1;
+    }
+    return 0;
+}
+
+# ---- synthetic sovereign audio ------------------------------------------------
+fn _hear_uni(lo, hi): i64 {           # uniform f64 in [lo, hi) via tyche
+    var u = f64_div(f64_from((rng_u64() & 0x7FFFFFFFFFFFFFFF) % 1000000), f64_from(1000000));
+    return f64_add(lo, f64_mul(f64_sub(hi, lo), u));
+}
+
+# synthesize one jittered waveform of class `cls` into hear_wave
+fn _hear_synth(cls): i64 {
+    hear_front_init();                # owns hear_wave — init before first write
+    var N = HEAR_NSAMP();
+    var sr = f64_from(HEAR_SR());
+    var amp = _hear_uni(f64_div(f64_from(7), f64_from(10)), f64_from(1));
+    var ph = _hear_uni(f64_from(0), _hear_2pi());
+    var i = 0;
+    if (cls == 0) {                                   # rising chirp
+        var f0 = _hear_uni(f64_from(250), f64_from(450));
+        var f1 = _hear_uni(f64_from(1500), f64_from(2100));
+        while (i < N) {
+            var f = f64_add(f0, f64_div(f64_mul(f64_sub(f1, f0), f64_from(i)), f64_from(N)));
+            ph = f64_add(ph, f64_div(f64_mul(_hear_2pi(), f), sr));
+            store64(hear_wave + i * 8, f64_mul(amp, f64_sin(ph)));
+            i = i + 1;
+        }
+    }
+    elif (cls == 1) {                                 # falling chirp
+        var fa = _hear_uni(f64_from(1500), f64_from(2100));
+        var fb = _hear_uni(f64_from(250), f64_from(450));
+        while (i < N) {
+            var f2 = f64_add(fa, f64_div(f64_mul(f64_sub(fb, fa), f64_from(i)), f64_from(N)));
+            ph = f64_add(ph, f64_div(f64_mul(_hear_2pi(), f2), sr));
+            store64(hear_wave + i * 8, f64_mul(amp, f64_sin(ph)));
+            i = i + 1;
+        }
+    }
+    elif (cls == 2) {                                 # two-tone syllable pair + gap
+        var fA = _hear_uni(f64_from(300), f64_from(600));
+        var fB = _hear_uni(f64_from(1200), f64_from(2000));
+        var gap0 = (N * 45) / 100;
+        var gap1 = (N * 55) / 100;
+        while (i < N) {
+            var fs = fA;
+            if (i >= gap1) { fs = fB; }
+            var s = f64_from(0);
+            if ((i < gap0) | (i >= gap1)) {
+                ph = f64_add(ph, f64_div(f64_mul(_hear_2pi(), fs), sr));
+                s = f64_mul(amp, f64_sin(ph));
+            }
+            store64(hear_wave + i * 8, s);
+            i = i + 1;
+        }
+    }
+    else {                                            # harmonic stack (vowel-like)
+        var fh = _hear_uni(f64_from(200), f64_from(400));
+        var ph2 = f64_mul(ph, f64_from(2));
+        var ph3 = f64_mul(ph, f64_from(3));
+        var d1 = f64_div(f64_mul(_hear_2pi(), fh), sr);
+        while (i < N) {
+            ph = f64_add(ph, d1);
+            ph2 = f64_add(ph2, f64_mul(d1, f64_from(2)));
+            ph3 = f64_add(ph3, f64_mul(d1, f64_from(3)));
+            var v = f64_add(f64_sin(ph),
+                    f64_add(f64_mul(f64_div(f64_from(1), f64_from(2)), f64_sin(ph2)),
+                            f64_mul(f64_div(f64_from(1), f64_from(3)), f64_sin(ph3))));
+            store64(hear_wave + i * 8, f64_mul(f64_mul(amp, f64_div(f64_from(6), f64_from(11))), v));
+            i = i + 1;
+        }
+    }
+    # additive gaussian noise, sigma 0.05 — keeps the task honest
+    var sig = f64_div(f64_from(5), f64_from(100));
+    i = 0;
+    while (i < N) {
+        store64(hear_wave + i * 8, f64_add(load64(hear_wave + i * 8), f64_mul(sig, rng_normal())));
+        i = i + 1;
+    }
+    return 0;
+}
+
+# fill X(B,1,T,M) + labels Y(B): synth -> STFT/mel features per item
+fn hear_make_batch(X, Y, B): i64 {
+    var TM = HEAR_T() * HEAR_M();
+    var i = 0;
+    while (i < B) {
+        var cls = (rng_u64() & 0x7FFFFFFFFFFFFFFF) % HEAR_NCLS();
+        store64(Y + i * 8, cls);
+        _hear_synth(cls);
+        hear_features(hear_wave, X + i * TM * 8);
+        i = i + 1;
+    }
+    return 0;
+}
+
+# frontend probe (suite): pure tone at band j's center -> mean-over-frames argmax band
+fn hear_front_probe(j): i64 {
+    hear_front_init();
+    var N = HEAR_NSAMP();
+    var sr = f64_from(HEAR_SR());
+    var f = load64(hear_cfreq + j * 8);
+    var ph = f64_from(0);
+    var d = f64_div(f64_mul(_hear_2pi(), f), sr);
+    var i = 0;
+    while (i < N) { ph = f64_add(ph, d); store64(hear_wave + i * 8, f64_sin(ph)); i = i + 1; }
+    var TM = HEAR_T() * HEAR_M();
+    var out = t_alloc(TM);
+    hear_features(hear_wave, out);
+    var M = HEAR_M();
+    var best = 0;
+    var bv = f64_from(0 - 1000000);
+    var b = 0;
+    while (b < M) {                                   # mean over frames per band
+        var s = f64_from(0);
+        var t = 0;
+        while (t < HEAR_T()) { s = f64_add(s, load64(out + (t * M + b) * 8)); t = t + 1; }
+        if (f64_gt(s, bv) == 1) { bv = s; best = b; }
+        b = b + 1;
+    }
+    return best;
+}
+
+# ---- the CNN (the vision block, hear_-prefixed; same offsets/shapes) -----------
+var hear_P = 0; var hear_Gr = 0; var hear_M2 = 0; var hear_V2 = 0; var hear_NP = 0;
+
+fn hear_init(G, c1, c2, ncls, seed): i64 {
+    var flat = c2 * (G / 2) * (G / 2);
+    hear_NP = _vis_np(c1, c2, 3, flat, ncls);         # same layout as vision
+    hear_P = t_alloc(hear_NP);
+    hear_Gr = t_alloc(hear_NP);
+    hear_M2 = t_alloc(hear_NP);
+    hear_V2 = t_alloc(hear_NP);
+    t_zero(hear_Gr, hear_NP);
+    t_zero(hear_M2, hear_NP);
+    t_zero(hear_V2, hear_NP);
+    rng_seed(seed);
+    var std = f64_div(ff(1), ff(10));
+    t_randn(hear_P + _vis_o_Wc1() * 8, c1 * 9, std);
+    t_zero(hear_P + _vis_o_bc1(c1, 3) * 8, c1);
+    t_randn(hear_P + _vis_o_Wc2(c1, 3) * 8, c2 * c1 * 9, std);
+    t_zero(hear_P + _vis_o_bc2(c1, c2, 3) * 8, c2);
+    t_randn(hear_P + _vis_o_Wl(c1, c2, 3, flat, ncls) * 8, flat * ncls, std);
+    t_zero(hear_P + _vis_o_bl(c1, c2, 3, flat, ncls) * 8, ncls);
+    return hear_NP;
+}
+
+var _hear_y1p = 0; var _hear_y1 = 0; var _hear_y2p = 0; var _hear_y2 = 0;
+var _hear_lg = 0; var _hear_pr = 0; var _hear_cap = 0;
+
+fn _hear_scratch(B, G, c1, c2, ncls): i64 {
+    if (_hear_cap >= B) { return 0; }
+    _hear_y1p = t_alloc(B * c1 * G * G);
+    _hear_y1 = t_alloc(B * c1 * G * G);
+    _hear_y2p = t_alloc(B * c2 * (G / 2) * (G / 2));
+    _hear_y2 = t_alloc(B * c2 * (G / 2) * (G / 2));
+    _hear_lg = t_alloc(B * ncls);
+    _hear_pr = t_alloc(B * ncls);
+    _hear_cap = B;
+    return 0;
+}
+
+fn hear_fwd(X, Y, B, G, c1, c2, ncls): i64 {
+    _hear_scratch(B, G, c1, c2, ncls);
+    var h = G / 2;
+    var flat = c2 * h * h;
+    conv2d_fwd(X, hear_P + _vis_o_Wc1() * 8, hear_P + _vis_o_bc1(c1, 3) * 8,
+    _hear_y1p, B, 1, G, G, c1, 3, 3, 1, 1, 1, 1);
+    gelu_fwd(_hear_y1p, _hear_y1, B * c1 * G * G);
+    conv2d_fwd(_hear_y1, hear_P + _vis_o_Wc2(c1, 3) * 8, hear_P + _vis_o_bc2(c1, c2, 3) * 8,
+    _hear_y2p, B, c1, G, G, c2, 3, 3, 2, 2, 1, 1);
+    gelu_fwd(_hear_y2p, _hear_y2, B * flat);
+    linear_fwd(_hear_y2, hear_P + _vis_o_Wl(c1, c2, 3, flat, ncls) * 8,
+    hear_P + _vis_o_bl(c1, c2, 3, flat, ncls) * 8, _hear_lg, B, flat, ncls);
+    return softmax_xent_fwd(_hear_lg, Y, _hear_pr, B, ncls);
+}
+
+fn hear_bwd(X, Y, B, G, c1, c2, ncls): i64 {
+    var h = G / 2;
+    var flat = c2 * h * h;
+    var dlg = t_alloc(B * ncls);
+    softmax_xent_bwd(_hear_pr, Y, dlg, B, ncls);
+    var dflat = t_alloc(B * flat);
+    linear_bwd(_hear_y2, hear_P + _vis_o_Wl(c1, c2, 3, flat, ncls) * 8, dlg, dflat,
+    hear_Gr + _vis_o_Wl(c1, c2, 3, flat, ncls) * 8,
+    hear_Gr + _vis_o_bl(c1, c2, 3, flat, ncls) * 8, B, flat, ncls);
+    var dy2p = t_alloc(B * flat);
+    gelu_bwd(_hear_y2p, dflat, dy2p, B * flat);
+    var dy1 = t_alloc(B * c1 * G * G);
+    conv2d_bwd(_hear_y1, hear_P + _vis_o_Wc2(c1, 3) * 8, dy2p, dy1,
+    hear_Gr + _vis_o_Wc2(c1, 3) * 8, hear_Gr + _vis_o_bc2(c1, c2, 3) * 8,
+    B, c1, G, G, c2, 3, 3, 2, 2, 1, 1);
+    var dy1p = t_alloc(B * c1 * G * G);
+    gelu_bwd(_hear_y1p, dy1, dy1p, B * c1 * G * G);
+    conv2d_bwd(X, hear_P + _vis_o_Wc1() * 8, dy1p, 0,
+    hear_Gr + _vis_o_Wc1() * 8, hear_Gr + _vis_o_bc1(c1, 3) * 8,
+    B, 1, G, G, c1, 3, 3, 1, 1, 1, 1);
+    return 0;
+}
+
+fn hear_clip(clip): i64 {
+    var ss = ff(0);
+    var i = 0;
+    while (i < hear_NP) {
+        var g = load64(hear_Gr + i * 8);
+        ss = f64_add(ss, f64_mul(g, g));
+        i = i + 1;
+    }
+    var norm = f64_sqrt(ss);
+    if (f64_gt(norm, clip) == 1) { t_scale(hear_Gr, hear_NP, f64_div(clip, norm)); }
+    return 0;
+}
+
+fn hear_adam(lr, step): i64 {
+    var b1 = f64_div(ff(9), ff(10));
+    var b2 = f64_div(ff(999), ff(1000));
+    var om1 = f64_div(ff(1), ff(10));
+    var om2 = f64_div(ff(1), ff(1000));
+    var eps = f64_div(ff(1), ff(100000000));
+    var one = ff(1);
+    var bc1 = f64_sub(one, f64_pow(b1, f64_from(step)));
+    var bc2 = f64_sub(one, f64_pow(b2, f64_from(step)));
+    var i = 0;
+    while (i < hear_NP) {
+        var g = load64(hear_Gr + i * 8);
+        var m = f64_add(f64_mul(b1, load64(hear_M2 + i * 8)), f64_mul(om1, g));
+        var v = f64_add(f64_mul(b2, load64(hear_V2 + i * 8)), f64_mul(om2, f64_mul(g, g)));
+        store64(hear_M2 + i * 8, m);
+        store64(hear_V2 + i * 8, v);
+        var upd = f64_div(f64_div(m, bc1), f64_add(f64_sqrt(f64_div(v, bc2)), eps));
+        store64(hear_P + i * 8, f64_sub(load64(hear_P + i * 8), f64_mul(lr, upd)));
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn hear_acc_x1000(Y, B, ncls): i64 {
+    var right = 0;
+    var i = 0;
+    while (i < B) {
+        var row = _hear_pr + i * ncls * 8;
+        var am = 0;
+        var j = 1;
+        while (j < ncls) {
+            if (f64_gt(load64(row + j * 8), load64(row + am * 8)) == 1) { am = j; }
+            j = j + 1;
+        }
+        if (am == load64(Y + i * 8)) { right = right + 1; }
+        i = i + 1;
+    }
+    return (right * 1000) / B;
+}
+
+# ---- the end-to-end FD gate (random feature maps — the frontend is fixed) ------
+fn hear_grad_check(): i64 {
+    var G = 6;
+    var c1 = 2;
+    var c2 = 3;
+    var ncls = 3;
+    var B = 2;
+    hear_init(G, c1, c2, ncls, 778);
+    var X = t_alloc(B * G * G);
+    var Y = alloc(B * 8);
+    rng_seed(4343);
+    t_randn(X, B * G * G, ff(1));
+    var i0 = 0;
+    while (i0 < B) { store64(Y + i0 * 8, (rng_u64() & 0x7FFFFFFFFFFFFFFF) % ncls); i0 = i0 + 1; }
+    t_zero(hear_Gr, hear_NP);
+    hear_fwd(X, Y, B, G, c1, c2, ncls);
+    hear_bwd(X, Y, B, G, c1, c2, ncls);
+    var eps = f64_div(ff(1), ff(10000));
+    var tol = f64_div(ff(1), ff(100000));
+    var fails = 0;
+    var checked = 0;
+    var i = 0;
+    while (i < hear_NP) {
+        var save = load64(hear_P + i * 8);
+        store64(hear_P + i * 8, f64_add(save, eps));
+        var lp = hear_fwd(X, Y, B, G, c1, c2, ncls);
+        store64(hear_P + i * 8, f64_sub(save, eps));
+        var lm = hear_fwd(X, Y, B, G, c1, c2, ncls);
+        store64(hear_P + i * 8, save);
+        var fd = f64_div(f64_sub(lp, lm), f64_mul(ff(2), eps));
+        var an = load64(hear_Gr + i * 8);
+        var den = f64_add(f64_abs(an), f64_div(ff(1), ff(1000000000)));
+        var rel = f64_div(f64_abs(f64_sub(fd, an)), den);
+        var skip = 0;
+        if (f64_lt(f64_abs(fd), f64_div(ff(1), ff(1000000000))) == 1) {
+            if (f64_lt(f64_abs(an), f64_div(ff(1), ff(1000000000))) == 1) { skip = 1; }
+        }
+        if (skip == 0) {
+            checked = checked + 1;
+            if (f64_gt(rel, tol) == 1) { fails = fails + 1; }
+        }
+        i = i + 7;
+    }
+    puts("hearing grad-check: ");
+    fmt_int(checked - fails); puts("/"); fmt_int(checked);
+    puts(" within 1e-5\n");
+    return fails;
+}
+
+# ---- the demo: attn11 --hearing -------------------------------------------------
+# Train on fresh synthetic batches; gate = loss descends AND held-out accuracy
+# >= 900/1000. Returns 0 PASS / 1 FAIL.
+fn hearing_demo(steps, B, seed): i64 {
+    var G = HEAR_T();                                 # 16x16 feature map
+    var c1 = HEAR_C1();
+    var c2 = HEAR_C2();
+    var ncls = HEAR_NCLS();
+    puts("attn11 hearing lane — the hearing proof (synthetic audio, ");
+    fmt_int(ncls); puts(" classes, STFT ");
+    fmt_int(HEAR_T()); puts("x"); fmt_int(HEAR_M()); puts(" mel)\n");
+    hear_init(G, c1, c2, ncls, seed);
+    puts("  params: "); fmt_int(hear_NP); puts("\n");
+    var TM = HEAR_T() * HEAR_M();
+    var X = t_alloc(B * TM);
+    var Y = alloc(B * 8);
+    var lr = f64_div(ff(1), ff(1000));
+    var loss0 = ff(0);
+    var loss = ff(0);
+    var s = 0;
+    while (s < steps) {
+        hear_make_batch(X, Y, B);
+        t_zero(hear_Gr, hear_NP);
+        loss = hear_fwd(X, Y, B, G, c1, c2, ncls);
+        if (s == 0) { loss0 = loss; }
+        hear_bwd(X, Y, B, G, c1, c2, ncls);
+        hear_clip(ff(1));
+        hear_adam(lr, s + 1);
+        if ((s % 20) == 0) {
+            puts("  step "); fmt_int(s);
+            puts("  loss "); f_print(loss, 4);
+            puts("  batch-acc "); fmt_int(hear_acc_x1000(Y, B, ncls));
+            puts("/1000\n");
+        }
+        s = s + 1;
+    }
+    var EB = 128;
+    var Xe = t_alloc(EB * TM);
+    var Ye = alloc(EB * 8);
+    hear_make_batch(Xe, Ye, EB);
+    hear_fwd(Xe, Ye, EB, G, c1, c2, ncls);
+    var acc = hear_acc_x1000(Ye, EB, ncls);
+    puts("  loss "); f_print(loss0, 4); puts(" -> "); f_print(loss, 4);
+    puts("  held-out acc "); fmt_int(acc); puts("/1000\n");
+    var pass = 1;
+    if (f64_lt(loss, loss0) == 0) { pass = 0; puts("  GATE FAIL: loss did not descend\n"); }
+    if (acc < 900) { pass = 0; puts("  GATE FAIL: held-out accuracy < 900/1000\n"); }
+    if (pass == 1) { puts("RESULT: hearing proof PASS (loss descends, held-out >= 90%)\n"); return 0; }
+    puts("RESULT: hearing proof FAIL\n");
+    return 1;
+}

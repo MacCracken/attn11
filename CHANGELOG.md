@@ -4,6 +4,32 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.14.0] — 2026-07-07
+
+### Added — the HEARING lane (the modality-axis "hearing proof-of-life")
+- **`src/hearing.cyr` + `--hearing`** — the plan's reduction made literal (AST):
+  a mel-spectrogram IS an image. The STFT is sized **16 frames × 16 mel bands =
+  the vision lane's 16×16 canvas**, so the CNN + assembled FD-gated backward +
+  train/eval gates are the vision pattern verbatim, applied to sound.
+  **PROOF PASSED: loss 1.6713 → 0.0000, held-out 1000/1000** (600 steps, B=32,
+  seed 1337) — the same gate class as the sight proof.
+- **The fixed frontend** (not trained — no backprop through it): Hann-windowed
+  STFT via **hisab `num_fft`** (new `[deps.hisab]` 2.6.8; collision-checked vs
+  the full attn11 surface + stdlib, `comm -12` empty) → magnitude → a 16-band
+  triangular **mel filterbank** (centers equally spaced in `m(f) = ln(1+f/700)`
+  over 100–3800 Hz at the nominal 8 kHz rate) → `ln(1+e)` compression.
+- **Synthetic sovereign audio set** (no downloads; tyche-jittered): 4
+  keyword-spotting-like classes with genuine time-frequency structure — rising
+  chirp, falling chirp, two-tone "syllable pair" (gap-segmented), harmonic stack
+  (vowel-like); jittered frequency/amplitude/phase + gaussian noise.
+- **`--hearing-fd`** — the end-to-end assembled-backward FD gate (23/23 within
+  1e-5; driven with random feature maps — the frontend contributes no gradient).
+- **Suite 1060 → 1066**: frontend sanity (a pure tone at band j's center lands
+  in band j — STFT+mel gated without gradients, ×3 bands) + the FD gate + a
+  full-frontend micro-train (loss descends, held-out ≫ chance).
+- Fixed during bring-up: `_hear_synth` wrote the waveform buffer before
+  `hear_front_init` allocated it (use-before-init on the first batch item).
+
 ## [1.13.0] — 2026-07-05
 
 ### Added — the VISION lane (the modality-axis "sight proof-of-life")

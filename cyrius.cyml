@@ -80,4 +80,12 @@ modules = ["dist/rupantara.cyr"]
 git = "https://github.com/MacCracken/mabda"
 tag = "3.4.1"
 modules = ["dist/mabda.cyr"]
+
+# Sovereign FFT for the HEARING lane's fixed STFT+mel frontend (num_fft — the
+# frontend is not trained, no backprop through it). Collision-checked vs the
+# full attn11 surface + stdlib modules (comm -12 empty, 2026-07-07).
+[deps.hisab]
+git = "https://github.com/MacCracken/hisab"
+tag = "2.6.8"
+modules = ["dist/hisab.cyr"]
 ---

@@ -29,6 +29,8 @@ include "src/train.cyr"
 include "src/persist.cyr"
 include "src/stream.cyr"
 include "src/vision.cyr"     # the vision lane (sight proof)
+include "lib/hisab.cyr"      # sovereign FFT — the hearing lane's fixed frontend
+include "src/hearing.cyr"    # the hearing lane (hearing proof)
 
 fn _eps(): i64 { return f64_div(f64_from(1), f64_from(10000)); }     # 1e-4
 fn dotsum(a, b, n): i64 {
@@ -3455,6 +3457,61 @@ fn test_vision_fd(): i64 {
     return 0;
 }
 
+# ---- hearing lane (hearing proof): frontend sanity + FD gate + micro-train ----
+fn test_hearing_frontend(): i64 {
+    # a pure tone at mel band j's center frequency must land its energy in
+    # band j (mean over frames, argmax) — the STFT + filterbank, gated without
+    # gradients (the frontend is fixed). Three spread bands.
+    assert_eq(hear_front_probe(3), 3, "hearing frontend: 3rd-band tone -> band 3");
+    assert_eq(hear_front_probe(8), 8, "hearing frontend: 8th-band tone -> band 8");
+    assert_eq(hear_front_probe(12), 12, "hearing frontend: 12th-band tone -> band 12");
+    return 0;
+}
+
+fn test_hearing_fd(): i64 {
+    assert_eq(hear_grad_check(), 0, "hearing assembled backward FD-gated (rel < 1e-5)");
+    return 0;
+}
+
+fn test_hearing_train(): i64 {
+    # the REAL frontend (synth -> STFT -> mel) at the full 16x16 feature map,
+    # smaller channels + fewer steps so the suite stays fast; the gate is
+    # loss-descends + held-out well above chance (250).
+    var G = 16;
+    var c1 = 4;
+    var c2 = 8;
+    var ncls = 4;
+    var B = 16;
+    hear_init(G, c1, c2, ncls, 20260707);
+    var TM = HEAR_T() * HEAR_M();
+    var X = t_alloc(B * TM);
+    var Y = alloc(B * 8);
+    rng_seed(107);
+    var lr = f64_div(ff(1), ff(1000));
+    var loss0 = ff(0);
+    var loss = ff(0);
+    var st = 0;
+    while (st < 120) {
+        hear_make_batch(X, Y, B);
+        t_zero(hear_Gr, hear_NP);
+        loss = hear_fwd(X, Y, B, G, c1, c2, ncls);
+        if (st == 0) { loss0 = loss; }
+        hear_bwd(X, Y, B, G, c1, c2, ncls);
+        hear_clip(ff(1));
+        hear_adam(lr, st + 1);
+        st = st + 1;
+    }
+    assert(f64_lt(loss, loss0) == 1, "hearing micro-train: loss descends");
+    var EB = 64;
+    var Xe = t_alloc(EB * TM);
+    var Ye = alloc(EB * 8);
+    hear_make_batch(Xe, Ye, EB);
+    hear_fwd(Xe, Ye, EB, G, c1, c2, ncls);
+    var acc = hear_acc_x1000(Ye, EB, ncls);
+    assert_gt(acc, 600, "hearing micro-train: held-out well above chance (>600/1000)");
+    return 0;
+}
+
 fn test_vision_train(): i64 {
     # small dims so the suite stays fast: G=12 (8x8 + the ±3 jitter pushes
     # glyphs off-canvas — label noise, not a model problem), 4 classes,
@@ -3614,6 +3671,10 @@ fn main(): i64 {
     test_group("vision lane (sight proof)");
     test_vision_fd();
     test_vision_train();
+    test_group("hearing lane (hearing proof)");
+    test_hearing_frontend();
+    test_hearing_fd();
+    test_hearing_train();
 
     return assert_summary();
 }

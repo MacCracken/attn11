@@ -5,14 +5,32 @@
 
 ## Version
 
-**1.11.1** — *RL de-featured — REINFORCE migrated to the `tarka` repo (closes the M1 arc).*
+**1.14.0** — *the HEARING lane — the modality-axis hearing proof-of-life* (cut
+2026-07-07, user tags). The AST "a mel-spectrogram IS an image" reduction made
+literal: `src/hearing.cyr` + `--hearing`/`--hearing-fd` — Hann STFT via **hisab
+`num_fft`** (new `[deps.hisab]` 2.6.8, collision-checked `comm -12` empty) + a
+fixed 16-band mel filterbank sized **16 frames × 16 bands = the vision lane's
+16×16 canvas**, so the vision CNN + assembled FD-gated backward apply verbatim
+to sound. Synthetic sovereign audio set (4 keyword-spotting classes: chirps
+up/down, two-tone syllable pair, harmonic stack; tyche-jittered + noise).
+**PROOF PASSED: loss 1.6713 → 0.0000, held-out 1000/1000**; FD 23/23; frontend
+gated tone→band without gradients. Suite **1060 → 1066**. Both modality proofs
+(sight 1.13.0, hearing 1.14.0) are green; the axis's remaining opener =
+cross-attention (ASR/fusion). Prior: **1.13.0** (the VISION lane — sight proof:
+rosnet-1.1.0 conv2d CNN on synthetic shapes, held-out 1000/1000, suite
+1049→1060) · **1.12.0** (CPU leaf-op re-fold onto rupantara `ru_*`,
+whole-forward parity bit-identical, 1049 grad-checks in one binary) · **1.11.1**
+(below — this block was last refreshed at 1.11.1; the 1.12/1.13 entries live in
+the CHANGELOG).
+
+(**1.11.1** — *RL de-featured — REINFORCE migrated to the `tarka` repo (closes the M1 arc).*
 The `--objective rl` / `--rl-target` flags and the entire REINFORCE path (`rl_*`, the
 `g_rl`/`g_reinforce_scale` backward gate, the M17 grad-checks, `scripts/m17-rl.sh`) are
 **removed**; attn11 is now a pure **SFT + masked-diffusion** training reference. RL lives in
 [`tarka`](https://github.com/MacCracken/tarka), re-expressed on `rosnet`. AR/diffusion stay
 **byte-identical** (the `g_rl` gate was a no-op for them); suite **1060 → 1049** grad-checks
 green (x86_64 + aarch64/qemu), default training descends loss, fuzz/bench compile,
-`--objective rl` rejected. ADR 0015 marked superseded. Completes the rosnet/tyche/akshara/tarka split.
+`--objective rl` rejected. ADR 0015 marked superseded. Completes the rosnet/tyche/akshara/tarka split.)
 
 (**1.11.0** — *Tokenizer extraction — the sovereign `akshara` lib (M1).* The corpus +
 tokenizer data layer (byte vocab + opt-in BPE + packed store + streaming read) carved out

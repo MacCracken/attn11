@@ -2,8 +2,10 @@ commit	b40d00cf3be25e2b4fb3e69d5828044a0635b537	akshara	https://github.com/MacCr
 commit	ef54068c7ee4ee9478b7fa3046ed0a211b474e8b	tyche	https://github.com/MacCracken/tyche	0.1.1
 commit	14e56de061c6d9a78fc325364c47e7b7731706e8	rosnet	https://github.com/MacCracken/rosnet	1.1.0
 commit	a5a97ea9ad2157c17a396a32b3b7148b2815a7b4	mabda	https://github.com/MacCracken/mabda	3.4.1
+commit	9868446a06dbf6686e26feac6a6f9365ad60563c	hisab	https://github.com/MacCracken/hisab	2.6.8
 commit	35beb1b3d785ab3760bfda61c17d81c3827ba23e	samvada	https://github.com/MacCracken/samvada.git	0.4.1
 commit	c61651ffe183a72689cc1d2fd0c04e59b2db2366	chitra	https://github.com/MacCracken/chitra.git	0.1.0
+commit	d9dbb0239803421cbed430b00ea544f93516a27e	sakshi	https://github.com/MacCracken/sakshi.git	2.4.2
 d9f3b17ddbbe1bba48917c3a679807b01c39c4a1ce776efdbdfbb7a1680e86e4  lib/tagged.cyr
 d0e618655388c9d43c9927a9f5b306e61cb333546abc166f4f280a25993624f5  lib/net.cyr
 e84c090fd0f8532700d967ca3190837780a52a42630f4c6a0a4567ad9a49ab6b  lib/cffi.cyr
@@ -35,7 +37,7 @@ d5877d16113051fb95dae31717efc679c94b17a34667805b56e52a345bc48f8f  lib/freelist.c
 dc500d517e0896751699302f6d6033b765378576f8e9ac144480262ab4214348  lib/security.cyr
 a8ae4f1396d23bff31a4c22c53be396b4624dcd763f5a9de81d4933a07beae9e  lib/test.cyr
 ac55a4ff22d49ccf6c44893be077e1c824825aed845d82c04767f4f87c29d6da  lib/sync_macos.cyr
-2f29e8f47ccfad089c412c99f4f1aca1b16ec9ba9e582bdf84d6186dc52b4cab  lib/sakshi.cyr
+8d024d099db0a3243d4817e5bbf30d8ac6bc38e89c2037fbdb8ae01e553c9db4  lib/sakshi.cyr
 096eabc580c807f3e378fbe56058780a28cdf95b9c70b44672bca0a71cf969f6  lib/ct.cyr
 4ee0e3020c92b50d9bf865bc3e29f6becf8dbcd6b3c83ff2e7638d8d26db055d  lib/log.cyr
 98d1536d5bb355549b7e7be257fb6a5620525f93b447a5a5759b04a0aa053191  lib/dxgi.cyr
@@ -85,6 +87,7 @@ c4d6feec81b720c3a8b31380058e8b6a88061355a1f23575bac007f608502803  lib/sankoch.cy
 bb642e72aa8b7b471b0fc0f8f7cb31a906619f785b212a08fbf09ab2a170993b  lib/audit_walk.cyr
 ccfad90df061416eec7b8eafe729110d099810731c4a9fcd5477448095eb9ed2  lib/ws.cyr
 b635ed0a9c950c2e8da647c02eb0c4ff36961a39a5bdbd9b5890ca8c3734fdec  lib/rosnet-gpu.cyr
+d92ff4792807dc72b02089a244ce2ada7f5dfcae5ca73c4a667c574ae8d06cf9  lib/hisab.cyr
 aea2383e6fd828de155879b55ab954732f0e45eb6febaebdc03650e952c4d093  lib/async_agnos.cyr
 543be460c6d2a9922e47f4dafb4fae981802f74827b935d4ec9dadb35870cb43  lib/keccak.cyr
 b64c3fa9d44761957460676297f6f54bfe15c1ff566a0d98a529b1ac60c04693  lib/yantra.cyr
