@@ -93,8 +93,14 @@ include "src/train.cyr"
 include "src/persist.cyr"
 include "src/stream.cyr"
 include "src/vision.cyr"   # the VISION lane — the modality-axis sight proof (rosnet conv2d)
+#ifndef CYRIUS_ARCH_AARCH64
+# The HEARING lane is x86-only for now: f64_sin/f64_cos are x86 builtins with no
+# aarch64 polyfill yet (cyrius: "needs polyfill"), and hisab's num_fft twiddles
+# use them too. Gate lifts when the cyrius trig polyfill lands (issue filed:
+# docs/development/issues/2026-07-07-cyrius-aarch64-trig-polyfill.md).
 include "lib/hisab.cyr"    # sovereign FFT (num_fft) — the hearing lane's fixed frontend
 include "src/hearing.cyr"  # the HEARING lane — the modality-axis hearing proof (STFT+mel -> CNN)
+#endif
 
 # ---- hyperparameters -------------------------------------------------------
 fn CFG_C(): i64 { return 32; }       # d_model
@@ -145,8 +151,10 @@ fn usage(): i64 {
     puts("  --gen-only      skip training, just sample\n");
     puts("  --vision        the sight proof: tiny CNN on synthetic shapes (rosnet conv2d)\n");
     puts("  --vision-fd     the vision lane's end-to-end finite-difference gate only\n");
+    #ifndef CYRIUS_ARCH_AARCH64
     puts("  --hearing       the hearing proof: STFT+mel (hisab FFT) -> CNN on synthetic audio\n");
     puts("  --hearing-fd    the hearing lane's end-to-end finite-difference gate only\n");
+    #endif
     puts("  --preset        ctx 64 / d_model 64 / 8 heads / 4 layers\n");
     puts("  --d-model N     override d_model (width; 1..4096; must be divisible by heads)\n");
     puts("  --ctx N         override context length T (1..8192)\n");
@@ -226,8 +234,10 @@ fn main(): i64 {
         elif (streq(a, "--gen-only") == 1) { gen_only = 1; }
         elif (streq(a, "--vision") == 1) { return vision_demo(600, 32, 1337); }
         elif (streq(a, "--vision-fd") == 1) { return vis_grad_check(); }
+        #ifndef CYRIUS_ARCH_AARCH64
         elif (streq(a, "--hearing") == 1) { return hearing_demo(600, 32, 1337); }
         elif (streq(a, "--hearing-fd") == 1) { return hear_grad_check(); }
+        #endif
         #ifndef CYRIUS_TARGET_AGNOS
         elif (streq(a, "--gpu") == 1) { g_gpu = 1; }
         elif (streq(a, "--gpu-tc") == 1) { g_gpu = 1; g_gpu_tc = 1; }

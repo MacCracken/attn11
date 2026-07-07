@@ -71,7 +71,7 @@ fn hear_front_init(): i64 {
     while (i < W) {
         var ph = f64_div(f64_mul(_hear_2pi(), f64_from(i)), f64_from(W - 1));
         store64(hear_hann + i * 8, f64_mul(f64_div(f64_from(1), f64_from(2)),
-                                           f64_sub(f64_from(1), f64_cos(ph))));
+        f64_sub(f64_from(1), f64_cos(ph))));
         i = i + 1;
     }
     # M+2 mel-grid points from 100 Hz to 3800 Hz -> triangular filters
@@ -121,7 +121,7 @@ fn hear_features(wave, out): i64 {
         var i = 0;
         while (i < W) {                               # windowed frame -> complex buf
             store64(hear_cbuf + i * 16,
-                    f64_mul(load64(wave + (base + i) * 8), load64(hear_hann + i * 8)));
+            f64_mul(load64(wave + (base + i) * 8), load64(hear_hann + i * 8)));
             store64(hear_cbuf + i * 16 + 8, f64_from(0));
             i = i + 1;
         }
@@ -211,8 +211,8 @@ fn _hear_synth(cls): i64 {
             ph2 = f64_add(ph2, f64_mul(d1, f64_from(2)));
             ph3 = f64_add(ph3, f64_mul(d1, f64_from(3)));
             var v = f64_add(f64_sin(ph),
-                    f64_add(f64_mul(f64_div(f64_from(1), f64_from(2)), f64_sin(ph2)),
-                            f64_mul(f64_div(f64_from(1), f64_from(3)), f64_sin(ph3))));
+            f64_add(f64_mul(f64_div(f64_from(1), f64_from(2)), f64_sin(ph2)),
+            f64_mul(f64_div(f64_from(1), f64_from(3)), f64_sin(ph3))));
             store64(hear_wave + i * 8, f64_mul(f64_mul(amp, f64_div(f64_from(6), f64_from(11))), v));
             i = i + 1;
         }

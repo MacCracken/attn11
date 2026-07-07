@@ -30,6 +30,23 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fixed during bring-up: `_hear_synth` wrote the waveform buffer before
   `hear_front_init` allocated it (use-before-init on the first batch item).
 
+### Changed — CI fixes (post-cut, pre-tag)
+- **The hearing lane is x86-only for now**: `f64_sin`/`f64_cos` are x86 builtins
+  with **no aarch64 polyfill** (cyrius gap — filed
+  [`issues/2026-07-07-cyrius-aarch64-trig-polyfill.md`](docs/development/issues/2026-07-07-cyrius-aarch64-trig-polyfill.md));
+  hisab's `num_fft` twiddles use them too, and dep modules auto-prepend on every
+  matching target, so the gate is two-part: `[deps.hisab] target = "x86_64"`
+  (dep never resolves on aarch64) + `#ifndef CYRIUS_ARCH_AARCH64` around the
+  includes / CLI flags / suite registrations. aarch64 + agnos cross-builds
+  verified OK; the hearing suite group is skipped on aarch64 (the cyrius
+  SIMD-XFAIL pattern) until the polyfill lands.
+- **Cyrius pin 6.2.29 → 6.4.14** (`cyrius lib sync --full`): the dep `target`
+  key is a v6.3.1 feature and CI installs the pin. Local builds had already been
+  running cycc 6.4.14 (drift warn-only), so the suite had de-facto validated the
+  migration; re-verified 1066/1066 at the pin after the sync.
+- `src/hearing.cyr` formatted (`cyrius fmt` — the CI fmt gate); all src/tests
+  files re-checked clean.
+
 ## [1.13.0] — 2026-07-05
 
 ### Added — the VISION lane (the modality-axis "sight proof-of-life")

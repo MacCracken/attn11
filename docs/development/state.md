@@ -14,9 +14,13 @@ fixed 16-band mel filterbank sized **16 frames × 16 bands = the vision lane's
 to sound. Synthetic sovereign audio set (4 keyword-spotting classes: chirps
 up/down, two-tone syllable pair, harmonic stack; tyche-jittered + noise).
 **PROOF PASSED: loss 1.6713 → 0.0000, held-out 1000/1000**; FD 23/23; frontend
-gated tone→band without gradients. Suite **1060 → 1066**. Both modality proofs
-(sight 1.13.0, hearing 1.14.0) are green; the axis's remaining opener =
-cross-attention (ASR/fusion). Prior: **1.13.0** (the VISION lane — sight proof:
+gated tone→band without gradients. Suite **1060 → 1066**. **x86-only for now**
+(f64_sin/f64_cos have no aarch64 polyfill — cyrius issue filed
+2026-07-07-cyrius-aarch64-trig-polyfill.md; gate = `[deps.hisab]
+target="x86_64"` + `#ifndef CYRIUS_ARCH_AARCH64`, aarch64/agnos cross-builds
+verified OK). **Pin 6.2.29 → 6.4.14** (the dep `target` key is v6.3.1+; suite
+1066/1066 re-verified at the pin). Both modality proofs (sight 1.13.0, hearing
+1.14.0) are green; the axis's remaining opener = cross-attention (ASR/fusion). Prior: **1.13.0** (the VISION lane — sight proof:
 rosnet-1.1.0 conv2d CNN on synthetic shapes, held-out 1000/1000, suite
 1049→1060) · **1.12.0** (CPU leaf-op re-fold onto rupantara `ru_*`,
 whole-forward parity bit-identical, 1049 grad-checks in one binary) · **1.11.1**

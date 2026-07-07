@@ -29,8 +29,12 @@ include "src/train.cyr"
 include "src/persist.cyr"
 include "src/stream.cyr"
 include "src/vision.cyr"     # the vision lane (sight proof)
+#ifndef CYRIUS_ARCH_AARCH64
+# hearing is x86-only: f64_sin/f64_cos have no aarch64 polyfill yet (see
+# docs/development/issues/2026-07-07-cyrius-aarch64-trig-polyfill.md)
 include "lib/hisab.cyr"      # sovereign FFT — the hearing lane's fixed frontend
 include "src/hearing.cyr"    # the hearing lane (hearing proof)
+#endif
 
 fn _eps(): i64 { return f64_div(f64_from(1), f64_from(10000)); }     # 1e-4
 fn dotsum(a, b, n): i64 {
@@ -3458,6 +3462,7 @@ fn test_vision_fd(): i64 {
 }
 
 # ---- hearing lane (hearing proof): frontend sanity + FD gate + micro-train ----
+#ifndef CYRIUS_ARCH_AARCH64
 fn test_hearing_frontend(): i64 {
     # a pure tone at mel band j's center frequency must land its energy in
     # band j (mean over frames, argmax) — the STFT + filterbank, gated without
@@ -3511,6 +3516,7 @@ fn test_hearing_train(): i64 {
     assert_gt(acc, 600, "hearing micro-train: held-out well above chance (>600/1000)");
     return 0;
 }
+#endif
 
 fn test_vision_train(): i64 {
     # small dims so the suite stays fast: G=12 (8x8 + the ±3 jitter pushes
@@ -3671,10 +3677,12 @@ fn main(): i64 {
     test_group("vision lane (sight proof)");
     test_vision_fd();
     test_vision_train();
+    #ifndef CYRIUS_ARCH_AARCH64
     test_group("hearing lane (hearing proof)");
     test_hearing_frontend();
     test_hearing_fd();
     test_hearing_train();
+    #endif
 
     return assert_summary();
 }
