@@ -4,7 +4,7 @@ version = "${file:VERSION}"
 description = "attn11 — a from-scratch GPT-style transformer, trained, in Cyrius"
 license = "GPL-3.0-only"
 language = "cyrius"
-cyrius = "6.4.14"
+cyrius = "6.4.72"
 repository = "https://github.com/MacCracken/attn11"
 
 [build]
@@ -65,7 +65,7 @@ modules = ["dist/rosnet.cyr", "dist/rosnet-gpu.cyr"]
 [deps.rupantara]
 git = "https://github.com/MacCracken/rupantara"
 path = "../rupantara"
-tag = "0.3.0"
+tag = "0.4.1"
 modules = ["dist/rupantara.cyr"]
 
 # M18 (the v1.8.x GPU arc): mabda is the GPU *foundation* — device/context init,
