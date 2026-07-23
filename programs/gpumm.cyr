@@ -1,0 +1,81 @@
+# programs/gpumm.cyr — attn11 ML-layer-on-GPU crown proof (AGNOS gfx90c, f64 #83) — the THIRD jewel.
+#
+# Proves attn11's OWN forward-projection hook, `qlinear_fwd` (src/ops.cyr), runs on the gfx90c shader cores.
+# On AGNOS with g_gpu=1, the bias-free K<=8 branch now routes to rupantara's linear_fwd_gpu (#83); this proof
+# runs a real projection three ways and byte-compares:
+#   pyc = linear_fwd(x,W,0,...)          — the rosnet CPU reference
+#   pyg = linear_fwd_gpu(x,W,0,...)      — the direct GPU-tiled peer (#83), returns the GPU tile count
+#   pyh = qlinear_fwd(x,W,0,...) [g_gpu=1 on AGNOS] — attn11's hook, which on AGNOS routes to linear_fwd_gpu
+# Bit-EXACT (bias-free, K=8 single-tile): #83 is unfused v_mul_f64+v_add_f64 and rosnet linear_fwd's f64 body
+# is SSE2 mulpd+addpd (cyrius has no f64 hardware FMA) — same two-rounding order. Fractional data exercises
+# real rounding. On host the hook uses g_gpu=0 (CPU, avoids the mabda path), so pyh==pyc trivially there.
+#
+# ORACLE = the EXIT CODE:
+#   95 = pyc==pyg==pyh AND all 4 tiles on the GPU (CROWN: attn11's qlinear_fwd ran a projection on gfx90c).
+#   96 = all identical, 0 GPU tiles (host/QEMU — tiling proven, hook on CPU, no GPU).
+#   90 = linear_fwd_gpu mismatch. 91 = qlinear_fwd hook mismatch. 97 = partial dispatch.
+
+# AGNOS stub (mirrors main.cyr:74) — mabda + rosnet-gpu are auto-prepended on every target and can't be
+# #ifndef'd out; their dead-on-agnos DRM-ioctl code references SYS_IOCTL, so a stub lets the bundle type-check.
+#ifdef CYRIUS_TARGET_AGNOS
+var SYS_IOCTL = 16;
+#endif
+
+include "lib/tyche.cyr"
+include "lib/rosnet.cyr"
+include "lib/rupantara.cyr"
+include "src/tensor.cyr"
+include "src/fileio.cyr"
+include "lib/akshara.cyr"
+include "src/ops.cyr"
+include "src/attn.cyr"
+include "src/attn_linear.cyr"
+include "src/attn_ssm.cyr"
+include "src/model.cyr"
+include "src/train.cyr"
+include "src/persist.cyr"
+include "src/stream.cyr"
+
+var px[64];     # x : M x K = 8 x 8   f64
+var pw[256];    # W : K x N = 8 x 32  f64
+var pyc[256];   # y_cpu  (linear_fwd)
+var pyg[256];   # y_gpu  (linear_fwd_gpu, direct)
+var pyh[256];   # y_hook (qlinear_fwd)
+
+fn pfill(): i64 {
+    var i = 0;
+    while (i < 64) { store64(&px + i * 8, f64_div(f64_from((i * 3 + 1) % 17 + 1), f64_from(7))); i = i + 1; }
+    var j = 0;
+    while (j < 256) { store64(&pw + j * 8, f64_div(f64_from((j * 5 + 2) % 19 + 1), f64_from(11))); j = j + 1; }
+    return 0;
+}
+
+fn gpumm_main(): i64 {
+    alloc_init();
+    pfill();
+
+    linear_fwd(&px, &pw, 0, &pyc, 8, 8, 32);                       # CPU reference
+    var tiles = linear_fwd_gpu(&px, &pw, 0, &pyg, 8, 8, 32);       # direct GPU peer (tile count)
+
+    g_ternary = 0;
+    #ifdef CYRIUS_TARGET_AGNOS
+    g_gpu = 1;                                                     # route the hook to #83 on iron
+    #endif
+    #ifndef CYRIUS_TARGET_AGNOS
+    g_gpu = 0;                                                     # host: CPU hook (no mabda)
+    #endif
+    qlinear_fwd(&px, &pw, 0, &pyh, 8, 8, 32);                      # attn11's own projection hook
+
+    var i = 0;
+    while (i < 256) {
+        if (load64(&pyc + i * 8) != load64(&pyg + i * 8)) { return 90; }   # direct GPU tiling wrong
+        if (load64(&pyc + i * 8) != load64(&pyh + i * 8)) { return 91; }   # qlinear_fwd hook routing wrong
+        i = i + 1;
+    }
+    if (tiles == 4) { return 95; }    # CROWN
+    if (tiles == 0) { return 96; }    # host/QEMU — no GPU
+    return 97;                         # partial dispatch
+}
+
+fn _entry(): i64 { var r = gpumm_main(); syscall(SYS_EXIT, r); return 0; }
+_entry();

@@ -4,6 +4,36 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.14.1] — 2026-07-23
+
+**AGNOS GPU offload (the 1.54.x GPU crown / C6): attn11's `qlinear_fwd` forward projection runs on the AMD
+gfx90c shader cores — the THIRD crown consumer** (after rupantara/f64/`#83` and tentib/integer/`#82`).
+Additive: the default CPU forward and the attn11↔rupantara parity contract are unchanged; the offload fires
+only under `g_gpu==1` on the AGNOS target, for the bit-exact regime.
+
+### Added / Changed
+- **`src/ops.cyr` `qlinear_fwd` — AGNOS GPU branch.** When `g_gpu==1` on AGNOS, a **bias-free K≤8** projection
+  now routes to rupantara's `linear_fwd_gpu` (`#83`, gpu_dispatch_f64) — the gfx90c shader cores — instead of
+  the CPU `linear_fwd`. Self-falls-back to CPU for bias / K>8 (which the single-k-tile offload can't take
+  bit-exactly), mirroring the mabda `gpu_matmul_fwd` hook's fallback. **Bit-identical** to CPU `linear_fwd`:
+  both `#83` (unfused `v_mul_f64`+`v_add_f64`) and rosnet `linear_fwd` (SSE2 `mulpd+addpd`, no f64 hardware
+  FMA) round identically, and K≤8 is a single k-tile. attn11 already deps on rupantara (path), so
+  `linear_fwd_gpu` is reachable via the flat namespace — no new dependency.
+- **`programs/gpumm.cyr` — the crown proof.** Runs a real bias-free projection (8×8×32) three ways — CPU
+  `linear_fwd`, direct `linear_fwd_gpu`, and attn11's `qlinear_fwd` hook (`g_gpu=1` on AGNOS) — and
+  byte-compares. Exit: **95** = all three byte-identical AND all 4 tiles on the GPU (crown: attn11's own hook
+  ran a projection on gfx90c); **96** = identical, 0 GPU tiles (host/QEMU — tiling proven, hook on CPU);
+  **90/91** = mismatch (direct / hook).
+
+### Verified
+- attn11 (main + the proof) builds `--agnos`; the auto-prepended mabda/rosnet-gpu bundles compile as dead code
+  (the `#ifdef CYRIUS_TARGET_AGNOS var SYS_IOCTL` stub), and every `gpu_*` CALL stays `#ifndef`-guarded except
+  the new bit-exact AGNOS branch.
+- **Host proof exits 96** (2026-07-23): the direct `linear_fwd_gpu` tiling AND the `qlinear_fwd` hook are both
+  byte-for-byte equal to the production `linear_fwd`. The GPU `#83` dispatch is iron-only; the archaemenid
+  crown burn (`run /bin/gpuattn` → `run: exit 95`) is the remaining confirmation, tracked in agnosticos
+  `iron-nuc-zen-log.md`.
+
 ## [1.14.0] — 2026-07-07
 
 ### Added — the HEARING lane (the modality-axis "hearing proof-of-life")

@@ -684,11 +684,20 @@ fn qlinear_fwd(x, W, b, y, M, K, N): i64 {
         #ifndef CYRIUS_TARGET_AGNOS
         if (g_gpu == 1) { if (gpu_matmul_fwd(x, W, b, y, M, K, N) == 0) { return 0; } }
         #endif
+        # AGNOS: offload the BIT-EXACT regime (bias-free, K<=8) to the gfx90c shader cores via rupantara's
+        # linear_fwd_gpu (#83, gpu_dispatch_f64). Self-falls-back to CPU linear_fwd for bias / K>8, which the
+        # single-k-tile offload cannot take bit-exactly — mirroring the mabda hook's own fallback discipline.
+        #ifdef CYRIUS_TARGET_AGNOS
+        if (g_gpu == 1) { if (b == 0) { if (K <= 8) { linear_fwd_gpu(x, W, b, y, M, K, N); return 0; } } }
+        #endif
         return linear_fwd(x, W, b, y, M, K, N);
     }
     ternary_quant(W, g_qscratch, K, N);
     #ifndef CYRIUS_TARGET_AGNOS
     if (g_gpu == 1) { if (gpu_matmul_fwd(x, g_qscratch, b, y, M, K, N) == 0) { return 0; } }
+    #endif
+    #ifdef CYRIUS_TARGET_AGNOS
+    if (g_gpu == 1) { if (b == 0) { if (K <= 8) { linear_fwd_gpu(x, g_qscratch, b, y, M, K, N); return 0; } } }
     #endif
     return linear_fwd(x, g_qscratch, b, y, M, K, N);
 }
