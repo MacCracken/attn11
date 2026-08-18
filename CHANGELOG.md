@@ -4,6 +4,50 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.14.2] — 2026-08-18
+
+### Changed
+
+- **Cyrius pin `6.4.72` -> `6.5.27`** (2026-08-17, ecosystem-wide ML/AI-arc realign ahead of
+  the arc reopening). `cyrius lib sync --full` re-vendored the whole version-matched stdlib
+  snapshot, clearing the toolchain-drift and `./lib/ shadows version-pinned` warnings.
+  Suite **1066/1066**, identical to the pre-bump baseline; every FD grad-check unchanged (vision 23/23, hearing 23/23). `--agnos` builds re-verified for `src/main.cyr`, `tests/attn11.tcyr` and `programs/gpumm.cyr`.
+
+- **Dependency set brought current — all six: `akshara` 0.1.0 -> 1.0.2, `tyche` 0.1.1 -> 1.0.1,
+  `rosnet` 1.1.0 -> 1.1.1, `rupantara` 0.4.1 -> 0.4.2, `mabda` 4.0.7 -> 4.0.9,
+  `hisab` 2.6.8 -> 2.11.1.** attn11 is the deepest consumer in the arc, so it moves last: three of
+  these (tyche, rosnet, akshara) froze their public surfaces at 1.0 in early July and no consumer
+  had left the pre-1.0 tags until this sweep. **`hisab` is the one worth watching — four minors in
+  one step**, and the hearing lane consumes its `num_fft` for the Hann STFT; the 23/23 hearing
+  FD grad-check and the tone→band frontend gate both pass unchanged at 2.11.1, which is the real
+  evidence the jump is safe. `rupantara` is a `path` override, so its declared tag had never been
+  exercised locally — CI is the first honest build of that edge. Verified every bump took rather
+  than merely built: vendored headers confirmed at tyche `1.0.1`, rosnet `1.1.1`, akshara `1.0.2`,
+  rupantara `0.4.2`, mabda `4.0.9`, hisab `2.11.1`. Suite **1066/1066** and all three `--agnos`
+  targets still build clean.
+
+### Changed
+
+- **mabda `3.4.1` → `4.0.7`** — 3.4.1 does not compile on cycc ≥ **6.5.1**, on *either*
+  target. Its `gpu_texture_create_cube` dispatched a 4-arg backend filler through
+  `fncall5` (which passes `fp` + 5 args); the surplus argument was zero-filled and
+  ignored by the callee, so it was latent until 6.5.1 escalated a wrong argument count
+  from a warning to a hard error. mabda corrected it to `fncall4` in **4.0.2**; 4.0.7 is
+  the head of that line.
+
+  attn11 never calls the symbol — but a dep's `modules` are auto-prepended on every
+  target and must type-check, which is precisely why this bit the **agnos** build where
+  the entire mabda bundle is dead code. Nothing was edited in `lib/`; it is materialized
+  from `[deps]` by `cyrius deps`.
+
+  The 3.x → 4.x major is safe here. 4.0.0 **adds** a native NVIDIA backend, and
+  4.0.0 / 4.0.1 / 4.0.2 each state no public-API signature change. 4.0.1's deprecation is
+  AMD-on-**wgpu** (warn-and-allow, with a `MABDA_AMD_WGPU_STRICT` opt-in), and its
+  breaking note applies to consumers that **vendor** `deps/wgpu_main.c`. attn11 does
+  neither: the `--gpu` path rides `BACKEND_KIND_AMD`, the native amdgpu DRM route.
+  Builds clean for host and `--agnos`; suite **1066 passed, 0 failed**. The live `--gpu`
+  path is unchanged but was not re-run — it needs AMD iron.
+
 ## [1.14.1] — 2026-07-23
 
 **AGNOS GPU offload (the 1.54.x GPU crown / C6): attn11's `qlinear_fwd` forward projection runs on the AMD
@@ -30,9 +74,12 @@ only under `g_gpu==1` on the AGNOS target, for the bit-exact regime.
   (the `#ifdef CYRIUS_TARGET_AGNOS var SYS_IOCTL` stub), and every `gpu_*` CALL stays `#ifndef`-guarded except
   the new bit-exact AGNOS branch.
 - **Host proof exits 96** (2026-07-23): the direct `linear_fwd_gpu` tiling AND the `qlinear_fwd` hook are both
-  byte-for-byte equal to the production `linear_fwd`. The GPU `#83` dispatch is iron-only; the archaemenid
-  crown burn (`run /bin/gpuattn` → `run: exit 95`) is the remaining confirmation, tracked in agnosticos
-  `iron-nuc-zen-log.md`.
+  byte-for-byte equal to the production `linear_fwd`.
+- **CROWN PROVEN ON IRON** (2026-07-23): `run /bin/gpuattn` → **`exit 95`** on archaemenid — CPU == direct ==
+  hook byte-identical AND all 4 tiles on the GPU, so attn11's own `qlinear_fwd` routed a real projection to the
+  gfx90c shader cores via `#83`, bit-identical vs CPU. This is the THIRD (and final) consumer of the AGNOS
+  1.54.x GPU crown (C6), after rupantara (f64) and tentib (integer). Tracked in agnosticos
+  `iron-nuc-zen-log.md#tracker-156x-ml-crown-attn11`.
 
 ## [1.14.0] — 2026-07-07
 

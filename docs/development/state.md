@@ -967,7 +967,7 @@ deterministic resume. 0.2.0: stacked layers, grad clipping, LR schedule.)
 
 ## Toolchain
 
-- **Cyrius pin**: `6.2.29` (in `cyrius.cyml [package].cyrius`) — bumped from 6.2.27
+- **Cyrius pin**: `6.5.27` (in `cyrius.cyml [package].cyrius`) — bumped from 6.2.27
   in 1.7.4 (6.2.6 → 6.2.27 in 1.7.3, 6.2.5 → 6.2.6 in 1.7.2, 6.2.2 → 6.2.5 in 1.7.1) to
   realign with the fast-rolling installed cycc (`cyrius update` resyncs the gitignored `lib/`
   snapshot + `cyrius.lock`; tracked diff = `cyrius.cyml` + `cyrius.lock`). 1.7.3 also
@@ -990,6 +990,8 @@ deterministic resume. 0.2.0: stacked layers, grad clipping, LR schedule.)
   mismatch reproduces `argc()==0` under the kernel — the run gate caught it, so
   **every pin bump is followed by `cyrius update`** and a both-arches retest.
   (`docs/architecture/002` retired at ≥6.1.32.)
+
+**Pin bumped to `6.5.27` 2026-08-17** (ecosystem-wide ML/AI-arc realign, ahead of the arc reopening). `cyrius lib sync --full` re-vendored the whole version-matched stdlib snapshot; suite re-verified green at the new pin.
 
 ## Performance
 

@@ -4,7 +4,7 @@ version = "${file:VERSION}"
 description = "attn11 — a from-scratch GPT-style transformer, trained, in Cyrius"
 license = "GPL-3.0-only"
 language = "cyrius"
-cyrius = "6.4.72"
+cyrius = "6.5.27"
 repository = "https://github.com/MacCracken/attn11"
 
 [build]
@@ -23,7 +23,7 @@ stdlib = ["string", "fmt", "alloc", "io", "vec", "str", "syscalls", "assert", "b
 # to the local dist bundle the extraction was validated against).
 [deps.akshara]
 git = "https://github.com/MacCracken/akshara"
-tag = "0.1.0"
+tag = "1.0.2"
 modules = ["dist/akshara.cyr"]
 
 # M18 (v1.8.x GPU arc) — LANDED in v1.8.0 (X027). mabda 3.4.1 is consumed by
@@ -41,7 +41,7 @@ modules = ["dist/akshara.cyr"]
 # validate rosnet's linear, and a byte-identical training run proves the swap.
 [deps.tyche]
 git = "https://github.com/MacCracken/tyche"
-tag = "0.1.1"
+tag = "1.0.1"
 modules = ["dist/tyche.cyr"]
 
 # rosnet 1.1.0: the frozen 1.0 surface attn11 already exercised (identical to the 0.2.0
@@ -50,7 +50,7 @@ modules = ["dist/tyche.cyr"]
 # unchanged (dist/rosnet-gpu.cyr leaves mabda's symbols unresolved; [deps.mabda] supplies them).
 [deps.rosnet]
 git = "https://github.com/MacCracken/rosnet"
-tag = "1.1.0"
+tag = "1.1.1"
 modules = ["dist/rosnet.cyr", "dist/rosnet-gpu.cyr"]
 
 # The transformer FORWARD leaf-op CPU math, extracted to rupantara so there is ONE
@@ -65,7 +65,7 @@ modules = ["dist/rosnet.cyr", "dist/rosnet-gpu.cyr"]
 [deps.rupantara]
 git = "https://github.com/MacCracken/rupantara"
 path = "../rupantara"
-tag = "0.4.1"
+tag = "0.4.2"
 modules = ["dist/rupantara.cyr"]
 
 # M18 (the v1.8.x GPU arc): mabda is the GPU *foundation* — device/context init,
@@ -76,9 +76,24 @@ modules = ["dist/rupantara.cyr"]
 # LANDED for M18 (v1.8.x GPU arc): mabda 3.4.1, the collision-fixed release (X026). The
 # ~1 MB dist amalgamation is a transient binary-SIZE cost (cyrius lacks dep-module-call;
 # slated for 6.2.x, slims back with zero attn11 change) — NOT a gate on the GPU work.
+#
+# `3.4.1` → `4.0.7` (2026-07-30): 3.4.1 does not COMPILE on cycc >= 6.5.1. Its
+# `gpu_texture_create_cube` dispatched a 4-arg backend filler through `fncall5`
+# (`fp` + 5 args); the surplus arg was zero-filled and ignored, so it was latent —
+# until 6.5.1 escalated a wrong argument count from warning to hard ERROR. mabda
+# corrected it to `fncall4` in **4.0.2**; 4.0.7 is the head of that line. attn11
+# never calls the symbol — the whole bundle is dead code here on agnos, and the
+# Linux `--gpu` path goes through rosnet's [lib.gpu] profile — but a prepended dep
+# module must still type-check, so a build for EITHER target failed on it.
+#
+# The 3.x → 4.x major is safe for attn11: 4.0.0 ADDS a native NVIDIA backend, and
+# 4.0.0/4.0.1/4.0.2 each state no public-API signature change. The 4.0.1 breakage
+# is AMD-on-**wgpu** deprecation (warn-and-allow) plus a `deps/wgpu_main.c`
+# launcher change for consumers that VENDOR it — attn11 does neither: it rides
+# `BACKEND_KIND_AMD`, the native amdgpu DRM path.
 [deps.mabda]
 git = "https://github.com/MacCracken/mabda"
-tag = "3.4.1"
+tag = "4.0.9"
 modules = ["dist/mabda.cyr"]
 
 # Sovereign FFT for the HEARING lane's fixed STFT+mel frontend (num_fft — the
@@ -92,7 +107,7 @@ modules = ["dist/mabda.cyr"]
 # `#ifndef CYRIUS_ARCH_AARCH64` around the manual includes in src/tests.
 [deps.hisab]
 git = "https://github.com/MacCracken/hisab"
-tag = "2.6.8"
+tag = "2.11.1"
 target = "x86_64"
 modules = ["dist/hisab.cyr"]
 ---
