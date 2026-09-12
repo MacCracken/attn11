@@ -71,7 +71,7 @@ fn hear_front_init(): i64 {
     while (i < W) {
         var ph = f64_div(f64_mul(_hear_2pi(), f64_from(i)), f64_from(W - 1));
         store64(hear_hann + i * 8, f64_mul(f64_div(f64_from(1), f64_from(2)),
-        f64_sub(f64_from(1), f64_cos(ph))));
+            f64_sub(f64_from(1), f64_cos(ph))));
         i = i + 1;
     }
     # M+2 mel-grid points from 100 Hz to 3800 Hz -> triangular filters
@@ -121,7 +121,7 @@ fn hear_features(wave, out): i64 {
         var i = 0;
         while (i < W) {                               # windowed frame -> complex buf
             store64(hear_cbuf + i * 16,
-            f64_mul(load64(wave + (base + i) * 8), load64(hear_hann + i * 8)));
+              f64_mul(load64(wave + (base + i) * 8), load64(hear_hann + i * 8)));
             store64(hear_cbuf + i * 16 + 8, f64_from(0));
             i = i + 1;
         }
@@ -211,8 +211,8 @@ fn _hear_synth(cls): i64 {
             ph2 = f64_add(ph2, f64_mul(d1, f64_from(2)));
             ph3 = f64_add(ph3, f64_mul(d1, f64_from(3)));
             var v = f64_add(f64_sin(ph),
-            f64_add(f64_mul(f64_div(f64_from(1), f64_from(2)), f64_sin(ph2)),
-            f64_mul(f64_div(f64_from(1), f64_from(3)), f64_sin(ph3))));
+              f64_add(f64_mul(f64_div(f64_from(1), f64_from(2)), f64_sin(ph2)),
+                f64_mul(f64_div(f64_from(1), f64_from(3)), f64_sin(ph3))));
             store64(hear_wave + i * 8, f64_mul(f64_mul(amp, f64_div(f64_from(6), f64_from(11))), v));
             i = i + 1;
         }
@@ -312,13 +312,13 @@ fn hear_fwd(X, Y, B, G, c1, c2, ncls): i64 {
     var h = G / 2;
     var flat = c2 * h * h;
     conv2d_fwd(X, hear_P + _vis_o_Wc1() * 8, hear_P + _vis_o_bc1(c1, 3) * 8,
-    _hear_y1p, B, 1, G, G, c1, 3, 3, 1, 1, 1, 1);
+      _hear_y1p, B, 1, G, G, c1, 3, 3, 1, 1, 1, 1);
     gelu_fwd(_hear_y1p, _hear_y1, B * c1 * G * G);
     conv2d_fwd(_hear_y1, hear_P + _vis_o_Wc2(c1, 3) * 8, hear_P + _vis_o_bc2(c1, c2, 3) * 8,
-    _hear_y2p, B, c1, G, G, c2, 3, 3, 2, 2, 1, 1);
+      _hear_y2p, B, c1, G, G, c2, 3, 3, 2, 2, 1, 1);
     gelu_fwd(_hear_y2p, _hear_y2, B * flat);
     linear_fwd(_hear_y2, hear_P + _vis_o_Wl(c1, c2, 3, flat, ncls) * 8,
-    hear_P + _vis_o_bl(c1, c2, 3, flat, ncls) * 8, _hear_lg, B, flat, ncls);
+      hear_P + _vis_o_bl(c1, c2, 3, flat, ncls) * 8, _hear_lg, B, flat, ncls);
     return softmax_xent_fwd(_hear_lg, Y, _hear_pr, B, ncls);
 }
 
@@ -329,19 +329,19 @@ fn hear_bwd(X, Y, B, G, c1, c2, ncls): i64 {
     softmax_xent_bwd(_hear_pr, Y, dlg, B, ncls);
     var dflat = t_alloc(B * flat);
     linear_bwd(_hear_y2, hear_P + _vis_o_Wl(c1, c2, 3, flat, ncls) * 8, dlg, dflat,
-    hear_Gr + _vis_o_Wl(c1, c2, 3, flat, ncls) * 8,
-    hear_Gr + _vis_o_bl(c1, c2, 3, flat, ncls) * 8, B, flat, ncls);
+      hear_Gr + _vis_o_Wl(c1, c2, 3, flat, ncls) * 8,
+      hear_Gr + _vis_o_bl(c1, c2, 3, flat, ncls) * 8, B, flat, ncls);
     var dy2p = t_alloc(B * flat);
     gelu_bwd(_hear_y2p, dflat, dy2p, B * flat);
     var dy1 = t_alloc(B * c1 * G * G);
     conv2d_bwd(_hear_y1, hear_P + _vis_o_Wc2(c1, 3) * 8, dy2p, dy1,
-    hear_Gr + _vis_o_Wc2(c1, 3) * 8, hear_Gr + _vis_o_bc2(c1, c2, 3) * 8,
-    B, c1, G, G, c2, 3, 3, 2, 2, 1, 1);
+      hear_Gr + _vis_o_Wc2(c1, 3) * 8, hear_Gr + _vis_o_bc2(c1, c2, 3) * 8,
+      B, c1, G, G, c2, 3, 3, 2, 2, 1, 1);
     var dy1p = t_alloc(B * c1 * G * G);
     gelu_bwd(_hear_y1p, dy1, dy1p, B * c1 * G * G);
     conv2d_bwd(X, hear_P + _vis_o_Wc1() * 8, dy1p, 0,
-    hear_Gr + _vis_o_Wc1() * 8, hear_Gr + _vis_o_bc1(c1, 3) * 8,
-    B, 1, G, G, c1, 3, 3, 1, 1, 1, 1);
+      hear_Gr + _vis_o_Wc1() * 8, hear_Gr + _vis_o_bc1(c1, 3) * 8,
+      B, 1, G, G, c1, 3, 3, 1, 1, 1, 1);
     return 0;
 }
 

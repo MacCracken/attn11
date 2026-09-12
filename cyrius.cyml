@@ -4,7 +4,7 @@ version = "${file:VERSION}"
 description = "attn11 — a from-scratch GPT-style transformer, trained, in Cyrius"
 license = "GPL-3.0-only"
 language = "cyrius"
-cyrius = "6.5.27"
+cyrius = "6.6.2"
 repository = "https://github.com/MacCracken/attn11"
 
 [build]
@@ -48,9 +48,15 @@ modules = ["dist/tyche.cyr"]
 # code) + conv2d/conv1d fwd+bwd (NCHW, per-axis stride/pad, FD-gated) — pulled in for the
 # vision lane (src/vision.cyr, the sight proof). The GPU [lib.gpu] profile rides along
 # unchanged (dist/rosnet-gpu.cyr leaves mabda's symbols unresolved; [deps.mabda] supplies them).
+#
+# `1.1.1` → `1.1.2` (6.6.2 migration): 1.1.1's dist/rosnet-gpu.cyr predates the
+# v6.6.0 Result VALUE FORM. It bound `var res = gpu_context_new_native();` (a
+# single-value bind of a `: stack` pair — now a hard error) and called the
+# `payload()` helper deleted at v6.6.0. 1.1.2 is the migrated release; both
+# dist modules are clean of the retired API.
 [deps.rosnet]
 git = "https://github.com/MacCracken/rosnet"
-tag = "1.1.1"
+tag = "1.1.2"
 modules = ["dist/rosnet.cyr", "dist/rosnet-gpu.cyr"]
 
 # The transformer FORWARD leaf-op CPU math, extracted to rupantara so there is ONE
@@ -91,9 +97,16 @@ modules = ["dist/rupantara.cyr"]
 # is AMD-on-**wgpu** deprecation (warn-and-allow) plus a `deps/wgpu_main.c`
 # launcher change for consumers that VENDOR it — attn11 does neither: it rides
 # `BACKEND_KIND_AMD`, the native amdgpu DRM path.
+#
+# `4.0.9` → `4.1.1` (6.6.2 migration): 4.0.9 predates the v6.6.0 Result VALUE
+# FORM — `surface_state_acquire` + the seven `gpu_texture_load_*_result` call
+# sites single-value-bound a `: stack` pair (now a hard error), and the bundle
+# still called the deleted `payload()`. 4.1.1 is migrated. As before, the whole
+# bundle is dead code for attn11 (it rides rosnet's [lib.gpu] profile) but a
+# prepended dep module must still type-check, so a stale pin fails the build.
 [deps.mabda]
 git = "https://github.com/MacCracken/mabda"
-tag = "4.0.9"
+tag = "4.1.1"
 modules = ["dist/mabda.cyr"]
 
 # Sovereign FFT for the HEARING lane's fixed STFT+mel frontend (num_fft — the
@@ -105,9 +118,19 @@ modules = ["dist/mabda.cyr"]
 # modules auto-prepend on every matching target, so the arch gate must live
 # HERE (v6.3.1 `target` key — the reason the pin is >= 6.3.1), paired with the
 # `#ifndef CYRIUS_ARCH_AARCH64` around the manual includes in src/tests.
+#
+# `2.11.1` → `2.11.2` (6.6.2 migration): the 2.11.1 TAG DOES NOT EXIST upstream —
+# `git clone --branch 2.11.1` fails "Remote branch not found", so dep resolution
+# errored and the build aborted before compiling a single line. 2.11.1 was a real
+# release (VERSION 2.11.1 at hisab commit a09d228) but its tag was never pushed /
+# was deleted; no tag points at that commit today. 2.11.2 is the next patch,
+# a09d228 is its ancestor, and it is what six sibling repos (ghurni, dhvani,
+# garjan, prakash, prani, nidhi) already pin. Not a value-form change: hisab's
+# dist has zero Result/Option surface — verified by the hearing-lane grad-check
+# (23/23), which is the live num_fft exercise.
 [deps.hisab]
 git = "https://github.com/MacCracken/hisab"
-tag = "2.11.1"
+tag = "2.11.2"
 target = "x86_64"
 modules = ["dist/hisab.cyr"]
 ---

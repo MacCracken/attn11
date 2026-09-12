@@ -138,7 +138,7 @@ fn _atoi(s): i64 {
 }
 
 # Kept in sync with the VERSION file (CI's docs job gates the match).
-fn CFG_VERSION(): i64 { return "1.14.2"; }
+fn CFG_VERSION(): i64 { return "1.14.3"; }
 
 fn usage(): i64 {
     puts("attn11 — a from-scratch GPT-style transformer, trained, in Cyrius\n");
@@ -580,19 +580,19 @@ fn main(): i64 {
     } elif (cfg_objective == 1) {
         # M15 masked-diffusion (uniform MHA + learned-abs + dense; bidirectional)
         model_init_full(V, cfg_c, cfg_t, cfg_nh, cfg_nkv, cfg_nl,
-        CFG_ATTN_BIAS(), CFG_DROPOUT(), CFG_SEED(),
-        cfg_attn_kind, cfg_latent_dim, cfg_pos_kind, cfg_rope_dim,
-        cfg_num_experts, cfg_expert_topk, 0, 1);
+          CFG_ATTN_BIAS(), CFG_DROPOUT(), CFG_SEED(),
+          cfg_attn_kind, cfg_latent_dim, cfg_pos_kind, cfg_rope_dim,
+          cfg_num_experts, cfg_expert_topk, 0, 1);
     } elif (cfg_hybrid == 1) {
         model_init_full(V, cfg_c, cfg_t, cfg_nh, cfg_nkv, cfg_nl,
-        CFG_ATTN_BIAS(), CFG_DROPOUT(), CFG_SEED(),
-        cfg_attn_kind, cfg_latent_dim, cfg_pos_kind, cfg_rope_dim,
-        cfg_num_experts, cfg_expert_topk, &lkinds, 0);
+          CFG_ATTN_BIAS(), CFG_DROPOUT(), CFG_SEED(),
+          cfg_attn_kind, cfg_latent_dim, cfg_pos_kind, cfg_rope_dim,
+          cfg_num_experts, cfg_expert_topk, &lkinds, 0);
     } else {
         model_init_moe(V, cfg_c, cfg_t, cfg_nh, cfg_nkv, cfg_nl,
-        CFG_ATTN_BIAS(), CFG_DROPOUT(), CFG_SEED(),
-        cfg_attn_kind, cfg_latent_dim, cfg_pos_kind, cfg_rope_dim,
-        cfg_num_experts, cfg_expert_topk);
+          CFG_ATTN_BIAS(), CFG_DROPOUT(), CFG_SEED(),
+          cfg_attn_kind, cfg_latent_dim, cfg_pos_kind, cfg_rope_dim,
+          cfg_num_experts, cfg_expert_topk);
     }
 
     puts("attn11 — transformer training in Cyrius\n");
@@ -735,9 +735,9 @@ fn main(): i64 {
     #ifndef CYRIUS_TARGET_AGNOS
     if (g_gpu == 1) {
         if ((gpu_mm_count() > 0) || (gpu_ln_count() > 0) || (gpu_gelu_count() > 0) ||
-        (gpu_head_count() > 0) || (gpu_attn_count() > 0) || (gpu_adam_count() > 0) ||
-        (gpu_linbwd_count() > 0) || (gpu_headbwd_count() > 0) || (gpu_lnbwd_count() > 0) ||
-        (gpu_attnbwd_count() > 0) || (gpu_rope_count() > 0)) {
+          (gpu_head_count() > 0) || (gpu_attn_count() > 0) || (gpu_adam_count() > 0) ||
+          (gpu_linbwd_count() > 0) || (gpu_headbwd_count() > 0) || (gpu_lnbwd_count() > 0) ||
+          (gpu_attnbwd_count() > 0) || (gpu_rope_count() > 0)) {
             puts("GPU: dispatched "); fmt_int(gpu_mm_count()); puts(" matmuls + ");
             fmt_int(gpu_ln_count()); puts(" layernorms");
             if (gpu_adam_count() > 0) { puts(" + "); fmt_int(gpu_adam_count()); puts(" adam steps"); }
@@ -751,7 +751,7 @@ fn main(): i64 {
             if (gpu_linbwd_count() > 0) { puts(" + "); fmt_int(gpu_linbwd_count()); puts(" linear-bwd"); }
             if (gpu_attnbwd_count() > 0) { puts(" + "); fmt_int(gpu_attnbwd_count()); puts(" attn-bwd"); }
             if ((gpu_gelu_count() > 0) || (gpu_head_count() > 0) || (gpu_attn_count() > 0) ||
-            (gpu_linbwd_count() > 0) || (gpu_attnbwd_count() > 0)) { puts(" (tolerance)"); }
+              (gpu_linbwd_count() > 0) || (gpu_attnbwd_count() > 0)) { puts(" (tolerance)"); }
             puts(" on-device\n");
         } else {
             puts("GPU: requested but nothing ran on-device — CPU fallback was used throughout\n");
