@@ -90,6 +90,10 @@ gated M18. With `g_gpu == 0` the path is the unchanged CPU code (byte-identical)
 
 ## AGNOS: mabda auto-prepends on EVERY target — gate the consumer, stub the one symbol
 
+> **1.14.4 note:** mabda is no longer a `[deps.mabda]` git dep — it is the bundled stdlib leaf
+> (`"mabda"` in `[deps] stdlib`, 4.1.7 at cyrius 6.6.20). It still auto-prepends on every target,
+> so the reasoning below holds; only the mechanism that injects it changed.
+
 cyrius auto-prepends a declared dep's `modules` (`[deps.mabda] modules = ["dist/mabda.cyr"]`)
 into **every** build, including `--agnos` — and there is no target-conditional dependency
 syntax, nor a way to fetch a dep without auto-prepending it (dropping `modules` stops the

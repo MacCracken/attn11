@@ -96,17 +96,21 @@ fn read_stdin(buf, maxlen): i64 {
 # on real aarch64), which would make the CI aarch64 lane unable to test the
 # save path; fdatasync (75/83) is emulated correctly and is sufficient (the
 # rename publishes the directory entry; we only need `path`'s data durable).
-# Raw number — the stdlib ships no sys_fdatasync wrapper. agnos: the frozen ABI
-# has no per-fd sync; sys_sync() (syscall 12) flushes globally, subsuming the fd.
+# Linux: the stdlib `sys_fdatasync` wrapper (in every Linux peer since cyrius
+# 6.2.14). It issues x86 75, which the aarch64 translation maps to 83. Do NOT
+# hand-roll the aarch64 number: from cyrius 6.6.5 a raw x86-numbered `83` is
+# translated as `mkdir` → `mkdirat` on aarch64, so the old `n = 83` issued
+# mkdirat(AT_FDCWD, fd, …) = EFAULT and every checkpoint save + shard write
+# returned -2 on that lane (observed under qemu-aarch64 -strace at 6.6.20).
+# agnos: the frozen ABI has no per-fd sync; sys_sync() (syscall 12) flushes
+# globally, subsuming the fd.
 fn _fdatasync(fd): i64 {
     #ifdef CYRIUS_TARGET_AGNOS
     return sys_sync();
     #endif
-    var n = 75;                  # SYS_FDATASYNC (x86_64)
-    #ifdef CYRIUS_ARCH_AARCH64
-    n = 83;                      # SYS_FDATASYNC (aarch64)
+    #ifndef CYRIUS_TARGET_AGNOS
+    return sys_fdatasync(fd);
     #endif
-    return syscall(n, fd);
 }
 
 # Seek an open fd to an ABSOLUTE byte offset (whence = SEEK_SET). Used by the

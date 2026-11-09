@@ -125,7 +125,11 @@ fn hear_features(wave, out): i64 {
             store64(hear_cbuf + i * 16 + 8, f64_from(0));
             i = i + 1;
         }
-        num_fft(hear_cbuf, W);
+        # hisab 3.x: num_fft returns a #must_use Result (Err on a non-power-of-2 n).
+        # W = HEAR_W() = 256, so Err is unreachable today; unwrap fails CLOSED so a
+        # future non-pow2 HEAR_W aborts instead of feeding un-transformed frames on.
+        var fft_t, fft_v = num_fft(hear_cbuf, W);
+        result_unwrap(fft_t, fft_v);
         var k = 0;
         while (k < NB) {
             var re = load64(hear_cbuf + k * 16);

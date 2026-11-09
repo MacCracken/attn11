@@ -555,3 +555,37 @@ even with the full step kept on-device at scale, the gap is a flat ~3.7× — a 
 an **oracle / coverage** path; a real speedup needs matrix-core f64 (a future mabda/hardware
 capability) or activation quantization (an integer matmul), not transfer optimization. Reproduce:
 `for C in 32 64; do for m in "" --gpu-tc; do time ./build/attn11 --d-model $C --ctx 64 --layers 2 --heads 8 --steps 25 $m; done; done`.
+
+## Toolchain 6.6.2 → 6.6.20 (1.14.4): matmul flat, per-element transcendentals slower
+
+The 1.14.4 realign moved the cyrius pin and the stdlib snapshot (ganita 1.2.4 → 1.2.14) along
+with every dep. A/B on the same host (dev box, Cezanne). The baseline is HEAD (1.14.3) rebuilt at
+6.6.2 against its original `lib/`. Both harnesses were DCE builds, run alone and interleaved
+old/new/old/new; the values are the means of the two runs (each one varied ~4% run to run).
+
+| metric | 6.6.2 | 6.6.20 | Δ |
+|---|---:|---:|---:|
+| `linear_fwd` T×C×F | 62 383 ns | 61 604 ns | −1.2 % |
+| `head_fwd` V768 C64 | 3.446 ms | 3.447 ms | 0.0 % |
+| `adam_step` (NP) | 770 526 ns | 756 858 ns | −1.8 % |
+| ternary i64-add mm | 184 328 ns | 175 909 ns | −4.6 % |
+| `model_forward` | 1.218 ms | 1.277 ms | +4.9 % |
+| `model_backward` | 2.111 ms | 2.174 ms | +3.0 % |
+| fwd+bwd step (default) | 3.380 ms | 3.529 ms | +4.4 % |
+| training tok/s (default) | 4 734 | 4 532 | −4.3 % |
+| gen kv-cached (default) | 145 831 ns | 182 420 ns | **+25.1 %** |
+| gen uncached (default) | 899 070 ns | 1 101 286 ns | **+22.5 %** |
+| fwd+bwd step `--preset` | 58.43 ms | 60.15 ms | +2.9 % |
+| gen kv-cached `--preset` | 598 152 ns | 609 812 ns | +1.9 % |
+
+The matmul-bound kernels are flat or faster, so the slowdown is a fixed cost per element. At
+the tiny default scale that cost is a large share of a generated token. At `--preset`, where
+matmul dominates, it is only a small one. The measured contributor is ganita 1.2.14's rewritten
+`f64_tanh`, which the GELU forward and backward call. Rebuilt with the new compiler, it runs at
+**~96 ns/op**, against **~42 ns/op** for the 1.2.4 formula (two `f64_exp` builtins). That is
+2.3× slower, measured with a scratch probe, 2 M inputs on [−3, 3], 3 runs. It also returns
+different bits on 62 % of those inputs. At the default config (3 layers × 4C = 384 GELU per
+token), that is ~21 µs of the ~36 µs kv-cached gen regression. The remainder was not
+attributed. Accuracy and correctness are owned upstream (ganita), so this is recorded, not
+patched locally. A fast-path `tanh` in attn11 would also break the attn11 ↔ rupantara GELU
+parity contract.

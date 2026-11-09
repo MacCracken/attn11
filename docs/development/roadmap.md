@@ -93,6 +93,35 @@ M19 below). The arc unblocked B4 (the GPU competitor row). This file is the plan
 > conformal abstention — "AI you can trust to touch the OS"). All research-watch,
 > demand-gated; names deferred per 2026-06-08.
 
+## Moving the cyrius pin to 6.6.5
+
+> **Status (2026-11-09, 1.14.4):** the pin went straight `6.6.2` → `6.6.20`. The ⛔ `_fdatasync`
+> item and the `cyrius deps` re-run are done (the hazard reproduced under `qemu-aarch64 -strace`
+> before the fix: `mkdirat(AT_FDCWD, 3, …) = EFAULT`). `file_seek` stays open — raw aarch64 `62`
+> still traces as a correct `lseek` at 6.6.20, so it is tidy-up only.
+
+⛔ Before bumping the pin to 6.6.5: replace the aarch64 raw `fdatasync` in `src/fileio.cyr:105-109`
+with `sys_fdatasync(fd)`. 6.6.5 adds a raw-x86-`mkdir` row (`83 → mkdirat`), so `n = 83;` (`:107`)
+turns into `mkdirat` on aarch64 and fails. Every checkpoint save (`secure_write_atomic`, `:150`) and
+every shard write (`src/stream.cyr:382`) then returns `-2` on the aarch64 lane. See the cyrius CHANGELOG
+[6.6.5] entry "`memfd_create`, `ftruncate`, `sendmsg` and eleven more had NO STDLIB NAME".
+
+cyrius 6.6.5 is not tagged yet. Nothing below can land against the pin until it is, except items marked
+**(can land now)**. The pin is 6.6.2 today, and this section lists only what 6.6.5 itself changes.
+
+- [x] ⛔ `_fdatasync`: make the non-AGNOS path `return sys_fdatasync(fd);`. **(can land now)** — the
+      wrapper has been in every Linux peer since cyrius 6.2.14, and it issues x86 75, which ESYSXLAT has
+      renumbered 75 → 83 on aarch64 since the same release (checked under `qemu-aarch64 -strace` on 6.6.2:
+      `fdatasync(1)`). Keep it inside `#ifndef CYRIUS_TARGET_AGNOS`: the agnos peer has no `sys_fdatasync`,
+      and the AGNOS lane (`.github/workflows/ci.yml:154`) compiles this file. The comment at `:99` ("the
+      stdlib ships no sys_fdatasync wrapper") is wrong. Fix it in the same change.
+- [ ] `file_seek` (`src/fileio.cyr:119-125`) can call `sys_lseek(fd, off, 0)`. 6.6.5 adds it to the
+      Linux/Darwin peers, which makes the comment at `:114` ("the stdlib ships no sys_lseek wrapper") stale.
+      Raw aarch64 `62` is not rewritten in 6.6.5, so this is tidy-up, not a fix.
+- [x] Re-run `cyrius deps` in the bump commit. The aarch64 peer moved `SYS_UNLINKAT` 35 → 263, and the
+      compiler's matching row is also new. If an old vendored `lib/` is built by the 6.6.5 compiler,
+      `sys_unlink` (`_unlink`, `src/fileio.cyr:36`) runs `nanosleep`, and nothing detects the mismatch.
+
 ## Versioning
 
 `VERSION` is the single source of truth (`cyrius.cyml` derives it via
@@ -827,3 +856,147 @@ experiment graduates into a milestone only when it earns one; results land in
 - Distributed / multi-process training.
 - A general autodiff engine — gradients stay hand-derived and grad-checked.
 - Windows / macOS as first-class training targets (cross-build only, if at all).
+
+## Moving the cyrius pin to 6.6.6
+
+> **Status (2026-11-09, 1.14.4):** done as part of the 6.6.20 move. Suite green on both arches
+> (x86_64 1066/1066, aarch64/qemu 1060/1060), resume determinism bit-for-bit. The default run
+> against a 6.6.2 build is identical through step 1000 and then drifts in the 4th–5th decimal,
+> with two identified sources: tyche 1.1.0's `rng_normal` (isolated) and ganita 1.2.14's
+> rewritten `f64_tanh`/`f64_pow` (source-diffed; not isolatable by build, so a codegen share is
+> not ruled out). See CHANGELOG 1.14.4.
+
+Current pin: `cyrius = "6.6.2"` (`cyrius.cyml`). Nothing needs to change first.
+
+attn11 is the SIMD-heaviest repo in this group, so item 3's "a SIMD-returning fn returning
+anything else is now a compile error" is the one to check — and it has no sites. All 13
+intrinsic uses are the **buffer form**, `f64v_fmadd(dst, a, b, c, n)`, in `src/attn.cyr`
+(lines 110, 154, 418, 461, 588, 589, 623, 624) and `src/model.cyr:970`. No function in the
+repo returns a SIMD vector, and there is no vector-typed parameter or `var` declaration
+anywhere, so the SIMD return gate, the `async fn`-with-vector-parameter gate and the Win64
+vector-retptr arity gate all have nothing to act on.
+
+`O_TRUNC` appears at two sites, both in atomic-write helpers: `src/fileio.cyr:140`
+(`secure_write_atomic`, `_O_WRONLY() | _O_CREAT() | _O_TRUNC() | _O_NOFOLLOW()`) and
+`src/stream.cyr:313`. Before 6.6.6 a PE build's `O_TRUNC` did not truncate, which would have
+left the old tail of a rewritten checkpoint or shard behind. **attn11 is not exposed**:
+`CYRIUS_TARGET_AGNOS` is the only `CYRIUS_TARGET_*` in `src/`, CI is `ubuntu-latest`, and
+`release.yml` declares no `windows-*` job. The remaining opens are read-only
+(`src/persist.cyr:545`, `src/fileio.cyr:58`, `src/stream.cyr:153`, `:279`). No `O_APPEND`
+outside the vendored `lib/`.
+
+Everything else checked and empty:
+
+- No `operator` fn, no `ret2`/`rethi`, no struct declarations in `src/` at all, no struct- or
+  vector-typed parameter or `var` declaration — so struct/vector copies, pair returns and
+  struct-valued calls at top level have no sites, and item 5's by-value-struct-param deep copy
+  is a no-op.
+- No top-level bare `{` blocks (item 4), no duplicated global declarations (item 6), no
+  `regression_*` call sites of its own (item 8 — the two `include` hits are
+  `lib/regression.cyr` pulling `lib/regression_agnos.cyr`), and no own `vec_*` function
+  colliding with the 14 names `lib/vec.cyr` exports, so the new transitive
+  `lib/assert.cyr` → `lib/vec.cyr` include is inert (item 9).
+- Arity and `: cstring` scans over the repo's own sources: clean.
+
+After bumping, verify: the full `.tcyr` suite per-file, and one train → checkpoint → resume
+cycle with a numeric comparison against a 6.6.2-built run. The SIMD paths above are where any
+codegen drift would show up first, and a bitwise-identical loss curve is the cheapest proof
+there is none.
+
+## Adopting cmdit (CLI parsing)
+
+Demand-gated, not a forced sweep. attn11 is a Tier-3 ("rich / edge") candidate in the 2026-06-25
+ecosystem CLI review (`agnosticos/docs/development/planning/cmdit.md`), and nothing is broken today.
+cmdit raised its flag cap from 32 to 64 for this repo, and the comment on `cmdit_range` names the
+`--layers`/`--mtp`/`--bpe` caps.
+
+**What is hand-rolled.** `main()` parses with one `streq` chain over `args_init`/`argc`/`argv`
+(`src/main.cyr:224-294`). It covers 36 long-only flags plus `-h`, with no positionals,
+`--name=value` or `--`. `_av` (`:191-194`) prints `<flag> needs a value`, then usage, then calls
+`sys_exit(1)`. `_atoi` (`:121-138`) skips non-digits (`1e3` → 13) and saturates at ~1e9.
+`usage()` (`:143-187`), `--version` (`:228`) and every error print to **stdout** via `puts`. Usage
+errors exit **1**, and an unknown argument prints `attn11: unknown argument X` + usage (`:292`).
+`docs/STABILITY.md:44-46` freezes: unknown arguments and valueless value-flags "exit non-zero with
+usage".
+
+**Site → cmdit.**
+
+- [ ] The chain becomes `cmdit_new("attn11")` + 12 `cmdit_bool`, 14 `cmdit_int`, 6 `cmdit_str` (the
+      paths) and 4 `cmdit_enum`: 38 flags with the auto pair, under cmdit's 64. Keep the `#ifndef`
+      gates around the `--hearing*` (`:237-240`) and `--gpu*` (`:241-244`) registrations.
+- [ ] The four enums map 1:1 by index, so `cmdit_get_enum` feeds the existing ints directly:
+      `--attn-kind mha|mla|lin|ssm` (`:251-258`, the codes `src/model.cyr:390` checks),
+      `--pos-kind learned|rope|rope-decoupled` (`:260-266`), `--objective ar|diffusion`
+      (`:278-283`), `--decode-schedule cosine|linear` (`:286-291`).
+- [ ] `cmdit_version(h, CFG_VERSION())` prints `attn11 1.14.3\n` to stdout, the same bytes as today.
+      Keep `CFG_VERSION`, which `scripts/version-bump.sh:44-46` keeps in sync with `VERSION`.
+- [ ] `--vision`/`--vision-fd`/`--hearing`/`--hearing-fd` return from inside the loop (`:235-240`),
+      so `attn11 --vision --bogus` runs the demo and never sees `--bogus`. Checking them as bools
+      after the parse fixes that. It changes behaviour on that error path.
+- [ ] `use_bpe` (`:272`) becomes `cmdit_seen(h, f_bpe)`. `--gpu-tc` implying `--gpu` (`:243`) moves
+      after the parse.
+- [ ] `cmdit_range` fits two caps: `--mtp 1..8` (`:566`) and `--bpe 1..BPE_MAX_MERGES()` (`:463`).
+      Today `--mtp` is checked after the `--stream-encode`/`--encode-shard` early exits
+      (`:496-557`), so `--mtp 0 --encode-shard P` would go from success to error.
+- [ ] Settings that keep current behaviour: `cmdit_version_short(h, 0)`, because `-V` is an unknown
+      argument today. `cmdit_require_positionals_max(h, 0)`, so a stray `foo` still fails. And
+      return 1, not `CMDIT_EXIT_USAGE`, on `CMDIT_RESULT_ERR`.
+
+**Stays caller-side (ADR-0001 scope). None of it blocks adoption.**
+
+- The model-dimension caps (`d_model ≤ 4096`, `ctx ≤ 8192`, `layers ≤ 128`, `experts ≤ 256`) live
+  in `model_config_ok_moe` (`src/model.cyr:379`, `:426`). That function also guards `--preset` and
+  the checkpoint loader. **Do not** copy these caps into `cmdit_range`: under `--load` the CLI
+  dimensions are ignored, so `--load ck --layers 999` passes today and would start failing.
+  The `--layers 1..128` check at `:398` guards the `lkinds[1024]` stack buffer and stays as is.
+- Cross-field rules: `--rope-dim` even and ≤ d_model (`:350`), `--latent-dim ≤ d_model`,
+  `--expert-topk ≤ --experts` (`:372`), heads | d_model. `--decode-steps` **clamps** to ctx
+  (`:435`), while `cmdit_range` rejects.
+- The mutex / requires-with block (`:302-501`, `:566-572`) is v2-backlog mutex/required-if sugar.
+- `--preset` (`:245`) depends on order: "later flags override earlier ones" (`:62-63`), so
+  `--heads 4 --preset` gives 8 heads. cmdit does not record where in argv a flag appeared. Either
+  redefine the rule as "an explicit dimension beats `--preset`" (a documented change, using
+  `cmdit_seen`) or scan `cmdit_raw_argv`.
+- `--help --bogus` prints help today, because the loop returns at `:227`. cmdit parses the whole line
+  first, so it errors. `cmdit_int` is strict, so `--steps 1e3` errors instead of meaning 13.
+
+**Output identity is the real cost.** `cmdit_help`, `cmdit_help_flags` and `cmdit_print_error` write
+to **stderr**, and attn11 writes everything to stdout. `cmdit_print_error` also says `unknown flag`
+without the token, and cmdit stores neither the unknown token nor a rejected enum value. So keep
+`usage()` and the attn11-worded messages, and branch on `cmdit_error(h)` + `cmdit_err_flag(h)`.
+Generated help would also fix one existing mismatch. `usage()` gates the `--hearing` lines
+(`:154-157`), but it prints `--gpu`/`--gpu-tc` (`:182-183`) on AGNOS, where both are rejected.
+
+**Manifest.** There is no stdlib `flags` to drop, and `"args"`/`"io"` are already in
+`cyrius.cyml:16`. Add:
+
+    [deps.cmdit]
+    git = "https://github.com/MacCracken/cmdit.git"
+    tag = "1.3.0"
+    modules = ["dist/cmdit.cyr"]
+
+**Tests and gates.** No unit test reaches the parser: `tests/attn11.{tcyr,fcyr,bcyr}` include the
+library modules but never `src/main.cyr`. CLI coverage comes from three places:
+
+- `make smoke` (`Makefile:81-115`). It runs in `release:` but not in `ci.yml`, and it only checks
+  "non-zero and < 128", so an exit-2 regression would pass.
+- The aarch64 `--gen-only` run (`.github/workflows/ci.yml:128`).
+- The scripts that drive flags: `scripts/agnos-smoke.sh:88,199,231`, `moe-sweep.sh:18-21`,
+  `x021-heldout.sh:59,75-76` and `compete-bench.sh:62`, which greps `params=` from stdout.
+
+- [ ] Optional: move flag registration into a function, so a `.tcyr` can drive `cmdit_parse_argv`
+      with synthetic argv. That would be attn11's first parser unit test.
+- [ ] Identity bar: byte-compare stdout, stderr and exit before and after for `--help`, `-h`,
+      `--version`, `-V`, `--bogus`, `foo`, `--steps` (no value), one bad value per enum,
+      `--bpe 0`, `--mtp 9` and `--layers 129 --attn-every 2`. Also run
+      `--steps 20 --save a.ckpt --eval` both ways and `cmp` the checkpoints; the fixed seed makes
+      the run reproducible.
+
+Noticed while surveying, for a separate change: the check at `:437` reads only `cfg_decode_steps`,
+though its message names `--decode-schedule` too. So `--decode-schedule linear` without
+`--objective diffusion` is silently accepted. `cmdit_seen` makes it a one-line fix, but the fix
+changes behaviour.
+
+See cmdit's `README.md` (API reference), `docs/adr/0001-flag-modifiers.md` (scope boundaries) and
+`docs/development/roadmap.md` (v2 backlog). Worked examples: kii (single command), anuenue (its own
+help framing around `cmdit_help_flags`), dig (Tier-3, `cmdit_raw_argv`).

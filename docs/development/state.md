@@ -967,7 +967,8 @@ deterministic resume. 0.2.0: stacked layers, grad clipping, LR schedule.)
 
 ## Toolchain
 
-- **Cyrius pin**: `6.5.27` (in `cyrius.cyml [package].cyrius`) — bumped from 6.2.27
+- **Cyrius pin**: `6.6.20` (in `cyrius.cyml [package].cyrius`) — see the 1.14.4 note
+  below; the history that follows is the 1.7.x-era trail. Bumped from 6.2.27
   in 1.7.4 (6.2.6 → 6.2.27 in 1.7.3, 6.2.5 → 6.2.6 in 1.7.2, 6.2.2 → 6.2.5 in 1.7.1) to
   realign with the fast-rolling installed cycc (`cyrius update` resyncs the gitignored `lib/`
   snapshot + `cyrius.lock`; tracked diff = `cyrius.cyml` + `cyrius.lock`). 1.7.3 also
@@ -992,6 +993,20 @@ deterministic resume. 0.2.0: stacked layers, grad clipping, LR schedule.)
   (`docs/architecture/002` retired at ≥6.1.32.)
 
 **Pin bumped to `6.5.27` 2026-08-17** (ecosystem-wide ML/AI-arc realign, ahead of the arc reopening). `cyrius lib sync --full` re-vendored the whole version-matched stdlib snapshot; suite re-verified green at the new pin.
+
+**Pin bumped `6.6.2` → `6.6.20` 2026-11-09 (1.14.4)**, with every dep moved to its
+6.6.20-built release (akshara 1.0.4, tyche 1.1.1, rosnet 1.1.3, rupantara 0.4.4,
+hisab 3.3.7) and mabda consumed as the **bundled** stdlib leaf (4.1.7) instead of a git
+dep. `lib/` = the full 6.6.20 snapshot (`cyrius lib sync --full`, 113 files) + the five
+git-dep bundles; `cyrius.lock` regenerated from scratch, `cyrius deps --verify` 119/0.
+Gate: x86_64 **1066/1066**, aarch64/qemu **1060/1060**, fuzz, smoke, fmt, lint 0 warn,
+12-test GPU suite on-device (gfx90c), agnos main/tcyr/gpumm build. The default run is
+**not** byte-identical to 6.6.2: identical through step 1000, then 4th–5th-decimal
+drift, from two sources — tyche 1.1.0's portable-log `rng_normal` (isolated) and the
+stdlib ganita 1.2.4 → 1.2.14 refold's rewritten `f64_tanh` / `f64_pow` (CHANGELOG 1.14.4).
+**Perf at 6.6.20:** matmul-bound kernels flat; default-scale kv-cached generation **+25 %**
+slower and the training step +4.4 % (`--preset` only +2–3 %) — ganita 1.2.14's `f64_tanh`
+(GELU) is 2.3× the old formula and the measured contributor (`docs/benchmarks.md`).
 
 ## Performance
 
@@ -1490,14 +1505,24 @@ constant `nh·hd²` state instead of a T-growing K/V.
 
 Direct (declared in `cyrius.cyml`):
 
-- stdlib — string, fmt, alloc, io, vec, str, syscalls, assert, bench, math,
-  ganita, args
-- **[rosnet](https://github.com/MacCracken/rosnet) 0.1.0** — tensor storage +
-  BLAS-1 + dense matmul/gradient (`linear_fwd`/`linear_bwd`, `t_*`); 1.1.0
-  extraction, pinned in `cyrius.lock`
-- **[tyche](https://github.com/MacCracken/tyche) 0.1.0** — deterministic
-  statistical PRNG (`rng_seed`/`rng_u64`/`rng_uniform`/`rng_normal`); 1.1.0
-  extraction, pinned in `cyrius.lock`
+- stdlib (the 6.6.20 snapshot) — string, fmt, alloc, io, vec, str, syscalls,
+  assert, bench, math, ganita, args, hashmap, tagged, fnptr, mmap, dynlib, sakshi,
+  thread, sankoch, **mabda** (the bundled GPU foundation, 4.1.7 at 6.6.20 — a
+  stdlib leaf since 1.14.4, no longer a `[deps.mabda]` git dep)
+- **[akshara](https://github.com/MacCracken/akshara) 1.0.4** — corpus + byte/BPE
+  tokenizer data layer (1.11.0 extraction)
+- **[tyche](https://github.com/MacCracken/tyche) 1.1.1** — deterministic
+  statistical PRNG (`rng_seed`/`rng_u64`/`rng_uniform`/`rng_normal`)
+- **[rosnet](https://github.com/MacCracken/rosnet) 1.1.3** — tensor storage +
+  BLAS-1 + dense matmul/gradient + conv; plus the `[lib.gpu]` profile
+  (`dist/rosnet-gpu.cyr`, the whole GPU backend since 1.10.0)
+- **[rupantara](https://github.com/MacCracken/rupantara) 0.4.4** — the `ru_*`
+  forward leaf ops attn11 delegates its CPU forward bodies to (git+tag; the old
+  `../rupantara` path override is gone)
+- **[hisab](https://github.com/MacCracken/hisab) 3.3.7** — `num_fft` for the
+  hearing lane's STFT frontend (x86_64-gated)
+
+All git deps are commit-pinned in `cyrius.lock`.
 
 ## Consumers
 

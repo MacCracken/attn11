@@ -18,7 +18,9 @@ target*, not a different model.
 - The toolchain resolves **rosnet 0.2.0** (the GPU backend bundle `dist/rosnet-gpu.cyr`) **+ mabda
   3.4.1** (`cyrius deps`); mabda's native SPIR-V→GFX9 f64 emitter is what runs the kernel —
   launcher-free, pure-Cyrius, no ROCm / Vulkan loader / vendor BLAS. (mabda's symbols ship unresolved in
-  the rosnet bundle; attn11's `[deps.mabda]` supplies them — both auto-prepend on Linux targets.)
+  the rosnet bundle; since 1.14.4 they come from the **bundled** stdlib `mabda` leaf (4.1.7 at
+  cyrius 6.6.20, listed in `[deps] stdlib`; the old `[deps.mabda]` git dep is retired), which
+  rosnet 1.1.3's `dist/rosnet-gpu.cyr` also `include`s itself.)
 
 No GPU? `--gpu` prints that no device was found and runs entirely on the CPU. Everything
 still works; nothing crashes.

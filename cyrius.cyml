@@ -4,7 +4,7 @@ version = "${file:VERSION}"
 description = "attn11 — a from-scratch GPT-style transformer, trained, in Cyrius"
 license = "GPL-3.0-only"
 language = "cyrius"
-cyrius = "6.6.2"
+cyrius = "6.6.20"
 repository = "https://github.com/MacCracken/attn11"
 
 [build]
@@ -13,7 +13,7 @@ test = "src/test.cyr"
 output = "build/attn11"
 
 [deps]
-stdlib = ["string", "fmt", "alloc", "io", "vec", "str", "syscalls", "assert", "bench", "math", "ganita", "args", "hashmap", "tagged", "fnptr", "mmap", "dynlib", "sakshi", "thread", "sankoch"]
+stdlib = ["string", "fmt", "alloc", "io", "vec", "str", "syscalls", "assert", "bench", "math", "ganita", "args", "hashmap", "tagged", "fnptr", "mmap", "dynlib", "sakshi", "thread", "sankoch", "mabda"]
 
 # The corpus + tokenizer data layer (byte-level + BPE), extracted from src/train.cyr
 # at M1 (was src/tok.cyr). attn11 supplies the consumer symbols the bundle leaves
@@ -21,9 +21,10 @@ stdlib = ["string", "fmt", "alloc", "io", "vec", "str", "syscalls", "assert", "b
 # `file_seek` (src/fileio.cyr); `t_alloc`/`t_zero` come from [deps.rosnet] above.
 # Pinned to akshara's 0.1.0 release tag (the resolved lib/akshara.cyr is byte-identical
 # to the local dist bundle the extraction was validated against).
+# `1.0.2` → `1.0.4` (6.6.20 realign): the akshara release built against 6.6.20.
 [deps.akshara]
 git = "https://github.com/MacCracken/akshara"
-tag = "1.0.2"
+tag = "1.0.4"
 modules = ["dist/akshara.cyr"]
 
 # M18 (v1.8.x GPU arc) — LANDED in v1.8.0 (X027). mabda 3.4.1 is consumed by
@@ -39,24 +40,32 @@ modules = ["dist/akshara.cyr"]
 # layer -> rosnet; the deterministic statistical PRNG -> tyche. attn11 now
 # consumes both and dogfoods them — its own finite-difference grad-checks
 # validate rosnet's linear, and a byte-identical training run proves the swap.
+# `1.0.1` → `1.1.1` (6.6.20 realign): 1.1.0's portable-log `rng_normal` moves
+# 0.011% of x86_64 normal draws by 1–3 ulp (and makes aarch64 match x86_64), so
+# weight init — and with it a default training run — is no longer byte-identical
+# to the 1.0.1 stream. The frozen 1.x API is unchanged.
 [deps.tyche]
 git = "https://github.com/MacCracken/tyche"
-tag = "1.0.1"
+tag = "1.1.1"
 modules = ["dist/tyche.cyr"]
 
 # rosnet 1.1.0: the frozen 1.0 surface attn11 already exercised (identical to the 0.2.0
 # code) + conv2d/conv1d fwd+bwd (NCHW, per-axis stride/pad, FD-gated) — pulled in for the
 # vision lane (src/vision.cyr, the sight proof). The GPU [lib.gpu] profile rides along
-# unchanged (dist/rosnet-gpu.cyr leaves mabda's symbols unresolved; [deps.mabda] supplies them).
+# unchanged (dist/rosnet-gpu.cyr leaves mabda's symbols unresolved; the bundled stdlib
+# `mabda` leaf supplies them — see the retired [deps.mabda] note below).
 #
 # `1.1.1` → `1.1.2` (6.6.2 migration): 1.1.1's dist/rosnet-gpu.cyr predates the
 # v6.6.0 Result VALUE FORM. It bound `var res = gpu_context_new_native();` (a
 # single-value bind of a `: stack` pair — now a hard error) and called the
 # `payload()` helper deleted at v6.6.0. 1.1.2 is the migrated release; both
 # dist modules are clean of the retired API.
+#
+# `1.1.2` → `1.1.3` (6.6.20 realign): no source change; the CPU bundle differs
+# only in whitespace, and the gpu sidecar now names mabda/math/ganita itself.
 [deps.rosnet]
 git = "https://github.com/MacCracken/rosnet"
-tag = "1.1.2"
+tag = "1.1.3"
 modules = ["dist/rosnet.cyr", "dist/rosnet-gpu.cyr"]
 
 # The transformer FORWARD leaf-op CPU math, extracted to rupantara so there is ONE
@@ -65,13 +74,16 @@ modules = ["dist/rosnet.cyr", "dist/rosnet-gpu.cyr"]
 # diffusion (g_bidir) branches stay attn11-local, as does ALL backward. rupantara
 # consumes the same rosnet 0.2.0, so the matmul under the delegated forward is
 # bit-identical (the parity contract); attn11's full grad-check suite is the live
-# parity proof (one binary, no offline compare). Local `path` override during the
-# re-fold (the ru_* rename is unreleased); switch to git+tag once rupantara cuts the
-# release — the resolved lib/ is identical either way.
+# parity proof (one binary, no offline compare).
+#
+# `0.4.2` → `0.4.4` (6.6.20 realign), and the local `path = "../rupantara"`
+# override is DROPPED: it was a re-fold-era stopgap (the ru_* rename has long
+# since shipped), and it resolved from whatever the sibling worktree held — by
+# now rupantara 0.5.3, a 6.7.18-pinned line — so the declared tag was never what
+# built locally. The git+tag is now the only source.
 [deps.rupantara]
 git = "https://github.com/MacCracken/rupantara"
-path = "../rupantara"
-tag = "0.4.2"
+tag = "0.4.4"
 modules = ["dist/rupantara.cyr"]
 
 # M18 (the v1.8.x GPU arc): mabda is the GPU *foundation* — device/context init,
@@ -104,10 +116,17 @@ modules = ["dist/rupantara.cyr"]
 # still called the deleted `payload()`. 4.1.1 is migrated. As before, the whole
 # bundle is dead code for attn11 (it rides rosnet's [lib.gpu] profile) but a
 # prepended dep module must still type-check, so a stale pin fails the build.
-[deps.mabda]
-git = "https://github.com/MacCracken/mabda"
-tag = "4.1.1"
-modules = ["dist/mabda.cyr"]
+#
+# 6.6.20 realign — `[deps.mabda]` (git tag 4.1.1) is RETIRED in favour of the
+# BUNDLED stdlib leaf: the 6.6.20 snapshot folds mabda 4.1.7 (`lib/mabda.cyr`,
+# byte-identical to the 4.1.7 tag's dist/mabda.cyr), so `"mabda"` now sits in
+# `[deps] stdlib` above. Keeping both made `cyrius deps` refuse to overwrite the
+# stdlib leaf ("declare it in [deps] stdlib OR depend on the package, not
+# both") and pulled mabda's git deps samvada/chitra/sakshi transitively for
+# nothing (attn11 never reaches the samvada/chitra calls; they are `#ifdef`-
+# gated). rosnet 1.1.3's dist/rosnet-gpu.cyr also `include`s lib/mabda.cyr
+# itself now. 4.1.5 added the `chrono` leaf (`clock_now_ns`); the bundle
+# carries that `include` too. Future mabda moves ride the toolchain pin.
 
 # Sovereign FFT for the HEARING lane's fixed STFT+mel frontend (num_fft — the
 # frontend is not trained, no backprop through it). Collision-checked vs the
@@ -128,9 +147,16 @@ modules = ["dist/mabda.cyr"]
 # garjan, prakash, prani, nidhi) already pin. Not a value-form change: hisab's
 # dist has zero Result/Option surface — verified by the hearing-lane grad-check
 # (23/23), which is the live num_fft exercise.
+#
+# `2.11.2` → `3.3.7` (6.6.20 realign): the hisab release built against 6.6.20.
+# Two changes reach the hearing lane: 3.0.0 made `num_fft` return a
+# `Result` (`#must_use`, Ok(0) / Err(HSB_ERR_INVALID_INPUT)), and 3.3.7 reseeds
+# its twiddles every 64 steps, so from n = 256 (HEAR_W) the outputs move in
+# their last bits. The frontend is fixed (not trained), so FD grad-checks are
+# unaffected; the hearing features are not byte-identical to 2.11.2.
 [deps.hisab]
 git = "https://github.com/MacCracken/hisab"
-tag = "2.11.2"
+tag = "3.3.7"
 target = "x86_64"
 modules = ["dist/hisab.cyr"]
 ---

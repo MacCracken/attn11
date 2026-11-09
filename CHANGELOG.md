@@ -4,6 +4,111 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.14.4] - 2026-11-09
+
+A toolchain and dependency realign: cyrius `6.6.2` → `6.6.20`, with `lib/` and every dep
+moved to the version 6.6.20 bundles or pins. Two source fixes, both forced by the bump.
+
+### Changed
+
+- **Toolchain `6.6.2` → `6.6.20`** (through 6.6.3–6.6.19).
+- **Vendored `lib/` re-synced from scratch** (`cyrius lib sync --full`). It byte-matches the
+  6.6.20 snapshot (113 files) plus the five git-dep bundles. The leftover `agnosys`,
+  `samvada` and `chitra` bundles are gone, since no 6.6.20 snapshot or dep provides them.
+  `cyrius.lock` was regenerated from scratch: 6 commit-pinned deps, 119 file hashes, and
+  the `cyrius 6.6.20` line. `cyrius deps --verify` passes 119/0.
+- **Every git dep moved to its 6.6.20-built release.** These are the tags whose own
+  `cyrius.cyml` pins exactly 6.6.20: **akshara `1.0.2` → `1.0.4`**, **tyche `1.0.1` →
+  `1.1.1`**, **rosnet `1.1.2` → `1.1.3`**, **rupantara `0.4.2` → `0.4.4`**, and **hisab
+  `2.11.2` → `3.3.7`**. The vendored headers confirm each version.
+- **mabda now comes from the bundled stdlib, not a git dep.** The 6.6.20 snapshot already
+  folds mabda **4.1.7** as `lib/mabda.cyr`, byte-identical to the 4.1.7 tag's
+  `dist/mabda.cyr`. With both present, `cyrius deps` refused to overwrite the stdlib leaf
+  ("declare it in [deps] stdlib OR depend on the package, not both"). It also pulled
+  mabda's own git deps (samvada, chitra, sakshi) for nothing. `[deps.mabda]` is removed and
+  `"mabda"` is added to `[deps] stdlib`. rosnet 1.1.3's `dist/rosnet-gpu.cyr` now
+  `include`s `lib/mabda.cyr` itself. From here on, mabda versions follow the toolchain pin.
+- **rupantara's `path = "../rupantara"` override is removed.** It was left over from the
+  re-fold. It built from whatever the sibling checkout held, which today is rupantara
+  0.5.3 (pinned to cyrius 6.7.18), so the declared tag was never what got built locally.
+  The git tag is now the only source, and the local build matches CI.
+
+### Fixed
+
+- **aarch64: checkpoint saves and shard writes failed under cyrius ≥ 6.6.5.**
+  `_fdatasync` (`src/fileio.cyr`) set the aarch64 syscall number by hand (`n = 83`). From
+  6.6.5 on, a raw x86-numbered `83` is translated as `mkdir`, so on aarch64 it ran
+  `mkdirat(AT_FDCWD, fd, …)` and got EFAULT. Every `secure_write_atomic` and shard write
+  then returned −2. This was confirmed under `qemu-aarch64 -strace` at 6.6.20 before the
+  fix: two `mkdirat(…) = -1 errno=14`, and the suite aborted in the streaming-shard section.
+  The non-agnos path now calls the stdlib `sys_fdatasync(fd)`, and agnos keeps
+  `sys_sync()`. After the fix the trace shows `fdatasync(3) = 0` and the aarch64 suite
+  passes **1060/1060**. This was the ⛔ item in the roadmap's "Moving the cyrius pin to
+  6.6.5" checklist. `file_seek`'s raw aarch64 `62` still traces as a correct `lseek` at
+  6.6.20, so its optional `sys_lseek` cleanup is not part of this release.
+- **Hearing lane: `num_fft`'s result is now checked.** In hisab 3.0.0, `num_fft` returns a
+  `#must_use` Result: `Ok(0)`, or `Err(HSB_ERR_INVALID_INPUT)` for a length that is not a
+  power of 2. `hear_features` used to discard it, which the compiler flagged. It now binds
+  both halves and calls `result_unwrap`, which aborts on `Err`. `HEAR_W` = 256, so `Err`
+  cannot happen today. If `HEAR_W` is ever changed to a non-power of 2, the run aborts
+  instead of passing untransformed frames to the CNN.
+
+### Numerics: the default run is not byte-identical to 6.6.2
+
+The default training run matches the 6.6.2 build byte for byte through step 1000. After
+that the loss differs in the 4th–5th decimal (step 2000: `0.13821` → `0.13808`), and both
+runs keep descending. Two sources were found, by comparing three builds (6.6.2 · 6.6.20 ·
+6.6.20 with tyche set back to 1.0.1), which produced three different trajectories:
+
+- **tyche 1.1.0's portable-log `rng_normal`.** It changes 0.011 % of x86_64 normal draws by
+  1–3 ulp, which reaches weight init. This was isolated: changing only the tyche version
+  changes the trajectory.
+- **The stdlib ganita refold, 1.2.4 → 1.2.14.** It rewrote `f64_tanh` (the old sinh/cosh
+  ratio became an `expm1` form; used by the GELU forward and backward) and `f64_pow`
+  (the square-and-multiply loop was removed; used by Adam's bias correction). This one
+  was found by diffing the source and confirmed with a probe: in the same 6.6.20 build,
+  the new `f64_tanh` returns different bits from the 1.2.4 formula on 62 % of 2 M inputs
+  on [−3, 3]. The toolchain resets stdlib leaves to the pinned snapshot on every build, so
+  the whole run could not be rebuilt on the old ganita, and some of the drift could still
+  come from codegen.
+
+The hearing lane's features also move in their last bits, because hisab 3.3.7 reseeds
+`num_fft` twiddles from n = 256 upward. None of this touches gradient correctness: every
+FD grad-check passes unchanged. Resume determinism is still bit-for-bit (plain, dropout,
+GQA, BPE and streamed).
+
+### Performance: generation is slower at the default scale
+
+These are A/B results against HEAD rebuilt at 6.6.2. Both harnesses were DCE builds, run
+alone and interleaved. The full table is in `docs/benchmarks.md`.
+
+- **Flat or faster** (the matmul-bound kernels): `linear_fwd` −1.2 %, `head_fwd` 0.0 %,
+  Adam −1.8 %, ternary i64-add mm −4.6 %.
+- **Slower at the default scale:** fwd+bwd step +4.4 % (training 4 734 → 4 532 tok/s),
+  kv-cached generation **+25 %** (5 482 vs 6 858 tok/s), uncached generation **+22.5 %**.
+- **Slower at `--preset`, but much less:** step +2.9 %, kv-cached generation +1.9 %.
+
+So the slowdown is a fixed cost per element, not in the matmul. The measured contributor is
+ganita 1.2.14's `f64_tanh`, which runs at ~96 ns/op against ~42 ns/op for the 1.2.4 formula
+(2.3×). It accounts for ~21 µs of the ~36 µs added per generated token. The rest was not
+attributed. This is not patched locally: tanh belongs to ganita, and a local fast path
+would break the attn11 ↔ rupantara GELU parity contract.
+
+### Verified
+
+- x86_64 suite **1066/1066** (+ 2/2). aarch64/qemu **1060/1060** (the 6 hearing checks are
+  x86-only).
+- fuzz ok · CLI smoke ok · `cyrius fmt --check` clean · lint 0 warnings · DCE release build
+  is a static ELF (1,124,928 B).
+- GPU suite **12/12** ran on the device (gfx90c), bit-exact or within tolerance.
+- `--agnos` builds of `src/main.cyr`, `tests/attn11.tcyr` and `programs/gpumm.cyr` succeed.
+- New advisory: `large static data (~136 KB)`. It comes from function-local SPIR-V scratch
+  buffers in the bundled mabda and in rosnet-gpu, not from attn11 code. 6.6.9/6.6.10 changed
+  how statics are counted.
+- Known upstream wart: hisab 3.3.7 declares `[deps.sakshi]` 2.5.7, the same version the
+  6.6.20 snapshot bundles. `cyrius deps` warns and keeps the snapshot copy, so nothing
+  drifts.
+
 ## [1.14.3] - 2026-09-11
 
 ### Changed
