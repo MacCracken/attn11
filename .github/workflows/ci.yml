@@ -105,8 +105,14 @@ jobs:
             CYRIUS_VERSION="$CYRIUS_VERSION" sh
           echo "$HOME/.cyrius/bin" >> "$GITHUB_PATH"
 
-      - name: Install qemu-user-static
-        run: sudo apt-get update && sudo apt-get install -y qemu-user-static
+      - name: Install qemu-user
+        # `qemu-user-static` is only a VIRTUAL package on the newer ubuntu-latest image
+        # (provided by qemu-user-binfmt*), so `apt-get install qemu-user-static` exits 100
+        # with "no installation candidate". `qemu-user` exists on both the old and new
+        # images and ships `qemu-aarch64`; we invoke it explicitly, so no binfmt is needed.
+        run: |
+          sudo apt-get update && sudo apt-get install -y qemu-user
+          qemu-aarch64 --version
 
       - name: Resolve deps
         run: cyrius deps
@@ -117,7 +123,7 @@ jobs:
         run: |
           mkdir -p build
           cyrius build --aarch64 tests/attn11.tcyr build/test_a64
-          qemu-aarch64-static build/test_a64
+          qemu-aarch64 build/test_a64
 
       - name: Cross-build + smoke-run the binary on aarch64
         # --gen-only exercises the full forward + generation path under qemu
@@ -125,7 +131,7 @@ jobs:
         # grad-check suite above).
         run: |
           cyrius build --aarch64 src/main.cyr build/attn11_a64
-          qemu-aarch64-static build/attn11_a64 --gen-only
+          qemu-aarch64 build/attn11_a64 --gen-only
 
   agnos:
     name: AGNOS (cross-build)

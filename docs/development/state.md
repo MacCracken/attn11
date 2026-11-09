@@ -1006,7 +1006,8 @@ drift, from two sources — tyche 1.1.0's portable-log `rng_normal` (isolated) a
 stdlib ganita 1.2.4 → 1.2.14 refold's rewritten `f64_tanh` / `f64_pow` (CHANGELOG 1.14.4).
 **Perf at 6.6.20:** matmul-bound kernels flat; default-scale kv-cached generation **+25 %**
 slower and the training step +4.4 % (`--preset` only +2–3 %) — ganita 1.2.14's `f64_tanh`
-(GELU) is 2.3× the old formula and the measured contributor (`docs/benchmarks.md`).
+(GELU) is ~1.9× the old form and the measured contributor (`docs/benchmarks.md`; filed
+upstream as `ganita/docs/development/issues/2026-11-09-tanh-cost-on-gelu-consumers.md`).
 
 ## Performance
 

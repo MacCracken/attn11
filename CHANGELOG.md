@@ -53,6 +53,16 @@ moved to the version 6.6.20 bundles or pins. Two source fixes, both forced by th
   cannot happen today. If `HEAR_W` is ever changed to a non-power of 2, the run aborts
   instead of passing untransformed frames to the CNN.
 
+- **CI: the aarch64 lane failed at its `apt-get` step.** On the newer `ubuntu-latest` image,
+  `qemu-user-static` is only a virtual package, provided by `qemu-user-binfmt*`, so
+  `apt-get install -y qemu-user-static` exited 100 with "has no installation candidate" before
+  anything was built. The lane now installs `qemu-user`, which exists on both the old and the new
+  images, prints `qemu-aarch64 --version`, and runs `qemu-aarch64` instead of
+  `qemu-aarch64-static`. That is the same binary name `make aarch64` already used. No binfmt is
+  needed, because qemu is called explicitly. Verified locally: the suite (1060/1060) and the
+  `--gen-only` smoke pass under `qemu-aarch64`, and every locked dep tag resolves on GitHub at
+  its pinned commit. The fix itself is only proven once the runner runs it.
+
 ### Numerics: the default run is not byte-identical to 6.6.2
 
 The default training run matches the 6.6.2 build byte for byte through step 1000. After
@@ -89,10 +99,12 @@ alone and interleaved. The full table is in `docs/benchmarks.md`.
 - **Slower at `--preset`, but much less:** step +2.9 %, kv-cached generation +1.9 %.
 
 So the slowdown is a fixed cost per element, not in the matmul. The measured contributor is
-ganita 1.2.14's `f64_tanh`, which runs at ~96 ns/op against ~42 ns/op for the 1.2.4 formula
-(2.3×). It accounts for ~21 µs of the ~36 µs added per generated token. The rest was not
-attributed. This is not patched locally: tanh belongs to ganita, and a local fast path
-would break the attn11 ↔ rupantara GELU parity contract.
+ganita 1.2.14's `f64_tanh`, which runs at ~91–95 ns/op against ~46–48 ns/op for 1.2.4's body
+(~1.9×), mostly its `_gn_expm1` call (~70 ns, against ~15 ns for an `f64_exp` builtin). It
+accounts for ~17 µs of the ~36 µs added per generated token. The rest was not attributed.
+This is not patched locally: tanh belongs to ganita, and a local fast path would break the
+attn11 ↔ rupantara GELU parity contract. It is **filed upstream** as
+`ganita/docs/development/issues/2026-11-09-tanh-cost-on-gelu-consumers.md`, with a repro.
 
 ### Verified
 

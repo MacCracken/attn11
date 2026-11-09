@@ -581,11 +581,13 @@ old/new/old/new; the values are the means of the two runs (each one varied ~4% r
 The matmul-bound kernels are flat or faster, so the slowdown is a fixed cost per element. At
 the tiny default scale that cost is a large share of a generated token. At `--preset`, where
 matmul dominates, it is only a small one. The measured contributor is ganita 1.2.14's rewritten
-`f64_tanh`, which the GELU forward and backward call. Rebuilt with the new compiler, it runs at
-**~96 ns/op**, against **~42 ns/op** for the 1.2.4 formula (two `f64_exp` builtins). That is
-2.3× slower, measured with a scratch probe, 2 M inputs on [−3, 3], 3 runs. It also returns
-different bits on 62 % of those inputs. At the default config (3 layers × 4C = 384 GELU per
-token), that is ~21 µs of the ~36 µs kv-cached gen regression. The remainder was not
-attributed. Accuracy and correctness are owned upstream (ganita), so this is recorded, not
-patched locally. A fast-path `tanh` in attn11 would also break the attn11 ↔ rupantara GELU
-parity contract.
+`f64_tanh`, which the GELU forward and backward call. Built with the same 6.6.20 compiler, it
+runs at **~91–95 ns/op** on [−3, 3], against **~46–48 ns/op** for 1.2.4's body copied verbatim
+(two `f64_exp` builtins). That is **~1.9×** over 3 runs of 2 M inputs. Most of the cost is the
+`_gn_expm1` call it now makes, ~70 ns, against ~15 ns for one `f64_exp` builtin. The two forms
+return different bits on 61 % of those inputs. At the default config (3 layers × 4C = 384 GELU
+per token), the extra ~44 ns per call is ~17 µs of the ~36 µs kv-cached gen regression. The
+remainder was not attributed. Accuracy and correctness are owned upstream (ganita), so this is
+recorded and filed, not patched locally:
+`ganita/docs/development/issues/2026-11-09-tanh-cost-on-gelu-consumers.md`, with a repro. A
+fast-path `tanh` in attn11 would also break the attn11 ↔ rupantara GELU parity contract.
