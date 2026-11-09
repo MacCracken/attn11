@@ -591,3 +591,32 @@ remainder was not attributed. Accuracy and correctness are owned upstream (ganit
 recorded and filed, not patched locally:
 `ganita/docs/development/issues/2026-11-09-tanh-cost-on-gelu-consumers.md`, with a repro. A
 fast-path `tanh` in attn11 would also break the attn11 ↔ rupantara GELU parity contract.
+
+## Toolchain 6.6.20 → 6.7.9 (1.15.0): end-to-end flat, one small-shape kernel slower
+
+The 1.15.0 realign changed no source. Every dep moved with "no source or value change", and
+ganita 1.2.15 changes only its version line. A/B on the same host (Cezanne): HEAD built at 6.6.20
+against its `lib/`, and the same source at 6.7.9, both DCE builds, run alone and interleaved,
+two full passes each. The host ran warmer than during the 1.14.4 A/B, so compare rows within
+this table, not with the one above. Run-to-run spread was ~5% (the 6.6.20 step: 3.79 vs 3.59 ms).
+
+| metric | 6.6.20 | 6.7.9 | Δ |
+|---|---:|---:|---:|
+| fwd+bwd step (default) | 3.689 ms | 3.617 ms | −1.9 % |
+| training tok/s (default) | 4 340 | 4 423 | +1.9 % |
+| `model_forward` | 1.331 ms | 1.349 ms | +1.4 % |
+| `model_backward` | 2.266 ms | 2.223 ms | −1.9 % |
+| gen kv-cached (default) | 196 396 ns | 186 720 ns | −4.9 % |
+| fwd+bwd step `--preset` | 63.85 ms | 61.44 ms | −3.8 % |
+| `head_fwd` V768 C64 | 3.477 ms | 3.429 ms | −1.4 % |
+| `adam_step` (NP) | 817 450 ns | 769 266 ns | −5.9 % |
+| **`linear_fwd` T×C×F** (7 samples each) | **60 965 ns** | **67 993 ns** | **+11.5 %** |
+
+Every end-to-end row is within the run-to-run spread or better. The one consistent regression is
+the small-shape `linear_fwd` microbenchmark, and the SIMD-f64 ternary matmul, which runs the same
+kernel. Its seven samples do not overlap: 60.2–62.6 µs at 6.6.20, 66.4–70.5 µs at 6.7.9. The
+source is unchanged (rosnet 1.2.0's bundle differs from 1.1.3's only in its version line), so
+this is codegen or binary layout under 6.7.9. rosnet's own 6.7.9 benchmark measured 0–5 %
+*faster*, which points at layout in attn11's binary rather than at the kernel. It does not
+reach the larger matmul (`head_fwd`) or the training step. Recorded, not chased: there is no
+end-to-end cost to recover.

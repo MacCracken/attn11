@@ -4,6 +4,95 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.15.0] - 2026-11-09
+
+A toolchain and dependency realign onto the cyrius 6.7 series: `6.6.20` → `6.7.9`, with `lib/`
+and every dep moved to the version 6.7.9 bundles or pins. **No source change was needed**, and
+the default training run is **byte-identical** to 1.14.4.
+
+### Changed
+
+- **Toolchain `6.6.20` → `6.7.9`** (through 6.7.0–6.7.8).
+- **Vendored `lib/` re-synced from scratch** (`cyrius lib sync --full`). It byte-matches the 6.7.9
+  snapshot: the same 113 files, now bundling **mabda 4.2.0**, **sakshi 2.5.8**, **sankoch 2.8.3**
+  and **ganita 1.2.15** (version line only; `f64_tanh`/`f64_pow` are unchanged). `cyrius.lock` was
+  regenerated from scratch: 6 commit-pinned deps, 119 file hashes, the `cyrius 6.7.9` trailer.
+  `cyrius deps --verify` passes 119/0, and 6.7.6's `cyrius deps --locked` reports that `lib/` and
+  the lock are exactly what the tags resolve to.
+- **Every git dep moved to its 6.7.9-built release.** These are the only tags whose own
+  `cyrius.cyml` pins 6.7.9: **akshara `1.0.4` → `1.1.0`**, **tyche `1.1.1` → `1.2.0`**,
+  **rosnet `1.1.3` → `1.2.0`**, **rupantara `0.4.4` → `0.5.0`**, **hisab `3.3.7` → `3.4.0`**.
+  Each is a realign with no source or value change: tyche's stream dump, rosnet's 7,462-value
+  dump and akshara's 2,192-value dump are byte-identical across the move, and rupantara's
+  bundle changes only its version line and constant. The transitive pins agree: akshara and
+  rupantara both declare rosnet 1.2.0, and rosnet declares tyche 1.2.0. hisab 3.4.0 retires
+  27 public names in favour of `_checked` Result forms. attn11 calls none of them, and
+  `num_fft`, the one function the hearing lane uses, has the same body as in 3.3.7.
+- **mabda stays the bundled stdlib leaf** (since 1.14.4), now 4.2.0, byte-identical to the
+  4.2.0 tag's `dist/mabda.cyr`. 4.2.0 makes eleven colour names (`F64_0`, `F64_1`, `F64_255`,
+  `F64_LUM_*`, …) f64 `const`s, so a same-name `var` would now fail to compile. attn11 declares
+  none of them.
+
+### Checked: the 6.7.x language changes
+
+Every 6.7.x change the siblings flagged was scanned for in attn11's own sources (`src/`,
+`tests/`, `programs/`), with comments and strings stripped. The scan patterns were first
+confirmed to catch a planted example of each hazard and to ignore `!=`, binary minus, comments
+and strings. **No hits in any category:**
+
+- the newly reserved `trait`, `const`, `true`, `false`, `do`, `dyn` as identifiers;
+- a lone `!x`. Since 6.7.3 `!` is a real operator; before that, `!x` compiled silently as `x`,
+  so any such site would change behaviour;
+- unary `-` or `~` on a name or constant, which binds tighter from 6.7.9. attn11 writes
+  `(0 - N)`, per CLAUDE.md;
+- typed `*T` pointers, whose stepping changed in 6.7.8–6.7.9, and `f32`, which 6.7.6 rounds
+  on every write.
+
+`cyrius tests`, deprecated in 6.7.6 and removed in 6.7.12, is not used anywhere. CI, the
+Makefile and the docs use bare `cyrius test`, which still runs the suite.
+
+### Numerics: byte-identical to 1.14.4
+
+The 6.6.20 and 6.7.9 builds of the same source produce byte-identical output for:
+
+- the default training run (2,000 steps and the greedy sample);
+- `--hearing`, the full proof (loss 1.6713 → 0.0000, held-out 1000/1000);
+- `--vision`;
+- `--bpe 64 --steps 400 --eval`.
+
+This is the drift-free move 1.14.4 was not. 6.7.9's stdlib changes nothing attn11 computes with
+(ganita 1.2.15 changes only its version line), and the codegen produced no visible drift on
+these paths.
+
+### Performance: end-to-end flat, one small-shape kernel slower
+
+These are A/B results against HEAD at 6.6.20. Both harnesses were DCE builds, run alone and
+interleaved. The full table is in `docs/benchmarks.md`.
+
+- Every end-to-end path is within the ~5 % run-to-run spread or better: fwd+bwd step −1.9 %,
+  kv-cached generation −4.9 %, `--preset` step −3.8 %, `head_fwd` −1.4 %, Adam −5.9 %.
+- **The one consistent regression is the small-shape `linear_fwd` microbenchmark: +11.5 %**
+  (mean of 7 samples per build, no overlap: 60.2–62.6 µs vs 66.4–70.5 µs). The SIMD-f64
+  ternary matmul, which runs the same kernel, shows the same. The source is unchanged, so this
+  is codegen or binary layout under 6.7.9, and rosnet's own 6.7.9 bench measured 0–5 % faster.
+  It does not reach the larger matmul or the training step, so it is recorded, not chased.
+
+### Verified
+
+- x86_64 suite **1066/1066** (+ 2/2). aarch64/qemu **1060/1060**, and `--gen-only` ok. The
+  aarch64 syscall trace matches 1.14.4 (8 `fdatasync`, 638 `lseek`, no failing call).
+- fuzz ok, with accept/reject counts identical to 1.14.4 · CLI smoke ok · `cyrius fmt --check`
+  clean · lint 0 warnings · DCE release build is a static ELF (1,128,280 B, +3,352 B).
+- GPU suite **12/12** ran on the device (gfx90c), with no mismatches.
+- `--agnos` builds of `src/main.cyr`, `tests/attn11.tcyr` and `programs/gpumm.cyr` succeed, and
+  the result is a static ELF64.
+- Unchanged and still harmless: `cyrius deps` warns about sakshi, because hisab 3.4.0 declares
+  `[deps.sakshi]` 2.5.8, the same version 6.7.9 bundles. The `large static data` advisory comes
+  from the bundled GPU scratch buffers, as before.
+- Still open upstream: the ganita `f64_tanh` cost
+  (`ganita/docs/development/issues/2026-11-09-tanh-cost-on-gelu-consumers.md`). ganita 1.2.15
+  did not change its source.
+
 ## [1.14.4] - 2026-11-09
 
 A toolchain and dependency realign: cyrius `6.6.2` → `6.6.20`, with `lib/` and every dep

@@ -967,7 +967,7 @@ deterministic resume. 0.2.0: stacked layers, grad clipping, LR schedule.)
 
 ## Toolchain
 
-- **Cyrius pin**: `6.6.20` (in `cyrius.cyml [package].cyrius`) — see the 1.14.4 note
+- **Cyrius pin**: `6.7.9` (in `cyrius.cyml [package].cyrius`) — see the 1.15.0 + 1.14.4 notes
   below; the history that follows is the 1.7.x-era trail. Bumped from 6.2.27
   in 1.7.4 (6.2.6 → 6.2.27 in 1.7.3, 6.2.5 → 6.2.6 in 1.7.2, 6.2.2 → 6.2.5 in 1.7.1) to
   realign with the fast-rolling installed cycc (`cyrius update` resyncs the gitignored `lib/`
@@ -1008,6 +1008,17 @@ stdlib ganita 1.2.4 → 1.2.14 refold's rewritten `f64_tanh` / `f64_pow` (CHANGE
 slower and the training step +4.4 % (`--preset` only +2–3 %) — ganita 1.2.14's `f64_tanh`
 (GELU) is ~1.9× the old form and the measured contributor (`docs/benchmarks.md`; filed
 upstream as `ganita/docs/development/issues/2026-11-09-tanh-cost-on-gelu-consumers.md`).
+
+**Pin bumped `6.6.20` → `6.7.9` 2026-11-09 (1.15.0)**, with every dep moved to its 6.7.9-built
+release (akshara 1.1.0, tyche 1.2.0, rosnet 1.2.0, rupantara 0.5.0, hisab 3.4.0) and the bundled
+mabda 4.2.0. No source change was needed: attn11 has none of the 6.7.x hazards (reserved
+`trait`/`const`/`true`/`false`/`do`/`dyn`, lone `!`, unary `-`/`~`, typed `*T`, `f32`; the scan
+was validated against planted examples). Gate: x86_64 **1066/1066**, aarch64/qemu **1060/1060**,
+fuzz, smoke, fmt, lint 0 warn, 12-test GPU suite on-device, agnos builds, `cyrius deps --locked`
+clean. **Byte-identical to 1.14.4** on the default run, `--hearing`, `--vision` and
+`--bpe 64 --steps 400 --eval`. Perf: end-to-end flat or slightly faster. The small-shape
+`linear_fwd` microbench is +11.5 % (codegen or layout; source unchanged; it does not reach the
+step), per `docs/benchmarks.md`.
 
 ## Performance
 
@@ -1506,21 +1517,21 @@ constant `nh·hd²` state instead of a T-growing K/V.
 
 Direct (declared in `cyrius.cyml`):
 
-- stdlib (the 6.6.20 snapshot) — string, fmt, alloc, io, vec, str, syscalls,
+- stdlib (the 6.7.9 snapshot) — string, fmt, alloc, io, vec, str, syscalls,
   assert, bench, math, ganita, args, hashmap, tagged, fnptr, mmap, dynlib, sakshi,
-  thread, sankoch, **mabda** (the bundled GPU foundation, 4.1.7 at 6.6.20 — a
+  thread, sankoch, **mabda** (the bundled GPU foundation, 4.2.0 at 6.7.9 — a
   stdlib leaf since 1.14.4, no longer a `[deps.mabda]` git dep)
-- **[akshara](https://github.com/MacCracken/akshara) 1.0.4** — corpus + byte/BPE
+- **[akshara](https://github.com/MacCracken/akshara) 1.1.0** — corpus + byte/BPE
   tokenizer data layer (1.11.0 extraction)
-- **[tyche](https://github.com/MacCracken/tyche) 1.1.1** — deterministic
+- **[tyche](https://github.com/MacCracken/tyche) 1.2.0** — deterministic
   statistical PRNG (`rng_seed`/`rng_u64`/`rng_uniform`/`rng_normal`)
-- **[rosnet](https://github.com/MacCracken/rosnet) 1.1.3** — tensor storage +
+- **[rosnet](https://github.com/MacCracken/rosnet) 1.2.0** — tensor storage +
   BLAS-1 + dense matmul/gradient + conv; plus the `[lib.gpu]` profile
   (`dist/rosnet-gpu.cyr`, the whole GPU backend since 1.10.0)
-- **[rupantara](https://github.com/MacCracken/rupantara) 0.4.4** — the `ru_*`
+- **[rupantara](https://github.com/MacCracken/rupantara) 0.5.0** — the `ru_*`
   forward leaf ops attn11 delegates its CPU forward bodies to (git+tag; the old
   `../rupantara` path override is gone)
-- **[hisab](https://github.com/MacCracken/hisab) 3.3.7** — `num_fft` for the
+- **[hisab](https://github.com/MacCracken/hisab) 3.4.0** — `num_fft` for the
   hearing lane's STFT frontend (x86_64-gated)
 
 All git deps are commit-pinned in `cyrius.lock`.
