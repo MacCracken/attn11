@@ -4,7 +4,7 @@ version = "${file:VERSION}"
 description = "attn11 — a from-scratch GPT-style transformer, trained, in Cyrius"
 license = "GPL-3.0-only"
 language = "cyrius"
-cyrius = "6.7.9"
+cyrius = "6.7.18"
 repository = "https://github.com/MacCracken/attn11"
 
 [build]
@@ -23,9 +23,12 @@ stdlib = ["string", "fmt", "alloc", "io", "vec", "str", "syscalls", "assert", "b
 # to the local dist bundle the extraction was validated against).
 # `1.0.2` → `1.0.4` (6.6.20 realign): the akshara release built against 6.6.20.
 # `1.0.4` → `1.1.0` (6.7.9 realign): the 6.7.9-built release; no source/API change.
+# `1.1.0` → `1.1.3` (6.7.18 realign, latest): 1.1.2's hardening sweep — same output on
+# valid input; a second `bpe_learn` over an already-BPE store now returns -4 (learn again
+# after a fresh `corpus_set`); fatal messages go to stderr with an "akshara:" prefix.
 [deps.akshara]
 git = "https://github.com/MacCracken/akshara"
-tag = "1.1.0"
+tag = "1.1.3"
 modules = ["dist/akshara.cyr"]
 
 # M18 (v1.8.x GPU arc) — LANDED in v1.8.0 (X027). mabda 3.4.1 is consumed by
@@ -47,9 +50,12 @@ modules = ["dist/akshara.cyr"]
 # to the 1.0.1 stream. The frozen 1.x API is unchanged.
 # `1.1.1` → `1.2.0` (6.7.9 realign): no source change; tyche's golden stream dump
 # is byte-identical across the move.
+# `1.2.0` → `1.2.2` (6.7.18 realign, latest): same bits for every reachable state; a
+# written `_rng_state` of 0 now steps as 1 instead of hanging `rng_normal` (a checkpoint
+# captured from a running stream is never 0).
 [deps.tyche]
 git = "https://github.com/MacCracken/tyche"
-tag = "1.2.0"
+tag = "1.2.2"
 modules = ["dist/tyche.cyr"]
 
 # rosnet 1.1.0: the frozen 1.0 surface attn11 already exercised (identical to the 0.2.0
@@ -68,9 +74,14 @@ modules = ["dist/tyche.cyr"]
 # only in whitespace, and the gpu sidecar now names mabda/math/ganita itself.
 # `1.1.3` → `1.2.0` (6.7.9 realign): no source change; both bundles differ only in
 # their version line.
+# `1.2.0` → `1.4.1` (6.7.18 realign, latest): faster kernels with the SAME bits (rosnet
+# ADR 0002 — every optimization keeps each output's sequence of roundings): 1.2.2's packed
+# linear/conv rewrite + GPU hardening, 1.3.0's GPU fallback fixes, 1.4.0's tiled GPU
+# attention (hd < 128 now runs on device), 1.4.1's AVX2 linear (vmulpd+vaddpd, not FMA).
+# The CPU bundle now `include`s lib/simd.cyr itself.
 [deps.rosnet]
 git = "https://github.com/MacCracken/rosnet"
-tag = "1.2.0"
+tag = "1.4.1"
 modules = ["dist/rosnet.cyr", "dist/rosnet-gpu.cyr"]
 
 # The transformer FORWARD leaf-op CPU math, extracted to rupantara so there is ONE
@@ -88,9 +99,12 @@ modules = ["dist/rosnet.cyr", "dist/rosnet-gpu.cyr"]
 # built locally. The git+tag is now the only source.
 # `0.4.4` → `0.5.0` (6.7.9 realign): no change to the forward or the API; the
 # bundle differs only in its version line + version constant.
+# `0.5.0` → `0.5.3` (6.7.18 realign, latest): hardening (config/token-id validation at
+# the model entries, KV-cache bound) and faster attention/embedding; outputs on valid
+# input are bit-identical, and the attn11 parity contract is untouched.
 [deps.rupantara]
 git = "https://github.com/MacCracken/rupantara"
-tag = "0.5.0"
+tag = "0.5.3"
 modules = ["dist/rupantara.cyr"]
 
 # M18 (the v1.8.x GPU arc): mabda is the GPU *foundation* — device/context init,
@@ -165,9 +179,11 @@ modules = ["dist/rupantara.cyr"]
 # `3.3.7` → `3.4.0` (6.7.9 realign): 3.4.0 retires 27 public names for
 # `_checked` Result replacements, none of which attn11 calls; `num_fft` (the one
 # function the hearing lane uses) is body-identical to 3.3.7.
+# `3.4.0` → `3.4.1` (6.7.18 realign, latest): the 3.4.0 findings; `num_fft` only gains an
+# `n < 0` → Err guard (no change at n = 256).
 [deps.hisab]
 git = "https://github.com/MacCracken/hisab"
-tag = "3.4.0"
+tag = "3.4.1"
 target = "x86_64"
 modules = ["dist/hisab.cyr"]
 ---

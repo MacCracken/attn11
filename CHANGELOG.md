@@ -4,6 +4,119 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.15.1] - 2026-11-09
+
+A toolchain and dependency realign to the latest releases: cyrius `6.7.9` → `6.7.18`, with
+`lib/` re-synced from the 6.7.18 snapshot and every git dep at its latest tag. **No change to
+`src/`.** One GPU test was updated, because rosnet now runs wide attention heads on the device.
+
+### Changed
+
+- **Toolchain `6.7.9` → `6.7.18`** (through 6.7.10–6.7.17).
+- **Vendored `lib/` re-synced from scratch** (`cyrius lib sync --full`). It byte-matches the
+  6.7.18 snapshot: the same 113 files, with **sakshi 2.5.10** and **sankoch 2.8.9**. mabda 4.2.0
+  and ganita 1.2.15 are unchanged, so `f64_tanh` is too. `cyrius.lock` was regenerated from
+  scratch: 6 commit-pinned deps, 119 file hashes, the `cyrius 6.7.18` trailer. `cyrius deps
+  --verify` passes 119/0 and `--locked` is clean. From 6.7.12–6.7.13 a moved pin is refused
+  until `lib/` is re-synced, so the pin, `lib/` and the lock have to land in one commit.
+- **Every git dep moved to its latest release**, each pinned to 6.7.18. The transitive pins
+  agree: akshara and rupantara both declare rosnet 1.4.1, rosnet declares tyche 1.2.2, and
+  hisab declares sakshi 2.5.10, the version 6.7.18 bundles.
+  - **rosnet `1.2.0` → `1.4.1`.** Faster kernels that keep the same bits; rosnet's ADR 0002
+    requires every optimization to keep each output's sequence of roundings, and its
+    15,302-line golden dump is byte-identical throughout.
+    - 1.2.2: a packed `linear_fwd` / `linear_bwd` / conv rewrite (64×768×768 `linear_fwd`:
+      33.4 → 12.4 ms), plus GPU hardening: a stack overflow in `gpu_attn_core` at hd 64,
+      and a shader-cache key that left out hd.
+    - 1.3.0: GPU fallbacks leave the caller's outputs untouched.
+    - 1.4.0: tiled GPU attention, so hd < 128 runs on the device.
+    - 1.4.1: an AVX2 linear path that lowers to `vmulpd` + `vaddpd`, not a fused op, so it
+      rounds exactly as SSE2. The CPU bundle now `include`s `lib/simd.cyr` itself.
+  - **akshara `1.1.0` → `1.1.3`.** 1.1.2 is a hardening sweep with output bit-identical on
+    valid input, and `bpe_learn` / `tok_encode` / `corpus_set` are several times faster.
+    Visible behaviour changes: a second `bpe_learn` over a store that is already BPE now
+    returns −4 and changes nothing (learn again after a fresh `corpus_set`), and fatal
+    messages go to stderr with an `akshara:` prefix instead of to stdout through attn11's
+    `puts`. No attn11 test or CLI path hits either: the suite and the smoke run pass unchanged.
+  - **tyche `1.2.0` → `1.2.2`.** Every reachable state gives the same bits. The one change is
+    that a written `_rng_state` of 0 now steps as 1 instead of hanging `rng_normal`; a
+    checkpoint captured from a running stream is never 0.
+  - **rupantara `0.5.0` → `0.5.3`.** Validation at the model entries, a KV-cache bound, and
+    faster attention and embedding. Output on valid input is bit-identical, and the attn11
+    parity contract is untouched.
+  - **hisab `3.4.0` → `3.4.1`.** The 3.4.0 findings. `num_fft` only gains an `n < 0` → `Err`
+    guard, so nothing changes at n = 256.
+
+### Changed — tests
+
+- **`tests/gpu_attn_bwd.cyr`: hd 32 and hd 64 are now on-device checks, and the fallback is
+  checked at hd 128.** As rosnet 1.4.0's consumer note predicted, its tiled backward runs
+  those two shapes on the device, so 1.9.0's two "must fall back" checks reported
+  `UNEXPECTED on-device` and the suite failed. Both shapes now get the full tolerance check,
+  and both match the CPU bit for bit (max diff 0) on the gfx90c, GPT-2's hd 64 included. A new
+  check at hd 128, the bound set by rosnet's 7-bit shader-cache key, keeps the clean CPU
+  fallback covered. The GPU guide's "very wide heads" note is updated to match.
+
+### Checked: the 6.7.10–6.7.18 language and tool changes
+
+- **6.7.17** makes a statement that is only a value builtin (`f64_sqrt(x);`) a compile
+  error. attn11 has none: it built with no source change.
+- **6.7.11–6.7.12** add `cyrlint` warnings for array overruns and write lengths. None fires:
+  the lint gate passes with 0 warnings.
+- `cyrius tests`, removed in 6.7.12, is not used anywhere.
+
+### Numerics: byte-identical to 1.15.0
+
+The 6.7.9 and 6.7.18 builds produce byte-identical output for:
+
+- the default training run (2,000 steps and the greedy sample);
+- `--hearing` (loss 1.6713 → 0.0000, held-out 1000/1000);
+- `--vision` (1.3768 → 0.0012, 1000/1000);
+- `--bpe 64 --steps 400 --eval`.
+
+This is end-to-end evidence that rosnet's rewritten kernels (packed, then AVX2) keep its
+same-bits rule inside attn11, not only in rosnet's own dump.
+
+### Performance: faster across the board, from rosnet's kernels
+
+These are A/B results against HEAD at 6.7.9. Both harnesses were DCE builds, run alone and
+interleaved (two full passes, plus 5 extra `linear_fwd` samples each). The full table is in
+`docs/benchmarks.md`.
+
+- **`linear_fwd` (small T×C×F): −49 %**, a mean of 7 samples, 70,240 → 35,803 ns, with no
+  overlap. That more than cancels 1.15.0's +11.5 % on this row.
+- **Training step −12.8 %** (4,109 → 4,711 tok/s). **kv-cached generation −14.9 %** (4,970 →
+  5,840 tok/s).
+- **`--preset`: step −23.4 %** (966 → 1,262 tok/s), kv-cached generation −28.4 %, and
+  uncached generation −33.1 %.
+- Every attention and mixer variant is 8–21 % faster (MQA, MLA, RoPE, MoE, linear, SSM, the
+  hybrids, diffusion).
+- Flat, as expected, because they don't run rosnet's rewritten kernels: Adam −1.8 %, the
+  attn11-local SIMD LM head (`head_fwd`) +0.4 %, the i64-add ternary matmul +2.0 %.
+
+The gain comes from rosnet 1.2.2's packed kernels and 1.4.1's AVX2 path, at the same bits (see
+Numerics). The host ran warm during this session, so compare rows within this A/B, not with
+earlier releases' tables.
+
+### Verified
+
+- x86_64 suite **1066/1066** (+ 2/2). aarch64/qemu **1060/1060**, and `--gen-only` ok. The
+  aarch64 syscall trace is identical to 1.15.0 (8 `fdatasync`, 638 `lseek`, no failing call).
+- fuzz ok, with accept/reject counts identical to 1.15.0 · CLI smoke ok · `cyrius fmt --check`
+  clean · lint 0 warnings.
+- GPU suite **12/12** ran on the device (gfx90c). attn-bwd now dispatches 9 cores on the device
+  instead of 7, because hd 32 and hd 64 no longer fall back.
+- `--agnos` builds of `src/main.cyr`, `tests/attn11.tcyr` and `programs/gpumm.cyr` succeed, and
+  the result is a static ELF64.
+- **The DCE release grew 1,128,280 → 1,346,592 B (+218 KB).** Not a gate. Most of the source
+  growth is hisab 3.4.1 (+1.0 MB of source, x86-only): the non-DCE x86 build grew +611 KB, the
+  aarch64 build, which does not include hisab, only +90 KB. The DCE share was not broken down.
+  The `large static data` advisory no longer prints.
+- While `make gpu-test` was running, one build failed once with `cannot hash lib/hisab.cyr …
+  (errno 2)`. A re-run passed, and the failure did not come back. The likely cause is the
+  editor's cyrius LSP re-resolving deps after a file edit, at the same moment as the build.
+  That is environmental, not attn11's.
+
 ## [1.15.0] - 2026-11-09
 
 A toolchain and dependency realign onto the cyrius 6.7 series: `6.6.20` → `6.7.9`, with `lib/`

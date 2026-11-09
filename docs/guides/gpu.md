@@ -80,9 +80,11 @@ matmuls (re-uploading each expert's weights `T·K`×/step would be a poor GPU fi
 gather is the deferred proper path).
 
 What stays on CPU: **GQA / bidirectional (diffusion) attention** (fall back to the CPU core), the
-**MoE routed expert MLPs** (above), and **very wide heads** (`hd > 32` — the untiled `dp` pass would
-exceed the build budget, so the attention backward self-falls-back; `--preset --heads 1` is the corner
-case). Everything else of a training step runs on the GPU at default and preset (RoPE since 1.9.1,
+**MoE routed expert MLPs** (above), and **very wide heads** (`hd >= 128`; since rosnet 1.4.0, which
+attn11 consumes from 1.15.1, the attention kernels run in tiles of 8 over the head dimension, so hd 32
+and hd 64, GPT-2's head size, run on the device; `tests/gpu_attn_bwd.cyr` checks both within
+tolerance, and checks that hd 128 falls back cleanly to the CPU. Through 1.15.0 the cut-off was
+`hd > 32`, so `--preset --heads 1` fell back). Everything else of a training step runs on the GPU at default and preset (RoPE since 1.9.1,
 preset-scale since 1.9.0). Each op
 self-falls-back to CPU if the device is absent, the contraction
 dimension isn't a multiple of `GPU_TK` (16) / the tile `TK` (4), or a buffer/dispatch limit is

@@ -620,3 +620,35 @@ this is codegen or binary layout under 6.7.9. rosnet's own 6.7.9 benchmark measu
 *faster*, which points at layout in attn11's binary rather than at the kernel. It does not
 reach the larger matmul (`head_fwd`) or the training step. Recorded, not chased: there is no
 end-to-end cost to recover.
+
+## Toolchain 6.7.9 → 6.7.18 + rosnet 1.4.1 (1.15.1): the matmul gets 2× faster, same bits
+
+1.15.1 moves to cyrius 6.7.18 and every dep's latest release. The perf-relevant one is rosnet
+**1.2.0 → 1.4.1**: 1.2.2 packed `linear_fwd` / `linear_bwd` into one `f64v_axpy` per row step,
+and 1.4.1 added an AVX2 path that lowers to `vmulpd` + `vaddpd`, not a fused op. Both keep each
+output's sequence of roundings (rosnet ADR 0002), and attn11's default, hearing, vision and BPE
+runs are byte-identical to 1.15.0. A/B on the same host (Cezanne): HEAD built at 6.7.9 against
+its `lib/`, and the same source at 6.7.18, both DCE builds, run alone and interleaved, two full
+passes each. The host ran warm (the 6.7.9 step read 3.89 ms here, against 3.62 ms in the 1.15.0
+session), so compare rows within this table.
+
+| metric | 6.7.9 / rosnet 1.2.0 | 6.7.18 / rosnet 1.4.1 | Δ |
+|---|---:|---:|---:|
+| **`linear_fwd` T×C×F** (7 samples each) | **70 240 ns** | **35 803 ns** | **−49 %** |
+| `model_forward` | 1.451 ms | 1.220 ms | −15.9 % |
+| `model_backward` | 2.383 ms | 2.122 ms | −11.0 % |
+| fwd+bwd step (default) | 3.895 ms | 3.397 ms | −12.8 % |
+| training tok/s (default) | 4 109 | 4 711 | +14.7 % |
+| gen kv-cached (default) | 201 190 ns | 171 224 ns | −14.9 % |
+| fwd+bwd step `--preset` | 66.22 ms | 50.71 ms | **−23.4 %** |
+| training tok/s `--preset` | 966 | 1 262 | +30.6 % |
+| gen kv-cached `--preset` | 706 474 ns | 505 560 ns | −28.4 % |
+| gen uncached `--preset` | 16.05 ms | 10.73 ms | −33.1 % |
+| `adam_step` (NP) | 855 411 ns | 839 626 ns | −1.8 % |
+| `head_fwd` V768 C64 | 3.801 ms | 3.815 ms | +0.4 % |
+
+Every attention and sequence-mixer variant's step and kv-cached decode are 8–21 % faster. The
+three flat rows are the ones that don't call rosnet's linear kernels: Adam, the attn11-local
+SIMD tied LM head (`head_fwd`), and the i64-add ternary matmul (+2.0 %). The gain grows with
+model width (`--preset` beats the default), as you'd expect from a matmul speed-up. 1.15.0's
+small-shape `linear_fwd` regression (+11.5 %) is gone. This row is now half its 6.7.9 cost.

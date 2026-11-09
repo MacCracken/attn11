@@ -122,8 +122,10 @@ fn run_shape(T, C, nh, atol, rtol): i64 {
     print_cstr("  FAIL\n"); return 0;
 }
 
-# 1.9.0 Finding 2: the untiled dp kernel (pass A) unrolls hd into the build buffer; hd>32 must
-# self-fall-back (return -1), never overflow/crash. Asserts a clean CPU fallback for a wide head.
+# 1.9.0 Finding 2: the untiled dp kernel (pass A) unrolled hd into the build buffer, so hd>32 had
+# to self-fall-back (return -1), never overflow/crash. rosnet 1.4.0 tiles the dp kernel over hd
+# (tiles of 8), so hd < 128 now runs ON DEVICE; the fallback boundary is hd >= 128 (the shader-cache
+# key's 7-bit hd field). Asserts a clean CPU fallback for a head at/over that boundary.
 fn expect_fb(T, C, nh): i64 {
     var Qc = alloc(T*C*8); var Kc = alloc(T*C*8); var Vc = alloc(T*C*8);
     var Pc = alloc(nh*T*T*8); var dc = alloc(T*C*8);
@@ -132,7 +134,7 @@ fn expect_fb(T, C, nh): i64 {
     print_cstr("  T="); print_i64(T); print_cstr(" C="); print_i64(C); print_cstr(" nh="); print_i64(nh);
     print_cstr(" hd="); print_i64(C/nh); print_cstr(": ");
     if (rc != 0) { print_cstr("CPU fallback (correct — no build-buffer overflow)\n"); return 1; }
-    print_cstr("UNEXPECTED on-device (hd>32 should fall back)\n"); return 0;
+    print_cstr("UNEXPECTED on-device (hd>=128 should fall back)\n"); return 0;
 }
 
 fn main(): i64 {
@@ -153,8 +155,12 @@ fn main(): i64 {
     if (run_shape(64, 64, 8, atol, rtol) == 0) { ok = 0; }    # 1.9.0: preset (T=64 → tiled over T)
     if (run_shape(64, 32, 4, atol, rtol) == 0) { ok = 0; }    # 1.9.0: T=64, hd=8, 4 j-tiles
     if (run_shape(20, 32, 4, atol, rtol) == 0) { ok = 0; }    # 1.9.0: T%16≠0 (tiles 16 + tail 4)
-    if (expect_fb(16, 64, 2) == 0) { ok = 0; }                # 1.9.0: hd=32 → dp exceeds 256-id cap → clean fallback
-    if (expect_fb(16, 64, 1) == 0) { ok = 0; }                # 1.9.0 Finding 2: hd=64 > 32 guard → clean fallback (no overflow)
+    # rosnet 1.4.0 tiled the dp kernel over hd: the two shapes 1.9.0 pinned as clean fallbacks
+    # (hd=32 past the 256-id cap; hd=64 past the hd>32 guard) now run ON DEVICE — so they are
+    # tolerance checks now (GPT-2's hd=64 included), and the fallback is pinned at hd=128.
+    if (run_shape(16, 64, 2, atol, rtol) == 0) { ok = 0; }    # hd=32 on device (was: fallback)
+    if (run_shape(16, 64, 1, atol, rtol) == 0) { ok = 0; }    # hd=64 on device (was: fallback)
+    if (expect_fb(16, 128, 1) == 0) { ok = 0; }               # hd=128 >= the 7-bit key bound → clean fallback
     print_cstr("GPU attn-bwd cores dispatched on-device: "); print_i64(gpu_attnbwd_count()); print_cstr("\n");
     if (ok == 0) { print_cstr("\nFAIL: GPU attn_core_bwd exceeds tolerance vs the CPU oracle\n"); return 1; }
     print_cstr("\nOK — gpu_attn_core_bwd allclose(1e-9) to attn_core_bwd across causal-MHA shapes\n");
