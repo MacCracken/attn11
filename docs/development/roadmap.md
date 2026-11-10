@@ -13,7 +13,14 @@
 
 ## Where we are
 
-Current: **v1.10.0** — **the GPU backend extracted to rosnet (ADR 0017).** ADR 0016's extraction
+> **Current (2026-11-09): v1.16.0.** The training-science #3 lane is closed: `--curriculum N`
+> (X044, a null result at 52 K) follows `--mtp N` (X043). **Next: #1, training dynamics**, under
+> [Training-science explorations](#training-science-explorations-parked--for-a-future-attn11-agent).
+> 1.11–1.15 were extractions (akshara, tarka), the vision/hearing lanes, the rupantara re-fold, the
+> toolchain moves to cyrius 6.7.18 and the 1.15.2 hardening sweep (see the CHANGELOG). The paragraph
+> below was last refreshed at v1.10.0.
+
+Current (at v1.10.0): **v1.10.0** — **the GPU backend extracted to rosnet (ADR 0017).** ADR 0016's extraction
 promise came due now that M18+M19 proved the backend: `src/gpu.cyr` moved **whole** into **rosnet
 0.2.0** as a mabda-gated `[lib.gpu]` profile (`dist/rosnet-gpu.cyr`); attn11 consumes it, pure
 relocation, `--gpu` byte-identical. (Whole-backend over the cleaner generic/transformer split for
@@ -97,8 +104,8 @@ M19 below). The arc unblocked B4 (the GPU competitor row). This file is the plan
 
 > **Status (2026-11-09, 1.14.4):** the pin went straight `6.6.2` → `6.6.20`. The ⛔ `_fdatasync`
 > item and the `cyrius deps` re-run are done (the hazard reproduced under `qemu-aarch64 -strace`
-> before the fix: `mkdirat(AT_FDCWD, 3, …) = EFAULT`). `file_seek` stays open — raw aarch64 `62`
-> still traces as a correct `lseek` at 6.6.20, so it is tidy-up only.
+> before the fix: `mkdirat(AT_FDCWD, 3, …) = EFAULT`). `file_seek` was tidy-up only (raw aarch64 `62`
+> still traced as a correct `lseek` at 6.6.20); it moved to `sys_lseek` in 1.15.2.
 
 ⛔ Before bumping the pin to 6.6.5: replace the aarch64 raw `fdatasync` in `src/fileio.cyr:105-109`
 with `sys_fdatasync(fd)`. 6.6.5 adds a raw-x86-`mkdir` row (`83 → mkdirat`), so `n = 83;` (`:107`)
@@ -115,7 +122,7 @@ cyrius 6.6.5 is not tagged yet. Nothing below can land against the pin until it 
       `fdatasync(1)`). Keep it inside `#ifndef CYRIUS_TARGET_AGNOS`: the agnos peer has no `sys_fdatasync`,
       and the AGNOS lane (`.github/workflows/ci.yml:154`) compiles this file. The comment at `:99` ("the
       stdlib ships no sys_fdatasync wrapper") is wrong. Fix it in the same change.
-- [ ] `file_seek` (`src/fileio.cyr:119-125`) can call `sys_lseek(fd, off, 0)`. 6.6.5 adds it to the
+- [x] `file_seek` (`src/fileio.cyr:119-125`) can call `sys_lseek(fd, off, 0)`. **Done in 1.15.2.** 6.6.5 adds it to the
       Linux/Darwin peers, which makes the comment at `:114` ("the stdlib ships no sys_lseek wrapper") stale.
       Raw aarch64 `62` is not rewritten in 6.6.5, so this is tidy-up, not a fix.
 - [x] Re-run `cyrius deps` in the bump commit. The aarch64 peer moved `SYS_UNLINKAT` 35 → 263, and the
@@ -683,6 +690,8 @@ for the native-AMD f64 route.
 > picks any thread below; all are **matched-A/B at the f64 oracle**, X021 protocol
 > (`c4-24-trainA`/`heldB`, held-out bits/byte = the honest metric). Sequencing intent
 > (user, 2026-06-22): **#3 → #1**, which then inform the **#2 / #4** bets with data.
+> **Status (2026-11-09, 1.16.0):** #3 is done (MTP X043 and curriculum X044, both null-or-negative
+> at 52 K and kept behind their flags); **#1 (training dynamics) is next.**
 
 ### #3 — Objective / curriculum
 - **Multi-token prediction — DONE (X043; mechanism shipped at 1.10.1).** `--mtp N`:
@@ -693,8 +702,14 @@ for the native-AMD f64 route.
     shrink toward Meta's crossover? (~hours/run); a **λ sweep** (0.1–0.5); **sequential
     MTP** (DeepSeek-style per-head transformer module vs the current parallel C×C heads);
     **self-speculative decoding** from the trained aux heads.
-- **Curriculum** — easy→hard ordering on the curated corpus (reuse the X016–X021 curation
-  infra); does ordered exposure beat the random window at tiny scale?
+- **Curriculum — DONE (X044; mechanism shipped at 1.16.0).** `--curriculum N`: a competence-based
+  (Platanios et al. 2019) easy→hard order by unigram rarity, RNG-neutral and resume-deterministic,
+  no-flag run byte-identical. **Null result at 52 K:** ramping over half the run is within seed noise
+  (paired mean +0.20 % held-out over 3 seeds, against a 0.38 % baseline seed spread); ramping over
+  the whole run is +0.67 % worse; the hardest-first control is no worse (−0.33 %). Kept behind the flag.
+  - **Curriculum follow-ups (parked):** a different difficulty measure (the 1.5.x prose-quality
+    score, or the model's own loss as in self-paced learning); shorter ramps (500 / 1000); the preset
+    (~229 K) scale bracket; a multi-epoch run, where ordering may matter more than in half an epoch.
 
 > **RL is no longer an attn11 lane.** The "deeper RL" thread (better baselines /
 > reward-shaping, PPO-lite, multi-target rewards) moved with the M17 surface to the
@@ -995,7 +1010,7 @@ library modules but never `src/main.cyr`. CLI coverage comes from three places:
 Noticed while surveying, for a separate change: the check at `:437` reads only `cfg_decode_steps`,
 though its message names `--decode-schedule` too. So `--decode-schedule linear` without
 `--objective diffusion` is silently accepted. `cmdit_seen` makes it a one-line fix, but the fix
-changes behaviour.
+changes behaviour. **Fixed in 1.15.2** (`cfg_decode_set`: either flag without `--objective diffusion` is rejected).
 
 See cmdit's `README.md` (API reference), `docs/adr/0001-flag-modifiers.md` (scope boundaries) and
 `docs/development/roadmap.md` (v2 backlog). Worked examples: kii (single command), anuenue (its own

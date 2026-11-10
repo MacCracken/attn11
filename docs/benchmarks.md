@@ -709,3 +709,20 @@ The A/B is the 1.15.2 tree and this one, both on rupantara 0.6.1: DCE bench bina
 - **`--preset` gains less.** It is not profiled here; its 64-token context gives attention a
   larger share of the step.
 
+
+## akshara 1.1.3 → 1.3.1 (1.15.4): a faster small BPE learn, same ids
+
+akshara 1.2.0 caches `bpe_learn`'s per-row argmax and 1.3.0 merges `tok_encode` by rank for inputs
+up to 8 KiB, both gated on identical ids. The A/B is the 1.15.3 and 1.15.4 DCE binaries, which differ
+only in the akshara bundle: wall time of a `--steps 0 --gen-only` startup (corpus load, BPE learn, a
+short sample), 5 interleaved runs, medians, Cezanne.
+
+| corpus, merges | 1.15.3 | 1.15.4 | Δ |
+|---|---:|---:|---:|
+| 64 KiB of `c4-24-trainA`, `--bpe 512` | 264 ms | 122 ms | **−54 %** |
+| 4 MB `c4-24-trainA` (the X021 protocol), `--bpe 256` | 2.30 s | 2.26 s | −1.7 % (noise) |
+
+- **The cached argmax only pays where the argmax dominates.** On 4 MB the learn is dominated by the
+  O(n) merge pass, as akshara's own 1 MiB row (−7.6 %) predicts.
+- **Training is unchanged:** a step runs no akshara code. The checkpoint the 4 MB learn writes is
+  byte-identical across the two builds.

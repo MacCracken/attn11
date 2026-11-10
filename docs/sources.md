@@ -217,6 +217,18 @@ inference. attn11's heads are C×C transforms into the tied unembedding, weighte
 λ/(N−1). Used in: `src/model.cyr` (`P_mtp`, `mtp_aux_loss`, `mtp_aux_backward`),
 `src/train.cyr` (`mtp_fill_targets`). See X043 (an honest negative at tiny scale).
 
+### Curriculum learning (easy-to-hard data order, X044)
+**Bengio, Y., Louradour, J., Collobert, R., Weston, J. (2009).** "Curriculum Learning."
+*ICML 2009.* doi:[10.1145/1553374.1553380](https://doi.org/10.1145/1553374.1553380) — training on
+easier examples first, then widening to the full distribution.
+**Platanios, E. A., Stretcu, O., Neubig, G., Póczos, B., Mitchell, T. M. (2019).**
+"Competence-based Curriculum Learning for Neural Machine Translation." *NAACL 2019.*
+arXiv:[1903.09848](https://arxiv.org/abs/1903.09848) — the competence schedule
+`c(t) = min(1, sqrt(t(1 − c0²)/T + c0²))`: at step t the sampler draws only from examples whose
+difficulty CDF is ≤ c(t). Its "word rarity" difficulty, the negative log-likelihood of an example
+under unigram token frequencies, is the one attn11 uses (as a per-token mean over fixed-length blocks).
+Used in: `src/train.cyr` (`curriculum_build`, `curriculum_open`, `curriculum_pick`). See X044.
+
 ## Weight precision / quantization
 
 ### Ternary (BitNet b1.58) weight quantization, fake-quant with a straight-through estimator (M16)

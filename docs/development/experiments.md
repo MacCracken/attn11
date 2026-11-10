@@ -1833,3 +1833,62 @@ bracket — would test whether the harm shrinks toward the Meta crossover, but p
 (ctx 64 → ~16× the attention FLOPs) and the 52 K result is decisive on its own. Reproduce: `for M in 1 2
 3; do ./build/attn11 --corpus data/c4-24-trainA.txt --bpe 256 --steps 4000 --mtp $M --eval --eval-corpus
 data/c4-24-heldB.txt; done`.
+
+## X044 — an easy-to-hard curriculum does not beat random windows at tiny scale (null result) (training-science, v1.16.0, 2026-11-09)
+
+**Result — no win.** A competence-based curriculum that opens the corpus easiest-first by unigram
+rarity (1.16.0's `--curriculum N`) is within seed noise of the random-window baseline when it ramps
+over half the run. It is worse when it ramps over the whole run. The reversed order, hardest first,
+is no worse than either. At 52 K params the order in which windows arrive carries no usable signal,
+so the mechanism stays behind its flag, default off.
+
+**The mechanism (1.16.0).** The window starts are cut into blocks of 16 (123,142 blocks here). Each
+block is scored by the mean −ln p(token) of the tokens its windows touch, under the corpus's own
+unigram frequencies (Platanios et al.'s "word rarity"). The blocks are sorted easiest first, once. At
+step t the sampler draws only from the easiest c(t) share, c(t) = min(1, sqrt(t(1 − c0²)/N + c0²)),
+c0 = 0.1 (Platanios et al. 2019), and from step N on it is the uniform sampler. A pick spends the one
+`rng_u64` the uniform sampler draws, so **every arm at a seed shares its init, dropout and RNG
+stream**; only which windows it sees differs. Building the order costs ~70 ms on this corpus.
+
+**The matched A/B (X021 protocol).** `--corpus c4-24-trainA --bpe 256 --steps 4000`, held-out eval on
+the disjoint `c4-24-heldB` (4 MB each, ~1.97 M BPE tokens; 52,768 params, V = 440). The seed is
+frozen (`CFG_SEED`), so seeds 1338 and 1339 are scratch builds that change only that constant, and
+the hardest-first control is a scratch build that reverses the order in `curriculum_pick`. Held-out
+bits/byte, Δ against the same seed's baseline:
+
+| arm | seed 1337 | seed 1338 | seed 1339 |
+|---|---:|---:|---:|
+| baseline (random windows) | **2.83681** | 2.82608 | 2.83581 |
+| `--curriculum 2000` (ramp over half the run) | 2.83023 (−0.23 %) | 2.83910 (+0.46 %) | 2.84610 (+0.36 %) |
+| `--curriculum 4000` (ramp over the whole run) | 2.85577 (+0.67 %) | — | — |
+| hardest first, ramp 2000 (scratch control) | 2.82755 (−0.33 %) | — | — |
+
+Own-corpus bits/byte at seed 1337: baseline 2.80388, ramp 2000 2.79729, ramp 4000 2.81863, hardest
+first 2.79451.
+
+**Reading it.**
+1. **Ramp over half the run: a wash.** Paired with its own seed's baseline it is −0.23 %, +0.46 % and
+   +0.36 %, a mean of **+0.20 %** (worse) with two of three seeds worse. The baseline's own seed spread
+   is 0.38 % (2.82608–2.83681), so this is noise, not an effect.
+2. **Ramp over the whole run: worse (+0.67 %, one seed),** more than the baseline's whole seed spread.
+   The hardest blocks open only as the cosine schedule decays the LR toward its floor, and 4000 × 16
+   windows cover about half an epoch, so that arm trains on the full distribution least.
+3. **Hardest first is no worse (−0.33 %, one seed, within noise).** If easy-to-hard ordering helped,
+   reversing it should hurt. It does not, so at this scale rarity ordering carries nothing the uniform
+   sampler lacks.
+4. **The baseline reproduces X043's to every printed digit** (2.80388 own, 2.83681 held-out), across
+   the 1.10 → 1.16 toolchain and dependency moves. The protocol is stable on this config.
+
+**Decision.** Recorded as a null result. **`--curriculum` stays behind its flag** (default off; the
+no-flag run is byte-identical), tested and resume-deterministic, as MTP did after X043. **Parked:**
+another difficulty measure (the 1.5.x prose-quality score, or the model's own loss, as in self-paced
+learning); shorter ramps (500 / 1000); the preset (~229 K) scale bracket; a multi-epoch run, where
+ordering might matter more than in half an epoch. **Next in the training-science sequence: #1, training
+dynamics** (optimizer, LR schedule, init, clip).
+
+Reproduce (each arm ~15 min on Cezanne with 8 running at once):
+
+    P="--corpus data/c4-24-trainA.txt --bpe 256 --steps 4000 --eval --eval-corpus data/c4-24-heldB.txt"
+    ./build/attn11 $P                     # baseline
+    ./build/attn11 $P --curriculum 2000   # ramp over half the run
+    ./build/attn11 $P --curriculum 4000   # ramp over the whole run

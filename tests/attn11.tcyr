@@ -3778,6 +3778,11 @@ fn main(): i64 {
     test_model_dropout_fd();
     test_model_mtp3();
     test_model_hybrid_moe();
+    test_group("1.16.0 curriculum (X044)");
+    test_curriculum_order();
+    test_curriculum_schedule();
+    test_curriculum_rng_neutral();
+    test_curriculum_resume();
 
     return assert_summary();
 }
@@ -4060,6 +4065,187 @@ fn test_model_hybrid_moe(): i64 {
     check("hybrid+moe dtokemb", aTok, nTok, n_tok, 1000);
     assert(_nonzero(aWk1, Cc) * _nonzero(aWq2, Cc) == 1,
       "hybrid+moe: the checked layer gradients are non-zero (the checks are not vacuous)");
+    return 0;
+}
+
+# ---- 1.16.0 curriculum (X044, --curriculum N) ------------------------------
+# Registered dead-last, after every RNG-consuming group, like the 1.15.2 groups.
+
+# A 400-byte corpus of alternating "ab" with a rare stretch [200, 264) cycling through 16
+# other bytes, so the rarest blocks are known. Returns the byte vocab (18).
+fn _curr_corpus(): i64 {
+    var n = 400;
+    var buf = alloc(n);
+    var i = 0;
+    while (i < n) {
+        if ((i >= 200) && (i < 264)) { store8(buf + i, 99 + (i % 16)); }
+        else { store8(buf + i, 97 + (i % 2)); }
+        i = i + 1;
+    }
+    return corpus_set(buf, n);
+}
+
+# The order: a permutation of the blocks, scores non-decreasing along it, ties in corpus
+# order, the rare stretch last and the common text first; a too-short corpus is refused.
+fn test_curriculum_order(): i64 {
+    var V = _curr_corpus();
+    assert(V == 18, "curriculum corpus: 2 common + 16 rare byte ids");
+    model_init(V, 8, 4, 2, 2, 1, 0, f64_from(0), 3);
+    var nb = curriculum_build(50);
+    assert(nb == 99, "curriculum: 395 starts cut into 99 blocks of 4");
+    assert((g_curr_bl == 4) && (g_curr_n == 50) && (g_curr_nb == 99), "curriculum: globals armed");
+    var seen = alloc(nb * 8);
+    var i = 0;
+    while (i < nb) { store64(seen + i * 8, 0); i = i + 1; }
+    var perm = 1; var mono = 1; var stable = 1;
+    i = 0;
+    while (i < nb) {
+        var b = load64(g_curr_ord + i * 8);
+        if ((b < 0) || (b >= nb)) { perm = 0; }
+        else { store64(seen + b * 8, load64(seen + b * 8) + 1); }
+        if (i > 0) {
+            var pb = load64(g_curr_ord + (i - 1) * 8);
+            var kp = load64(g_curr_key + pb * 8); var kb = load64(g_curr_key + b * 8);
+            if (kp > kb) { mono = 0; }
+            if ((kp == kb) && (pb > b)) { stable = 0; }
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < nb) { if (load64(seen + i * 8) != 1) { perm = 0; } i = i + 1; }
+    assert(perm == 1, "curriculum: the order is a permutation of the blocks");
+    assert(mono == 1, "curriculum: block scores are non-decreasing, easiest first");
+    assert(stable == 1, "curriculum: equal scores keep corpus order (stable sort)");
+    var hard = load64(g_curr_ord + (nb - 1) * 8) * 4;
+    var easy = load64(g_curr_ord) * 4;
+    assert((hard >= 196) && (hard < 264), "curriculum: the hardest block touches the rare stretch");
+    assert((easy + 8 <= 200) || (easy >= 264), "curriculum: the easiest block is plain common text");
+    var k0 = load64(g_curr_key + load64(g_curr_ord) * 8);
+    assert(((k0 >> 63) & 1) == 0, "curriculum: scores are non-negative (key order is numeric)");
+    # a corpus of T + 1 tokens has no start to order: refused, the sampler left off
+    g_curr_n = 0;
+    var sb = alloc(8);
+    store8(sb, 97); store8(sb + 1, 98); store8(sb + 2, 97); store8(sb + 3, 98); store8(sb + 4, 97);
+    var Vs = corpus_set(sb, 5);
+    model_init(Vs, 8, 4, 2, 2, 1, 0, f64_from(0), 3);
+    assert(curriculum_build(10) == (0 - 1), "curriculum: a corpus of ctx+1 tokens is refused (-1)");
+    assert(g_curr_n == 0, "curriculum: a refused build leaves the sampler off");
+    return 0;
+}
+
+# The schedule: open blocks start near c0 = 0.1 of nb, never shrink, reach nb at step N;
+# picks stay inside the open blocks, and at full competence every block is reachable.
+fn test_curriculum_schedule(): i64 {
+    var V = _curr_corpus();
+    model_init(V, 8, 4, 2, 2, 1, 0, f64_from(0), 3);
+    var nb = curriculum_build(50);
+    var o0 = curriculum_open(0);
+    assert((o0 >= 1) && (o0 <= nb / 10), "curriculum: step 0 opens about c0 = 10% of blocks");
+    var mono = 1; var prev = o0; var t = 1;
+    while (t <= 60) {
+        var o = curriculum_open(t);
+        if (o < prev) { mono = 0; }
+        prev = o; t = t + 1;
+    }
+    assert(mono == 1, "curriculum: the open share never shrinks");
+    assert((curriculum_open(49) < nb) && (curriculum_open(50) == nb), "curriculum: fully open at step N");
+    # step 0: every pick lands in one of the o0 easiest blocks
+    var rank = alloc(nb * 8);
+    var i = 0;
+    while (i < nb) { store64(rank + load64(g_curr_ord + i * 8) * 8, i); i = i + 1; }
+    _rng_state = 4242;
+    var inside = 1; var inrange = 1; i = 0;
+    while (i < 500) {
+        var s = curriculum_pick(rng_u64() & 0x7FFFFFFFFFFFFFFF, 0);
+        if ((s < 0) || (s >= 395)) { inrange = 0; }
+        elif (load64(rank + (s / 4) * 8) >= o0) { inside = 0; }
+        i = i + 1;
+    }
+    assert(inrange == 1, "curriculum: early picks are valid starts");
+    assert(inside == 1, "curriculum: early picks come only from the open (easiest) blocks");
+    # full competence: 4000 picks reach every block and stay in [0, span)
+    var hit = alloc(nb * 8);
+    i = 0;
+    while (i < nb) { store64(hit + i * 8, 0); i = i + 1; }
+    i = 0;
+    while (i < 4000) {
+        var s2 = curriculum_pick(rng_u64() & 0x7FFFFFFFFFFFFFFF, 50);
+        if ((s2 < 0) || (s2 >= 395)) { inrange = 0; }
+        else { store64(hit + (s2 / 4) * 8, 1); }
+        i = i + 1;
+    }
+    var all = 1; i = 0;
+    while (i < nb) { if (load64(hit + i * 8) == 0) { all = 0; } i = i + 1; }
+    assert(inrange == 1, "curriculum: late picks are valid starts (the short last block included)");
+    assert(all == 1, "curriculum: at full competence every block is reachable");
+    g_curr_n = 0;
+    return 0;
+}
+
+# RNG-neutral: a curriculum window spends exactly the one draw the uniform sampler does,
+# at any step, so the stream (dropout, later windows) stays aligned with an off run.
+fn test_curriculum_rng_neutral(): i64 {
+    var V = _curr_corpus();
+    model_init(V, 8, 4, 2, 2, 1, 0, f64_from(0), 3);
+    curriculum_build(50);
+    var same = 1; var t = 0;
+    while (t < 3) {
+        g_step = t * 40;
+        _rng_state = 9001 + t;
+        g_curr_n = 50; sample_window();
+        var r_on = _rng_state;
+        _rng_state = 9001 + t;
+        g_curr_n = 0; sample_window();
+        if (_rng_state != r_on) { same = 0; }
+        t = t + 1;
+    }
+    assert(same == 1, "curriculum: one draw per window, as the uniform sampler");
+    g_curr_n = 0; g_step = 0;
+    return 0;
+}
+
+# Resume: train(K) with the curriculum equals train(K1) -> checkpoint -> a REBUILT order ->
+# train(K), bit-for-bit (the order is a pure function of the corpus, the schedule of
+# g_step). And the curriculum changes the run, so the check is not vacuous.
+fn test_curriculum_resume(): i64 {
+    var V = build_corpus();
+    var C = 8; var T = 4; var nh = 2; var NL = 2;
+    var base = _lrc(3, 1000); var minl = _lrc(3, 10000); var clip = f64_from(1);
+    var K = 24; var K1 = 9; var B = 4; var warm = 5; var quiet = 1000000000; var N = 16;
+    model_init(V, C, T, nh, nh, NL, 0, f64_from(0), 7);
+    curriculum_build(N);
+    train(K, K, B, base, minl, warm, clip, quiet);
+    var np = g_NP;
+    var snapA = t_alloc(np); t_copy(snapA, g_params, np);
+
+    model_init(V, C, T, nh, nh, NL, 0, f64_from(0), 7);
+    curriculum_build(N);
+    train(K1, K, B, base, minl, warm, clip, quiet);
+    var sz = ckpt_size();
+    var buf = alloc(sz);
+    ckpt_serialize(buf);
+    g_curr_n = 0; g_curr_nb = 0; g_curr_ord = 0;     # a fresh process: no order yet
+    model_init(V, C, T, nh, nh, NL, 0, f64_from(0), 999);
+    var rc = ckpt_load_buf(buf, sz);
+    curriculum_build(N);
+    train(K, K, B, base, minl, warm, clip, quiet);
+    var mism = 0; var i = 0;
+    while (i < np) {
+        if (load64(g_params + i * 8) != load64(snapA + i * 8)) { mism = mism + 1; }
+        i = i + 1;
+    }
+    assert(rc == 0, "curriculum resume: checkpoint loads");
+    assert(mism == 0, "curriculum resume: a rebuilt order reproduces params bit-for-bit");
+
+    g_curr_n = 0;
+    model_init(V, C, T, nh, nh, NL, 0, f64_from(0), 7);
+    train(K, K, B, base, minl, warm, clip, quiet);
+    var diff = 0; i = 0;
+    while (i < np) {
+        if (load64(g_params + i * 8) != load64(snapA + i * 8)) { diff = diff + 1; }
+        i = i + 1;
+    }
+    assert(diff > 0, "curriculum resume: the curriculum changes the trained params (not vacuous)");
     return 0;
 }
 

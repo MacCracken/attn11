@@ -37,6 +37,7 @@ attn11 --rope-dim N          decoupled-RoPE channel width d_rope (even, 2..d_mod
 attn11 --experts N           MoE: N experts per block (1 = dense; >1 enables top-K routing, 1..256)
 attn11 --expert-topk K       active experts per token (default 2; 1..N)
 attn11 --mtp N               multi-token prediction: N-1 aux heads predict t+2..t+N (1 = off; 1..8)
+attn11 --curriculum N        easy-to-hard data order: open the corpus by unigram rarity over N steps (0 = off)
 attn11 --bpe K               learn K BPE merges first (1..512; default is byte-level)
 attn11 --eval                print CE/token + bits-per-byte after training/save
 attn11 --eval-corpus P       held-out eval on a disjoint corpus via the loaded tokenizer

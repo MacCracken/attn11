@@ -4,6 +4,146 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.16.0] - 2026-11-09
+
+The training-science #3 lane's second thread: an easy-to-hard curriculum, `--curriculum N`, and its
+matched experiment X044, **a null result at 52 K params**. The flag is additive and off by default,
+and the no-flag run is byte-identical to 1.15.4.
+
+### Added
+
+- **`--curriculum N`: a competence-based curriculum** (Bengio et al. 2009; Platanios et al. 2019).
+  - **Order:** the window starts are cut into blocks of `ctx` starts, more when needed to keep at
+    most 2²⁰ blocks. Each block is scored by unigram rarity, the mean −ln p(token) of the tokens its
+    windows touch under the corpus's own frequencies, and the blocks are sorted easiest first, once.
+    The sort is stable, so the order is a pure function of the corpus and `ctx`.
+  - **Schedule:** at step t the sampler draws only from the easiest c(t) share,
+    c(t) = min(1, sqrt(t(1 − c0²)/N + c0²)) with c0 = 0.1. From step N on it is the uniform sampler.
+  - **RNG-neutral:** a pick spends the one `rng_u64` the uniform sampler draws, so init, dropout and
+    every later draw match a run without the flag. Only which windows are seen changes.
+  - **Resume:** the checkpoint does not store the order. `--load` with the same `--curriculum N`
+    rebuilds it and continues bit-for-bit, because the schedule depends only on the restored step.
+  - **Limits:** AR objective only, and an in-memory corpus only, so not `--stream-corpus`; not with
+    `--gen-only`. Each of those, a negative N, a non-integer and a corpus shorter than ctx + 2
+    tokens exits 1 with a message. `0` means off.
+  - **Cost:** ~70 ms to build the order for the X021 protocol's 4 MB corpus (123,142 blocks). The
+    order's buffers are three i64 arrays of one entry per block, at most 24 MB. The per-window pick
+    is not measurable: 1000 steps on that corpus took 57.9 s with it and 58.0 s without (4
+    interleaved pairs, medians).
+  - **Banner:** a curriculum run prints `curriculum=rarity(ramp=N steps, blocks=… of … starts)` after
+    the corpus line. Nothing new prints without the flag.
+
+### Experiment — X044 (`docs/development/experiments.md`)
+
+The X021 protocol: `--corpus c4-24-trainA --bpe 256 --steps 4000`, held-out bits/byte on the
+disjoint `c4-24-heldB`. Seeds 1338 and 1339 and the hardest-first control are scratch builds.
+
+| arm | held-out bits/byte vs its seed's baseline |
+|---|---|
+| ramp over half the run (`--curriculum 2000`), 3 seeds | −0.23 %, +0.46 %, +0.36 %; **mean +0.20 %** |
+| ramp over the whole run (`--curriculum 4000`), seed 1337 | **+0.67 %** |
+| hardest first, ramp 2000 (control), seed 1337 | −0.33 % |
+
+- The baseline's own seed spread is 0.38 %, so the half-run ramp is noise.
+- The whole-run ramp is worse: the hardest blocks open only as the LR decays.
+- Reversing the order does not hurt, so at this scale rarity ordering carries nothing the random
+  window lacks.
+- The seed-1337 baseline reproduces X043's to every printed digit (2.83681 held-out).
+
+**Decision:** the mechanism stays behind its flag, as `--mtp` did after X043. The roadmap's #3 lane is
+closed and **#1, training dynamics, is next**.
+
+### Tests
+
+- **`1.16.0 curriculum (X044)`**, four tests, 22 assertions, registered last so no earlier test's RNG
+  position moves:
+  - `test_curriculum_order`:
+    - the order is a permutation;
+    - scores never decrease along it, and ties keep corpus order;
+    - the planted rare stretch sorts last, and common text sorts first;
+    - a corpus of ctx + 1 tokens is refused and leaves the sampler off.
+  - `test_curriculum_schedule`:
+    - step 0 opens about 10 % of the blocks, the share never shrinks, and every block is open at
+      step N;
+    - 500 early picks stay inside the open blocks;
+    - 4,000 late picks reach every block, the short last block included.
+  - `test_curriculum_rng_neutral`: a window spends exactly the uniform sampler's one draw, at three
+    different steps.
+  - `test_curriculum_resume`: train(24) equals train(9) → checkpoint → a rebuilt order → train(24),
+    bit-for-bit. The same run without the curriculum differs, so the check is not vacuous.
+- **Mutation run, in a scratch copy: 7 of 7 mutants killed.** The mutants are:
+  - a descending sort, and an unstable sort;
+  - a schedule that is always fully open;
+  - a pick that ignores the order, and a pick with an extra RNG draw;
+  - a pick without the last block's clamp;
+  - negative scores.
+- **`make smoke`:**
+  - a valid `--curriculum 10 --steps 20` run;
+  - hostile `--curriculum -1`, `--curriculum x` and `--curriculum 5 --gen-only`;
+  - clean rejections of `--curriculum` with `--objective diffusion` and with `--stream-corpus`.
+- **Suite:** x86_64 **1139/1139** (+22), aarch64/qemu **1132/1132**. Fuzz, bench, the AGNOS build,
+  `cyrius fmt --check` and `cyrius lint` (0 warnings) pass.
+
+### Verified — the no-flag path is byte-identical
+
+The golden suite, 28 runs plus the checkpoint and shard they write, is byte-identical to 1.15.4's.
+The one differing line is the output path `--encode-shard` prints.
+
+### Docs
+
+- `experiments.md` X044, the roadmap's #3 lane, `docs/sources.md` (Bengio et al. 2009; Platanios et
+  al. 2019), `getting-started.md`, the README and `--help`.
+- **The roadmap:**
+  - its "Where we are" now leads with the current state;
+  - the `file_seek` item is ticked (done in 1.15.2);
+  - the cmdit section's `--decode-schedule` note is marked fixed (1.15.2).
+
+## [1.15.4] - 2026-11-09
+
+onto akshara 1.3.1, which closes the `stream_tok` issue attn11's 1.15.2 audit filed upstream. Every
+output is byte-identical to 1.15.3's.
+
+### Changed
+
+- **`[deps.akshara]` `1.1.3` → `1.3.1`.**
+  - 1.2.0: `bpe_learn`'s argmax reads a per-row cache. 1.3.0: `tok_encode` merges by rank for inputs
+    up to 8 KiB. akshara gates both on producing the same ids, and attn11's runs confirm it (below).
+  - 1.3.1: `stream_tok` checks every chunk it reads against the installed tokenizer's vocabulary,
+    and fails with `akshara: shard token id out of vocabulary -- corrupt shard` (exit 1) before
+    returning any id from that chunk. That closes
+    [the issue](https://github.com/MacCracken/akshara/blob/main/docs/development/issues/2026-11-09-stream-tok-unchecked-ids.md)
+    filed in 1.15.2. It needs the shard's tokenizer installed before the first read, which
+    `shard_open` already does.
+  - **The lock:** `cyrius.lock` was regenerated. Against 1.15.3's it differs in exactly two lines,
+    akshara's commit and its file hash. `deps --verify` passes 119/0, `--locked` is clean, and
+    `lib/akshara.cyr` is byte-identical to akshara's `dist/akshara.cyr` at the tag.
+- **`tok_ld` stays.** A corrupt shard now stops in akshara first, so `make smoke`'s out-of-vocabulary
+  shard exits 1 with akshara's message instead of attn11's. attn11's check still bounds every token
+  by the *model's* `g_V` on every path, streamed or not. Its comment says so now.
+
+### Verified — byte-identical
+
+- **The golden suite, 28 runs plus the checkpoint and shard they write, is byte-identical** to the
+  1.15.3 build's: every mixer and objective, `--mtp`, `--ternary`, `--bpe 64`, `--preset`, `--gpu`,
+  vision and hearing, save → resume, `--encode-shard` → `--stream-corpus`. The one differing line
+  is the output path `--encode-shard` prints.
+- **The BPE shard paths are identical too:** an `--encode-shard` and a `--stream-encode` BPE shard,
+  a 100-step `--stream-corpus` run from the BPE shard, and the X021 protocol's 4 MB `--bpe 256`
+  learn, compared through the checkpoint it writes.
+- **Suite:** x86_64 1117/1117, aarch64/qemu 1110/1110. The fuzz harness, `make smoke` and
+  `cyrius lint` (0 warnings) pass.
+
+### Performance
+
+Wall time of a `--steps 0 --gen-only` startup, both builds, 5 interleaved runs, medians:
+
+| corpus, merges | 1.15.3 | 1.15.4 | Δ |
+|---|---:|---:|---:|
+| 64 KiB, `--bpe 512` | 264 ms | 122 ms | **−54 %** (akshara's cached argmax) |
+| 4 MB (`c4-24-trainA`), `--bpe 256` | 2.30 s | 2.26 s | −1.7 % (noise; the O(n) merge pass dominates) |
+
+Training steps run no akshara code, so they are unchanged.
+
 ## [1.15.3] - 2026-11-09
 
 The training step reuses GELU's tanh: rupantara 0.6.1's `ru_gelu_fwd_t`, the change 1.15.2 filed

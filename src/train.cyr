@@ -14,6 +14,9 @@
 # shard could hand `embed_bwd` an id >= V: an out-of-bounds gradient WRITE, plus OOB
 # reads in `embed_fwd_n` / the CE target / `g_tok_len` (1.15.2 audit, HIGH). Fail
 # closed here instead: one compare per token loaded, off the per-element hot path.
+# Since akshara 1.3.1 (attn11 1.15.4) `stream_tok` also checks each chunk it reads
+# against the installed tokenizer's vocabulary and exits first; this check stays as
+# the bound against the MODEL's g_V, and as defense in depth for every other path.
 fn tok_ld(i): i64 {
     var t = gd_ld(i);
     if ((t < 0) || (t >= g_V)) {
@@ -48,6 +51,145 @@ fn mtp_fill_targets(s): i64 {
     }
     return 0;
 }
+
+# ---- competence-based curriculum (X044, --curriculum N) --------------------
+# Easy-to-hard data order (Bengio et al. 2009) under the competence schedule of
+# Platanios et al. 2019: at step t the sampler draws only from the easiest c(t) share of
+# the corpus, c(t) = min(1, sqrt(t * (1 - c0^2) / N + c0^2)) with c0 = 0.1. It opens to the
+# whole corpus at step N, and from then on it is the uniform sampler.
+# - Difficulty is unigram rarity (Platanios's "word rarity"): the mean -ln p(token) under
+#   the corpus's own token frequencies, over every token a window starting in the block
+#   touches.
+# - The window starts [0, span) are cut into nb blocks of g_curr_bl starts (bl = T, or more
+#   so nb <= CURR_MAX_BLOCKS), scored once and sorted easiest first. The sort is stable, so
+#   ties keep corpus order and the order is a pure function of the corpus and T: a resume
+#   with the same flag rebuilds it and continues bit-for-bit.
+# - RNG-neutral: a pick spends the one rng_u64 the uniform sampler draws, so init, dropout
+#   and every later draw stay aligned with an uncurriculated run. Only the windows differ.
+var g_curr_n = 0;      # ramp length N in steps (0 = off)
+var g_curr_nb = 0;     # blocks in the order
+var g_curr_bl = 0;     # window starts per block
+var g_curr_ord = 0;    # nb i64 block indices, easiest first
+var g_curr_key = 0;    # nb f64 block scores (mean surprisal, nats), indexed by block
+
+# cap on the block count, so the order's three nb-long i64 buffers stay <= 24 MB
+fn CURR_MAX_BLOCKS(): i64 { return 1048576; }
+
+# Stable bottom-up merge sort of the n block indices in `ord` by key[idx], using `tmp`
+# (n i64) as the other buffer. Keys compare as signed i64, which is the numeric order
+# for the non-negative f64 bit patterns curriculum_build stores. Returns 0.
+fn _curr_sort(ord, tmp, key, n): i64 {
+    var src = ord; var dst = tmp;
+    var w = 1;
+    while (w < n) {
+        var lo = 0;
+        while (lo < n) {
+            var mid = lo + w; if (mid > n) { mid = n; }
+            var hi = lo + 2 * w; if (hi > n) { hi = n; }
+            var a = lo; var b = mid; var k = lo;
+            while (k < hi) {
+                var take_a = 0;
+                if (a < mid) {
+                    if (b >= hi) { take_a = 1; }
+                    else {
+                        var ka = load64(key + load64(src + a * 8) * 8);
+                        if (ka <= load64(key + load64(src + b * 8) * 8)) { take_a = 1; }
+                    }
+                }
+                if (take_a == 1) { store64(dst + k * 8, load64(src + a * 8)); a = a + 1; }
+                else { store64(dst + k * 8, load64(src + b * 8)); b = b + 1; }
+                k = k + 1;
+            }
+            lo = hi;
+        }
+        var sw = src; src = dst; dst = sw;
+        w = w * 2;
+    }
+    if (src != ord) {
+        var i = 0;
+        while (i < n) { store64(ord + i * 8, load64(src + i * 8)); i = i + 1; }
+    }
+    return 0;
+}
+
+# Build the curriculum order for a ramp of n steps over the loaded corpus (g_T and g_V
+# set). Returns the block count nb > 0, or -1 when the corpus is too short to cut
+# (fewer than T + 2 tokens), -2 when an allocation fails. Arms the sampler only on success.
+fn curriculum_build(n): i64 {
+    var T = g_T;
+    var span = g_datalen - T - 1;        # the uniform sampler's starts are [0, span)
+    if (span < 1) { return 0 - 1; }
+    var bl = T;
+    var cap = CURR_MAX_BLOCKS();
+    if ((span + bl - 1) / bl > cap) { bl = (span + cap - 1) / cap; }
+    var nb = (span + bl - 1) / bl;
+    var V = g_V;
+    var cnt = alloc(V * 8); var st = alloc(V * 8);
+    var key = alloc(nb * 8); var ord = alloc(nb * 8); var tmp = alloc(nb * 8);
+    if ((cnt == 0) || (st == 0) || (key == 0) || (ord == 0) || (tmp == 0)) { return 0 - 2; }
+    var i = 0;
+    while (i < V) { store64(cnt + i * 8, 0); i = i + 1; }
+    var N = span + T;                    # a window touches tokens s..s+T, so [0, span + T)
+    i = 0;
+    while (i < N) {
+        var t = tok_ld(i);
+        store64(cnt + t * 8, load64(cnt + t * 8) + 1);
+        i = i + 1;
+    }
+    # surprisal per token id: ln N - ln count (0 for an id the corpus never uses)
+    var lnN = f64_ln(f64_from(N));
+    i = 0;
+    while (i < V) {
+        var c = load64(cnt + i * 8);
+        var s = 0;
+        if (c > 0) { s = f64_sub(lnN, f64_ln(f64_from(c))); }
+        if (((s >> 63) & 1) == 1) { s = 0; }    # never negative: the key order stays numeric
+        store64(st + i * 8, s);
+        i = i + 1;
+    }
+    # block b holds starts [b*bl, min((b+1)*bl, span)); its windows touch [b*bl, hi + T)
+    var b = 0;
+    while (b < nb) {
+        var lo = b * bl;
+        var hi = lo + bl; if (hi > span) { hi = span; }
+        var sum = 0;
+        var j = lo;
+        while (j < hi + T) { sum = f64_add(sum, load64(st + tok_ld(j) * 8)); j = j + 1; }
+        store64(key + b * 8, f64_div(sum, f64_from(hi + T - lo)));
+        store64(ord + b * 8, b);
+        b = b + 1;
+    }
+    _curr_sort(ord, tmp, key, nb);
+    g_curr_n = n; g_curr_nb = nb; g_curr_bl = bl; g_curr_ord = ord; g_curr_key = key;
+    return nb;
+}
+
+# The number of blocks open at step t: floor(c(t) * nb) clamped to [1, nb], every block
+# from step g_curr_n on.
+fn curriculum_open(t): i64 {
+    var nb = g_curr_nb;
+    if (t >= g_curr_n) { return nb; }
+    var c0sq = f64_div(f64_from(1), f64_from(100));                 # c0 = 0.1
+    var frac = f64_div(f64_from(t), f64_from(g_curr_n));
+    var c = f64_sqrt(f64_add(f64_mul(frac, f64_sub(f64_from(1), c0sq)), c0sq));
+    var k = f64_to(f64_floor(f64_mul(c, f64_from(nb))));
+    if (k < 1) { k = 1; }
+    if (k > nb) { k = nb; }
+    return k;
+}
+
+# The window start for a non-negative draw r at step t: the block of rank r % open in
+# the easiest-first order, then a start inside that block from the remaining bits.
+fn curriculum_pick(r, t): i64 {
+    var open = curriculum_open(t);
+    var b = load64(g_curr_ord + (r % open) * 8);
+    var lo = b * g_curr_bl;
+    var len = g_curr_bl;
+    var span = g_datalen - g_T - 1;
+    if (lo + len > span) { len = span - lo; }
+    return lo + (r / open) % len;
+}
+
 # Fill A_tokens/A_targets from a random window of the corpus.
 fn sample_window(): i64 {
     var T = g_T;
@@ -57,6 +199,7 @@ fn sample_window(): i64 {
     # index out of bounds. Masking always yields a non-negative value.
     var s = rng_u64() & 0x7FFFFFFFFFFFFFFF;
     if (span < 1) { s = 0; }      # corpus barely long enough; start at 0
+    elif (g_curr_n > 0) { s = curriculum_pick(s, g_step); }   # X044: same draw, easiest first
     else { s = s % span; }
     var t = 0;
     while (t < T) {

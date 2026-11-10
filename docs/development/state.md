@@ -5,6 +5,27 @@
 
 ## Version
 
+**1.16.0** — *the curriculum, X044* (2026-11-09).
+- **What changed:** `--curriculum N`, a competence-based easy-to-hard data order by unigram rarity
+  (Platanios et al. 2019). It is RNG-neutral (one draw per window, as the uniform sampler) and
+  resume-deterministic; AR objective and in-memory corpus only.
+- **Result (X044):** a null result at 52 K params. Ramping over half the run is within seed noise
+  (paired mean +0.20 % held-out bits/byte over 3 seeds); over the whole run it is +0.67 % worse; the
+  hardest-first control is no worse. Kept behind the flag; the roadmap's #3 lane is closed and **#1,
+  training dynamics, is next**.
+- **Same results without the flag:** the golden suite is byte-identical to 1.15.4's.
+- **Suite:** **1139** on x86_64 and **1132** on aarch64 (+22).
+
+**1.15.4** — *onto akshara 1.3.1* (2026-11-09).
+- **What changed:** `[deps.akshara]` 1.1.3 → 1.3.1. Its `stream_tok` now checks every chunk it reads
+  against the installed vocabulary, closing the issue the 1.15.2 audit filed upstream; `tok_ld` stays
+  as the model-`g_V` bound.
+- **Same results:** the 28-run golden suite, its checkpoint and shard, and the BPE shard paths are
+  byte-identical to 1.15.3's.
+- **Speed:** a 64 KiB `--bpe 512` startup is 264 → 122 ms (akshara's cached `bpe_learn` argmax);
+  the 4 MB `--bpe 256` learn and the training step are unchanged.
+- **Suite:** **1117** on x86_64 and **1110** on aarch64 (unchanged).
+
 **1.15.3** — *the GELU tanh cache* (2026-11-09).
 - **What changed:** onto rupantara 0.6.1. Its `ru_gelu_fwd_t` hands the training forward's tanh to
   the backward, which reuses it (`gelu_bwd_t`) instead of calling `f64_tanh` again.
@@ -1308,10 +1329,16 @@ checkpoint vs Linux at fixed CPU — `scripts/agnos-smoke.sh`):
   `rl_rollout`/`rl_reward`/`rl_prompt`/`rl_eval` (train.cyr). Grad-checked 3 ways
   (`test_rl_op`) + rollout structural (`test_rl_rollout`), +11 checks. X024: policy
   target-char freq 9–19% → ~99.7% (gate met) with the honest SFT→RL alignment tax.
+- **Competence-based curriculum** (1.16.0, `--curriculum N`, X044): the window starts are cut into
+  blocks scored by unigram rarity and sorted easiest first; at step t the sampler draws from the
+  easiest `c(t) = min(1, sqrt(t(1 − c0²)/N + c0²))` share (c0 = 0.1), uniform from step N on. One
+  RNG draw per window, as the uniform sampler, so a seed's init and dropout are unchanged;
+  resume-deterministic (the order is rebuilt from the corpus). AR + in-memory corpus only.
+  `curriculum_build`/`curriculum_open`/`curriculum_pick` (train.cyr). X044: a null result at 52 K.
 - CLI: `--corpus --stdin --load --save --steps --gen-only --preset --heads
   --kv-heads --layers --attn-kind --latent-dim --attn-every --pos-kind --rope-dim
   --experts --expert-topk --bpe --eval --eval-corpus --encode-shard --stream-encode
-  --stream-corpus --objective --decode-steps --decode-schedule --ternary`
+  --stream-corpus --objective --decode-steps --decode-schedule --ternary --curriculum`
   (`--attn-kind` takes `mha`/`mla`/`lin`/`ssm`; `--latent-dim` is the MLA latent /
   SSM state size; `--attn-every K` builds the per-layer hybrid over the `--attn-kind`
   base; `--objective` takes `ar`/`diffusion` — `diffusion` adds `--decode-steps` /
@@ -1471,8 +1498,8 @@ constant `nh·hd²` state instead of a T-growing K/V.
 
 ## Tests
 
-- `tests/attn11.tcyr` — **1117 checks** on x86_64, 1110 on aarch64 (1.15.3: +12 for the
-  GELU tanh cache; 1105 / 1098 at 1.15.2; the
+- `tests/attn11.tcyr` — **1139 checks** on x86_64, 1132 on aarch64 (1.16.0: +22 for the
+  curriculum; 1117 / 1110 at 1.15.3–1.15.4, +12 for the GELU tanh cache; 1105 / 1098 at 1.15.2; the
   x86-only hearing lane accounts for the difference): finite-difference gradient checks
   (every op incl. dropout; attention at head dims 6/8/10 and GQA/MQA at
   `nkv ∈ {1, 2, nh}` incl. `dWk`/`dWv`/`dbv`; the `|dbk| ≈ 0`
@@ -1580,8 +1607,9 @@ Direct (declared in `cyrius.cyml`):
   assert, bench, math, ganita, args, hashmap, tagged, fnptr, mmap, dynlib, sakshi,
   thread, sankoch, **mabda** (the bundled GPU foundation, 4.2.0 at 6.7.18 — a
   stdlib leaf since 1.14.4, no longer a `[deps.mabda]` git dep)
-- **[akshara](https://github.com/MacCracken/akshara) 1.1.3** — corpus + byte/BPE
-  tokenizer data layer (1.11.0 extraction)
+- **[akshara](https://github.com/MacCracken/akshara) 1.3.1** (1.15.4; 1.1.3 through 1.15.3) —
+  corpus + byte/BPE tokenizer data layer (1.11.0 extraction); since 1.3.1 `stream_tok` fails loud on
+  a shard id outside the installed vocabulary
 - **[tyche](https://github.com/MacCracken/tyche) 1.2.2** — deterministic
   statistical PRNG (`rng_seed`/`rng_u64`/`rng_uniform`/`rng_normal`)
 - **[rosnet](https://github.com/MacCracken/rosnet) 1.4.1** — tensor storage +
