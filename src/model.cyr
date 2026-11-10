@@ -311,6 +311,12 @@ var LA_xmid = 0;  # NL pointers, each T*C  (xin + attn)
 var LA_b = 0;     # NL pointers, each T*C  (ln2 out / mlp in)
 var LA_fc = 0;    # NL pointers, each T*F  (pre-GELU)
 var LA_g = 0;     # NL pointers, each T*F  (GELU out)
+# Dense-MLP GELU tanh cache, held only when g_gelu_cache == 1 (see model_gelu_cache_on):
+# LA_gt[L] (T*F) is the tanh gelu_fwd_t wrote in layer L's training forward, and
+# LA_gt_ok[L] is 1 while it is valid for LA_fc[L], so gelu_bwd_t skips its f64_tanh.
+var LA_gt = 0;    # NL pointers, each T*F  (GELU tanh, ru_gelu_fwd_t)
+var LA_gt_ok = 0; # NL i64: 1 = LA_gt[L] holds the tanh of the current LA_fc[L]
+var g_gelu_cache = 0;   # 1 when model_init allocated LA_gt / LA_gt_ok
 var LA_m1 = 0; var LA_r1 = 0;         # NL pointers, each T
 var LA_m2 = 0; var LA_r2 = 0;         # NL pointers, each T
 var LA_arena = 0; # NL pointers, each attn_arena_size
@@ -568,6 +574,25 @@ fn model_alloc_extra_bytes(V, C, T, mtp, ternary): i64 {
     return e * 8;
 }
 
+# The dense-MLP GELU tanh cache in bytes: the LA_gt and LA_gt_ok arrays (2*NL) plus
+# NL*T*F f64 of tanh. 0 for MoE, whose experts run their own GELU and keep no cache.
+fn model_gelu_cache_bytes(C, T, NL, num_experts): i64 {
+    if (num_experts > 1) { return 0; }
+    return (2 * NL + NL * T * 4 * C) * 8;
+}
+
+# 1 when model_init holds the GELU tanh cache: a dense model whose required bytes
+# (model_alloc_bytes_hyb + model_alloc_extra_bytes) leave room for it under the cap.
+# The cache is optional — without it gelu_bwd recomputes the tanh, at the same bits —
+# so the cap itself still counts only the required buffers and refuses no config,
+# fresh or loaded, that it accepted before the cache existed.
+fn model_gelu_cache_on(required_bytes, C, T, NL, num_experts): i64 {
+    var gcb = model_gelu_cache_bytes(C, T, NL, num_experts);
+    if (gcb <= 0) { return 0; }
+    if (required_bytes > CKPT_MAX_MODEL_BYTES() - gcb) { return 0; }
+    return 1;
+}
+
 # The model-allocation cap (128 MB), gating model_alloc_bytes for BOTH the
 # checkpoint loader (persist.cyr `-18`) and model_init's fresh-path pre-flight.
 # Defined here, not in persist.cyr, so every harness that builds a model has it
@@ -685,6 +710,7 @@ fn model_init_full(V, C, T, nh, nkv, NL, attn_bias, dropout, seed,
         puts("attn11: model_init: config exceeds the 128 MB model-allocation cap\n");
         sys_exit(1);
     }
+    g_gelu_cache = model_gelu_cache_on(abytes, C, T, NL, num_experts);
 
     g_params = t_alloc(g_NP);
     g_grads = t_alloc(g_NP);
@@ -800,6 +826,8 @@ fn model_init_full(V, C, T, nh, nkv, NL, attn_bias, dropout, seed,
     LA_resid = t_alloc(NL + 1);
     LA_a = t_alloc(NL); LA_xmid = t_alloc(NL); LA_b = t_alloc(NL);
     LA_fc = t_alloc(NL); LA_g = t_alloc(NL);
+    LA_gt = 0; LA_gt_ok = 0;
+    if (g_gelu_cache == 1) { LA_gt = t_alloc(NL); LA_gt_ok = t_alloc(NL); }
     LA_m1 = t_alloc(NL); LA_r1 = t_alloc(NL);
     LA_m2 = t_alloc(NL); LA_r2 = t_alloc(NL);
     LA_arena = t_alloc(NL);
@@ -827,6 +855,7 @@ fn model_init_full(V, C, T, nh, nkv, NL, attn_bias, dropout, seed,
         store64(LA_b + L * 8, t_alloc(TC));
         store64(LA_fc + L * 8, t_alloc(TF));
         store64(LA_g + L * 8, t_alloc(TF));
+        if (g_gelu_cache == 1) { store64(LA_gt + L * 8, t_alloc(TF)); }
         store64(LA_m1 + L * 8, t_alloc(T));
         store64(LA_r1 + L * 8, t_alloc(T));
         store64(LA_m2 + L * 8, t_alloc(T));
@@ -1379,7 +1408,12 @@ fn model_forward(): i64 {
         } else {
             var fc = La(LA_fc, L); var gg = La(LA_g, L);
             qlinear_fwd(b, PL(L, _o_Wfc()), PL(L, _o_bfc()), fc, T, C, F);
-            gelu_fwd(fc, gg, T * F);
+            if (g_gelu_cache == 1) {
+                # cache the tanh for gelu_bwd_t (1 = valid; 0 when --gpu-tc ran it on the GPU)
+                store64(LA_gt_ok + L * 8, gelu_fwd_t(fc, gg, La(LA_gt, L), T * F));
+            } else {
+                gelu_fwd(fc, gg, T * F);
+            }
             qlinear_fwd(gg, PL(L, _o_Wproj()), PL(L, _o_bproj()), A_mlp, T, F, C);
         }
         # residual dropout on the MLP branch
@@ -1514,6 +1548,8 @@ fn model_eval_window(n): i64 {
         } else {
             var fc = La(LA_fc, L); var gg = La(LA_g, L);
             qlinear_fwd(b, PL(L, _o_Wfc()), PL(L, _o_bfc()), fc, n, C, F);
+            # this n-row pass overwrites LA_fc[L] but not the tanh cache: mark it stale
+            if (g_gelu_cache == 1) { store64(LA_gt_ok + L * 8, 0); }
             gelu_fwd(fc, gg, n * F);
             qlinear_fwd(gg, PL(L, _o_Wproj()), PL(L, _o_bproj()), A_mlp, n, F, C);
         }
@@ -1565,7 +1601,9 @@ fn model_backward(): i64 {
               D_b, GL(L, _o_Wgate()), g_moe_dlaux, g_moe_sc, T, C, g_num_experts, g_expert_topk);
         } else {
             qlinear_bwd(La(LA_g, L), PL(L, _o_Wproj()), D_drop, D_g, GL(L, _o_Wproj()), GL(L, _o_bproj()), T, F, C);
-            gelu_bwd(La(LA_fc, L), D_g, D_fc, T * F);
+            var gt = 0;   # the forward's cached tanh when valid, else 0 (recompute)
+            if (g_gelu_cache == 1) { if (load64(LA_gt_ok + L * 8) == 1) { gt = La(LA_gt, L); } }
+            gelu_bwd_t(La(LA_fc, L), gt, D_g, D_fc, T * F);
             qlinear_bwd(La(LA_b, L), PL(L, _o_Wfc()), D_fc, D_b, GL(L, _o_Wfc()), GL(L, _o_bfc()), T, C, F);
         }
         ln_bwd(xmid, PL(L, _o_ln2g()), D_b, La(LA_m2, L), La(LA_r2, L), D_tmp,

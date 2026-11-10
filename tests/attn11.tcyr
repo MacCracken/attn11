@@ -1580,7 +1580,7 @@ fn test_alloc_accounting(): i64 {
     var used0 = alloc_used();
     model_init(5, 16, 8, 4, 2, 2, 1, f64_from(0), 4);
     var delta = alloc_used() - used0;
-    var predicted = model_alloc_bytes(5, 16, 8, 4, 2, 2, g_NP);
+    var predicted = model_alloc_bytes(5, 16, 8, 4, 2, 2, g_NP) + _gcache();
     assert(delta >= predicted, "model_alloc_bytes never under-predicts model_init");
     assert(delta <= predicted + 8192, "model_alloc_bytes tracks model_init (no forgotten buffers)");
     # second pin at a BPE-scale vocab (V > 256): the V-dependent terms
@@ -1588,14 +1588,14 @@ fn test_alloc_accounting(): i64 {
     used0 = alloc_used();
     model_init(300, 16, 8, 4, 2, 2, 1, f64_from(0), 4);
     delta = alloc_used() - used0;
-    predicted = model_alloc_bytes(300, 16, 8, 4, 2, 2, g_NP);
+    predicted = model_alloc_bytes(300, 16, 8, 4, 2, 2, g_NP) + _gcache();
     assert(delta >= predicted, "alloc accounting holds at V=300 (under)");
     assert(delta <= predicted + 8192, "alloc accounting holds at V=300 (over)");
     # MLA pin: the latent buffers (LA_c + D_lat1/D_lat2) must be accounted too
     used0 = alloc_used();
     model_init_arch(5, 16, 8, 4, 4, 2, 1, f64_from(0), 4, 1, 6, 0, 0);
     delta = alloc_used() - used0;
-    predicted = model_alloc_bytes_arch(5, 16, 8, 4, 4, 2, g_NP, 1, 6, 0, 0);
+    predicted = model_alloc_bytes_arch(5, 16, 8, 4, 4, 2, g_NP, 1, 6, 0, 0) + _gcache();
     assert(delta >= predicted, "mla alloc accounting (under)");
     assert(delta <= predicted + 8192, "mla alloc accounting (over)");
     # decoupled-RoPE pin: the rope projections (W_QR/W_KR in np) + the LA_qr/LA_kr
@@ -1603,7 +1603,7 @@ fn test_alloc_accounting(): i64 {
     used0 = alloc_used();
     model_init_arch(5, 16, 8, 4, 4, 2, 1, f64_from(0), 4, 1, 6, 2, 4);
     delta = alloc_used() - used0;
-    predicted = model_alloc_bytes_arch(5, 16, 8, 4, 4, 2, g_NP, 1, 6, 2, 4);
+    predicted = model_alloc_bytes_arch(5, 16, 8, 4, 4, 2, g_NP, 1, 6, 2, 4) + _gcache();
     assert(delta >= predicted, "mla-dec alloc accounting (under)");
     assert(delta <= predicted + 8192, "mla-dec alloc accounting (over)");
     # MoE pin (M13.2): the per-layer router/expert caches (LA_mlogits/msel/mgate/
@@ -1611,7 +1611,7 @@ fn test_alloc_accounting(): i64 {
     used0 = alloc_used();
     model_init_moe(5, 16, 8, 4, 4, 2, 1, f64_from(0), 4, 0, 0, 0, 0, 8, 2);
     delta = alloc_used() - used0;
-    predicted = model_alloc_bytes_moe(5, 16, 8, 4, 4, 2, g_NP, 0, 0, 0, 0, 8, 2);
+    predicted = model_alloc_bytes_moe(5, 16, 8, 4, 4, 2, g_NP, 0, 0, 0, 0, 8, 2) + _gcache();
     assert(delta >= predicted, "moe alloc accounting (under)");
     assert(delta <= predicted + 8192, "moe alloc accounting (over)");
     # gated-linear pin (M14): the per-layer retention state cache (g_lin_state)
@@ -1619,7 +1619,7 @@ fn test_alloc_accounting(): i64 {
     used0 = alloc_used();
     model_init_arch(5, 16, 8, 4, 4, 2, 1, f64_from(0), 4, 2, 0, 0, 0);
     delta = alloc_used() - used0;
-    predicted = model_alloc_bytes_arch(5, 16, 8, 4, 4, 2, g_NP, 2, 0, 0, 0);
+    predicted = model_alloc_bytes_arch(5, 16, 8, 4, 4, 2, g_NP, 2, 0, 0, 0) + _gcache();
     assert(delta >= predicted, "lin alloc accounting (under)");
     assert(delta <= predicted + 8192, "lin alloc accounting (over)");
     # selective-SSM pin (1.4.2): the per-layer Δ/B/C/h/y caches + the C*N decode
@@ -1627,7 +1627,7 @@ fn test_alloc_accounting(): i64 {
     used0 = alloc_used();
     model_init_arch(5, 16, 8, 4, 4, 2, 1, f64_from(0), 4, 3, 4, 0, 0);
     delta = alloc_used() - used0;
-    predicted = model_alloc_bytes_arch(5, 16, 8, 4, 4, 2, g_NP, 3, 4, 0, 0);
+    predicted = model_alloc_bytes_arch(5, 16, 8, 4, 4, 2, g_NP, 3, 4, 0, 0) + _gcache();
     assert(delta >= predicted, "ssm alloc accounting (under)");
     assert(delta <= predicted + 8192, "ssm alloc accounting (over)");
     # per-layer HYBRID pin (M14 rung c): the per-layer g_layer_kind array (pl=NL) +
@@ -1638,13 +1638,13 @@ fn test_alloc_accounting(): i64 {
     used0 = alloc_used();
     model_init_full(5, 16, 8, 4, 4, 2, 1, f64_from(0), 4, 2, 0, 0, 0, 1, 1, &hkA, 0);   # base lin
     delta = alloc_used() - used0;
-    predicted = model_alloc_bytes_hyb(5, 16, 8, 4, 4, 2, g_NP, 2, 0, 0, 0, 1, 1, &hkA);
+    predicted = model_alloc_bytes_hyb(5, 16, 8, 4, 4, 2, g_NP, 2, 0, 0, 0, 1, 1, &hkA) + _gcache();
     assert(delta >= predicted, "hybrid(base lin) alloc accounting (under)");
     assert(delta <= predicted + 8192, "hybrid(base lin) alloc accounting (over)");
     used0 = alloc_used();
     model_init_full(5, 16, 8, 4, 4, 2, 1, f64_from(0), 4, 0, 0, 0, 0, 1, 1, &hkA, 0);   # base mha
     delta = alloc_used() - used0;
-    predicted = model_alloc_bytes_hyb(5, 16, 8, 4, 4, 2, g_NP, 0, 0, 0, 0, 1, 1, &hkA);
+    predicted = model_alloc_bytes_hyb(5, 16, 8, 4, 4, 2, g_NP, 0, 0, 0, 0, 1, 1, &hkA) + _gcache();
     assert(delta >= predicted, "hybrid(base mha) alloc accounting (under)");
     assert(delta <= predicted + 8192, "hybrid(base mha) alloc accounting (over)");
     # mla/ssm hybrid alloc pins (M14 rung d): the padded K/V region + the present
@@ -1655,14 +1655,14 @@ fn test_alloc_accounting(): i64 {
     used0 = alloc_used();
     model_init_full(5, 16, 8, 4, 4, 2, 1, f64_from(0), 4, 1, 6, 0, 0, 1, 1, &hkM, 0);   # base mla, latent 6
     delta = alloc_used() - used0;
-    predicted = model_alloc_bytes_hyb(5, 16, 8, 4, 4, 2, g_NP, 1, 6, 0, 0, 1, 1, &hkM);
+    predicted = model_alloc_bytes_hyb(5, 16, 8, 4, 4, 2, g_NP, 1, 6, 0, 0, 1, 1, &hkM) + _gcache();
     assert(delta >= predicted, "hybrid(mha/mla) alloc accounting (under)");
     assert(delta <= predicted + 8192, "hybrid(mha/mla) alloc accounting (over)");
     var hkS[16]; store64(&hkS + 0, 0); store64(&hkS + 8, 3);          # mha,ssm
     used0 = alloc_used();
     model_init_full(5, 16, 8, 4, 4, 2, 1, f64_from(0), 4, 3, 4, 0, 0, 1, 1, &hkS, 0);   # base ssm, state N=4
     delta = alloc_used() - used0;
-    predicted = model_alloc_bytes_hyb(5, 16, 8, 4, 4, 2, g_NP, 3, 4, 0, 0, 1, 1, &hkS);
+    predicted = model_alloc_bytes_hyb(5, 16, 8, 4, 4, 2, g_NP, 3, 4, 0, 0, 1, 1, &hkS) + _gcache();
     assert(delta >= predicted, "hybrid(mha/ssm) alloc accounting (under)");
     assert(delta <= predicted + 8192, "hybrid(mha/ssm) alloc accounting (over)");
     return 0;
@@ -3423,6 +3423,84 @@ fn test_stream_bpe_encode(): i64 {
 # live in-binary comparison, never an offline dump/compare. rupantara's packed
 # layout is byte-identical to attn11's (blocks.cyr §PACKED PARAMETER LAYOUT), so
 # attn11's g_params feeds ru_model_fwd directly.
+# The GELU tanh cache model_init just allocated, in bytes (0 when it is off): the
+# alloc-accounting pins add it, since the cache rides outside the required bytes.
+fn _gcache(): i64 {
+    if (g_gelu_cache == 0) { return 0; }
+    return model_gelu_cache_bytes(g_C, g_T, g_NL, g_num_experts);
+}
+
+# gelu_fwd_t / gelu_bwd_t (rupantara 0.6.1's ru_gelu_fwd_t): the forward's y is
+# gelu_fwd's, the cached tanh's backward dx is the recomputing gelu_bwd's, bit for bit,
+# over a [-8, 8] sweep and random values.
+fn test_gelu_t(): i64 {
+    var n = 401 + 64;
+    var x = t_alloc(n); var dy = t_alloc(n);
+    var i = 0;
+    while (i < 401) { store64(x + i * 8, f64_div(f64_from(i - 200), f64_from(25))); i = i + 1; }
+    t_randn(x + 401 * 8, 64, f64_from(3));
+    t_randn(dy, n, f64_from(1));
+    var y0 = t_alloc(n); var y1 = t_alloc(n); var tc = t_alloc(n);
+    gelu_fwd(x, y0, n);
+    assert(gelu_fwd_t(x, y1, tc, n) == 1, "gelu_fwd_t reports its tanh cached (CPU)");
+    var dx0 = t_alloc(n); var dx1 = t_alloc(n);
+    gelu_bwd(x, dy, dx0, n);
+    gelu_bwd_t(x, tc, dy, dx1, n);
+    var d = 0;
+    i = 0;
+    while (i < n) {
+        if (load64(y0 + i * 8) != load64(y1 + i * 8)) { d = d + 1; }
+        if (load64(dx0 + i * 8) != load64(dx1 + i * 8)) { d = d + 1; }
+        i = i + 1;
+    }
+    assert(d == 0, "gelu_fwd_t y and gelu_bwd_t dx (cached tanh) == the recomputing pair, bit for bit");
+    return 0;
+}
+
+# The dense-MLP tanh cache end to end: model_backward's every gradient is bit-identical
+# with the cache valid and with it marked stale (the recompute path), and the eval-window
+# pass, which overwrites LA_fc, marks it stale.
+fn test_gelu_cache_model(): i64 {
+    var V = 7; var C = 8; var T = 5; var NL = 2;
+    model_init(V, C, T, 2, 2, NL, 1, f64_from(0), 31);
+    assert(g_gelu_cache == 1, "a small dense model holds the GELU tanh cache");
+    var i = 0;
+    while (i < T) { store64(A_tokens + i * 8, (i * 3 + 1) % V); store64(A_targets + i * 8, (i + 2) % V); i = i + 1; }
+    model_forward(); model_zero_grads(); model_backward();
+    var ok = 0; var L = 0;
+    while (L < NL) { ok = ok + load64(LA_gt_ok + L * 8); L = L + 1; }
+    assert(ok == NL, "the training forward marks every layer's tanh cache valid");
+    var g1 = t_alloc(g_NP);
+    t_copy(g1, g_grads, g_NP);
+    model_forward();
+    L = 0;
+    while (L < NL) { store64(LA_gt_ok + L * 8, 0); L = L + 1; }   # force the recompute path
+    model_zero_grads(); model_backward();
+    var d = 0;
+    i = 0;
+    while (i < g_NP) { if (load64(g1 + i * 8) != load64(g_grads + i * 8)) { d = d + 1; } i = i + 1; }
+    assert(d == 0, "model_backward with the cached tanh == recomputed, every gradient bit for bit");
+    model_forward();
+    model_eval_window(3);
+    ok = 0; L = 0;
+    while (L < NL) { ok = ok + load64(LA_gt_ok + L * 8); L = L + 1; }
+    assert(ok == 0, "model_eval_window marks the tanh cache stale");
+    return 0;
+}
+
+# model_gelu_cache_on: the cache rides only in the room the cap leaves; MoE holds none.
+fn test_gelu_cache_cap(): i64 {
+    var gcb = model_gelu_cache_bytes(16, 8, 2, 1);
+    assert(gcb == (2 * 2 + 2 * 8 * 64) * 8, "model_gelu_cache_bytes = (2*NL + NL*T*F) f64");
+    assert(model_gelu_cache_bytes(16, 8, 2, 8) == 0, "an MoE model holds no GELU tanh cache");
+    var cap = CKPT_MAX_MODEL_BYTES();
+    assert(model_gelu_cache_on(cap - gcb, 16, 8, 2, 1) == 1, "cache on when it fits exactly under the cap");
+    assert(model_gelu_cache_on(cap - gcb + 8, 16, 8, 2, 1) == 0, "cache off when it would pass the cap");
+    assert(model_gelu_cache_on(cap, 16, 8, 2, 1) == 0, "cache off at a config already at the cap");
+    assert(model_gelu_cache_on(1024, 16, 8, 2, 8) == 0, "cache off for MoE");
+    return 0;
+}
+
 fn _ru_parity(V, C, T, nh, nkv, NL, bias, seed, name): i64 {
     model_init(V, C, T, nh, nkv, NL, bias, f64_from(0), seed);
     var i = 0;
@@ -3566,6 +3644,7 @@ fn main(): i64 {
     test_linear();
     test_layernorm();
     test_gelu();
+    test_gelu_t();
     test_softmax_xent();
     test_dropout();
     test_moe_op();
@@ -3594,6 +3673,8 @@ fn main(): i64 {
     test_head_tail();
     test_group("rupantara re-fold parity");
     test_rupantara_parity();
+    test_gelu_cache_model();
+    test_gelu_cache_cap();
     test_group("persistence");
     test_resume_determinism();
     test_resume_dropout();
@@ -3830,7 +3911,7 @@ fn test_alloc_accounting_mtp_ternary(): i64 {
     g_mtp = 3;
     model_init(5, 64, 16, 4, 4, 2, 1, f64_from(0), 4);
     var delta = alloc_used() - used0;
-    var predicted = model_alloc_bytes(5, 64, 16, 4, 4, 2, g_NP) + model_alloc_extra_bytes(5, 64, 16, 3, 0);
+    var predicted = model_alloc_bytes(5, 64, 16, 4, 4, 2, g_NP) + model_alloc_extra_bytes(5, 64, 16, 3, 0) + _gcache();
     g_mtp = 1;
     assert(delta >= predicted, "mtp: pre-flight never under-predicts model_init");
     assert(delta <= predicted + 8192, "mtp: pre-flight tracks model_init (aux scratch counted)");
@@ -3838,7 +3919,7 @@ fn test_alloc_accounting_mtp_ternary(): i64 {
     g_ternary = 1;
     model_init(5, 64, 16, 4, 4, 2, 1, f64_from(0), 4);
     delta = alloc_used() - used0;
-    predicted = model_alloc_bytes(5, 64, 16, 4, 4, 2, g_NP) + model_alloc_extra_bytes(5, 64, 16, 1, 1);
+    predicted = model_alloc_bytes(5, 64, 16, 4, 4, 2, g_NP) + model_alloc_extra_bytes(5, 64, 16, 1, 1) + _gcache();
     g_ternary = 0;
     assert(delta >= predicted, "ternary: pre-flight never under-predicts model_init");
     assert(delta <= predicted + 8192, "ternary: pre-flight tracks model_init (g_qscratch counted)");

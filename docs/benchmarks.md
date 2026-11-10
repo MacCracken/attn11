@@ -681,3 +681,31 @@ The head-backward packing (`f64v_scale` + `f64v_add` over C-wide rows) is small 
 V = 25 and large where the head dominates. A whole `--corpus <165 KB> --bpe 512 --steps 40` run
 (V = 652) takes **4.44 → 3.68 s, −17 %** (wall, min of 3; outputs identical). The bench has no
 head-backward row, which is why the step rows barely move.
+
+## The GELU tanh cache (`[Unreleased]`, rupantara 0.6.1): the step −14 %, same bits
+
+The dense-MLP backward recomputed `f64_tanh` (~91–95 ns, the cost recorded above) for every
+element the forward had already computed it for. rupantara 0.6.1's `ru_gelu_fwd_t` hands the
+forward's tanh out, and the training forward caches it per layer (`LA_gt`, `T·F` f64; 48 KB at the
+default config). `gelu_bwd_t` then loads it.
+
+The A/B is the 1.15.2 tree and this one, both on rupantara 0.6.1: DCE bench binaries, run alone,
+4 interleaved pairs, medians, Cezanne. The noise band is +1.0 to +1.2 % (the unchanged
+`adam_step` and kv-cached generation).
+
+| row | 1.15.2 | cached tanh | Δ |
+|---|---:|---:|---:|
+| `model_forward` | 1.089 ms | 1.099 ms | +0.9 % |
+| `model_backward` | 1.875 ms | 1.426 ms | **−23.9 %** |
+| fwd+bwd step (default) | 3.021 ms | 2.591 ms | **−14.2 %** |
+| fwd+bwd step, MQA | 2.882 ms | 2.469 ms | −14.3 % |
+| fwd+bwd step, rope | 3.007 ms | 2.642 ms | −12.1 % |
+| fwd+bwd, `--preset` | 47.2 ms | 42.8 ms | −9.3 % |
+
+- **The prototype predicted −25.8 % and −17.4 %.** It measured −25.8 % on `model_backward` and
+  −17.4 % on the step (see rupantara's issue file).
+- **This build lands at −23.9 % and −14.2 %,** with every training output byte-identical across
+  21 artifacts (CHANGELOG).
+- **`--preset` gains less.** It is not profiled here; its 64-token context gives attention a
+  larger share of the step.
+

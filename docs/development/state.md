@@ -1462,7 +1462,8 @@ constant `nh·hd²` state instead of a T-growing K/V.
 
 ## Tests
 
-- `tests/attn11.tcyr` — **1105 checks** on x86_64, 1098 on aarch64 (1.15.2; the
+- `tests/attn11.tcyr` — **1117 checks** on x86_64, 1110 on aarch64 (`[Unreleased]`: +12 for the
+  GELU tanh cache; 1105 / 1098 at 1.15.2; the
   x86-only hearing lane accounts for the difference): finite-difference gradient checks
   (every op incl. dropout; attention at head dims 6/8/10 and GQA/MQA at
   `nkv ∈ {1, 2, nh}` incl. `dWk`/`dWv`/`dbv`; the `|dbk| ≈ 0`
@@ -1577,9 +1578,11 @@ Direct (declared in `cyrius.cyml`):
 - **[rosnet](https://github.com/MacCracken/rosnet) 1.4.1** — tensor storage +
   BLAS-1 + dense matmul/gradient + conv; plus the `[lib.gpu]` profile
   (`dist/rosnet-gpu.cyr`, the whole GPU backend since 1.10.0)
-- **[rupantara](https://github.com/MacCracken/rupantara) 0.5.3** — the `ru_*`
-  forward leaf ops attn11 delegates its CPU forward bodies to (git+tag; the old
-  `../rupantara` path override is gone)
+- **[rupantara](https://github.com/MacCracken/rupantara) 0.6.1** (`[Unreleased]`;
+  0.5.3 through 1.15.2) — the `ru_*` forward leaf ops attn11 delegates its CPU
+  forward bodies to (git+tag; the old `../rupantara` path override is gone). Since
+  0.6.1 the dense-MLP training forward runs `ru_gelu_fwd_t`, whose tanh the backward
+  reuses (`gelu_bwd_t`).
 - **[hisab](https://github.com/MacCracken/hisab) 3.4.1** — `num_fft` for the
   hearing lane's STFT frontend (x86_64-gated)
 

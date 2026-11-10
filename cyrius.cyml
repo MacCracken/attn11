@@ -104,9 +104,13 @@ modules = ["dist/rosnet.cyr", "dist/rosnet-gpu.cyr"]
 # `0.5.0` → `0.5.3` (6.7.18 realign, latest): hardening (config/token-id validation at
 # the model entries, KV-cache bound) and faster attention/embedding; outputs on valid
 # input are bit-identical, and the attn11 parity contract is untouched.
+# `0.5.3` → `0.6.1`: 0.6.1 adds `ru_gelu_fwd_t` (attn11's filed proposal), which the
+# training forward now uses so `gelu_bwd_t` reuses the forward's tanh. 0.6.0's lean
+# model-forward scratch and `ru_model_fwd_n` change no output: the parity test and the
+# delegated leaf ops are bit-identical.
 [deps.rupantara]
 git = "https://github.com/MacCracken/rupantara"
-tag = "0.5.3"
+tag = "0.6.1"
 modules = ["dist/rupantara.cyr"]
 
 # M18 (the v1.8.x GPU arc): mabda is the GPU *foundation* — device/context init,

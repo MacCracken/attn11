@@ -105,8 +105,29 @@ fn gelu_fwd(x, y, n): i64 {
     return ru_gelu_fwd(x, y, n);
 }
 
+# The training forward's GELU: as gelu_fwd, and on the CPU path it also writes
+# t[i] = tanh(c*(x + a*x^3)) through rupantara's ru_gelu_fwd_t (0.6.1). That is the
+# exact value gelu_bwd would recompute, so gelu_bwd_t can load it instead of paying
+# one f64_tanh (~95 ns) per element. Returns 1 when t holds the tanh, 0 when --gpu-tc
+# ran the forward on the GPU (t untouched; the backward then recomputes, as before).
+fn gelu_fwd_t(x, y, t, n): i64 {
+    #ifndef CYRIUS_TARGET_AGNOS
+    if (g_gpu_tc == 1) { if (gpu_gelu_fwd(x, y, n) == 0) { return 0; } }
+    #endif
+    ru_gelu_fwd_t(x, y, t, n);
+    return 1;
+}
+
 # dy -> dx (length n). Needs the original x.
 fn gelu_bwd(x, dy, dx, n): i64 {
+    return gelu_bwd_t(x, 0, dy, dx, n);
+}
+
+# gelu_bwd with the forward's cached tanh: tc is gelu_fwd_t's t when it returned 1, or 0
+# to recompute it here. The cached value is bit for bit the tanh this loop recomputes
+# (x2 = x*x, x3 = x2*x, the same inner and constants as ru_gelu_fwd), so dx is
+# bit-identical either way; the cache only skips the f64_tanh.
+fn gelu_bwd_t(x, tc, dy, dx, n): i64 {
     #ifndef CYRIUS_TARGET_AGNOS
     # GPU GELU backward (tolerance: in-shader exp) under --gpu-tc; self-falls-back to CPU.
     if (g_gpu_tc == 1) {
@@ -122,9 +143,14 @@ fn gelu_bwd(x, dy, dx, n): i64 {
     while (i < n) {
         var xv = load64(x + i * 8);
         var x2 = f64_mul(xv, xv);
-        var x3 = f64_mul(x2, xv);
-        var inner = f64_mul(c, f64_add(xv, f64_mul(a, x3)));
-        var t = f64_tanh(inner);
+        var t = 0;
+        if (tc != 0) {
+            t = load64(tc + i * 8);
+        } else {
+            var x3 = f64_mul(x2, xv);
+            var inner = f64_mul(c, f64_add(xv, f64_mul(a, x3)));
+            t = f64_tanh(inner);
+        }
         var sech2 = f64_sub(one, f64_mul(t, t));          # 1 - tanh^2
         var dinner = f64_mul(c, f64_add(one, f64_mul(f64_mul(three, a), x2)));
         # d/dx = 0.5*(1+t) + 0.5*x*sech2*dinner

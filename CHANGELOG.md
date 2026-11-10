@@ -4,6 +4,81 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+The training step reuses GELU's tanh: rupantara 0.6.1's `ru_gelu_fwd_t`, the change 1.15.2 filed
+upstream. Every training output is byte-identical; **the default fwd+bwd step is 14.2 % faster**
+and `model_backward` 23.9 %.
+
+### Changed
+
+- **`[deps.rupantara]` `0.5.3` → `0.6.1`.**
+  - 0.6.0: a model forward without attention-probability scratch, and the variable-length
+    `ru_model_fwd_n`. Neither changes an output: `test_rupantara_parity` and the delegated leaf ops
+    stay bit-identical.
+  - 0.6.1: adds `ru_gelu_fwd_t`.
+  - **The lock:** `cyrius.lock` was re-pinned with `cyrius deps`. Against 1.15.2's lock, exactly two
+    lines differ, rupantara's commit and its file hash. `deps --verify` passes 119/0, `--locked` is
+    clean, and the vendored bundle is byte-identical to rupantara's `dist/` at the tag.
+- **The dense-MLP backward no longer recomputes GELU's tanh.**
+  - **The forward caches it:** `model_forward` runs the new `gelu_fwd_t`, rupantara's
+    `ru_gelu_fwd_t` on the CPU path, which also stores each element's tanh in a per-layer `LA_gt`
+    cache (`T·F` f64).
+  - **The backward loads it:** `model_backward`'s new `gelu_bwd_t` loads that tanh instead of
+    calling `f64_tanh` again (~95 ns per element).
+  - **Bit-exact:** the stored value is the one `gelu_bwd` recomputed: the same `x2 = x·x`,
+    `x3 = x2·x`, `inner` and constants. `gelu_bwd` is now `gelu_bwd_t` with no cache, one loop for
+    both.
+  - **A per-layer `LA_gt_ok` flag says when the cache is valid.**
+    - **`--gpu-tc`:** when it runs the forward on the GPU, the flag stays 0 and the backward
+      recomputes, as before; the GPU backward is still tried first.
+    - **`model_eval_window`:** it overwrites `LA_fc` without the tanh, so it clears the flag.
+  - **The cache is optional and allocated only when it fits.** `model_gelu_cache_on` allocates it
+    for a dense model (MoE experts keep their own GELU) when the required bytes leave room for it
+    under the 128 MB cap.
+    - **The cap is unchanged.** `model_alloc_bytes*` still count only the required buffers, so no
+      config, fresh or loaded, that 1.15.2 accepted is refused.
+    - **The cost:** 48 KB at the default config. Without the cache, the backward recomputes the tanh
+      at the same bits.
+  - **Not cached yet:** the MoE experts and the vision/hearing CNN lanes have the same structure.
+    They still recompute.
+
+### Performance — bit-identical
+
+The A/B is the 1.15.2 tree and this one, both built on rupantara 0.6.1 (so it isolates the cache):
+DCE bench binaries, run alone, 4 interleaved pairs, medians, Cezanne. The unchanged rows
+(`adam_step`, kv-cached generation) moved +1.0 to +1.2 %, which gives the noise band.
+
+| row | 1.15.2 | cached tanh | Δ |
+|---|---:|---:|---:|
+| `model_forward` | 1.089 ms | 1.099 ms | +0.9 % (noise; the extra store) |
+| `model_backward` | 1.875 ms | 1.426 ms | **−23.9 %** |
+| fwd+bwd step (default) | 3.021 ms | 2.591 ms | **−14.2 %** |
+| fwd+bwd step, MQA | 2.882 ms | 2.469 ms | −14.3 % |
+| fwd+bwd step, rope | 3.007 ms | 2.642 ms | −12.1 % |
+| fwd+bwd, `--preset` | 47.2 ms | 42.8 ms | −9.3 % |
+
+**21 artifacts are byte-identical to the 1.15.2 tree's**, the same runs with both binaries:
+- the default run, `--steps 300 --eval` and `--bpe 64 --steps 400 --eval`;
+- the mixers and objectives: MoE, MQA, MLA, rope-decoupled MLA, SSM, a lin hybrid, `--mtp 3`,
+  `--ternary`, diffusion and `--preset`;
+- `--vision` and `--hearing`;
+- `--gpu` and `--gpu-tc` on the gfx90c, GPU dispatch counters included;
+- a save → resume, with both checkpoints.
+
+### Tests
+
+- **1105 → 1117 assertions on x86_64, 1098 → 1110 on aarch64 (qemu).**
+  - **`test_gelu_t`:** `gelu_fwd_t`'s `y` and `gelu_bwd_t`'s `dx` from the cached tanh are
+    bit-identical to the recomputing pair, over a [-8, 8] sweep plus random values.
+  - **`test_gelu_cache_model`:** every one of `model_backward`'s gradients is bit-identical with
+    the cache valid and with it forced stale. The training forward marks every layer valid, and
+    `model_eval_window` marks them stale.
+  - **`test_gelu_cache_cap`:** the cache's byte count, MoE holding none, and the fit rule at the cap
+    edge.
+- **The 13 alloc-accounting pins add the cache when `model_init` allocated it** (`_gcache()`), so
+  they stay exact.
+- **The rest of the gate:** fmt and lint (0 warnings) are clean, the fuzz harness passes, and
+  `cyrius doc --check` is clean.
+
 ## [1.15.2] - 2026-11-09
 
 The P(-1) hardening, optimization and repair sweep. The full report is
