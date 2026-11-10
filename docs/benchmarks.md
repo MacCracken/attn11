@@ -682,7 +682,7 @@ V = 25 and large where the head dominates. A whole `--corpus <165 KB> --bpe 512 
 (V = 652) takes **4.44 → 3.68 s, −17 %** (wall, min of 3; outputs identical). The bench has no
 head-backward row, which is why the step rows barely move.
 
-## The GELU tanh cache (`[Unreleased]`, rupantara 0.6.1): the step −14 %, same bits
+## The GELU tanh cache (1.15.3, rupantara 0.6.1): the step −14 %, same bits
 
 The dense-MLP backward recomputed `f64_tanh` (~91–95 ns, the cost recorded above) for every
 element the forward had already computed it for. rupantara 0.6.1's `ru_gelu_fwd_t` hands the

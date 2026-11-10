@@ -4,6 +4,8 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.15.3] - 2026-11-09
+
 The training step reuses GELU's tanh: rupantara 0.6.1's `ru_gelu_fwd_t`, the change 1.15.2 filed
 upstream. Every training output is byte-identical; **the default fwd+bwd step is 14.2 % faster**
 and `model_backward` 23.9 %.

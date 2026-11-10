@@ -132,7 +132,7 @@ fn CFG_ATTN_BIAS(): i64 { return 1; }                                 # Q/K/V/O 
 fn CFG_DROPOUT(): i64 { return f64_from(0); }                         # residual dropout (off; tiny corpus)
 
 # Kept in sync with the VERSION file (CI's docs job gates the match).
-fn CFG_VERSION(): i64 { return "1.15.2"; }
+fn CFG_VERSION(): i64 { return "1.15.3"; }
 
 # print the --help flag reference; returns 0 (every caller then exits)
 fn usage(): i64 {

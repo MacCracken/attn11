@@ -5,6 +5,15 @@
 
 ## Version
 
+**1.15.3** — *the GELU tanh cache* (2026-11-09).
+- **What changed:** onto rupantara 0.6.1. Its `ru_gelu_fwd_t` hands the training forward's tanh to
+  the backward, which reuses it (`gelu_bwd_t`) instead of calling `f64_tanh` again.
+- **Speed:** the default fwd+bwd step is **14.2 %** faster and `model_backward` **23.9 %**.
+- **Same results:** 21 artifacts are byte-identical to the 1.15.2 tree's.
+- **The cache is optional:** it is held only where it fits under the 128 MB cap, so no config is
+  newly refused.
+- **Suite:** **1117** on x86_64 and **1110** on aarch64.
+
 **1.15.2** — *the P(-1) hardening, optimization and repair sweep* (2026-11-09;
 [`docs/audit/2026-11-09-audit.md`](../audit/2026-11-09-audit.md)). It fixes:
 - **1 HIGH:** a `--stream-corpus` shard's token ids were unchecked, so an id ≥ V became an
@@ -1462,7 +1471,7 @@ constant `nh·hd²` state instead of a T-growing K/V.
 
 ## Tests
 
-- `tests/attn11.tcyr` — **1117 checks** on x86_64, 1110 on aarch64 (`[Unreleased]`: +12 for the
+- `tests/attn11.tcyr` — **1117 checks** on x86_64, 1110 on aarch64 (1.15.3: +12 for the
   GELU tanh cache; 1105 / 1098 at 1.15.2; the
   x86-only hearing lane accounts for the difference): finite-difference gradient checks
   (every op incl. dropout; attention at head dims 6/8/10 and GQA/MQA at
@@ -1578,7 +1587,7 @@ Direct (declared in `cyrius.cyml`):
 - **[rosnet](https://github.com/MacCracken/rosnet) 1.4.1** — tensor storage +
   BLAS-1 + dense matmul/gradient + conv; plus the `[lib.gpu]` profile
   (`dist/rosnet-gpu.cyr`, the whole GPU backend since 1.10.0)
-- **[rupantara](https://github.com/MacCracken/rupantara) 0.6.1** (`[Unreleased]`;
+- **[rupantara](https://github.com/MacCracken/rupantara) 0.6.1** (1.15.3;
   0.5.3 through 1.15.2) — the `ru_*` forward leaf ops attn11 delegates its CPU
   forward bodies to (git+tag; the old `../rupantara` path override is gone). Since
   0.6.1 the dense-MLP training forward runs `ru_gelu_fwd_t`, whose tanh the backward
