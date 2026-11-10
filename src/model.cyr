@@ -1657,6 +1657,7 @@ fn model_adam_step(lr, step): i64 {
         if (gpu_adam_step(g_params, g_grads, g_adam_m, g_adam_v, g_NP, lr, step) == 0) { return 0; }
     }
     #endif
+    if (g_optim == 1) { return _muon_adam_step(lr, step); }   # 1.17.0 --optim muon (CPU only)
     var b1 = f64_div(f64_from(9), f64_from(10));        # 0.9
     var b2 = f64_div(f64_from(999), f64_from(1000));    # 0.999
     var om1 = f64_div(f64_from(1), f64_from(10));       # 1-b1
@@ -1677,6 +1678,191 @@ fn model_adam_step(lr, step): i64 {
         var upd = f64_div(mhat, f64_add(f64_sqrt(vhat), eps));
         var pi = g_params + i * 8;
         store64(pi, f64_sub(load64(pi), f64_mul(lr, upd)));
+        i = i + 1;
+    }
+    return 0;
+}
+
+# ---- Muon (1.17.0, --optim muon; training dynamics #1, X046) ---------------
+# Source: K. Jordan et al. (2024), "Muon: An optimizer for hidden layers in neural
+# networks" — SGD-momentum (Nesterov, mu = 0.95) whose update for each hidden 2D weight
+# matrix is orthogonalized by a 5-step quintic Newton-Schulz iteration, coefficients
+# (a, b, c) = (3.4445, -4.7750, 2.0315). The update is scaled by 0.2 * sqrt(max(rows,
+# cols)), J. Liu et al. (2025), "Muon is Scalable for LLM Training" (arXiv:2502.16982):
+# that gives it the RMS of a typical Adam update, so one LR schedule drives both groups.
+# - Muon owns the six hidden matrices of each block: Wq, Wk, Wv, Wo, Wfc, Wproj. The
+#   embeddings (the head is tied to them), LayerNorm parameters, biases, the diffusion
+#   mask embedding and the MTP heads stay on Adam, as in the reference.
+# - Its momentum lives in those entries' g_adam_m slots, and their g_adam_v slots stay 0,
+#   so a checkpoint keeps its format and a resume with the same flag continues
+#   bit-for-bit. No weight decay, matching attn11's Adam.
+# - Dense MHA/GQA blocks only (no MLA/lin/ssm, MoE, hybrid or ternary), CPU only.
+var g_optim = 0;        # 0 = Adam (default), 1 = Muon on the hidden matrices
+var g_muon_mask = 0;    # g_NP bytes: 1 = the entry belongs to a Muon matrix
+var g_muon_nmat = 0;    # Muon matrices (6 per block)
+var g_muon_mats = 0;    # per matrix 3 i64: param offset, rows, cols
+var g_ns_x = 0;         # Newton-Schulz scratch: X (p x q), its transpose, the update U and
+var g_ns_xt = 0;        # the result O (r x c), all sized for the largest matrix (C*F),
+var g_ns_u = 0;         # plus the p x p products A, A^2 and b*A + c*A^2, and B @ X.
+var g_ns_o = 0;
+var g_ns_a = 0;
+var g_ns_a2 = 0;
+var g_ns_b = 0;
+var g_ns_bx = 0;
+
+fn _muon_add(off, r, c): i64 {
+    var e = g_muon_mats + g_muon_nmat * 24;
+    store64(e, off); store64(e + 8, r); store64(e + 16, c);
+    var i = 0;
+    while (i < r * c) { store8(g_muon_mask + off + i, 1); i = i + 1; }
+    g_muon_nmat = g_muon_nmat + 1;
+    return 0;
+}
+
+# Arm Muon for the current model. Returns the matrix count, -1 when an allocation fails,
+# or -2 for an architecture Muon does not cover here (it then stays off).
+fn muon_init(): i64 {
+    if ((g_attn_kind != 0) || (g_num_experts != 1) || (g_layer_kind != 0) || (g_ternary != 0)) {
+        return 0 - 2;
+    }
+    var C = g_C; var F = g_F; var Ckv = _Ckv();
+    g_muon_mask = alloc(g_NP);
+    g_muon_mats = alloc(g_NL * 6 * 24);
+    var big = C * F;
+    g_ns_x = alloc(big * 8); g_ns_xt = alloc(big * 8); g_ns_u = alloc(big * 8); g_ns_o = alloc(big * 8);
+    g_ns_a = alloc(C * C * 8); g_ns_a2 = alloc(C * C * 8); g_ns_b = alloc(C * C * 8); g_ns_bx = alloc(big * 8);
+    if ((g_muon_mask == 0) || (g_muon_mats == 0) || (g_ns_x == 0) || (g_ns_xt == 0) || (g_ns_u == 0)) {
+        return 0 - 1;
+    }
+    if ((g_ns_o == 0) || (g_ns_a == 0) || (g_ns_a2 == 0) || (g_ns_b == 0) || (g_ns_bx == 0)) { return 0 - 1; }
+    var i = 0;
+    while (i < g_NP) { store8(g_muon_mask + i, 0); i = i + 1; }
+    g_muon_nmat = 0;
+    var L = 0;
+    while (L < g_NL) {
+        var b = _blk_base(L);
+        _muon_add(b + _o_Wq(), C, C);
+        _muon_add(b + _o_Wk(), C, Ckv);
+        _muon_add(b + _o_Wv(), C, Ckv);
+        _muon_add(b + _o_Wo(), C, C);
+        _muon_add(b + _o_Wfc(), C, F);
+        _muon_add(b + _o_Wproj(), F, C);
+        L = L + 1;
+    }
+    g_optim = 1;
+    return g_muon_nmat;
+}
+
+# O (r x c) = the quintic Newton-Schulz orthogonalization of U (r x c), both row-major.
+# It runs in the wide orientation (p = min(r, c) rows) so the products are p x p, which
+# makes NS5(U^T) exactly NS5(U)^T. A zero U gives a zero O. Returns 0.
+fn muon_ns5(U, r, c, O): i64 {
+    var tr = 0; var p = r; var q = c;
+    if (r > c) { tr = 1; p = c; q = r; }
+    var X = g_ns_x; var XT = g_ns_xt; var A = g_ns_a; var A2 = g_ns_a2; var B = g_ns_b; var BX = g_ns_bx;
+    var i = 0;
+    while (i < r) {
+        var j = 0;
+        while (j < c) {
+            var v = load64(U + (i * c + j) * 8);
+            if (tr == 1) { store64(X + (j * q + i) * 8, v); } else { store64(X + (i * c + j) * 8, v); }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    var n2 = f64_from(0);           # summed in X's order, so both orientations get the same bits
+    i = 0;
+    while (i < p * q) { var x = load64(X + i * 8); n2 = f64_add(n2, f64_mul(x, x)); i = i + 1; }
+    var eps = f64_div(f64_from(1), f64_from(10000000));             # 1e-7
+    t_scale(X, p * q, f64_div(f64_from(1), f64_add(f64_sqrt(n2), eps)));
+    var ca = f64_div(f64_from(34445), f64_from(10000));
+    var cb = f64_sub(f64_from(0), f64_div(f64_from(47750), f64_from(10000)));
+    var cc = f64_div(f64_from(20315), f64_from(10000));
+    var it = 0;
+    while (it < 5) {
+        var a = 0;
+        while (a < p) {
+            var bq = 0;
+            while (bq < q) { store64(XT + (bq * p + a) * 8, load64(X + (a * q + bq) * 8)); bq = bq + 1; }
+            a = a + 1;
+        }
+        linear_fwd(X, XT, 0, A, p, q, p);           # A = X X^T
+        linear_fwd(A, A, 0, A2, p, p, p);           # A^2
+        var k = 0;
+        while (k < p * p) {
+            store64(B + k * 8, f64_add(f64_mul(cb, load64(A + k * 8)), f64_mul(cc, load64(A2 + k * 8))));
+            k = k + 1;
+        }
+        linear_fwd(B, X, 0, BX, p, p, q);           # (b A + c A^2) X
+        k = 0;
+        while (k < p * q) {
+            store64(X + k * 8, f64_add(f64_mul(ca, load64(X + k * 8)), load64(BX + k * 8)));
+            k = k + 1;
+        }
+        it = it + 1;
+    }
+    i = 0;
+    while (i < r) {
+        var j2 = 0;
+        while (j2 < c) {
+            if (tr == 1) { store64(O + (i * c + j2) * 8, load64(X + (j2 * q + i) * 8)); }
+            else { store64(O + (i * c + j2) * 8, load64(X + (i * c + j2) * 8)); }
+            j2 = j2 + 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# One Muon + Adam step (g_optim == 1): Muon on each armed matrix, then Adam, unchanged,
+# on every entry outside them. lr is f64 bits; step is the 1-based update count.
+fn _muon_adam_step(lr, step): i64 {
+    var mu = f64_div(f64_from(95), f64_from(100));
+    var fifth = f64_div(f64_from(1), f64_from(5));
+    var mi = 0;
+    while (mi < g_muon_nmat) {
+        var e = g_muon_mats + mi * 24;
+        var off = load64(e); var r = load64(e + 8); var c = load64(e + 16);
+        var n = r * c;
+        var G = g_grads + off * 8; var M = g_adam_m + off * 8; var W = g_params + off * 8;
+        var k = 0;
+        while (k < n) {
+            var g = load64(G + k * 8);
+            var mb = f64_add(f64_mul(mu, load64(M + k * 8)), g);
+            store64(M + k * 8, mb);
+            store64(g_ns_u + k * 8, f64_add(g, f64_mul(mu, mb)));      # Nesterov
+            k = k + 1;
+        }
+        muon_ns5(g_ns_u, r, c, g_ns_o);
+        var mx = r; if (c > mx) { mx = c; }
+        var sc = f64_mul(lr, f64_mul(fifth, f64_sqrt(f64_from(mx))));
+        k = 0;
+        while (k < n) {
+            store64(W + k * 8, f64_sub(load64(W + k * 8), f64_mul(sc, load64(g_ns_o + k * 8))));
+            k = k + 1;
+        }
+        mi = mi + 1;
+    }
+    var b1 = f64_div(f64_from(9), f64_from(10));
+    var b2 = f64_div(f64_from(999), f64_from(1000));
+    var om1 = f64_div(f64_from(1), f64_from(10));
+    var om2 = f64_div(f64_from(1), f64_from(1000));
+    var eps = f64_div(f64_from(1), f64_from(100000000));
+    var one = f64_from(1);
+    var bc1 = f64_sub(one, f64_pow(b1, f64_from(step)));
+    var bc2 = f64_sub(one, f64_pow(b2, f64_from(step)));
+    var i = 0;
+    while (i < g_NP) {
+        if (load8(g_muon_mask + i) == 0) {
+            var g2 = load64(g_grads + i * 8);
+            var m = f64_add(f64_mul(b1, load64(g_adam_m + i * 8)), f64_mul(om1, g2));
+            var v = f64_add(f64_mul(b2, load64(g_adam_v + i * 8)), f64_mul(om2, f64_mul(g2, g2)));
+            store64(g_adam_m + i * 8, m);
+            store64(g_adam_v + i * 8, v);
+            var upd = f64_div(f64_div(m, bc1), f64_add(f64_sqrt(f64_div(v, bc2)), eps));
+            var pi = g_params + i * 8;
+            store64(pi, f64_sub(load64(pi), f64_mul(lr, upd)));
+        }
         i = i + 1;
     }
     return 0;

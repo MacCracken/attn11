@@ -3783,6 +3783,13 @@ fn main(): i64 {
     test_curriculum_schedule();
     test_curriculum_rng_neutral();
     test_curriculum_resume();
+    test_group("1.17.0 training dynamics: Muon");
+    test_muon_ns5_orth();
+    test_muon_ns5_transpose();
+    test_muon_mask();
+    test_muon_step_split();
+    test_muon_resume();
+    test_muon_learns();
 
     return assert_summary();
 }
@@ -4246,6 +4253,237 @@ fn test_curriculum_resume(): i64 {
         i = i + 1;
     }
     assert(diff > 0, "curriculum resume: the curriculum changes the trained params (not vacuous)");
+    return 0;
+}
+
+# ---- 1.17.0 training dynamics: Muon (--optim muon, X046) --------------------
+# Registered dead-last, after every RNG-consuming group.
+
+# A small dense GQA model with Muon armed: C 8, T 4, 2 heads, 1 KV head, 2 blocks.
+fn _muon_model(seed): i64 {
+    var V = build_corpus();
+    model_init(V, 8, 4, 2, 1, 2, 1, f64_from(0), seed);
+    return muon_init();
+}
+
+# |a . b| / (|a| |b|) for two n-vectors (f64 bits)
+fn _cosabs(a, b, n): i64 {
+    var ab = f64_from(0); var aa = f64_from(0); var bb = f64_from(0); var i = 0;
+    while (i < n) {
+        var x = load64(a + i * 8); var y = load64(b + i * 8);
+        ab = f64_add(ab, f64_mul(x, y)); aa = f64_add(aa, f64_mul(x, x)); bb = f64_add(bb, f64_mul(y, y));
+        i = i + 1;
+    }
+    return f64_div(f64_abs(ab), f64_sqrt(f64_mul(aa, bb)));
+}
+
+# NS5 orthogonalizes: U = D Q with orthonormal rows Q (4 rows of the 8x8 Hadamard matrix,
+# over sqrt 8) and D = diag(10, 1, 0.5, 2), a 20:1 spread. Each output row keeps its
+# direction, the rows stay orthogonal, and every singular value lands in NS5's band.
+fn test_muon_ns5_orth(): i64 {
+    assert(_muon_model(5) == 12, "muon: 6 matrices per block armed");
+    var r = 4; var c = 8;
+    var U = t_alloc(r * c); var Q = t_alloc(r * c); var O = t_alloc(r * c);
+    var dsc[32];
+    store64(&dsc, f64_from(10)); store64(&dsc + 8, f64_from(1));
+    store64(&dsc + 16, f64_div(f64_from(1), f64_from(2))); store64(&dsc + 24, f64_from(2));
+    var rs8 = f64_div(f64_from(1), f64_sqrt(f64_from(8)));
+    var i = 0;
+    while (i < r) {
+        var j = 0;
+        while (j < c) {
+            var h = i & j; var par = 0;                     # Hadamard sign: parity of popcount(i & j)
+            while (h != 0) { par = par ^ (h & 1); h = h >> 1; }
+            var q = rs8;
+            if (par == 1) { q = f64_sub(f64_from(0), rs8); }
+            store64(Q + (i * c + j) * 8, q);
+            store64(U + (i * c + j) * 8, f64_mul(load64(&dsc + i * 8), q));
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    muon_ns5(U, r, c, O);
+    var dir_ok = 1; var band_ok = 1; var orth_ok = 1;
+    var lo = f64_div(f64_from(6), f64_from(10)); var hi = f64_div(f64_from(125), f64_from(100));
+    var tol = f64_div(f64_from(1), f64_from(100));
+    var cosmin = f64_div(f64_from(999), f64_from(1000));
+    i = 0;
+    while (i < r) {
+        if (f64_lt(_cosabs(O + i * c * 8, Q + i * c * 8, c), cosmin) == 1) { dir_ok = 0; }
+        var n2 = f64_from(0); var j2 = 0;
+        while (j2 < c) { var o = load64(O + (i * c + j2) * 8); n2 = f64_add(n2, f64_mul(o, o)); j2 = j2 + 1; }
+        var nrm = f64_sqrt(n2);
+        if ((f64_lt(nrm, lo) == 1) || (f64_gt(nrm, hi) == 1)) { band_ok = 0; }
+        var k = i + 1;
+        while (k < r) {
+            if (f64_gt(_cosabs(O + i * c * 8, O + k * c * 8, c), tol) == 1) { orth_ok = 0; }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    assert(dir_ok == 1, "muon ns5: each singular direction is kept (|cos| > 0.999)");
+    assert(band_ok == 1, "muon ns5: a 20:1 singular spread lands in [0.6, 1.25]");
+    assert(orth_ok == 1, "muon ns5: output rows stay orthogonal (|cos| < 0.01)");
+    g_optim = 0;
+    return 0;
+}
+
+# NS5 is orientation-blind: NS5(U^T) == NS5(U)^T bit-for-bit (a tall matrix runs in the
+# wide orientation), and a zero update stays zero.
+fn test_muon_ns5_transpose(): i64 {
+    _muon_model(5);
+    var r = 3; var c = 7;
+    var U = t_alloc(r * c); var UT = t_alloc(r * c); var O = t_alloc(r * c); var OT = t_alloc(r * c);
+    _rng_state = 7777;
+    var i = 0;
+    while (i < r * c) { store64(U + i * 8, f64_sub(rng_uniform(), f64_div(f64_from(1), f64_from(2)))); i = i + 1; }
+    i = 0;
+    while (i < r) {
+        var j = 0;
+        while (j < c) { store64(UT + (j * r + i) * 8, load64(U + (i * c + j) * 8)); j = j + 1; }
+        i = i + 1;
+    }
+    muon_ns5(U, r, c, O);
+    muon_ns5(UT, c, r, OT);
+    var same = 1; i = 0;
+    while (i < r) {
+        var j3 = 0;
+        while (j3 < c) {
+            if (load64(O + (i * c + j3) * 8) != load64(OT + (j3 * r + i) * 8)) { same = 0; }
+            j3 = j3 + 1;
+        }
+        i = i + 1;
+    }
+    assert(same == 1, "muon ns5: NS5(U^T) == NS5(U)^T bit-for-bit");
+    t_zero(U, r * c);
+    muon_ns5(U, r, c, O);
+    var z = 1; i = 0;
+    while (i < r * c) { if ((load64(O + i * 8) & 0x7FFFFFFFFFFFFFFF) != 0) { z = 0; } i = i + 1; }
+    assert(z == 1, "muon ns5: a zero update stays zero");
+    g_optim = 0;
+    return 0;
+}
+
+# The mask covers exactly the six hidden matrices per block; embeddings, LayerNorm
+# parameters and biases stay on Adam; an uncovered architecture refuses and stays Adam.
+fn test_muon_mask(): i64 {
+    _muon_model(5);
+    var C = 8; var F = 32; var Ckv = 4;
+    var want = 2 * (2 * C * C + 2 * C * Ckv + 2 * C * F);
+    var n = 0; var i = 0;
+    while (i < g_NP) { n = n + load8(g_muon_mask + i); i = i + 1; }
+    assert(n == want, "muon mask: exactly NL * (2C^2 + 2C*Ckv + 2C*F) entries");
+    var b1 = _blk_base(1);
+    var adam_ok = (load8(g_muon_mask) == 0) && (load8(g_muon_mask + b1 + _o_ln1g()) == 0);
+    adam_ok = adam_ok && (load8(g_muon_mask + b1 + _o_bfc()) == 0) && (load8(g_muon_mask + b1 + _o_bq()) == 0);
+    adam_ok = adam_ok && (load8(g_muon_mask + (P_lnfg() - g_params) / 8) == 0);
+    assert(adam_ok, "muon mask: tok_emb, LayerNorm, MLP and attention biases, ln_f stay on Adam");
+    var mus_ok = (load8(g_muon_mask + b1 + _o_Wq()) == 1) && (load8(g_muon_mask + b1 + _o_Wproj() + F * C - 1) == 1);
+    assert(mus_ok, "muon mask: Wq's first and Wproj's last entry are Muon's");
+    g_optim = 0;
+    var V = build_corpus();
+    model_init_arch(V, 8, 4, 2, 2, 1, 0, f64_from(0), 5, 3, 4, 0, 0);
+    assert(muon_init() == (0 - 2), "muon: an ssm model is refused (-2)");
+    assert(g_optim == 0, "muon: a refused init leaves Adam in charge");
+    return 0;
+}
+
+# One step: every non-Muon entry gets exactly the Adam update (bit-for-bit vs an Adam
+# step from the same state), a Muon entry's m holds g and its v stays 0, and each Muon
+# matrix moves by an update of RMS ~0.2 * lr.
+fn test_muon_step_split(): i64 {
+    _muon_model(11);
+    var np = g_NP;
+    store64(A_tokens + 0, 1); store64(A_tokens + 8, 3); store64(A_tokens + 16, 0); store64(A_tokens + 24, 2);
+    store64(A_targets + 0, 3); store64(A_targets + 8, 0); store64(A_targets + 16, 2); store64(A_targets + 24, 1);
+    model_zero_grads(); model_forward(); model_backward();
+    var p0 = t_alloc(np); t_copy(p0, g_params, np);
+    var lr = f64_div(f64_from(1), f64_from(100));
+    g_optim = 0; model_adam_step(lr, 1);
+    var pa = t_alloc(np); t_copy(pa, g_params, np);
+    t_copy(g_params, p0, np); t_zero(g_adam_m, np); t_zero(g_adam_v, np);
+    g_optim = 1; model_adam_step(lr, 1);
+    var split_ok = 1; var mv_ok = 1; var i = 0;
+    while (i < np) {
+        if (load8(g_muon_mask + i) == 0) {
+            if (load64(g_params + i * 8) != load64(pa + i * 8)) { split_ok = 0; }
+        } else {
+            if (load64(g_adam_m + i * 8) != load64(g_grads + i * 8)) { mv_ok = 0; }
+            if (load64(g_adam_v + i * 8) != 0) { mv_ok = 0; }
+        }
+        i = i + 1;
+    }
+    assert(split_ok == 1, "muon step: non-Muon entries get the exact Adam update");
+    assert(mv_ok == 1, "muon step: Muon momentum is g after step 1, its v stays 0");
+    var rms_ok = 1; var mi = 0;
+    var lo = f64_mul(lr, f64_div(f64_from(1), f64_from(10)));
+    var hi = f64_mul(lr, f64_div(f64_from(3), f64_from(10)));
+    while (mi < g_muon_nmat) {
+        var e = g_muon_mats + mi * 24;
+        var off = load64(e); var n = load64(e + 8) * load64(e + 16);
+        var s2 = f64_from(0); var k = 0;
+        while (k < n) {
+            var d = f64_sub(load64(g_params + (off + k) * 8), load64(p0 + (off + k) * 8));
+            s2 = f64_add(s2, f64_mul(d, d)); k = k + 1;
+        }
+        var rms = f64_sqrt(f64_div(s2, f64_from(n)));
+        if ((f64_lt(rms, lo) == 1) || (f64_gt(rms, hi) == 1)) { rms_ok = 0; }
+        mi = mi + 1;
+    }
+    assert(rms_ok == 1, "muon step: every matrix update has RMS in [0.1, 0.3] * lr");
+    g_optim = 0;
+    return 0;
+}
+
+# Resume: train(24) under Muon equals train(9) -> checkpoint -> re-armed Muon -> train(24),
+# bit-for-bit (the momentum rides in the checkpoint's m). The Adam run differs (not vacuous).
+fn test_muon_resume(): i64 {
+    var V = build_corpus();
+    var C = 8; var T = 4; var nh = 2; var NL = 2;
+    var base = _lrc(3, 1000); var minl = _lrc(3, 10000); var clip = f64_from(1);
+    var K = 24; var K1 = 9; var B = 4; var warm = 5; var quiet = 1000000000;
+    model_init(V, C, T, nh, nh, NL, 0, f64_from(0), 7);
+    muon_init();
+    train(K, K, B, base, minl, warm, clip, quiet);
+    var np = g_NP;
+    var snapA = t_alloc(np); t_copy(snapA, g_params, np);
+    model_init(V, C, T, nh, nh, NL, 0, f64_from(0), 7);
+    muon_init();
+    train(K1, K, B, base, minl, warm, clip, quiet);
+    var sz = ckpt_size();
+    var buf = alloc(sz);
+    ckpt_serialize(buf);
+    g_optim = 0;
+    model_init(V, C, T, nh, nh, NL, 0, f64_from(0), 999);
+    var rc = ckpt_load_buf(buf, sz);
+    muon_init();
+    train(K, K, B, base, minl, warm, clip, quiet);
+    var mism = 0; var i = 0;
+    while (i < np) { if (load64(g_params + i * 8) != load64(snapA + i * 8)) { mism = mism + 1; } i = i + 1; }
+    assert(rc == 0, "muon resume: checkpoint loads");
+    assert(mism == 0, "muon resume: params reproduce bit-for-bit");
+    g_optim = 0;
+    model_init(V, C, T, nh, nh, NL, 0, f64_from(0), 7);
+    train(K, K, B, base, minl, warm, clip, quiet);
+    var diff = 0; i = 0;
+    while (i < np) { if (load64(g_params + i * 8) != load64(snapA + i * 8)) { diff = diff + 1; } i = i + 1; }
+    assert(diff > 0, "muon resume: Muon and Adam train different params (not vacuous)");
+    return 0;
+}
+
+# Muon learns: 60 steps on the embedded corpus cut its eval cross-entropy (both Muon and
+# Adam cut it ~8% here; 5% leaves margin).
+fn test_muon_learns(): i64 {
+    var V = build_corpus();
+    model_init(V, 8, 4, 2, 2, 2, 0, f64_from(0), 13);
+    muon_init();
+    eval_corpus();
+    var before = g_eval_nats;
+    train(60, 60, 4, _lrc(3, 1000), _lrc(3, 10000), 5, f64_from(1), 1000000000);
+    eval_corpus();
+    assert(f64_lt(g_eval_nats, f64_mul(before, f64_div(f64_from(95), f64_from(100)))) == 1,
+      "muon: 60 steps cut eval cross-entropy by more than 5% (Adam: ~8%)");
+    g_optim = 0;
     return 0;
 }
 

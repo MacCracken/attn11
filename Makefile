@@ -81,7 +81,7 @@ aarch64:
 # any exit >= 128 here is a signal/crash and fails the gate.
 smoke: build
 	@echo "smoke: hostile CLI args must reject cleanly, never crash"
-	@for args in "--layers 100000 --attn-every 2" "--layers 129 --attn-every 2" "--layers 0 --attn-every 2" "--ternary --experts 4" "--ternary --objective diffusion" "--ternary --attn-kind ssm" "--objective bogus" "--objective rl" "--latent-dim 8" "--attn-kind lin --latent-dim 8" "--steps 1e3" "--heads 4x" "--decode-schedule linear" "--curriculum -1" "--curriculum x" "--curriculum 5"; do \
+	@for args in "--layers 100000 --attn-every 2" "--layers 129 --attn-every 2" "--layers 0 --attn-every 2" "--ternary --experts 4" "--ternary --objective diffusion" "--ternary --attn-kind ssm" "--objective bogus" "--objective rl" "--latent-dim 8" "--attn-kind lin --latent-dim 8" "--steps 1e3" "--heads 4x" "--decode-schedule linear" "--curriculum -1" "--curriculum x" "--curriculum 5" "--lr 0" "--lr 2" "--lr 1e-3x" "--lr ." "--min-lr 1" "--clip -1" "--warmup -1" "--seed -1" "--optim sgd" "--optim muon --attn-kind ssm" "--optim muon --experts 4" "--optim muon --gpu"; do \
 	  ./build/attn11 $$args --gen-only >/dev/null 2>&1; rc=$$?; \
 	  if [ $$rc -ge 128 ]; then echo "smoke: CRASH (signal $$((rc-128))) on: $$args"; exit 1; fi; \
 	  if [ $$rc -eq 0 ]; then echo "smoke: expected rejection but succeeded on: $$args"; exit 1; fi; \
@@ -92,6 +92,13 @@ smoke: build
 	if [ $$? -ne 0 ]; then echo "smoke: a valid --ternary run failed"; exit 1; fi; \
 	./build/attn11 --curriculum 10 --steps 20 >/dev/null 2>&1; \
 	if [ $$? -ne 0 ]; then echo "smoke: a valid --curriculum run failed"; exit 1; fi; \
+	./build/attn11 --optim muon --steps 5 >/dev/null 2>&1; \
+	if [ $$? -ne 0 ]; then echo "smoke: a valid --optim muon run failed"; exit 1; fi; \
+	./build/attn11 --lr 6e-3 --clip 0 --warmup 10 --seed 7 --steps 5 >/dev/null 2>&1; \
+	if [ $$? -ne 0 ]; then echo "smoke: a valid --lr/--clip/--warmup/--seed run failed"; exit 1; fi; \
+	./build/attn11 --steps 20 --save /tmp/attn11-smoke-d1.ckpt >/dev/null 2>&1; \
+	./build/attn11 --lr 0.003 --min-lr 3e-4 --warmup 100 --clip 1 --seed 1337 --steps 20 --save /tmp/attn11-smoke-d2.ckpt >/dev/null 2>&1; \
+	if ! cmp -s /tmp/attn11-smoke-d1.ckpt /tmp/attn11-smoke-d2.ckpt; then echo "smoke: explicit default --lr/--min-lr/--warmup/--clip/--seed changed the checkpoint"; exit 1; fi; \
 	./build/attn11 --curriculum 5 --objective diffusion --steps 3 >/dev/null 2>&1; rc=$$?; \
 	if [ $$rc -eq 0 ] || [ $$rc -ge 128 ]; then echo "smoke: --curriculum with --objective diffusion gave rc $$rc (want a clean rejection)"; exit 1; fi; \
 	./build/attn11 --gen-only --eval-corpus /nonexistent/attn11-smoke >/dev/null 2>&1; rc=$$?; \
@@ -126,8 +133,8 @@ smoke: build
 	  if [ $$rc -ge 128 ]; then echo "smoke: CRASH (signal $$((rc-128))) on: $$sa"; exit 1; fi; \
 	  if [ $$rc -eq 0 ]; then echo "smoke: expected rejection but succeeded on: $$sa"; exit 1; fi; \
 	done; \
-	rm -f /tmp/attn11-smoke-seed.txt /tmp/attn11-smoke-corpus.txt /tmp/attn11-smoke.tsh /tmp/attn11-smoke-bad.tsh /tmp/attn11-smoke-z.tsh /tmp/attn11-smoke-z.tsh.tmp /tmp/attn11-smoke-bpe.tsh /tmp/attn11-smoke.ckpt /tmp/attn11-smoke-x.tsh; \
-	echo "smoke: ok (hostile args rejected; valid hybrid + ternary + curriculum + stream + resume-from-stream + stream-encode; bad shard / out-of-vocab shard ids / vocab-mismatch / held-out eval error cleanly)"
+	rm -f /tmp/attn11-smoke-seed.txt /tmp/attn11-smoke-corpus.txt /tmp/attn11-smoke.tsh /tmp/attn11-smoke-bad.tsh /tmp/attn11-smoke-z.tsh /tmp/attn11-smoke-z.tsh.tmp /tmp/attn11-smoke-bpe.tsh /tmp/attn11-smoke.ckpt /tmp/attn11-smoke-x.tsh /tmp/attn11-smoke-d1.ckpt /tmp/attn11-smoke-d2.ckpt; \
+	echo "smoke: ok (hostile args rejected; valid hybrid + ternary + curriculum + muon + default-knob identity + stream + resume-from-stream + stream-encode; bad shard / out-of-vocab shard ids / vocab-mismatch / held-out eval error cleanly)"
 
 clean:
 	rm -rf build/

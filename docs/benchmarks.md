@@ -726,3 +726,21 @@ short sample), 5 interleaved runs, medians, Cezanne.
   O(n) merge pass, as akshara's own 1 MiB row (−7.6 %) predicts.
 - **Training is unchanged:** a step runs no akshara code. The checkpoint the 4 MB learn writes is
   byte-identical across the two builds.
+
+## Muon's step cost (1.17.0, X046): +22 % per step, still ahead at matched wall time
+
+`--optim muon` adds a 5-step Newton–Schulz orthogonalization of each of the 18 hidden matrices to
+every optimizer step. At the X021 config (`c4-24-trainA`, `--bpe 256`, V = 440, batch 16, ctx 16) the
+DCE binary's 1000-step runs, 3 interleaved pairs, medians, startup (2.3 s) subtracted:
+
+| optimizer | 1000 steps | per step | Δ |
+|---|---:|---:|---:|
+| Adam | 54.6 s | 54.6 ms | — |
+| Muon | 66.7 s | 66.7 ms | **+22 %** |
+
+- **The cost is per optimizer step, not per token.** Newton–Schulz depends on the matrix shapes only,
+  so a larger batch or context amortizes it.
+- **At matched wall time Muon still wins:** Adam with 4900 steps reaches 2.79336 held-out bits/byte,
+  and Muon's 4000 steps 2.70234 (−3.26 %, X046).
+- **Muon's runs varied more** (66.5–73.4 s across pairs), which suggests sensitivity to the other load
+  on the power-limited APU rather than to the code.

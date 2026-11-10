@@ -5,6 +5,16 @@
 
 ## Version
 
+**1.17.0** — *training dynamics #1: Muon, and the knob flags* (2026-11-09).
+- **What changed:** `--optim muon` (Newton–Schulz-orthogonalized Nesterov momentum on the hidden
+  matrices, Adam elsewhere), and `--lr`/`--min-lr`/`--warmup`/`--clip`/`--seed` as flags.
+- **Result (X046):** **Muon is 4.59 % better held-out than default Adam** (4.19 % vs the best Adam),
+  3 of 3 seeds, at `--lr 1e-2`; its step is 22 % slower, and it is still 3.26 % better at matched
+  wall time. X045: Adam's default LR is already optimal; `--clip 0` is −0.42 %.
+- **Same results without the flags:** the golden suite is byte-identical to 1.16.0's, and explicit
+  default knobs reproduce the no-flag checkpoint bit-for-bit.
+- **Suite:** **1157** on x86_64 and **1150** on aarch64 (+18).
+
 **1.16.0** — *the curriculum, X044* (2026-11-09).
 - **What changed:** `--curriculum N`, a competence-based easy-to-hard data order by unigram rarity
   (Platanios et al. 2019). It is RNG-neutral (one draw per window, as the uniform sampler) and
@@ -1335,10 +1345,19 @@ checkpoint vs Linux at fixed CPU — `scripts/agnos-smoke.sh`):
   RNG draw per window, as the uniform sampler, so a seed's init and dropout are unchanged;
   resume-deterministic (the order is rebuilt from the corpus). AR + in-memory corpus only.
   `curriculum_build`/`curriculum_open`/`curriculum_pick` (train.cyr). X044: a null result at 52 K.
+- **Muon optimizer** (1.17.0, `--optim muon`, X046): Nesterov momentum (0.95) on each block's six
+  hidden matrices, orthogonalized by a 5-step quintic Newton–Schulz iteration and scaled to Adam's
+  update RMS (0.2·√max(rows, cols)); embeddings, LayerNorm, biases and MTP heads stay on Adam.
+  Momentum rides in the Adam `m` slots, so checkpoints are unchanged and resume is bit-for-bit.
+  Dense MHA/GQA, CPU only. `muon_init`/`muon_ns5`/`_muon_adam_step` (model.cyr). X046: **−4.6 %
+  held-out vs Adam**.
+- **Training-dynamics flags** (1.17.0): `--lr`, `--min-lr`, `--warmup`, `--clip` (0 = off), `--seed`;
+  the defaults are the frozen `CFG_*` values, bit-for-bit (`_af` parses decimals exactly).
 - CLI: `--corpus --stdin --load --save --steps --gen-only --preset --heads
   --kv-heads --layers --attn-kind --latent-dim --attn-every --pos-kind --rope-dim
   --experts --expert-topk --bpe --eval --eval-corpus --encode-shard --stream-encode
-  --stream-corpus --objective --decode-steps --decode-schedule --ternary --curriculum`
+  --stream-corpus --objective --decode-steps --decode-schedule --ternary --curriculum --lr
+  --min-lr --warmup --clip --seed --optim`
   (`--attn-kind` takes `mha`/`mla`/`lin`/`ssm`; `--latent-dim` is the MLA latent /
   SSM state size; `--attn-every K` builds the per-layer hybrid over the `--attn-kind`
   base; `--objective` takes `ar`/`diffusion` — `diffusion` adds `--decode-steps` /
@@ -1384,7 +1403,9 @@ MLP with N experts + a `C→N` gate: total params scale with N (215 648 at N=8 v
 the dense default (params unchanged). `--attn-kind lin` (1.4.0; full heads,
 learned-abs) swaps the softmax core for the gated retention recurrence —
 parameter-free (same 39 488 params as MHA), and the decode cache becomes the
-constant `nh·hd²` state instead of a T-growing K/V.
+constant `nh·hd²` state instead of a T-growing K/V. Since 1.17.0 the optimizer row's knobs are
+flags too: `--lr`/`--min-lr`/`--warmup`/`--clip`/`--seed` (defaults unchanged, bit-for-bit) and
+`--optim muon` (X046: −4.6 % held-out vs Adam).
 
 ## Source (`src/`, 14 files, ~7,700 lines at 1.15.2)
 
@@ -1498,8 +1519,8 @@ constant `nh·hd²` state instead of a T-growing K/V.
 
 ## Tests
 
-- `tests/attn11.tcyr` — **1139 checks** on x86_64, 1132 on aarch64 (1.16.0: +22 for the
-  curriculum; 1117 / 1110 at 1.15.3–1.15.4, +12 for the GELU tanh cache; 1105 / 1098 at 1.15.2; the
+- `tests/attn11.tcyr` — **1157 checks** on x86_64, 1150 on aarch64 (1.17.0: +18 for Muon;
+  1139 / 1132 at 1.16.0, +22 for the curriculum; 1117 / 1110 at 1.15.3–1.15.4, +12 for the GELU tanh cache; 1105 / 1098 at 1.15.2; the
   x86-only hearing lane accounts for the difference): finite-difference gradient checks
   (every op incl. dropout; attention at head dims 6/8/10 and GQA/MQA at
   `nkv ∈ {1, 2, nh}` incl. `dWk`/`dWv`/`dbv`; the `|dbk| ≈ 0`

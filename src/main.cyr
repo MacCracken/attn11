@@ -132,7 +132,7 @@ fn CFG_ATTN_BIAS(): i64 { return 1; }                                 # Q/K/V/O 
 fn CFG_DROPOUT(): i64 { return f64_from(0); }                         # residual dropout (off; tiny corpus)
 
 # Kept in sync with the VERSION file (CI's docs job gates the match).
-fn CFG_VERSION(): i64 { return "1.16.0"; }
+fn CFG_VERSION(): i64 { return "1.17.0"; }
 
 # print the --help flag reference; returns 0 (every caller then exits)
 fn usage(): i64 {
@@ -164,6 +164,12 @@ fn usage(): i64 {
     puts("  --experts N     MoE: N experts per block (1=dense; >1 enables top-K routing, 1..256)\n");
     puts("  --mtp N         multi-token prediction: N-1 aux heads predict t+2..t+N (1=off; 1..8)\n");
     puts("  --curriculum N  easy-to-hard data order: open the corpus by unigram rarity over N steps (0=off)\n");
+    puts("  --lr F          peak learning rate (default 3e-3; (0, 1])\n");
+    puts("  --min-lr F      cosine-schedule floor (default 3e-4; <= --lr)\n");
+    puts("  --warmup N      linear warmup steps before the cosine decay (default 100)\n");
+    puts("  --clip F        global-norm gradient clip (default 1; 0 = off)\n");
+    puts("  --seed N        PRNG seed for a fresh model (default 1337)\n");
+    puts("  --optim O       optimizer: adam (default) or muon (hidden matrices; mha + dense, CPU)\n");
     puts("  --expert-topk K active experts per token (default 2; 1..N)\n");
     puts("  --bpe K         learn K BPE merges first (1..512; byte-level is the default)\n");
     puts("  --eval          print CE/token + bits-per-byte after training/save\n");
@@ -215,6 +221,71 @@ fn _ai(idx, flag): i64 {
     return v;
 }
 
+# Consume a value-flag's non-negative DECIMAL argument as f64 bits, strictly: digits with
+# at most one '.', at least one digit, then an optional e/E exponent with an optional sign
+# ("3e-3", "0.0003", "1", "2.5E2"). At most 15 significant digits, so the mantissa m is an
+# exact f64, and |exponent| <= 22 after folding in the fraction digits, so 10^k is exact
+# too: the value is ONE correctly rounded m / 10^k or m * 10^k. That makes `--lr 3e-3`
+# and `--lr 0.003` the same bits as CFG_LR's 3 / 1000. Anything else exits 1 with usage.
+fn _af(idx, flag): i64 {
+    var s = _av(idx, flag);
+    var m = 0; var nd = 0; var fd = 0; var dot = 0; var dg = 0; var bad = 0; var i = 0;
+    while ((load8(s + i) != 0) && (load8(s + i) != 101) && (load8(s + i) != 69)) {
+        var c = load8(s + i);
+        if (c == 46) {
+            if (dot == 1) { bad = 1; }
+            dot = 1;
+        } elif ((c < 48) || (c > 57)) { bad = 1; }
+        else {
+            dg = 1;
+            if ((nd > 0) || (c != 48)) { nd = nd + 1; }      # leading zeros are not significant
+            if (nd > 15) { bad = 1; }                       # no longer an exact mantissa
+            else {
+                m = m * 10 + (c - 48);
+                if (dot == 1) { fd = fd + 1; }              # every fraction digit scales by 10
+            }
+        }
+        i = i + 1;
+    }
+    if (dg == 0) { bad = 1; }                               # "", ".", "e5"
+    var ex = 0;
+    if ((load8(s + i) == 101) || (load8(s + i) == 69)) {
+        i = i + 1;
+        var eneg = 0;
+        if ((load8(s + i) == 45) || (load8(s + i) == 43)) { if (load8(s + i) == 45) { eneg = 1; } i = i + 1; }
+        if (load8(s + i) == 0) { bad = 1; }
+        while (load8(s + i) != 0) {
+            var e = load8(s + i);
+            if ((e < 48) || (e > 57)) { bad = 1; }
+            elif (ex < 1000) { ex = ex * 10 + (e - 48); }
+            i = i + 1;
+        }
+        if (eneg == 1) { ex = 0 - ex; }
+    }
+    var k = ex - fd;
+    if ((bad == 0) && ((k > 22) || (k < (0 - 22)))) {
+        if (m != 0) { bad = 1; }
+        k = 0;
+    }
+    if (bad == 1) {
+        puts("attn11: "); puts(flag); puts(" needs a non-negative decimal (e.g. 3e-3), got '"); puts(s); puts("'\n");
+        usage(); sys_exit(1);
+    }
+    var p = f64_from(1); var j = 0; var ak = k;
+    if (ak < 0) { ak = 0 - ak; }
+    while (j < ak) { p = f64_mul(p, f64_from(10)); j = j + 1; }
+    if (k < 0) { return f64_div(f64_from(m), p); }
+    return f64_mul(f64_from(m), p);
+}
+
+# Print a non-negative f64 to d decimals, rounded half up (f_print truncates, so 3e-4,
+# whose nearest f64 is just below it, would print as 0.000299). Display only.
+fn _fprint_r(x, d): i64 {
+    var h = f64_div(f64_from(1), f64_from(2)); var j = 0;
+    while (j < d) { h = f64_div(h, f64_from(10)); j = j + 1; }
+    return f_print(f64_add(x, h), d);
+}
+
 # CLI driver: parse flags (lane demos return early), then encode / load-or-init, train, save, eval, sample.
 # Returns the process exit code the epilogue below hands to sys_exit.
 fn main(): i64 {
@@ -243,6 +314,11 @@ fn main(): i64 {
     var cfg_objective = 0;                           # M15: 0 = AR (default), 1 = masked diffusion
     var cfg_mtp = 1;                                 # X043: --mtp N>1 = multi-token prediction (N-1 aux heads)
     var cfg_curriculum = 0;                          # X044: --curriculum N = easiest-first ramp over N steps (0 = off)
+    # 1.17.0 (training dynamics #1): the frozen CFG_* knobs, now flag-overridable; defaults unchanged
+    var cfg_lr = CFG_LR(); var cfg_minlr = CFG_MINLR(); var cfg_warmup = CFG_WARMUP();
+    var cfg_clip = CFG_CLIP(); var cfg_seed = CFG_SEED(); var cfg_tdyn_set = 0;
+    var cfg_seed_set = 0;
+    var cfg_optim = 0;                               # 1.17.0: 0 = adam (default), 1 = muon
     var cfg_decode_steps = 0;                        # diffusion decode iterations (0 = default, resolved post-parse)
     var cfg_decode_sched = 0;                        # diffusion decode schedule: 0 = cosine (default), 1 = linear
     var cfg_decode_set = 0;                          # 1 = --decode-steps or --decode-schedule was given
@@ -295,6 +371,11 @@ fn main(): i64 {
         elif (streq(a, "--experts") == 1) { i = i + 1; cfg_num_experts = _ai(i, a); }
         elif (streq(a, "--mtp") == 1) { i = i + 1; cfg_mtp = _ai(i, a); }
         elif (streq(a, "--curriculum") == 1) { i = i + 1; cfg_curriculum = _ai(i, a); }
+        elif (streq(a, "--lr") == 1) { i = i + 1; cfg_lr = _af(i, a); cfg_tdyn_set = 1; }
+        elif (streq(a, "--min-lr") == 1) { i = i + 1; cfg_minlr = _af(i, a); cfg_tdyn_set = 1; }
+        elif (streq(a, "--warmup") == 1) { i = i + 1; cfg_warmup = _ai(i, a); cfg_tdyn_set = 1; }
+        elif (streq(a, "--clip") == 1) { i = i + 1; cfg_clip = _af(i, a); cfg_tdyn_set = 1; }
+        elif (streq(a, "--seed") == 1) { i = i + 1; cfg_seed = _ai(i, a); cfg_tdyn_set = 1; cfg_seed_set = 1; }
         elif (streq(a, "--expert-topk") == 1) { i = i + 1; cfg_expert_topk = _ai(i, a); }
         elif (streq(a, "--bpe") == 1) { use_bpe = 1; i = i + 1; bpe_k = _ai(i, a); }
         elif (streq(a, "--eval") == 1) { do_eval = 1; }
@@ -309,6 +390,12 @@ fn main(): i64 {
             else { puts("attn11: --objective must be ar or diffusion\n"); return 1; }
         }
         elif (streq(a, "--ternary") == 1) { cfg_ternary = 1; }
+        elif (streq(a, "--optim") == 1) {
+            i = i + 1; var op = _av(i, a);
+            if (streq(op, "adam") == 1) { cfg_optim = 0; }
+            elif (streq(op, "muon") == 1) { cfg_optim = 1; }
+            else { puts("attn11: --optim must be adam or muon\n"); return 1; }
+        }
         elif (streq(a, "--decode-steps") == 1) { i = i + 1; cfg_decode_steps = _ai(i, a); cfg_decode_set = 1; }
         elif (streq(a, "--decode-schedule") == 1) {
             i = i + 1; var ds = _av(i, a); cfg_decode_set = 1;
@@ -617,6 +704,17 @@ fn main(): i64 {
         puts("attn11: --mtp requires the AR objective (not --objective diffusion)\n"); return 1;
     }
     g_mtp = cfg_mtp;
+    # 1.17.0: the training-dynamics knobs. --clip 0 means off: +inf, which no finite norm exceeds.
+    if (((cfg_lr & 0x7FFFFFFFFFFFFFFF) == 0) || (f64_gt(cfg_lr, f64_from(1)) == 1)) {
+        puts("attn11: --lr must be in (0, 1]\n"); return 1;
+    }
+    if (f64_gt(cfg_minlr, cfg_lr) == 1) { puts("attn11: --min-lr (default 3e-4) must not exceed --lr\n"); return 1; }
+    if (cfg_warmup < 0) { puts("attn11: --warmup must be >= 0\n"); return 1; }
+    if (cfg_seed < 0) { puts("attn11: --seed must be >= 0\n"); return 1; }
+    if ((cfg_clip & 0x7FFFFFFFFFFFFFFF) == 0) { cfg_clip = 0x7FF0000000000000; }
+    if ((cfg_seed_set == 1) && (load_path != 0)) {
+        puts("attn11: --seed ignored; the checkpoint carries its RNG state\n");
+    }
     # X044: --curriculum orders the in-memory corpus easiest-first, so it needs one, and it
     # only changes which windows training samples.
     if (cfg_curriculum < 0) { puts("attn11: --curriculum must be >= 0 (0 = off)\n"); return 1; }
@@ -638,19 +736,30 @@ fn main(): i64 {
     } elif (cfg_objective == 1) {
         # M15 masked-diffusion (uniform MHA + learned-abs + dense; bidirectional)
         model_init_full(V, cfg_c, cfg_t, cfg_nh, cfg_nkv, cfg_nl,
-          CFG_ATTN_BIAS(), CFG_DROPOUT(), CFG_SEED(),
+          CFG_ATTN_BIAS(), CFG_DROPOUT(), cfg_seed,
           cfg_attn_kind, cfg_latent_dim, cfg_pos_kind, cfg_rope_dim,
           cfg_num_experts, cfg_expert_topk, 0, 1);
     } elif (cfg_hybrid == 1) {
         model_init_full(V, cfg_c, cfg_t, cfg_nh, cfg_nkv, cfg_nl,
-          CFG_ATTN_BIAS(), CFG_DROPOUT(), CFG_SEED(),
+          CFG_ATTN_BIAS(), CFG_DROPOUT(), cfg_seed,
           cfg_attn_kind, cfg_latent_dim, cfg_pos_kind, cfg_rope_dim,
           cfg_num_experts, cfg_expert_topk, &lkinds, 0);
     } else {
         model_init_moe(V, cfg_c, cfg_t, cfg_nh, cfg_nkv, cfg_nl,
-          CFG_ATTN_BIAS(), CFG_DROPOUT(), CFG_SEED(),
+          CFG_ATTN_BIAS(), CFG_DROPOUT(), cfg_seed,
           cfg_attn_kind, cfg_latent_dim, cfg_pos_kind, cfg_rope_dim,
           cfg_num_experts, cfg_expert_topk);
+    }
+    # 1.17.0: arm Muon on the final model (under --load the checkpoint's architecture wins,
+    # so its limits are checked here, against the built model).
+    if (cfg_optim == 1) {
+        if (g_gpu == 1) { puts("attn11: --optim muon runs on the CPU (not with --gpu)\n"); return 1; }
+        var mr = muon_init();
+        if (mr == 0 - 2) {
+            puts("attn11: --optim muon needs dense mha blocks (no mla/lin/ssm, --experts, --attn-every, --ternary)\n");
+            return 1;
+        }
+        if (mr < 0) { puts("attn11: --optim muon: out of memory\n"); return 1; }
     }
     # X044: build the easiest-first order once the model (g_T, g_V) and corpus are final.
     # Under --load the checkpoint's objective wins, so re-check it here.
@@ -696,6 +805,16 @@ fn main(): i64 {
     if (g_bpe_on == 1) { puts("bpe(merges="); fmt_int(g_bpe_nmerges); puts(")"); }
     else { puts("byte"); }
     puts(" corpus tokens="); fmt_int(g_datalen); _putc(10);
+    if (cfg_tdyn_set > 0) {
+        puts("  train: lr="); _fprint_r(cfg_lr, 6); puts(" min_lr="); _fprint_r(cfg_minlr, 6);
+        puts(" warmup="); fmt_int(cfg_warmup); puts(" clip=");
+        if (cfg_clip == 0x7FF0000000000000) { puts("off"); } else { _fprint_r(cfg_clip, 4); }
+        puts(" seed="); fmt_int(cfg_seed); _putc(10);
+    }
+    if (g_optim == 1) {
+        puts("  optim=muon(matrices="); fmt_int(g_muon_nmat);
+        puts(", nesterov 0.95, ns5, rms 0.2; adam elsewhere)\n");
+    }
     if (g_curr_n > 0) {
         puts("  curriculum=rarity(ramp="); fmt_int(g_curr_n); puts(" steps, blocks="); fmt_int(g_curr_nb);
         puts(" of "); fmt_int(g_curr_bl); puts(" starts)\n");
@@ -709,7 +828,7 @@ fn main(): i64 {
             puts("attn11: no/short corpus (need >= ctx+1 bytes); skipping training\n");
         } else {
             puts("training:\n");
-            train_rc = train(steps, steps, CFG_BATCH(), CFG_LR(), CFG_MINLR(), CFG_WARMUP(), CFG_CLIP(), CFG_LOG());
+            train_rc = train(steps, steps, CFG_BATCH(), cfg_lr, cfg_minlr, cfg_warmup, cfg_clip, CFG_LOG());
         }
     }
 

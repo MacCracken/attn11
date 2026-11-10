@@ -217,6 +217,18 @@ inference. attn11's heads are C×C transforms into the tied unembedding, weighte
 λ/(N−1). Used in: `src/model.cyr` (`P_mtp`, `mtp_aux_loss`, `mtp_aux_backward`),
 `src/train.cyr` (`mtp_fill_targets`). See X043 (an honest negative at tiny scale).
 
+### Muon (orthogonalized momentum for hidden weight matrices, X046)
+**Jordan, K., Jin, Y., Boza, V., You, J., Cesista, F., Newhouse, L., Bernstein, J. (2024).**
+"Muon: An optimizer for hidden layers in neural networks." Blog post,
+[kellerjordan.github.io/posts/muon](https://kellerjordan.github.io/posts/muon/) — SGD with Nesterov
+momentum (μ = 0.95) whose update for each hidden 2D weight is replaced by its orthogonalization,
+approximated by 5 steps of a quintic Newton–Schulz iteration with coefficients
+(3.4445, −4.7750, 2.0315); embeddings, the head and gains/biases stay on AdamW.
+**Liu, J., Su, J., Yao, X., Jiang, Z., Lai, G., Du, Y., et al. (2025).** "Muon is Scalable for LLM
+Training." arXiv:[2502.16982](https://arxiv.org/abs/2502.16982) — scaling the orthogonalized update
+by 0.2·√max(rows, cols) matches AdamW's update RMS, so both parameter groups share one LR.
+Used in: `src/model.cyr` (`muon_init`, `muon_ns5`, `_muon_adam_step`). See X046.
+
 ### Curriculum learning (easy-to-hard data order, X044)
 **Bengio, Y., Louradour, J., Collobert, R., Weston, J. (2009).** "Curriculum Learning."
 *ICML 2009.* doi:[10.1145/1553374.1553380](https://doi.org/10.1145/1553374.1553380) — training on

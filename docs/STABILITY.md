@@ -56,23 +56,25 @@ positions and full heads.
 
 ## Config knobs (compile-time constants — frozen defaults)
 
-These live in `src/main.cyr` (`CFG_*`) and are **not** flag-exposed; changing
-them requires a rebuild. Their *values* are the frozen defaults:
+These live in `src/main.cyr` (`CFG_*`). Their *values* are the frozen defaults. Since 1.17.0
+the seed, LR, warmup and clip are also flag-overridable (additive: the defaults are unchanged,
+and passing them explicitly reproduces the no-flag run bit-for-bit); the rest need a rebuild:
 
 | knob | value | flag override |
 |------|-------|---------------|
-| d_model `C` | 32 (preset 64) | via `--preset` |
-| ctx `T` | 16 (preset 64) | via `--preset` |
+| d_model `C` | 32 (preset 64) | `--d-model`, `--preset` |
+| ctx `T` | 16 (preset 64) | `--ctx`, `--preset` |
 | heads | 4 (preset 8) | `--heads`, `--preset` |
 | kv-heads | = heads | `--kv-heads`, `--preset` |
 | layers | 3 (preset 4) | `--layers`, `--preset` |
 | steps | 2000 | `--steps` |
-| seed | 1337 | — (rebuild) |
+| seed | 1337 | `--seed` (1.17.0; fresh model only) |
 | batch | 16 | — (rebuild) |
 | log-every | 250 | — (rebuild) |
-| LR warmup | 100 | — (rebuild) |
-| LR (base → min) | 3e-3 → 3e-4, cosine | — (rebuild) |
-| grad-clip (global-norm) | 1.0 | — (rebuild) |
+| LR warmup | 100 | `--warmup` (1.17.0) |
+| LR (base → min) | 3e-3 → 3e-4, cosine | `--lr`, `--min-lr` (1.17.0) |
+| grad-clip (global-norm) | 1.0 | `--clip` (1.17.0; `0` = off) |
+| optimizer | Adam (0.9, 0.999, 1e-8; no weight decay) | `--optim muon` (1.17.0) |
 | attention bias | on | — (rebuild) |
 | residual dropout | 0.0 | — (rebuild) |
 

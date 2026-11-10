@@ -13,8 +13,10 @@
 
 ## Where we are
 
-> **Current (2026-11-09): v1.16.0.** The training-science #3 lane is closed: `--curriculum N`
-> (X044, a null result at 52 K) follows `--mtp N` (X043). **Next: #1, training dynamics**, under
+> **Current (2026-11-09): v1.17.0.** Training dynamics (#1) is under way: **`--optim muon` beats
+> tuned Adam by 4.6 % held-out (X046)**, and `--lr`/`--min-lr`/`--warmup`/`--clip`/`--seed` are flags
+> (X045). The #3 lane closed at 1.16.0 (`--curriculum`, X044, null; `--mtp`, X043). **Next: the rest
+> of #1** (Lion, schedule-free, init, the Muon follow-ups), under
 > [Training-science explorations](#training-science-explorations-parked--for-a-future-attn11-agent).
 > 1.11–1.15 were extractions (akshara, tarka), the vision/hearing lanes, the rupantara re-fold, the
 > toolchain moves to cyrius 6.7.18 and the 1.15.2 hardening sweep (see the CHANGELOG). The paragraph
@@ -690,8 +692,9 @@ for the native-AMD f64 route.
 > picks any thread below; all are **matched-A/B at the f64 oracle**, X021 protocol
 > (`c4-24-trainA`/`heldB`, held-out bits/byte = the honest metric). Sequencing intent
 > (user, 2026-06-22): **#3 → #1**, which then inform the **#2 / #4** bets with data.
-> **Status (2026-11-09, 1.16.0):** #3 is done (MTP X043 and curriculum X044, both null-or-negative
-> at 52 K and kept behind their flags); **#1 (training dynamics) is next.**
+> **Status (2026-11-09, 1.17.0):** #3 is done (MTP X043 and curriculum X044, both null-or-negative
+> at 52 K and kept behind their flags). **#1 is under way: Muon wins (X046, −4.6 %)**; X045 tuned the
+> Adam baseline. Lion / schedule-free / init remain.
 
 ### #3 — Objective / curriculum
 - **Multi-token prediction — DONE (X043; mechanism shipped at 1.10.1).** `--mtp N`:
@@ -717,9 +720,23 @@ for the native-AMD f64 route.
 > v1.11.1. attn11 stays a pure SFT + masked-diffusion reference; RL work belongs in tarka.
 
 ### #1 — Training dynamics (cheap, high signal-per-token; do early)
-- **Optimizer** beyond Adam — Muon (winning at small scale), Lion, schedule-free.
-- **LR schedule / warmup**; **init** (the 0.02 / GPT-2 residual-scale choices); **grad-clip**
-  threshold. All pure-f64, no new infra.
+- **Muon — DONE, a WIN (X046; shipped at 1.17.0, `--optim muon`).** Newton–Schulz-orthogonalized
+  Nesterov momentum on the 18 hidden matrices, Adam elsewhere: **−4.59 % held-out bits/byte vs
+  default Adam, −4.19 % vs the best Adam, 3 of 3 seeds; −3.26 % at matched wall time** (its step is
+  22 % slower). An ablation without the orthogonalization is 11–15 % worse at the same LR. Opt-in; the default stays Adam (no-flag byte-identity).
+  - **Muon follow-ups (parked):**
+    - the preset (~229 K) scale bracket;
+    - covering the MLA/lin/ssm/MoE matrix layouts;
+    - Muon with `--clip 0`, and a momentum or Newton–Schulz step-count sweep;
+    - a cheaper Newton–Schulz (a symmetric X·Xᵀ, no explicit transpose), and a GPU one if `--gpu`
+      ever needs it.
+- **LR schedule / warmup / grad-clip — swept (X045; the flags shipped at 1.17.0).**
+  - **LR:** the default 3e-3 is the best of 1e-3 / 3e-3 / 6e-3 / 1e-2.
+  - **Warmup and the floor:** warmup 400 is noise, and a lower floor is slightly worse.
+  - **Clip:** off (`--clip 0`) is −0.42 % on 3 of 3 seeds, since the 1.0 clip binds almost every step.
+  - **Open:** schedule *shape* (WSD / trapezoid vs cosine), batch size.
+- **Still open:** Lion, schedule-free, **init** (the 0.02 / GPT-2 residual-scale choices; needs an
+  `--init-std`-style flag). All pure-f64, no new infra.
 
 ### #2 — Architecture variants (matched compute; #1/#3 results inform the picks)
 - GQA/MQA (flag-driven via `--kv-heads`), sliding-window attention, SwiGLU vs GELU MLP,

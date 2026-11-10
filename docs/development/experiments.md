@@ -1892,3 +1892,117 @@ Reproduce (each arm ~15 min on Cezanne with 8 running at once):
     ./build/attn11 $P                     # baseline
     ./build/attn11 $P --curriculum 2000   # ramp over half the run
     ./build/attn11 $P --curriculum 4000   # ramp over the whole run
+
+## X045 — the Adam baseline is tuned; gradient clipping at 1.0 costs a little (training dynamics #1, v1.17.0, 2026-11-09)
+
+**Result.** Before comparing optimizers, the default Adam setup was swept one knob at a time with
+1.17.0's new flags (`--lr`, `--min-lr`, `--warmup`, `--clip`, `--seed`). **The default LR (3e-3) is the
+best of the four tried**, and no other knob moves held-out bits/byte by more than seed noise except
+the clip. **Turning the clip off is 0.42 % better, on 3 of 3 seeds.**
+
+**Protocol (X021):** `--corpus c4-24-trainA --bpe 256 --steps 4000 --eval --eval-corpus c4-24-heldB`,
+52,768 params, seed 1337 unless noted. The baseline's own seed spread (X044) is 0.38 %.
+
+| arm (seed 1337) | own bits/byte | held-out | Δ held-out |
+|---|---:|---:|---:|
+| default: `--lr 3e-3 --min-lr 3e-4 --warmup 100 --clip 1` | 2.80388 | **2.83681** | — |
+| `--lr 1e-3 --min-lr 1e-4` | 2.94044 | 2.96851 | +4.64 % |
+| `--lr 6e-3` | 2.84106 | 2.87181 | +1.23 % |
+| `--lr 1e-2` | 2.84028 | 2.87062 | +1.19 % |
+| `--min-lr 3e-5` | 2.81812 | 2.85092 | +0.50 % |
+| `--warmup 400` | 2.79821 | 2.83119 | −0.20 % |
+| `--clip 0.5` | 2.79795 | 2.83066 | −0.22 % |
+| `--clip 0` (off) | 2.78951 | 2.82289 | −0.49 % |
+
+**Clip off, confirmed on two more seeds** (paired with X044's baselines at those seeds): 2.81844 vs
+2.82608 at seed 1338 (−0.27 %) and 2.82191 vs 2.83581 at seed 1339 (−0.49 %). The mean is **−0.42 %**,
+all three better.
+
+**Reading it.**
+1. **The LR optimum is at the default.** Both directions cost: a third of it +4.6 %, double it or more
+   about +1.2 %. Adam is not under-tuned here, so it is a fair baseline for X046.
+2. **The clip at 1.0 is active almost every step.** The logged global norm sits around 1.5 late in
+   training, so the clip rescales nearly every update, and removing it helps slightly. The default
+   stays: it is frozen (the no-flag run is byte-identical by contract), and 0.42 % is small.
+3. `--seed N` reproduces a `CFG_SEED = N` build bit-for-bit (checked at 50 steps by checkpoint bytes),
+   so seed variation no longer needs scratch builds.
+
+## X046 — Muon beats tuned Adam by ~4.6 % held-out at 52 K params (training dynamics #1, v1.17.0, 2026-11-09)
+
+**Result — a win, the first in the training-science lanes.** 1.17.0's `--optim muon` (Newton–Schulz-
+orthogonalized Nesterov momentum on the 18 hidden matrices, Adam on everything else) cuts held-out
+bits/byte by **4.59 % against default Adam and 4.19 % against the best Adam X045 found**, on 3 of 3
+seeds. At matched wall time (Adam given 22.5 % more steps) it is still **3.26 %** better. At the same LR, an ablation that keeps everything but the orthogonalization is 11–15 % worse
+than Muon, so the orthogonalization is what helps.
+
+**The mechanism.** Jordan et al. (2024) with the RMS-matched scaling of Liu et al. (2025):
+- **The momentum:** `m ← 0.95·m + g`, and Nesterov `u = g + 0.95·m`.
+- **The update:** `O = NS5(u)`, a 5-step quintic Newton–Schulz iteration.
+- **The step:** `W ← W − lr · 0.2·√max(rows, cols) · O`.
+- **What it covers:** Wq, Wk, Wv, Wo, Wfc and Wproj of each block. The tied embedding/head, LayerNorm
+  parameters and biases stay on Adam, under the same LR schedule.
+
+**Protocol:** X021, as X045. Muon's LR was swept like Adam's: 3e-3, 1e-2 and 2e-2. That LR also
+drives the Adam-group parameters.
+
+| arm | seed 1337 | seed 1338 | seed 1339 | mean |
+|---|---:|---:|---:|---:|
+| Adam, default (`--clip 1`) | 2.83681 | 2.82608 | 2.83581 | 2.83290 |
+| Adam, `--clip 0` (X045's best) | 2.82289 | 2.81844 | 2.82191 | 2.82108 |
+| **Muon, `--lr 1e-2`** | **2.70234** | **2.69105** | **2.71547** | **2.70295** |
+| Δ vs Adam default | −4.74 % | −4.78 % | −4.24 % | **−4.59 %** |
+| Δ vs Adam `--clip 0` | −4.27 % | −4.52 % | −3.77 % | **−4.19 %** |
+
+Muon's LR sweep (seed 1337, held-out): 2.75073 at 3e-3 (−3.03 %), **2.70234 at 1e-2**, 2.73770 at
+2e-2 (−3.49 %). Even at Adam's own LR for every parameter (3e-3), Muon is 3 % better, so the gain
+is not a higher LR. Own-corpus bits/byte follows: 2.66471 / 2.65361 / 2.67846 vs Adam's 2.80388 /
+2.79322 / 2.80134.
+
+**Ablation — no orthogonalization** (a scratch build): the same momentum, scope and Adam split, but
+the Newton–Schulz iterations removed. The update is the Frobenius-normalized `u`, scaled by
+0.2·√(rows·cols), so its RMS is the same 0.2·lr. Seed 1337, held-out:
+
+| LR | no orthogonalization | Muon at the same LR | Adam default |
+|---|---:|---:|---:|
+| 1e-3 (`--min-lr 1e-4`) | 2.99089 (+5.43 % vs Adam) | — | 2.83681 |
+| 3e-3 | 3.09928 (+9.25 %) | 2.75073 | 2.83681 |
+| 1e-2 | 3.18268 (+12.19 %) | 2.70234 | 2.83681 |
+
+**Reading it.**
+1. **The gain is large and consistent:** about 12× the baseline's seed spread, and 3 of 3 seeds, against
+   an Adam baseline whose LR X045 showed is at its optimum.
+2. **The orthogonalization is the active ingredient.** At the same LR and update RMS, removing it costs
+   11 % (3e-3) and 15 % (1e-2). A Frobenius-normalized step puts most of its norm into the top singular
+   directions; Muon equalizes the singular values. Two caveats:
+   - **The ablation was not tuned as far:** its best LR is the lowest tried (1e-3, still +5.4 % vs Adam),
+     and its trend was still improving downward.
+   - **A lower LR also slows the Adam-group parameters,** which costs Adam 4.6 % at 1e-3 (X045).
+
+   So this shows the orthogonalization is what Muon's win rests on, not that every normalized-momentum
+   variant loses to Adam.
+3. **It is not an LR artefact:** at 3e-3 for every parameter, Muon still wins by 3 %.
+4. **It survives matching compute.** Muon's step is 22 % slower here: 66.7 vs 54.6 ms (1000-step runs,
+   3 interleaved pairs, medians). Newton–Schulz on 18 small matrices costs the same at any batch, and
+   a batch of 16 × 16 tokens is small. Adam given 22.5 % more steps (`--steps 4900`, so the same wall
+   time) reaches 2.79336 held-out at seed 1337. That is 1.5 % better than its 4000 steps, and **Muon is
+   still 3.26 % better than it**.
+5. **Scope of the claim:** one tiny config (52 K params, d_model 32, 3 blocks), half an epoch of 4 MB,
+   one corpus. Muon's published results are at far larger scale. This shows the gain also holds at
+   attn11's size; it says nothing beyond this config.
+
+**Decision.** `--optim muon` ships as an opt-in flag. The default stays Adam: the no-flag run is
+byte-identical by contract, and changing it would be a behaviour change for every existing script and
+checkpoint. **Parked follow-ups:**
+- the preset (~229 K) scale bracket;
+- Muon on the MLA/lin/ssm/MoE blocks (which have other matrix layouts);
+- Muon with `--clip 0`, and a momentum or Newton–Schulz step-count sweep;
+- the remaining #1 items: Lion, schedule-free, and init.
+
+Reproduce:
+
+    P="--corpus data/c4-24-trainA.txt --bpe 256 --steps 4000 --eval --eval-corpus data/c4-24-heldB.txt"
+    for S in 1337 1338 1339; do
+      ./build/attn11 $P --seed $S                        # Adam
+      ./build/attn11 $P --seed $S --clip 0               # Adam, no clip
+      ./build/attn11 $P --seed $S --optim muon --lr 1e-2 # Muon
+    done

@@ -4,6 +4,107 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.17.0] - 2026-11-09
+
+Training dynamics (#1), first rung: **Muon beats tuned Adam by 4.6 % held-out bits/byte** at 52 K
+params on 3 of 3 seeds (X046), the first win in the training-science lanes. The LR, warmup, clip and
+seed become flags (X045 tunes the Adam baseline with them). Everything is additive: the no-flag run is
+byte-identical to 1.16.0, and passing the defaults explicitly reproduces it bit-for-bit.
+
+### Added
+
+- **`--optim muon`** (Jordan et al. 2024; RMS-matched scaling of Liu et al. 2025).
+  - **The update:** Nesterov momentum (0.95), orthogonalized by a 5-step quintic Newton–Schulz
+    iteration, coefficients (3.4445, −4.7750, 2.0315), and scaled by 0.2·√max(rows, cols). That
+    scale gives the update a typical Adam update's RMS, so one LR schedule drives both groups.
+  - **Which parameters:** the six hidden matrices of each block (Wq, Wk, Wv, Wo, Wfc, Wproj; 18 at
+    the default config). The tied embedding/head, LayerNorm parameters, biases, the diffusion mask
+    embedding and the MTP heads stay on Adam, as in the reference.
+  - **Checkpoints unchanged:** Muon's momentum lives in those entries' Adam `m` slots, and their `v`
+    slots stay 0. A resume with the same flag continues bit-for-bit.
+  - **Limits:** dense MHA/GQA blocks only (no `mla`/`lin`/`ssm`, `--experts`, `--attn-every` or
+    `--ternary`), on the CPU only (not with `--gpu`). Each exits 1 with a message.
+  - **Code:** `muon_init`, `muon_ns5` (on rosnet's `linear_fwd`, in the wide orientation, so
+    NS5(Uᵀ) = NS5(U)ᵀ bit-for-bit) and `_muon_adam_step` (`src/model.cyr`).
+    `model_adam_step` is unchanged when the flag is off.
+- **`--lr F`, `--min-lr F`, `--warmup N`, `--clip F` (`0` = off), `--seed N`.** These are the frozen
+  `CFG_*` knobs, now flag-overridable.
+  - **Decimals parse exactly:** `_af` reads a decimal strictly (≤ 15 significant digits,
+    |exponent| ≤ 22) as one correctly rounded `m / 10^k`. So `--lr 3e-3` and `--lr 0.003` are the
+    same bits as `CFG_LR`.
+  - **Validation:** `--lr` in (0, 1], `--min-lr` ≤ `--lr`, `--warmup` and `--seed` ≥ 0. Anything
+    else exits 1 with usage.
+  - **`--seed` is for a fresh model:** under `--load` it is ignored with a note, and the checkpoint's
+    RNG state wins.
+  - **Banner:** a `train:` line prints when any of them is given. A resume needs the same values to
+    continue bit-for-bit, as `--steps` already did.
+
+### Experiments (`docs/development/experiments.md`)
+
+The X021 protocol: `--corpus c4-24-trainA --bpe 256 --steps 4000`, held-out bits/byte on
+`c4-24-heldB`.
+
+- **X045, the Adam baseline is tuned.**
+  - **LR:** 3e-3, the default, beats 1e-3 (+4.6 %), 6e-3 (+1.2 %) and 1e-2 (+1.2 %).
+  - **Warmup and the LR floor:** warmup 400 is noise, and a lower floor is slightly worse.
+  - **Clip:** off is −0.42 % on 3 of 3 seeds. The 1.0 clip is active almost every step.
+- **X046, Muon at `--lr 1e-2`:**
+  - **Held-out:** 2.70234 / 2.69105 / 2.71547, against Adam's 2.83681 / 2.82608 / 2.83581.
+    That is **−4.59 %** paired, and −4.19 % against Adam with the clip off.
+  - **Not an LR effect:** at Adam's own LR, 3e-3, Muon is still 3.0 % better.
+  - **Not a compute effect:** Muon's step is 22 % slower, but Adam given 22.5 % more steps is still
+    3.26 % behind.
+  - **The ablation:** without the Newton–Schulz orthogonalization, at the same update RMS, it is
+    11–15 % worse than Muon at the same LR.
+- **The defaults stay Adam with the clip at 1.0.** The no-flag run is byte-identical by contract.
+
+### Tests
+
+- **`1.17.0 training dynamics: Muon`,** six tests, 18 assertions, registered last:
+  - **Newton–Schulz:** it keeps each singular direction, brings a 20:1 singular spread into
+    [0.6, 1.25] and keeps the rows orthogonal. NS5(Uᵀ) = NS5(U)ᵀ bit-for-bit, and a zero update
+    stays zero.
+  - **The mask:** it covers exactly NL·(2C² + 2C·Ckv + 2C·F) entries, and an `ssm` model is refused.
+  - **One step:**
+    - every non-Muon entry gets the exact Adam update, bit-for-bit;
+    - Muon's `m` holds `g` and its `v` stays 0;
+    - every matrix's update has an RMS in [0.1, 0.3]·lr.
+  - **Resume:** train(24) equals train(9) → checkpoint → re-armed Muon → train(24), bit-for-bit, and
+    Adam's run differs.
+  - **Learning:** Muon cuts the embedded corpus's eval cross-entropy by more than 5 % in 60 steps.
+- **Mutation run, in a scratch copy: 8 of 8 mutants killed.** The mutants are:
+  - a wrong Newton–Schulz coefficient, and zero iterations;
+  - Adam ignoring the mask, and a mask missing Wproj;
+  - no 0.2 RMS factor, and momentum not stored;
+  - a tall matrix not transposed back, and no norm scaling.
+- **`make smoke`:**
+  - 12 new hostile cases (bad `--lr`, `--min-lr`, `--clip`, `--warmup`, `--seed`, `--optim`, and
+    Muon with ssm, `--experts` or `--gpu`);
+  - valid Muon and knob runs;
+  - **explicit default knobs must write a checkpoint byte-identical to the no-flag run's.**
+- **Suite:** x86_64 **1157/1157** (+18), aarch64/qemu **1150/1150**. Fuzz, bench, the AGNOS build,
+  `cyrius fmt --check` and `cyrius lint` (0 warnings) pass.
+
+### Performance
+
+Muon's step is **22 % slower** at the X021 config: 66.7 ms against Adam's 54.6 ms, from 1000-step
+runs (3 interleaved pairs, medians, startup subtracted). Newton–Schulz on 18 small matrices costs the
+same at any batch size, and a batch of 16 × 16 tokens is small. **At matched wall time the win
+holds:** Adam given 4900 steps reaches 2.79336 held-out at seed 1337, and Muon's 4000 steps are 3.26 %
+better than that. Adam's step, and every run without `--optim muon`, is unchanged.
+
+### Verified — the no-flag path is byte-identical
+
+The golden suite, 28 runs plus the checkpoint and shard they write, is byte-identical to 1.16.0's.
+The one differing line is the output path `--encode-shard` prints.
+
+### Docs
+
+- `experiments.md` X045 and X046, and the roadmap's #1 lane.
+- `docs/sources.md`: Jordan et al. 2024 and Liu et al. 2025.
+- `docs/STABILITY.md`: the knob table names the new overrides.
+- `getting-started.md`, the README and `--help`.
+
 ## [1.16.0] - 2026-11-09
 
 The training-science #3 lane's second thread: an easy-to-hard curriculum, `--curriculum N`, and its
