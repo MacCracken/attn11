@@ -31,10 +31,12 @@ git = "https://github.com/MacCracken/akshara"
 tag = "1.1.3"
 modules = ["dist/akshara.cyr"]
 
-# M18 (v1.8.x GPU arc) — LANDED in v1.8.0 (X027). mabda 3.4.1 is consumed by
-# src/gpu.cyr (`include "lib/mabda.cyr"` in src/main.cyr + the test/fuzz/bench
-# harnesses); the 8 stdlib needs above (hashmap/tagged/fnptr/mmap/dynlib/sakshi/
-# thread/sankoch) are mabda's. The `--gpu` forward matmul runs on the native-AMD
+# M18 (v1.8.x GPU arc) — LANDED in v1.8.0 (X027). mabda is the GPU foundation under
+# rosnet's [lib.gpu] profile (dist/rosnet-gpu.cyr, which owns the whole GPU backend
+# since 1.10.0 — attn11's own src/gpu.cyr was deleted then); since 1.14.4 mabda is the
+# bundled stdlib leaf "mabda" above, not a git dep. The 8 stdlib needs above
+# (hashmap/tagged/fnptr/mmap/dynlib/sakshi/thread/sankoch) are mabda's.
+# The `--gpu` forward matmul runs on the native-AMD
 # f64 SPIR-V path, BIT-EXACT vs the CPU oracle (a --gpu run reproduces the no-flag
 # run byte-for-byte). The ~1 MB dist amalgamation (binary ~373 KB → ~1.34 MB) is a
 # transient binary-SIZE cost — cyrius lacks `dep-module-call` (slated for 6.2.x,

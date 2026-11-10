@@ -26,9 +26,13 @@
 # additive noise — square (filled block), plus (+), cross (X), stripes.
 # Learnable-but-not-trivial at MNIST-class difficulty.
 
+# synthetic-shape canvas side G (images are G×G, one channel)
 fn VIS_G(): i64 { return 16; }        # canvas side
+# conv1 output channels of the vision CNN
 fn VIS_C1(): i64 { return 8; }        # conv1 channels
+# conv2 output channels of the vision CNN
 fn VIS_C2(): i64 { return 16; }       # conv2 channels
+# number of shape classes (square, plus, cross, stripes)
 fn VIS_NCLS(): i64 { return 4; }      # classes
 
 # ---- params: one flat block (Wc1 bc1 Wc2 bc2 Wl bl), rosnet-conv layouts ----
@@ -146,24 +150,51 @@ fn vis_make_batch(X, Y, B, G): i64 {
 }
 
 # ---- forward / backward -------------------------------------------------------
-# scratch (sized for the largest use; reallocated when B grows)
+# scratch, forward AND backward, sized by ELEMENT COUNT and regrown only when a
+# shape needs more. Through 1.15.1 the five backward buffers were t_alloc'd on every
+# vis_bwd call (~1.5 MiB/step that the bump allocator never frees, ~0.9 GiB peak RSS
+# for one `--vision` run), and the forward scratch was keyed on B alone, so a later
+# call with the same B but a larger G/c1/c2 would have reused undersized buffers
+# (1.15.2 audit). Reuse is bit-safe: every producer below fully overwrites its output
+# (conv2d_fwd/linear_fwd/gelu_*/softmax_xent_* store every element; conv2d_bwd zeroes
+# its dx itself).
 var _vis_y1p = 0;   # conv1 pre-act  (B,C1,G,G)
 var _vis_y1 = 0;    # conv1 post-gelu
 var _vis_y2p = 0;   # conv2 pre-act  (B,C2,G/2,G/2)
 var _vis_y2 = 0;    # conv2 post-gelu (the flatten view)
 var _vis_lg = 0;    # logits (B,NCLS)
 var _vis_pr = 0;    # probs  (B,NCLS)
-var _vis_cap = 0;
+var _vis_dlg = 0;   # d logits        (B,NCLS)
+var _vis_dfl = 0;   # d flatten       (B,C2,G/2,G/2)
+var _vis_dy2p = 0;  # d conv2 pre-act (B,C2,G/2,G/2)
+var _vis_dy1 = 0;   # d conv1 post    (B,C1,G,G)
+var _vis_dy1p = 0;  # d conv1 pre-act (B,C1,G,G)
+var _vis_n1 = 0;    # capacity (f64s) of the (B,C1,G,G) buffers
+var _vis_n2 = 0;    # ... of the (B,C2,G/2,G/2) buffers
+var _vis_nl = 0;    # ... of the (B,NCLS) buffers
 
 fn _vis_scratch(B, G, c1, c2, ncls): i64 {
-    if (_vis_cap >= B) { return 0; }
-    _vis_y1p = t_alloc(B * c1 * G * G);
-    _vis_y1 = t_alloc(B * c1 * G * G);
-    _vis_y2p = t_alloc(B * c2 * (G / 2) * (G / 2));
-    _vis_y2 = t_alloc(B * c2 * (G / 2) * (G / 2));
-    _vis_lg = t_alloc(B * ncls);
-    _vis_pr = t_alloc(B * ncls);
-    _vis_cap = B;
+    # the stride-2 conv emits ceil(G/2) per side; every buffer and offset below
+    # assumes G/2, so an odd G would overrun them — refuse it.
+    if ((G % 2) != 0) { puts("attn11: vision lane needs an even canvas side\n"); sys_exit(1); }
+    var h = G / 2;
+    var n1 = B * c1 * G * G;
+    var n2 = B * c2 * h * h;
+    var nl = B * ncls;
+    if (n1 > _vis_n1) {
+        _vis_y1p = t_alloc(n1); _vis_y1 = t_alloc(n1);
+        _vis_dy1 = t_alloc(n1); _vis_dy1p = t_alloc(n1);
+        _vis_n1 = n1;
+    }
+    if (n2 > _vis_n2) {
+        _vis_y2p = t_alloc(n2); _vis_y2 = t_alloc(n2);
+        _vis_dfl = t_alloc(n2); _vis_dy2p = t_alloc(n2);
+        _vis_n2 = n2;
+    }
+    if (nl > _vis_nl) {
+        _vis_lg = t_alloc(nl); _vis_pr = t_alloc(nl); _vis_dlg = t_alloc(nl);
+        _vis_nl = nl;
+    }
     return 0;
 }
 
@@ -187,19 +218,20 @@ fn vis_fwd(X, Y, B, G, c1, c2, ncls): i64 {
 fn vis_bwd(X, Y, B, G, c1, c2, ncls): i64 {
     var h = G / 2;
     var flat = c2 * h * h;
-    var dlg = t_alloc(B * ncls);
+    _vis_scratch(B, G, c1, c2, ncls);   # no-op after vis_fwd sized it; never allocates per step
+    var dlg = _vis_dlg;
     softmax_xent_bwd(_vis_pr, Y, dlg, B, ncls);
-    var dflat = t_alloc(B * flat);
+    var dflat = _vis_dfl;
     linear_bwd(_vis_y2, vis_P + _vis_o_Wl(c1, c2, 3, flat, ncls) * 8, dlg, dflat,
       vis_Gr + _vis_o_Wl(c1, c2, 3, flat, ncls) * 8,
       vis_Gr + _vis_o_bl(c1, c2, 3, flat, ncls) * 8, B, flat, ncls);
-    var dy2p = t_alloc(B * flat);
+    var dy2p = _vis_dy2p;
     gelu_bwd(_vis_y2p, dflat, dy2p, B * flat);
-    var dy1 = t_alloc(B * c1 * G * G);
+    var dy1 = _vis_dy1;
     conv2d_bwd(_vis_y1, vis_P + _vis_o_Wc2(c1, 3) * 8, dy2p, dy1,
       vis_Gr + _vis_o_Wc2(c1, 3) * 8, vis_Gr + _vis_o_bc2(c1, c2, 3) * 8,
       B, c1, G, G, c2, 3, 3, 2, 2, 1, 1);
-    var dy1p = t_alloc(B * c1 * G * G);
+    var dy1p = _vis_dy1p;
     gelu_bwd(_vis_y1p, dy1, dy1p, B * c1 * G * G);
     conv2d_bwd(X, vis_P + _vis_o_Wc1() * 8, dy1p, 0,
       vis_Gr + _vis_o_Wc1() * 8, vis_Gr + _vis_o_bc1(c1, 3) * 8,

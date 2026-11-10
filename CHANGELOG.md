@@ -4,6 +4,114 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.15.2] - 2026-11-09
+
+The P(-1) hardening, optimization and repair sweep. The full report is
+[`docs/audit/2026-11-09-audit.md`](docs/audit/2026-11-09-audit.md). There is one HIGH and four
+MEDIUM defects, every one reproduced against 1.15.1 before it was fixed, plus fourteen LOW items,
+four grad-check gap closures, documentation and CI drift, and two speed-ups that keep every
+output bit-identical. The toolchain and dependencies are unchanged from 1.15.1. **The golden suite
+(28 runs plus the checkpoint and shard bytes) is byte-identical to 1.15.1**; the one difference
+is a GPU work counter the decode optimization lowers.
+
+### Security
+
+- **HIGH — a `--stream-corpus` shard could drive an out-of-bounds gradient write.** The shard's
+  token payload is not validated at open (only the header and tokenizer are), and akshara's
+  `stream_tok` returns raw ids. So an id ≥ V reached `embed_bwd` as an OOB **write**, and
+  `embed_fwd_n`, the CE target and `g_tok_len` read out of bounds. A poisoned byte-level shard
+  trained to completion, exited 0 and sampled garbage. Every corpus token the model consumes
+  (training windows, MTP targets, both eval paths) now goes through `tok_ld`, which fails closed
+  on an id outside `[0, V)` and names the id and its index. This also covers `--load` +
+  `--stream-corpus`.
+
+### Fixed
+
+- **`--mtp N --save` wrote a checkpoint that could not be loaded (−10).** The MTP aux heads are
+  train-time only, but the whole `g_NP` was serialized while the loader expects the base count.
+  The checkpoint now carries the base prefix of params and Adam state, and AR checkpoints are
+  byte-identical.
+- **`--latent-dim` on mha/gqa/lin was accepted, and the saved model was then rejected (−42).** It
+  is now refused at the CLI: it applies only to `--attn-kind mla` or `ssm`, SSM hybrids included.
+- **`--vision` / `--hearing` grew memory every step**: ~1.5 MiB/step that was never freed, peaking
+  at 912.6 MiB RSS per run. The backward scratch is now allocated once and sized by element count,
+  bringing the peak down to **~20 MiB**, with byte-identical results. An odd canvas side, which
+  the stride-2 conv cannot fit, is now refused.
+- **`--stream-encode` stored any byte missing from the 64 MB vocabulary prefix as id 0**, with no
+  error. It now refuses the file (−74).
+- **Loaded checkpoints are checked for finite payloads (−50).** Every parameter and Adam first
+  moment must be finite and every second moment finite and ≥ 0. A negative `v` used to NaN the
+  first step's `sqrt`.
+- **A run that stops on a non-finite loss now exits 1** instead of 0. Its last completed step is
+  still saved.
+- **`--stream-encode` on a special file** (`/dev/zero`, a FIFO) used to stream until the disk
+  filled. It is now refused (−75).
+- **Integer flag values are parsed strictly.** `--steps 1e3` used to mean 13, `--steps abc` 0 and
+  `--heads 4x` 4. A malformed value now exits 1 with usage, as a missing value does. Every
+  well-formed value parses as before.
+- **`--decode-schedule` without `--objective diffusion`** was silently ignored. It is now refused,
+  as `--decode-steps` already was.
+- **Cross-entropy no longer becomes +inf** when the target's probability underflows (a logit gap
+  above ~745). That one case uses the exact log-sum-exp form; every other row is bit-identical.
+- **Hardening:**
+  - `model_fwd_row` fails closed on an out-of-range position or token, since the K/V and latent
+    caches are T rows.
+  - The 128 MB allocation pre-flight now counts the MTP and ternary scratch.
+  - The MTP backward is gated on the AR objective.
+  - `gen_diffusion` clamps a negative prompt encode.
+  - `secure_write_atomic` checks its temp-name allocation.
+  - `file_seek` uses the stdlib `sys_lseek`.
+- **Every build is warning-free**: the three f64/int comparisons in `src/` are now explicit
+  NaN-safe bit tests, and five more were fixed in the test suite.
+
+### Performance
+
+Both changes keep every output bit-identical. These are A/B results against 1.15.1: interleaved,
+run alone, two full passes each. Details are in the audit and in `docs/benchmarks.md`.
+
+- **KV-cached generation is 14.7 % faster** (5,796 → 6,800 tok/s), and 8–16 % faster across every
+  mixer. Rows that are never sampled (prefill before the last prompt token, and re-prime after a
+  context shift) only extend the caches now: they skip the last block's MLP, the final
+  LayerNorm and the LM head.
+- **The tied LM head's backward runs packed** (`f64v_scale` + `f64v_add` in the original order,
+  one rounding per op on every target).
+  - At a 652-token BPE vocabulary, a whole 40-step run is **17 % faster** (4.44 → 3.68 s).
+  - At the default 25-token vocabulary, the step is −4.1 %, which is within this session's noise
+    band.
+
+### Tests
+
+- **1066 → 1105** passing on x86_64, **1060 → 1098** on aarch64/qemu.
+- **Regression tests:** six in-process tests for the fixes above, plus seven new `make smoke`
+  cases. Each was **mutation-checked**: with its fix reverted in a scratch copy, the test fails
+  (10 of 10 mutants killed, after one test was strengthened when its first version let a mutant
+  through).
+- **New finite-difference checks:**
+  - a full model with dropout p = 0.3, with the masks pinned by restoring the RNG before each
+    forward;
+  - MTP at N = 3 (the second aux head's offsets);
+  - a hybrid with MoE.
+
+  Each also asserts that its gradients are non-zero, so it cannot pass vacuously.
+
+### Documentation / CI
+
+- **CI now runs `make smoke`.** It was local-only, so a tag never ran the hostile-CLI or
+  corrupt-input checks.
+- `SECURITY.md`, `README.md`, `CONTRIBUTING.md`, `docs/guides/getting-started.md`, `gpu.md`, the ADR
+  and architecture indexes, `docs/sources.md` (seven new citations, including multi-token
+  prediction, the CNN and the hearing frontend) and `docs/development/state.md` were brought back
+  in line with the code.
+- **All 84 undocumented public functions now have doc comments** (`cyrius doc --check` clean). The
+  change is comment-only, verified by a byte-identical binary.
+- `bench-history.csv` gains the 1.15.1 baseline row.
+- **Filed upstream:**
+  - **akshara** — `stream_tok` should range-check each refilled chunk, with a self-proving repro.
+  - **rupantara** — an additive `ru_gelu_fwd_t` that returns GELU's tanh, so the backward can
+    reuse it. An attn11 prototype measured the training step **−17.4 %** at identical bits.
+
+  The files are in each repo's `docs/development/issues/`.
+
 ## [1.15.1] - 2026-11-09
 
 A toolchain and dependency realign to the latest releases: cyrius `6.7.9` → `6.7.18`, with

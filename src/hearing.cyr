@@ -31,14 +31,23 @@
 # ungated. The frontend contributes no gradient, so the FD gate drives the CNN
 # with random feature maps (t_randn) at tiny dims, exactly as valid.
 
+# nominal audio sample rate in Hz (sets the mel filterbank's Hz-per-bin)
 fn HEAR_SR(): i64 { return 8000; }    # nominal sample rate (Hz)
+# STFT window length in samples (a power of 2, as num_fft requires)
 fn HEAR_W(): i64 { return 256; }      # STFT window (power of 2 for num_fft)
+# STFT hop between consecutive frames, in samples
 fn HEAR_H(): i64 { return 128; }      # hop
+# STFT frame count = the feature map's rows (16, matching the vision canvas)
 fn HEAR_T(): i64 { return 16; }       # frames  = the feature map's rows
+# mel band count = the feature map's cols (16, matching the vision canvas)
 fn HEAR_M(): i64 { return 16; }       # mel bands = the feature map's cols
+# waveform length in samples, W + (T-1)*H, so exactly T frames fit
 fn HEAR_NSAMP(): i64 { return 2176; } # W + (T-1)*H
+# conv1 output channels of the hearing CNN
 fn HEAR_C1(): i64 { return 8; }
+# conv2 output channels of the hearing CNN
 fn HEAR_C2(): i64 { return 16; }
+# number of synthetic keyword classes (chirp up/down, two-tone, harmonic stack)
 fn HEAR_NCLS(): i64 { return 4; }
 
 fn _hear_2pi(): i64 { return f64_div(f64_from(6283185307179586), f64_from(1000000000000000)); }
@@ -55,6 +64,7 @@ var hear_front_ready = 0;
 fn _hear_melof(f): i64 { return f64_ln(f64_add(f64_from(1), f64_div(f, f64_from(700)))); }
 fn _hear_freqof(m): i64 { return f64_mul(f64_from(700), f64_sub(f64_exp(m), f64_from(1))); }
 
+# build the fixed frontend once (Hann window, 16-band mel filterbank, FFT scratch); idempotent, returns 0
 fn hear_front_init(): i64 {
     if (hear_front_ready == 1) { return 0; }
     var W = HEAR_W();
@@ -143,7 +153,9 @@ fn hear_features(wave, out): i64 {
             k = 1;
             while (k < NB) {
                 var w = load64(hear_mel + (j * NB + k) * 8);
-                if (w != f64_from(0)) { e = f64_add(e, f64_mul(w, load64(hear_mag + k * 8))); }
+                # skip zero mel weights, tested on the bit pattern (w is never -0.0);
+                # `w != f64_from(0)` mixed an f64 with an integer constant (1.15.2 audit)
+                if ((w & 0x7FFFFFFFFFFFFFFF) != 0) { e = f64_add(e, f64_mul(w, load64(hear_mag + k * 8))); }
                 k = k + 1;
             }
             store64(out + (t * M + j) * 8, f64_ln(f64_add(f64_from(1), e)));
@@ -275,6 +287,8 @@ fn hear_front_probe(j): i64 {
 # ---- the CNN (the vision block, hear_-prefixed; same offsets/shapes) -----------
 var hear_P = 0; var hear_Gr = 0; var hear_M2 = 0; var hear_V2 = 0; var hear_NP = 0;
 
+# allocate + gaussian-init the CNN for (G, C1, C2, K=3, NCLS), vision layout; zeroes grads + Adam moments.
+# Reseeds the RNG with `seed`; returns the param count (also left in hear_NP).
 fn hear_init(G, c1, c2, ncls, seed): i64 {
     var flat = c2 * (G / 2) * (G / 2);
     hear_NP = _vis_np(c1, c2, 3, flat, ncls);         # same layout as vision
@@ -296,21 +310,40 @@ fn hear_init(G, c1, c2, ncls, seed): i64 {
     return hear_NP;
 }
 
+# Forward AND backward scratch, sized by element count and regrown only when a shape
+# needs more — the same 1.15.2 audit fix as vision.cyr's _vis_scratch (hear_bwd used
+# to t_alloc its five buffers on every step, ~0.9 GiB peak RSS for one `--hearing`
+# run; capacity was keyed on B alone). Every producer fully overwrites its output.
 var _hear_y1p = 0; var _hear_y1 = 0; var _hear_y2p = 0; var _hear_y2 = 0;
-var _hear_lg = 0; var _hear_pr = 0; var _hear_cap = 0;
+var _hear_lg = 0; var _hear_pr = 0;
+var _hear_dlg = 0; var _hear_dfl = 0; var _hear_dy2p = 0; var _hear_dy1 = 0; var _hear_dy1p = 0;
+var _hear_n1 = 0; var _hear_n2 = 0; var _hear_nl = 0;
 
 fn _hear_scratch(B, G, c1, c2, ncls): i64 {
-    if (_hear_cap >= B) { return 0; }
-    _hear_y1p = t_alloc(B * c1 * G * G);
-    _hear_y1 = t_alloc(B * c1 * G * G);
-    _hear_y2p = t_alloc(B * c2 * (G / 2) * (G / 2));
-    _hear_y2 = t_alloc(B * c2 * (G / 2) * (G / 2));
-    _hear_lg = t_alloc(B * ncls);
-    _hear_pr = t_alloc(B * ncls);
-    _hear_cap = B;
+    # the stride-2 conv emits ceil(G/2) per side; every buffer assumes G/2.
+    if ((G % 2) != 0) { puts("attn11: hearing lane needs an even feature-map side\n"); sys_exit(1); }
+    var h = G / 2;
+    var n1 = B * c1 * G * G;
+    var n2 = B * c2 * h * h;
+    var nl = B * ncls;
+    if (n1 > _hear_n1) {
+        _hear_y1p = t_alloc(n1); _hear_y1 = t_alloc(n1);
+        _hear_dy1 = t_alloc(n1); _hear_dy1p = t_alloc(n1);
+        _hear_n1 = n1;
+    }
+    if (n2 > _hear_n2) {
+        _hear_y2p = t_alloc(n2); _hear_y2 = t_alloc(n2);
+        _hear_dfl = t_alloc(n2); _hear_dy2p = t_alloc(n2);
+        _hear_n2 = n2;
+    }
+    if (nl > _hear_nl) {
+        _hear_lg = t_alloc(nl); _hear_pr = t_alloc(nl); _hear_dlg = t_alloc(nl);
+        _hear_nl = nl;
+    }
     return 0;
 }
 
+# forward the batch; returns mean loss (f64). Probs land in _hear_pr.
 fn hear_fwd(X, Y, B, G, c1, c2, ncls): i64 {
     _hear_scratch(B, G, c1, c2, ncls);
     var h = G / 2;
@@ -326,22 +359,24 @@ fn hear_fwd(X, Y, B, G, c1, c2, ncls): i64 {
     return softmax_xent_fwd(_hear_lg, Y, _hear_pr, B, ncls);
 }
 
+# backward the batch into hear_Gr (accumulates; caller zeroes hear_Gr per step). Needs hear_fwd first.
 fn hear_bwd(X, Y, B, G, c1, c2, ncls): i64 {
     var h = G / 2;
     var flat = c2 * h * h;
-    var dlg = t_alloc(B * ncls);
+    _hear_scratch(B, G, c1, c2, ncls);   # no-op after hear_fwd sized it; never allocates per step
+    var dlg = _hear_dlg;
     softmax_xent_bwd(_hear_pr, Y, dlg, B, ncls);
-    var dflat = t_alloc(B * flat);
+    var dflat = _hear_dfl;
     linear_bwd(_hear_y2, hear_P + _vis_o_Wl(c1, c2, 3, flat, ncls) * 8, dlg, dflat,
       hear_Gr + _vis_o_Wl(c1, c2, 3, flat, ncls) * 8,
       hear_Gr + _vis_o_bl(c1, c2, 3, flat, ncls) * 8, B, flat, ncls);
-    var dy2p = t_alloc(B * flat);
+    var dy2p = _hear_dy2p;
     gelu_bwd(_hear_y2p, dflat, dy2p, B * flat);
-    var dy1 = t_alloc(B * c1 * G * G);
+    var dy1 = _hear_dy1;
     conv2d_bwd(_hear_y1, hear_P + _vis_o_Wc2(c1, 3) * 8, dy2p, dy1,
       hear_Gr + _vis_o_Wc2(c1, 3) * 8, hear_Gr + _vis_o_bc2(c1, c2, 3) * 8,
       B, c1, G, G, c2, 3, 3, 2, 2, 1, 1);
-    var dy1p = t_alloc(B * c1 * G * G);
+    var dy1p = _hear_dy1p;
     gelu_bwd(_hear_y1p, dy1, dy1p, B * c1 * G * G);
     conv2d_bwd(X, hear_P + _vis_o_Wc1() * 8, dy1p, 0,
       hear_Gr + _vis_o_Wc1() * 8, hear_Gr + _vis_o_bc1(c1, 3) * 8,
@@ -349,6 +384,7 @@ fn hear_bwd(X, Y, B, G, c1, c2, ncls): i64 {
     return 0;
 }
 
+# global-norm gradient clip over hear_Gr (f64 `clip`; the model_clip_grads pattern, local block)
 fn hear_clip(clip): i64 {
     var ss = ff(0);
     var i = 0;
@@ -362,6 +398,7 @@ fn hear_clip(clip): i64 {
     return 0;
 }
 
+# local Adam over the hearing block (same constants as model_adam_step); `step` is 1-based for bias correction
 fn hear_adam(lr, step): i64 {
     var b1 = f64_div(ff(9), ff(10));
     var b2 = f64_div(ff(999), ff(1000));
@@ -385,6 +422,7 @@ fn hear_adam(lr, step): i64 {
     return 0;
 }
 
+# batch accuracy (argmax of _hear_pr vs Y) ×1000, integer; reads the probs of the last hear_fwd
 fn hear_acc_x1000(Y, B, ncls): i64 {
     var right = 0;
     var i = 0;

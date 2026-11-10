@@ -214,25 +214,40 @@ fn _o_bo(): i64 { return _blk_base_size() + g_C + 2 * _Ckv(); }
 
 # per-layer param / grad sub-pointers
 fn PL(L, off): i64 { return g_params + (_blk_base(L) + off) * 8; }
+# byte address in g_grads of layer L's element at within-block offset `off` (PL's gradient twin)
 fn GL(L, off): i64 { return g_grads + (_blk_base(L) + off) * 8; }
 # attention-bias sub-pointers — return 0 (no bias) when disabled
 fn P_bq(L): i64 { if (g_attn_bias == 0) { return 0; } return PL(L, _o_bq()); }
+# layer L's K bias (Ckv f64) param pointer, or 0 when attention biases are off
 fn P_bk(L): i64 { if (g_attn_bias == 0) { return 0; } return PL(L, _o_bk()); }
+# layer L's V bias (Ckv f64) param pointer, or 0 when attention biases are off
 fn P_bv(L): i64 { if (g_attn_bias == 0) { return 0; } return PL(L, _o_bv()); }
+# layer L's output-projection bias (C f64) param pointer, or 0 when attention biases are off
 fn P_bo(L): i64 { if (g_attn_bias == 0) { return 0; } return PL(L, _o_bo()); }
+# layer L's Q bias (C f64) grad pointer, or 0 when attention biases are off
 fn G_bq(L): i64 { if (g_attn_bias == 0) { return 0; } return GL(L, _o_bq()); }
+# layer L's K bias (Ckv f64) grad pointer, or 0 when attention biases are off
 fn G_bk(L): i64 { if (g_attn_bias == 0) { return 0; } return GL(L, _o_bk()); }
+# layer L's V bias (Ckv f64) grad pointer, or 0 when attention biases are off
 fn G_bv(L): i64 { if (g_attn_bias == 0) { return 0; } return GL(L, _o_bv()); }
+# layer L's output-projection bias (C f64) grad pointer, or 0 when attention biases are off
 fn G_bo(L): i64 { if (g_attn_bias == 0) { return 0; } return GL(L, _o_bo()); }
 
 # shared param / grad sub-pointers
 fn P_tokemb(): i64 { return g_params; }
+# token-embedding grad pointer (V x C f64 at the start of g_grads; the LM head is weight-tied to it)
 fn G_tokemb(): i64 { return g_grads; }
+# learned positional-embedding param pointer (T x C f64, right after the V x C token embedding)
 fn P_posemb(): i64 { return g_params + (g_V * g_C) * 8; }
+# learned positional-embedding grad pointer (T x C f64, right after the V x C token embedding)
 fn G_posemb(): i64 { return g_grads + (g_V * g_C) * 8; }
+# final-LayerNorm gain param pointer (C f64, after the last block)
 fn P_lnfg(): i64 { return g_params + (_emb_end() + g_NL * _blk()) * 8; }
+# final-LayerNorm gain grad pointer (C f64, after the last block)
 fn G_lnfg(): i64 { return g_grads + (_emb_end() + g_NL * _blk()) * 8; }
+# final-LayerNorm bias param pointer (C f64, right after the gain)
 fn P_lnfb(): i64 { return P_lnfg() + g_C * 8; }
+# final-LayerNorm bias grad pointer (C f64, right after the gain)
 fn G_lnfb(): i64 { return G_lnfg() + g_C * 8; }
 # ---- diffusion [MASK] embedding (M15, E5) ----------------------------------
 # A single learned C-vector, appended to the param block AFTER lnf_b, present
@@ -241,7 +256,9 @@ fn G_lnfb(): i64 { return G_lnfg() + g_C * 8; }
 # input embedding at masked positions; the weight-tied LM head is untouched
 # (still V logits). Its offset is the OLD (AR) g_NP — i.e. just past lnf_b.
 fn _o_maskemb(): i64 { return _emb_end() + g_NL * _blk() + 2 * g_C; }
+# [MASK]-embedding param pointer (C f64; only meaningful when g_objective == 1)
 fn P_maskemb(): i64 { return g_params + _o_maskemb() * 8; }
+# [MASK]-embedding grad pointer (C f64; only meaningful when g_objective == 1)
 fn G_maskemb(): i64 { return g_grads + _o_maskemb() * 8; }
 # ---- MTP auxiliary heads (X043) --------------------------------------------
 # --mtp N adds (N-1) per-head C×C transforms, appended AFTER the maskemb slot so
@@ -257,7 +274,9 @@ fn _o_mtp(j): i64 {
     if (g_objective == 1) { base = base + g_C; }   # MTP rides after the maskemb slot
     return base + j * g_C * g_C;
 }
+# aux MTP head j's C×C transform W_mtp_j param pointer (j in 0..g_mtp-2; only when g_mtp > 1)
 fn P_mtp(j): i64 { return g_params + _o_mtp(j) * 8; }
+# aux MTP head j's C×C transform grad pointer (j in 0..g_mtp-2; only when g_mtp > 1)
 fn G_mtp(j): i64 { return g_grads + _o_mtp(j) * 8; }
 # MTP forward scratch (allocated only when g_mtp > 1). Per aux head a (0..g_mtp-2):
 # h_a = A_f @ W_mtp_a (g_mtp_h), logits→probs (g_mtp_probs cached for bwd), shifted
@@ -306,6 +325,7 @@ var LA_mlogits = 0; var LA_msel = 0; var LA_mgate = 0; var LA_mefc = 0; var LA_m
 var g_moe_sc = 0;    # shared MoE scratch, >= 2*F + 2*C + 3*N + K (fwd/bwd + aux)
 var g_moe_dlaux = 0; # shared aux-backward router-gradient scratch, T*N
 
+# layer L's buffer pointer from a per-layer pointer array (LA_*): arr[L]
 fn La(arr, L): i64 { return load64(arr + L * 8); }
 
 # ---- gradient temporaries (shared, reused across layers) -------------------
@@ -347,6 +367,8 @@ var R_f = 0;      # C  final-LN out
 var R_q = 0;      # C  query row
 var R_qr = 0;     # decoupled RoPE only: nh*d_rope  rope-query row scratch
 var R_concat = 0; # C  pre-Wo concat row
+var G_hbt = 0;    # C  head_bwd_into: packed product row (1.15.2)
+var G_hba = 0;    # C  head_bwd_into: packed accumulator row (1.15.2)
 var R_mean = 0; var R_rstd = 0;       # 1 each
 var R_prow = 0;   # T  attention-probability row scratch
 var R_logits = 0; # V  the processed position's logits
@@ -496,7 +518,7 @@ fn model_alloc_bytes_hyb(V, C, T, nh, nkv, NL, NP, attn_kind, d_c, pos_kind, d_r
     e = e + (NL + 1) * T * C;                         # residual stream
     e = e + NL * (5 * T * C + 2 * T * F + 4 * T + asz + 2 * T * Ckv);  # per-layer caches + arena + KV
     e = e + T * V + 7 * T * C + 2 * T * F;            # gradient temporaries
-    e = e + 9 * C + 2 * F + 2 + T + V + T;            # single-row scratch + G_win
+    e = e + 11 * C + 2 * F + 2 + T + V + T;           # single-row scratch (+ G_hbt/G_hba) + G_win
     # MLA latent buffers (ADR 0007): LA_c pointer array (NL) + per-layer latent c
     # (NL * T*d_c) + the two shared down/up backward temporaries (2 * T*d_c).
     if (_alloc_has(kinds, NL, attn_kind, 1) == 1) { e = e + NL + NL * T * d_c + 2 * T * d_c; }
@@ -534,6 +556,18 @@ fn model_alloc_bytes_hyb(V, C, T, nh, nkv, NL, NP, attn_kind, d_c, pos_kind, d_r
     return e * 8;
 }
 
+# Allocations model_alloc_bytes_hyb leaves out because its inputs don't carry them:
+# the MTP forward/backward scratch (only under --mtp N>1; the aux PARAMETERS are
+# already in NP) and the ternary quantization scratch g_qscratch (C·F). Through 1.15.1
+# the pre-flight under-counted both, so a config could pass the 128 MB cap and then
+# allocate well past it (1.15.2 audit, LOW). Callers pass the mode they are building.
+fn model_alloc_extra_bytes(V, C, T, mtp, ternary): i64 {
+    var e = 0;
+    if (mtp > 1) { e = e + (mtp - 1) * (T * C + T * V + 2 * T) + 2 * T * V + 2 * T * C; }
+    if (ternary == 1) { e = e + C * 4 * C; }
+    return e * 8;
+}
+
 # The model-allocation cap (128 MB), gating model_alloc_bytes for BOTH the
 # checkpoint loader (persist.cyr `-18`) and model_init's fresh-path pre-flight.
 # Defined here, not in persist.cyr, so every harness that builds a model has it
@@ -548,6 +582,8 @@ fn CKPT_MAX_MODEL_BYTES(): i64 { return 134217728; }
 fn model_init(V, C, T, nh, nkv, NL, attn_bias, dropout, seed): i64 {
     return model_init_arch(V, C, T, nh, nkv, NL, attn_bias, dropout, seed, 0, 0, 0, 0);
 }
+# model_init + the (attn_kind, d_c, pos_kind, d_rope) architecture descriptor; delegates to
+# model_init_moe with the dense MLP (1 expert, top-1)
 fn model_init_arch(V, C, T, nh, nkv, NL, attn_bias, dropout, seed, attn_kind, d_c, pos_kind, d_rope): i64 {
     return model_init_moe(V, C, T, nh, nkv, NL, attn_bias, dropout, seed, attn_kind, d_c, pos_kind, d_rope, 1, 1);
 }
@@ -644,7 +680,7 @@ fn model_init_full(V, C, T, nh, nkv, NL, attn_bias, dropout, seed,
     # g_layer_kind (0 = uniform, else the per-layer array) drives the per-kind
     # cache accounting — each present kind's buffers + the NL kind array.
     var abytes = model_alloc_bytes_hyb(V, C, T, nh, nkv, NL, g_NP, attn_kind, d_c, pos_kind, d_rope,
-      num_experts, topk, g_layer_kind);
+      num_experts, topk, g_layer_kind) + model_alloc_extra_bytes(V, C, T, g_mtp, g_ternary);
     if (abytes > CKPT_MAX_MODEL_BYTES()) {
         puts("attn11: model_init: config exceeds the 128 MB model-allocation cap\n");
         sys_exit(1);
@@ -857,6 +893,7 @@ fn model_init_full(V, C, T, nh, nkv, NL, attn_bias, dropout, seed,
     R_x = t_alloc(C); R_a = t_alloc(C); R_attn = t_alloc(C); R_xmid = t_alloc(C);
     R_b = t_alloc(C); R_fc = t_alloc(F); R_g = t_alloc(F); R_mlp = t_alloc(C);
     R_f = t_alloc(C); R_q = t_alloc(C); R_concat = t_alloc(C);
+    G_hbt = t_alloc(C); G_hba = t_alloc(C);
     R_mean = t_alloc(1); R_rstd = t_alloc(1);
     R_prow = t_alloc(T); R_logits = t_alloc(V);
     G_win = t_alloc(T);
@@ -914,6 +951,7 @@ fn moe_disp_reset(): i64 {
     while (i < g_num_experts) { store64(g_moe_disp + i * 8, 0); i = i + 1; }
     return 0;
 }
+# add the last forward's top-K picks (every layer's LA_msel) into the g_moe_disp histogram; no-op if dense
 fn moe_disp_accum(): i64 {
     if (g_num_experts <= 1) { return 0; }
     var L = 0;
@@ -930,6 +968,7 @@ fn moe_disp_accum(): i64 {
     }
     return 0;
 }
+# normalized routing entropy H/ln(N) of g_moe_disp, f64 in [0,1]; 0 if dense or nothing dispatched
 fn moe_entropy(): i64 {
     if (g_num_experts <= 1) { return f64_from(0); }
     var tot = 0;
@@ -996,6 +1035,7 @@ fn head_fwd_n(n): i64 {
     }
     return 0;
 }
+# full-window LM head: A_logits(T,V) = A_f @ tokemb^T over all g_T rows
 fn head_fwd(): i64 { return head_fwd_n(g_T); }
 
 # X043: the MTP auxiliary loss = (λ/(N-1)) · Σ_a CE(head_a, target t+2+a). Aux head
@@ -1025,43 +1065,62 @@ fn mtp_aux_loss(): i64 {
 # LM-head backward into caller-supplied buffers: df_out = dlog @ emb (OVERWRITE);
 # gemb += dlog^T @ f_in (ACCUMULATE — the tied unembed). Extracted from head_bwd so
 # the MTP aux heads reuse the EXACT same math (X043) and share the tied-unembed grad.
+# The tied LM head's backward: df = dlog · emb (T×V · V×C) and gemb += dlogᵀ · f
+# (V×T · T×C). 1.15.2: both products run packed — `f64v_scale` then `f64v_add` over
+# C-wide rows (an even prefix; the odd tail scalar) — instead of the old scalar triple
+# loops with a strided emb[v·C + c] walk. BIT-IDENTICAL on every target: each output
+# element still starts at +0.0 and adds its rounded products in the same order (v
+# ascending for df, t ascending for gemb's sum, then one add into gemb). f64v_scale /
+# f64v_add round once per element (mulpd/addpd, fmul/fadd), exactly as f64_mul /
+# f64_add, and IEEE multiply and add commute. NOT f64v_axpy / f64v_fmadd: those are a
+# fused FMLA on aarch64 and would change the bits there. df_out must not alias the
+# inputs (no caller does). G_hbt / G_hba are C-wide scratch rows from model_init.
 fn head_bwd_into(dlog, f_in, df_out, emb, gemb): i64 {
     var T = g_T; var C = g_C; var V = g_V;
+    var C2 = C - (C % 2);              # f64v_* write whole 2-lane pairs
+    var tmp = G_hbt; var acc = G_hba;
     var t = 0;
     while (t < T) {
-        var c = 0;
-        while (c < C) {
-            var acc = f64_from(0);
-            var v = 0;
-            while (v < V) {
-                acc = f64_add(acc, f64_mul(load64(dlog + (t * V + v) * 8),
-                    load64(emb + (v * C + c) * 8)));
-                v = v + 1;
+        var row = df_out + t * C * 8;
+        t_zero(row, C);
+        var v = 0;
+        while (v < V) {
+            var d = load64(dlog + (t * V + v) * 8);
+            var er = emb + v * C * 8;
+            if (C2 > 0) { f64v_scale(tmp, er, d, C2); f64v_add(row, row, tmp, C2); }
+            var c = C2;
+            while (c < C) {
+                store64(row + c * 8, f64_add(load64(row + c * 8), f64_mul(d, load64(er + c * 8))));
+                c = c + 1;
             }
-            store64(df_out + (t * C + c) * 8, acc);
-            c = c + 1;
+            v = v + 1;
         }
         t = t + 1;
     }
     var v2 = 0;
     while (v2 < V) {
-        var c = 0;
-        while (c < C) {
-            var acc = f64_from(0);
-            var tt = 0;
-            while (tt < T) {
-                acc = f64_add(acc, f64_mul(load64(dlog + (tt * V + v2) * 8),
-                    load64(f_in + (tt * C + c) * 8)));
-                tt = tt + 1;
+        t_zero(acc, C);
+        var tt = 0;
+        while (tt < T) {
+            var d2 = load64(dlog + (tt * V + v2) * 8);
+            var fr = f_in + tt * C * 8;
+            if (C2 > 0) { f64v_scale(tmp, fr, d2, C2); f64v_add(acc, acc, tmp, C2); }
+            var c2 = C2;
+            while (c2 < C) {
+                store64(acc + c2 * 8, f64_add(load64(acc + c2 * 8), f64_mul(d2, load64(fr + c2 * 8))));
+                c2 = c2 + 1;
             }
-            var gi = gemb + (v2 * C + c) * 8;
-            store64(gi, f64_add(load64(gi), acc));
-            c = c + 1;
+            tt = tt + 1;
         }
+        var gr = gemb + v2 * C * 8;
+        if (C2 > 0) { f64v_add(gr, gr, acc, C2); }
+        var c3 = C2;
+        while (c3 < C) { store64(gr + c3 * 8, f64_add(load64(gr + c3 * 8), load64(acc + c3 * 8))); c3 = c3 + 1; }
         v2 = v2 + 1;
     }
     return 0;
 }
+# main LM-head backward: D_logits -> D_f (written) and G_tokemb (+=); --gpu tries the bit-exact GPU path first
 fn head_bwd(): i64 {
     var T = g_T; var C = g_C; var V = g_V;
     var emb = P_tokemb(); var gemb = G_tokemb();
@@ -1130,6 +1189,7 @@ fn embed_fwd_n(n): i64 {
     }
     return 0;
 }
+# full-window embedding: A_tokens -> LA_resid[0] over all g_T rows (see embed_fwd_n)
 fn embed_fwd(): i64 { return embed_fwd_n(g_T); }
 
 # d(resid[0]) -> accumulate dtokemb (lookup part) and dposemb. Under RoPE the
@@ -1286,6 +1346,8 @@ fn _attn_block_fwd_row(L, pos): i64 {
     return 0;
 }
 
+# full forward over A_tokens/A_targets, filling every cache backward needs; returns the f64 loss:
+# AR = CE + MoE aux (+ MTP aux while training), diffusion = masked CE. Sets g_aux_loss.
 fn model_forward(): i64 {
     var T = g_T; var C = g_C; var F = g_F; var V = g_V;
     var TC = T * C;
@@ -1358,7 +1420,24 @@ fn model_forward(): i64 {
 # Per-row arithmetic is identical to the batch forward's — each op here is the
 # same kernel the T-row path runs, on one row — so a position's logits are
 # bit-identical to a full forward over the same window (pinned in tests).
-fn model_fwd_row(tok, pos): i64 {
+# One cached decode row that always produces logits (the tests' and the default form).
+fn model_fwd_row(tok, pos): i64 { return model_fwd_row_n(tok, pos, 1); }
+
+# need_logits == 0 (1.15.2): the row only has to EXTEND the caches. Prefill rows before
+# the last prompt token and every re-prime row after a context shift are never sampled,
+# so the last block's ln2 + MLP + residual, the final LN and the LM head are skipped:
+# they write only R_* scratch and R_logits, which the next row overwrites before
+# anything reads them. Every layer's attention block (its K/V cache, latent cache, or
+# lin/SSM state) still runs, so the caches, and every sampled token, are bit-identical.
+fn model_fwd_row_n(tok, pos, need_logits): i64 {
+    # Every in-tree caller keeps 0 <= pos < g_T (gen_prime clamps; gen_decode slides at
+    # G_n == g_T) and tok in [0, V). The K/V, latent and rope caches are T rows, so a
+    # future caller that broke either would write past them (the class rupantara 0.5.2
+    # fixed as HIGH). Fail closed: two compares per decoded row (1.15.2 audit, LOW).
+    if ((pos < 0) || (pos >= g_T) || (tok < 0) || (tok >= g_V)) {
+        puts("attn11: model_fwd_row: position or token out of range\n");
+        sys_exit(1);
+    }
     var C = g_C; var F = g_F;
     var emb = P_tokemb(); var posb = P_posemb();
     # under RoPE the learned posemb is off the path (positions enter inside
@@ -1376,6 +1455,7 @@ fn model_fwd_row(tok, pos): i64 {
     while (L < g_NL) {
         ln_fwd(R_x, PL(L, _o_ln1g()), PL(L, _o_ln1b()), R_a, R_mean, R_rstd, 1, C);
         _attn_block_fwd_row(L, pos);
+        if ((need_logits == 0) && (L == g_NL - 1)) { return 0; }   # caches extended; nothing below is read
         c = 0;
         while (c < C) {
             store64(R_xmid + c * 8, f64_add(load64(R_x + c * 8), load64(R_attn + c * 8)));
@@ -1459,7 +1539,10 @@ fn model_backward(): i64 {
         softmax_xent_bwd(A_probs, A_targets, D_logits, T, V);
     }
     head_bwd();                                   # -> D_f ; accum G_tokemb (head)
-    if ((g_mtp > 1) && (g_training == 1)) { mtp_aux_backward(); }   # X043: aux heads -> D_f, G_mtp, G_tokemb
+    # X043: aux heads -> D_f, G_mtp, G_tokemb. AR only: under diffusion model_forward
+    # returns before mtp_aux_loss, so this would differentiate stale aux state (the CLI
+    # rejects --mtp with diffusion; this is the in-library backstop, 1.15.2 audit).
+    if ((g_mtp > 1) && (g_training == 1) && (g_objective == 0)) { mtp_aux_backward(); }
     # through final LN: D_f -> D_resid (= d resid[NL])
     ln_bwd(La(LA_resid, g_NL), P_lnfg(), D_f, A_meanf, A_rstdf, D_resid, G_lnfg(), G_lnfb(), T, C);
     var L = g_NL - 1;
@@ -1503,6 +1586,7 @@ fn model_backward(): i64 {
     return 0;
 }
 
+# zero all g_NP gradients; backward accumulates across the batch, so train calls this once per step
 fn model_zero_grads(): i64 { t_zero(g_grads, g_NP); return 0; }
 
 # ---- gradient clipping (global L2 norm) ------------------------------------

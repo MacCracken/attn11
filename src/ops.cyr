@@ -159,16 +159,27 @@ fn dropout_gen_mask(mask, n, p, training): i64 {
     return 0;
 }
 
+# forward: y = x ⊙ mask over n f64 (elementwise, so y may alias x — model.cyr applies it in place)
 fn dropout_apply(x, mask, y, n): i64 {
     var i = 0;
     while (i < n) { store64(y + i * 8, f64_mul(load64(x + i * 8), load64(mask + i * 8))); i = i + 1; }
     return 0;
 }
 
+# backward: dx = dy ⊙ mask over n f64 (the same forward mask; dx is written, not accumulated)
 fn dropout_bwd(mask, dy, dx, n): i64 {
     var i = 0;
     while (i < n) { store64(dx + i * 8, f64_mul(load64(dy + i * 8), load64(mask + i * 8))); i = i + 1; }
     return 0;
+}
+
+# The CE term for a row whose target probability underflowed to exactly 0 (a logit
+# gap past ~745): -ln(p_t) would be +inf and train() would stop a run that is merely
+# confident and wrong (1.15.2 audit, LOW). The exact log-sum-exp form
+# (mx + ln sum) - logit_t is finite. Both CE forwards use it ONLY in that case, so
+# every other row keeps its -ln(p_t) bit for bit.
+fn _xent_lse(row, tgt, mx, sum): i64 {
+    return f64_sub(f64_add(mx, f64_ln(sum)), load64(row + tgt * 8));
 }
 
 # ===========================================================================
@@ -207,7 +218,8 @@ fn softmax_xent_fwd(logits, targets, probs, M, V): i64 {
         }
         var tgt = load64(targets + m * 8);
         var p_t = load64(prow + tgt * 8);
-        total = f64_sub(total, f64_ln(p_t));
+        if ((p_t & 0x7FFFFFFFFFFFFFFF) != 0) { total = f64_sub(total, f64_ln(p_t)); }
+        else { total = f64_add(total, _xent_lse(row, tgt, mx, sum)); }
         m = m + 1;
     }
     return f64_div(total, f64_from(M));
@@ -276,7 +288,8 @@ fn softmax_xent_masked_fwd(logits, targets, probs, mask, M, V): i64 {
         if (load64(mask + m * 8) != 0) {
             var tgt = load64(targets + m * 8);
             var p_t = load64(prow + tgt * 8);
-            total = f64_sub(total, f64_ln(p_t));
+            if ((p_t & 0x7FFFFFFFFFFFFFFF) != 0) { total = f64_sub(total, f64_ln(p_t)); }
+            else { total = f64_add(total, _xent_lse(row, tgt, mx, sum)); }
             nmask = nmask + 1;
         }
         m = m + 1;
@@ -347,6 +360,8 @@ fn softmax_xent_masked_bwd(probs, targets, mask, dlogits, M, V): i64 {
 # ===========================================================================
 fn _moe_estride(C, F): i64 { return C * F + F + F * C + C; }
 
+# Forward (layout above): y(T,C) = Σ_k gate·E_sel(x) [written fresh]; fills the logits/sel/gate/efc/egg
+# caches moe_bwd reads. Returns 0.
 fn moe_fwd(x, Wg, We, y, logits, sel, gate, efc, egg, sc, T, C, F, N, K): i64 {
     var estride = _moe_estride(C, F);
     var ej = sc;                          # scratch (C): one expert's output row
@@ -522,6 +537,8 @@ fn _moe_aux_counts(sel, f, T, N, K): i64 {
     return 0;
 }
 
+# Forward: returns L_aux = α·N·Σ_i f_i·P_i (f64 bits) from fwd's router logits(T,N) + sel(T,K);
+# α is f64 bits; sc >= 3*N.
 fn moe_aux_fwd(logits, sel, alpha, sc, T, N, K): i64 {
     var f = sc; var P = sc + N * 8; var p = sc + 2 * N * 8;
     _moe_aux_counts(sel, f, T, N, K);
@@ -651,7 +668,11 @@ fn ternary_quant(W, out, K, N): i64 {
     var i = 0;
     while (i < n) { s = f64_add(s, f64_abs(load64(W + i * 8))); i = i + 1; }
     var gamma = f64_div(s, f64_from(n));
-    if (gamma == f64_from(0)) {                      # all-zero matrix: t == 0
+    # all-zero matrix: t == 0. Tested on the bit pattern (+-0; a NaN is not zero):
+    # `gamma == f64_from(0)` compared an f64 with an integer constant (a compiler
+    # warning), and this toolchain's f64 compares are not NaN-correct. gamma is a
+    # mean of |w|, so it is never -0.0 and the result is unchanged (1.15.2 audit).
+    if ((gamma & 0x7FFFFFFFFFFFFFFF) == 0) {
         i = 0; while (i < n) { store64(out + i * 8, f64_from(0)); i = i + 1; }
         return 0;
     }
@@ -701,6 +722,8 @@ fn qlinear_fwd(x, W, b, y, M, K, N): i64 {
     #endif
     return linear_fwd(x, g_qscratch, b, y, M, K, N);
 }
+# linear_bwd counterpart: dx against W_eff (re-quantized when ternary), dW/db via STE pass-through;
+# --gpu-tc tries the GPU backward first (tolerance), else CPU.
 fn qlinear_bwd(x, W, dy, dx, dW, db, M, K, N): i64 {
     if (g_ternary == 0) {
         #ifndef CYRIUS_TARGET_AGNOS
@@ -746,7 +769,7 @@ fn ternary_signs(W, t, K, N): i64 {
     var i = 0;
     while (i < n) { s = f64_add(s, f64_abs(load64(W + i * 8))); i = i + 1; }
     var gamma = f64_div(s, f64_from(n));
-    if (gamma == f64_from(0)) {                      # all-zero matrix: signs == 0
+    if ((gamma & 0x7FFFFFFFFFFFFFFF) == 0) {         # all-zero matrix: signs == 0 (bit test, as above)
         i = 0; while (i < n) { store64(t + i * 8, 0); i = i + 1; }
         return gamma;
     }

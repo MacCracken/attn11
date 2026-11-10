@@ -15,12 +15,12 @@ target*, not a different model.
 
 - An **AMD GFX9 GPU** reachable as a DRM render node (`/dev/dri/renderD128`, no root needed
   if the node is mode 0666). The dev reference is an **AMD Cezanne (gfx90c)** APU.
-- The toolchain resolves **rosnet 0.2.0** (the GPU backend bundle `dist/rosnet-gpu.cyr`) **+ mabda
-  3.4.1** (`cyrius deps`); mabda's native SPIR-V→GFX9 f64 emitter is what runs the kernel —
-  launcher-free, pure-Cyrius, no ROCm / Vulkan loader / vendor BLAS. (mabda's symbols ship unresolved in
-  the rosnet bundle; since 1.14.4 they come from the **bundled** stdlib `mabda` leaf (4.1.7 at
-  cyrius 6.6.20, listed in `[deps] stdlib`; the old `[deps.mabda]` git dep is retired), which
-  rosnet 1.1.3's `dist/rosnet-gpu.cyr` also `include`s itself.)
+- The toolchain resolves **rosnet** (1.4.1 as of attn11 1.15.2; the GPU backend bundle
+  `dist/rosnet-gpu.cyr`) on top of **mabda** (`cyrius deps`). mabda's native SPIR-V→GFX9 f64 emitter is
+  what runs the kernel: launcher-free, pure-Cyrius, no ROCm / Vulkan loader / vendor BLAS. mabda's
+  symbols ship unresolved in the rosnet bundle. Since 1.14.4 they come from the **bundled** stdlib
+  `mabda` leaf (4.2.0 at cyrius 6.7.18, listed in `[deps] stdlib`; the old `[deps.mabda]` git dep is
+  retired), which `dist/rosnet-gpu.cyr` also `include`s itself.
 
 No GPU? `--gpu` prints that no device was found and runs entirely on the CPU. Everything
 still works; nothing crashes.

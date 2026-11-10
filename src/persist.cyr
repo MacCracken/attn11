@@ -41,6 +41,7 @@
 # allocation or copy. A truncated/corrupt/oversized buffer is rejected with a
 # negative error code, never a crash or a decode loop.
 
+# checkpoint magic, header field [0] ("ATTN11v1"); shared by every version, which [1] carries
 fn CKPT_MAGIC(): i64 { return 0x4154544E31317631; }   # "ATTN11v1" (file family)
 # The version the CURRENT model serializes as: v6 carries the M14 rung-c per-layer
 # mixer array (a hybrid); a uniform model writes v5 — byte-identical to pre-1.4.3,
@@ -56,6 +57,7 @@ fn CKPT_VER(): i64 {
     if (g_layer_kind != 0) { return 6; }
     return 5;
 }
+# fixed header i64 field count for v5/v6 (fields [0..22); v6's per-layer region follows it)
 fn CKPT_HDR(): i64 { return 22; }                     # v5/v6 fixed header i64 fields
 # v7 (M15, char-diffusion): one extra fixed field, the training objective, at slot
 # [22]; the vocab base shifts to 23. Diffusion is uniform (no hybrid), so a v7
@@ -73,15 +75,20 @@ fn _ckpt_hdr_cur(): i64 {
 # per-layer mixer region (v6, ADR 0011): NL i64 kinds appended after the fixed
 # header, before the vocab. 0 (no region) for a uniform model (v5 and earlier).
 fn _ckpt_pl(): i64 { if (g_layer_kind != 0) { return g_NL; } return 0; }
+# legacy v4 (pre-MoE, 1.2.x) header i64 field count; load-only
 fn CKPT_HDR_V4(): i64 { return 20; }                  # v4 header i64 fields
+# legacy v3 (pre-MLA, 1.0/1.1) header i64 field count; load-only
 fn CKPT_HDR_V3(): i64 { return 16; }                  # v3 header i64 fields
+# legacy v2 (pre-BPE, 0.7.0) header i64 field count; load-only
 fn CKPT_HDR_V2(): i64 { return 13; }                  # v2 header i64 fields
+# legacy v1 (pre-GQA, <=0.6.0) header i64 field count; load-only
 fn CKPT_HDR_V1(): i64 { return 12; }                  # v1 header i64 fields
 # Caps sized to the allocator's reality (lib alloc cap is 256 MB): a header
 # that passes every shape check must also FIT — params (4 vectors), the file
 # buffer itself, and the nh*T*T attention arenas all have to coexist. 4M
 # params is ~100x the largest real attn11 run (X001: 42K).
 fn CKPT_MAX_NP(): i64 { return 4194304; }             # 4M params cap
+# largest checkpoint file ckpt_load_file will read, in bytes (128 MB; larger is rejected -30 before alloc)
 fn CKPT_MAX_BYTES(): i64 { return 134217728; }        # 128 MB file cap
 # CKPT_MAX_MODEL_BYTES (the 128 MB model-alloc cap) lives in model.cyr beside
 # model_alloc_bytes: both the loader (here, -18) and model_init's fresh-path
@@ -98,6 +105,7 @@ fn CKPT_MAX_BYTES(): i64 { return 134217728; }        # 128 MB file cap
 fn ckpt_expected_np(V, C, T, nh, NL, bias, nkv): i64 {
     return ckpt_expected_np_arch(V, C, T, nh, NL, bias, nkv, 0, 0, 0, 0);   # mha
 }
+# expected param count with the (attn_kind, d_c, pos_kind, d_rope) descriptor, for the dense MLP (1 expert)
 fn ckpt_expected_np_arch(V, C, T, nh, NL, bias, nkv, attn_kind, d_c, pos_kind, d_rope): i64 {
     return ckpt_expected_np_moe(V, C, T, nh, NL, bias, nkv, attn_kind, d_c, pos_kind, d_rope, 1, 1);   # dense
 }
@@ -127,8 +135,16 @@ fn ckpt_expected_np_kvw(V, C, T, nh, NL, bias, nkv, kvw_blk, num_experts): i64 {
 fn _ckpt_vb(): i64 { if (g_bpe_on == 1) { return g_bpe_base; } return g_V; }
 fn _ckpt_k(): i64 { if (g_bpe_on == 1) { return g_bpe_nmerges; } return 0; }
 
+# The parameter count a checkpoint carries. X043's MTP aux heads are TRAIN-TIME ONLY
+# (model.cyr: "not serialized") and are the contiguous TAIL of g_params, starting at
+# _o_mtp(0), so the image keeps the base prefix of params / m / v. Through 1.15.1 the
+# whole g_NP was written while the loader's expected np has no MTP term, so every
+# `--mtp N --save` image was rejected on load with -10 (1.15.2 audit, MEDIUM). With
+# g_mtp == 1 this is g_NP, so every other image is byte-identical.
+fn _ckpt_np(): i64 { if (g_mtp > 1) { return _o_mtp(0); } return g_NP; }
+
 # Total checkpoint size in bytes for the current model.
-fn ckpt_size(): i64 { return (_ckpt_hdr_cur() + _ckpt_pl() + _ckpt_vb() + 2 * _ckpt_k() + 3 * g_NP) * 8; }
+fn ckpt_size(): i64 { return (_ckpt_hdr_cur() + _ckpt_pl() + _ckpt_vb() + 2 * _ckpt_k() + 3 * _ckpt_np()) * 8; }
 
 # Serialize the current model state into buf (caller allocs ckpt_size bytes).
 # The vocab loop runs to Vb, NOT g_V: g_vocab is a 256-entry base table, and
@@ -145,7 +161,7 @@ fn ckpt_serialize(buf): i64 {
     store64(buf + 6 * 8, g_NL);
     store64(buf + 7 * 8, g_attn_bias);
     store64(buf + 8 * 8, g_dropout);
-    store64(buf + 9 * 8, g_NP);
+    store64(buf + 9 * 8, _ckpt_np());
     store64(buf + 10 * 8, g_step);
     store64(buf + 11 * 8, _rng_state);
     store64(buf + 12 * 8, g_nkv);
@@ -181,9 +197,10 @@ fn ckpt_serialize(buf): i64 {
     i = 0;
     while (i < 2 * K) { store64(buf + (base + vb + i) * 8, load64(g_merges + i * 8)); i = i + 1; }
     var p = base + vb + 2 * K;
-    t_copy(buf + p * 8, g_params, g_NP);
-    t_copy(buf + (p + g_NP) * 8, g_adam_m, g_NP);
-    t_copy(buf + (p + 2 * g_NP) * 8, g_adam_v, g_NP);
+    var np = _ckpt_np();
+    t_copy(buf + p * 8, g_params, np);
+    t_copy(buf + (p + np) * 8, g_adam_m, np);
+    t_copy(buf + (p + 2 * np) * 8, g_adam_v, np);
     return ckpt_size();
 }
 
@@ -371,7 +388,7 @@ fn ckpt_load_buf(buf, len): i64 {
     # np) and the 4 parameter vectors must also fit the allocator. Reject any
     # config whose model_init total would exceed the cap — BEFORE allocating.
     var abytes = model_alloc_bytes_hyb(V, C, T, nh, nkv, NL, np, attn_kind, d_c, pos_kind, d_rope,
-      num_experts, topk, kinds);
+      num_experts, topk, kinds) + model_alloc_extra_bytes(V, C, T, 1, ternary);   # a --load never carries MTP
     if (abytes > CKPT_MAX_MODEL_BYTES()) { return 0 - 18; }
     var need = (hdr + pl + Vb + 2 * K + 3 * np) * 8;
     if (len != need) { return 0 - 11; }
@@ -453,6 +470,20 @@ fn ckpt_load_buf(buf, len): i64 {
             if (load64(g_merges + i * 8) != load64(buf + (base + Vb + i) * 8)) { return 0 - 15; }
             i = i + 1;
         }
+    }
+    # Payload finiteness (1.15.2 audit, LOW): every parameter and Adam first moment
+    # must be finite, and every second moment finite and not negative. A corrupt or
+    # hostile image with a negative v made the first Adam step's sqrt NaN, poisoning a
+    # weight that a later --save then wrote back out (and the run still exited 0).
+    # O(np), and like every check above it runs before any state change. -0.0 is
+    # allowed: sqrt(-0.0) is -0.0, harmless.
+    var pw = base + Vb + 2 * K;
+    i = 0;
+    while (i < 3 * np) {
+        var w = load64(buf + (pw + i) * 8);
+        if (f64_is_finite(w) == 0) { return 0 - 50; }
+        if ((i >= 2 * np) && (((w >> 63) & 1) == 1) && ((w & 0x7FFFFFFFFFFFFFFF) != 0)) { return 0 - 50; }
+        i = i + 1;
     }
     # validated — build the model and restore state. v6 rebuilds the per-layer
     # hybrid from the in-buffer kinds (already _hybrid_kinds_ok-validated above);

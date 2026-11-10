@@ -23,6 +23,8 @@
 #   dxq dxk dxv     : T*C each
 #   dprow           : T        (one softmax-row gradient scratch)
 
+# f64 ELEMENT count (not bytes) of one layer's attention arena: the layout above plus the
+# gated-linear S/dS scratch; sized for t_alloc
 fn attn_arena_size(T, C, nh, nkv): i64 {
     var Ckv = nkv * (C / nh);
     # + 2*(C/nh)^2 for the gated-linear core's running S / reverse dS scratch

@@ -3,6 +3,7 @@
 
 include "lib/syscalls.cyr"
 
+# placeholder test entry: no checks of its own, exits 0 (the real suite is tests/*.tcyr)
 fn main() {
     return 0;
 }

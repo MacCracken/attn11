@@ -208,6 +208,15 @@ softmax-CE backward over an on-policy rollout (since `∇ log π(a) = −∇ CE(
 advantage scale in `model_backward`) — all removed at 1.11.1; now lives in tarka.
 See ADR 0015.
 
+### Multi-token prediction (auxiliary future-token heads, X043)
+**Gloeckle, F., Youbi Idrissi, B., Rozière, B., Lopez-Paz, D., Synnaeve, G. (2024).**
+"Better & Faster Large Language Models via Multi-token Prediction." *ICML 2024.*
+arXiv:[2404.19737](https://arxiv.org/abs/2404.19737) — N−1 auxiliary heads on the shared
+trunk predict tokens t+2..t+N, trained jointly with the next-token head and dropped at
+inference. attn11's heads are C×C transforms into the tied unembedding, weighted by
+λ/(N−1). Used in: `src/model.cyr` (`P_mtp`, `mtp_aux_loss`, `mtp_aux_backward`),
+`src/train.cyr` (`mtp_fill_targets`). See X043 (an honest negative at tiny scale).
+
 ## Weight precision / quantization
 
 ### Ternary (BitNet b1.58) weight quantization, fake-quant with a straight-through estimator (M16)
@@ -309,6 +318,36 @@ doi:[10.1137/1006063](https://doi.org/10.1137/1006063).
 Used in: `src/tensor.cyr` (`rng_normal`) — rejection sampling in the unit disc;
 chosen over Box–Muller because it needs no `sin`/`cos` (which this toolchain
 lacks).
+
+## Modality lanes (vision, hearing)
+
+### Convolutional neural networks (the vision and hearing CNN)
+**LeCun, Y., Bottou, L., Bengio, Y., Haffner, P. (1998).** "Gradient-Based Learning
+Applied to Document Recognition." *Proc. IEEE* 86(11):2278–2324 — strided 2-D
+convolution + nonlinearity + a linear classifier, trained end to end by backprop.
+Used in: `src/vision.cyr` (the sight proof; conv2d via rosnet), `src/hearing.cyr` (the
+same CNN on the mel feature map).
+
+### Short-time Fourier transform, the Hann window, and the FFT (the hearing frontend)
+**Allen, J.B. (1977).** "Short Term Spectral Analysis, Synthesis, and Modification by
+Discrete Fourier Transform." *IEEE Trans. ASSP* 25(3):235–238 — the windowed,
+hop-strided STFT. **Harris, F.J. (1978).** "On the Use of Windows for Harmonic
+Analysis with the Discrete Fourier Transform." *Proc. IEEE* 66(1):51–83 — the Hann
+(raised-cosine) window. **Cooley, J.W., Tukey, J.W. (1965).** "An Algorithm for the
+Machine Calculation of Complex Fourier Series." *Math. Comp.* 19(90):297–301 — the
+radix-2 FFT behind hisab's `num_fft`. Used in: `src/hearing.cyr` (`hear_front_init`,
+`hear_features`).
+
+### Mel scale and the spectrogram-as-image reduction
+**Stevens, S.S., Volkmann, J., Newman, E.B. (1937).** "A Scale for the Measurement of
+the Psychological Magnitude Pitch." *JASA* 8(3):185–190 — the mel scale. **O'Shaughnessy,
+D. (1987).** *Speech Communication: Human and Machine.* Addison-Wesley — the
+m = 2595·log10(1 + f/700) form; attn11 uses ln(1 + f/700), a constant multiple of it, so
+its band centres are the same. **Gong, Y., Chung, Y.-A., Glass, J. (2021).** "AST: Audio
+Spectrogram Transformer." *Interspeech 2021.* arXiv:[2104.01778](https://arxiv.org/abs/2104.01778)
+— a (log-)mel spectrogram treated as an image, the reduction that lets the hearing lane
+reuse the vision CNN verbatim. Used in: `src/hearing.cyr` (`hear_front_init`'s triangular
+mel filterbank, the ln(1 + e) compression).
 
 ## Verification
 

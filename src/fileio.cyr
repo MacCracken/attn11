@@ -115,26 +115,28 @@ fn _fdatasync(fd): i64 {
 
 # Seek an open fd to an ABSOLUTE byte offset (whence = SEEK_SET). Used by the
 # streaming token-shard reader (src/stream.cyr) to fetch corpus windows by offset
-# without loading the whole corpus into RAM. The stdlib ships no sys_lseek wrapper
-# (the SysNr enum exists but no peer function), so we issue the raw syscall,
-# arch-dispatched exactly like _fdatasync above. Linux-only: the frozen agnos ABI
-# has no lseek, and shard_open rejects the agnos target before any seek (streaming
-# is a Linux feature). Returns the new offset (>= 0) or a negative errno.
+# without loading the whole corpus into RAM. Uses the stdlib sys_lseek wrapper
+# (in the Linux and Darwin peers since cyrius 6.6.5; it replaced a hand-rolled,
+# arch-dispatched raw syscall in 1.15.2, which the old "no wrapper" note described).
+# Linux-only in practice: the frozen agnos ABI has no lseek, and shard_open rejects
+# the agnos target before any seek (streaming is a Linux feature). Returns the new
+# offset (>= 0) or a negative errno.
 fn file_seek(fd, off): i64 {
-    var n = 8;                   # SYS_LSEEK (x86_64)
-    #ifdef CYRIUS_ARCH_AARCH64
-    n = 62;                      # SYS_LSEEK (aarch64)
-    #endif
-    return syscall(n, fd, off, 0);   # whence = SEEK_SET (0)
+    return sys_lseek(fd, off, 0);    # whence = SEEK_SET (0)
 }
 
 # Crash-atomic write: write to `path`.tmp (O_NOFOLLOW), fsync, then rename over
 # the target. A failed/interrupted write leaves the prior file intact (the
 # rename is the only mutation of `path`, and it is atomic). Returns bytes
-# written or a negative error.
+# written or a negative error. Single-writer by design: the temp name is fixed,
+# so two processes saving to the SAME path at once share one temp inode and the
+# later rename can publish the other's partial data (1.15.2 audit; documented
+# rather than fixed: a per-process temp name plus O_EXCL also needs a policy for
+# stale temps left by a crash, which is a design change, not a sweep fix).
 fn secure_write_atomic(path, buf, len): i64 {
     var plen = strlen(path);
     var tmp = alloc(plen + 6);
+    if (tmp == 0) { return 0 - 72; }   # refused alloc: never store through 0 (1.15.2 audit)
     var i = 0;
     while (i < plen) { store8(tmp + i, load8(path + i)); i = i + 1; }
     store8(tmp + plen, 46); store8(tmp + plen + 1, 116);        # '.t'

@@ -5,7 +5,23 @@
 
 ## Version
 
-**1.14.0** — *the HEARING lane — the modality-axis hearing proof-of-life* (cut
+**1.15.2** — *the P(-1) hardening, optimization and repair sweep* (2026-11-09;
+[`docs/audit/2026-11-09-audit.md`](../audit/2026-11-09-audit.md)). It fixes:
+- **1 HIGH:** a `--stream-corpus` shard's token ids were unchecked, so an id ≥ V became an
+  out-of-bounds gradient write. Every token now goes through `tok_ld`.
+- **4 MEDIUM:** `--mtp --save` and `--latent-dim`-on-MHA checkpoints could not be loaded;
+  `--vision`/`--hearing` leaked ~1.5 MiB/step (912 → 20 MiB peak); `--stream-encode` mapped
+  bytes beyond the vocabulary prefix to id 0.
+- **14 LOW**, including checkpoint payload finiteness (−50), a non-zero exit on divergence,
+  strict integer flags, `/dev/zero`, the CE underflow, and warning-free builds.
+
+It also closes three FD gaps (dropout p > 0, MTP N = 3, hybrid + MoE), adds `make smoke` to CI,
+documents all 84 undocumented functions, and brings back two bit-identical speed-ups: kv-cached
+generation −14.7 %, and the head backward −17 % at a 652-token BPE vocabulary. The golden suite
+is byte-identical to 1.15.1. Suite **1105** x86_64 / **1098** aarch64. Toolchain cyrius 6.7.18
+(unchanged since 1.15.1).
+
+Prior milestone: **1.14.0** — *the HEARING lane — the modality-axis hearing proof-of-life* (cut
 2026-07-07, user tags). The AST "a mel-spectrogram IS an image" reduction made
 literal: `src/hearing.cyr` + `--hearing`/`--hearing-fd` — Hann STFT via **hisab
 `num_fft`** (new `[deps.hisab]` 2.6.8, collision-checked `comm -12` empty) + a
@@ -1033,6 +1049,11 @@ give `linear_fwd` −49 %, the default step −12.8 % (+14.7 % tok/s), kv-cached
 
 ## Performance
 
+**Current (1.15.2, cyrius 6.7.18, rosnet 1.4.1; Cezanne, `bench-history.csv` row `7ee80f3` is the
+1.15.1 baseline):** default fwd+bwd step **~3.2 ms (~5,000 tok/s)**; kv-cached generation
+**~147 µs/token (~6,800 tok/s)**; `--preset` step ~49 ms (~1,290 tok/s). See
+`docs/benchmarks.md` for the 1.14.4 → 1.15.2 A/Bs. The figures below are the historical trail.
+
 4-wide SIMD (`f64v_fmadd`) matmul. x86_64:
 
 - Training (default config): fwd+bwd step ~3.7 ms, **~4 300 tokens/sec**
@@ -1311,6 +1332,8 @@ sampled output reproduces real corpus phrases.
 | optimizer   | Adam  | β 0.9/0.999, global-norm clip 1.0 |
 | lr schedule | warmup 100 → cosine | base 3e-3 → min 3e-4  |
 | steps/batch | 2000 / 16 |                               |
+| seed        | 1337  | model init + sampling stream      |
+| log every   | 250   | training-loss print interval      |
 
 `--preset` overrides to C 64 / T 64 / nh 8 / NL 4 (205 760 params at the
 embedded corpus); `--heads`/`--kv-heads`/`--layers` override individual dims
@@ -1327,7 +1350,7 @@ learned-abs) swaps the softmax core for the gated retention recurrence —
 parameter-free (same 39 488 params as MHA), and the decode cache becomes the
 constant `nh·hd²` state instead of a T-growing K/V.
 
-## Source (`src/`, ~1500 LOC)
+## Source (`src/`, 14 files, ~7,700 lines at 1.15.2)
 
 - `tensor.cyr` — attn11-local float printing (`f_print`) + `_putc`/`puts` (40
   lines); the f64-array helpers + dense matmul moved to **rosnet**, the PRNG to
@@ -1400,10 +1423,13 @@ constant `nh·hd²` state instead of a T-growing K/V.
   for any mix), the init loop + caches gate per-layer on `_lk(L)`/`_any_kind(k)`,
   `_hybrid_kinds_ok` validates the relaxed constraints, and `model_alloc_bytes_hyb`
   takes the per-layer `kinds` pointer to count each present kind's caches
-- `train.cyr` — byte + **BPE** tokenizer (`bpe_learn`/`tok_encode`/
-  `bpe_build_spans`/`tok_emit`), corpus (embedded/file/stdin, raw bytes
-  retained), batch sampling, LR schedule, resumable training loop, KV-cached
-  generation (`gen_prime`/`gen_decode` + context-shift), `eval_corpus`
+- `train.cyr` — batch sampling (every corpus token through `tok_ld`, which since
+  1.15.2 range-checks it against the vocabulary), LR schedule, resumable training
+  loop, KV-cached generation (`gen_prime`/`gen_decode` + context-shift; since 1.15.2
+  the non-sampled prefill / re-prime rows skip the last block's MLP and the head),
+  `eval_corpus`. The byte + **BPE** tokenizer and the corpus store
+  (`bpe_learn`/`tok_encode`/`corpus_set`/`gd_ld`) are the **akshara** library
+  (`lib/akshara.cyr`, extracted 1.11.0)
   (CE/token + bits-per-byte — pure CE, excludes the MoE aux term; accumulates the
   routing-entropy dispatch histogram)
 - `persist.cyr` — validated checkpoint serialize/load (tokenizer triple +
@@ -1418,14 +1444,26 @@ constant `nh·hd²` state instead of a T-growing K/V.
   a hybrid (uniform → v5, byte-identical); v≤5 synthesize the uniform pattern
 - `main.cyr` — CLI arg parsing (incl. `--preset`/`--heads`/`--kv-heads`/
   `--layers`/`--attn-kind`/`--latent-dim`/`--attn-every`/`--pos-kind`/`--rope-dim`/
-  `--experts`/`--expert-topk`/`--bpe`/`--eval`, null-guarded `_atoi`; `--attn-every K`
+  `--experts`/`--expert-topk`/`--bpe`/`--eval`; integer values through the strict
+  `_ai` (digits + optional `-`, saturating; 1.15.2 replaced the lenient `_atoi`); `--attn-every K`
   builds the per-layer hybrid and dispatches to `model_init_full`) + orchestration
+- `stream.cyr` — token-shard format: `shard_validate_buf` (header + tokenizer),
+  `shard_open` / the streamed resume, `shard_save_file`, and the bounded-RAM
+  `shard_stream_encode` (refuses special files `-75` and bytes missing from the vocab
+  prefix `-74`, 1.15.2)
+- `attn_linear.cyr`, `attn_ssm.cyr` — the gated-linear and selective-SSM sequence
+  mixers (forward, backward, single-row decode state)
+- `vision.cyr`, `hearing.cyr` — the modality lanes: a tiny CNN (rosnet conv2d) on
+  synthetic shapes, and the same CNN behind a fixed Hann-STFT + mel frontend (hisab
+  `num_fft`; x86_64-only); forward + backward scratch is allocated once, by element
+  count (1.15.2)
 - `test.cyr` — the `[build].test` entry (`cyrius.cyml`); delegates the unit suite to
   `tests/attn11.tcyr`
 
 ## Tests
 
-- `tests/attn11.tcyr` — **1014 checks**: finite-difference gradient checks
+- `tests/attn11.tcyr` — **1105 checks** on x86_64, 1098 on aarch64 (1.15.2; the
+  x86-only hearing lane accounts for the difference): finite-difference gradient checks
   (every op incl. dropout; attention at head dims 6/8/10 and GQA/MQA at
   `nkv ∈ {1, 2, nh}` incl. `dWk`/`dWv`/`dbv`; the `|dbk| ≈ 0`
   softmax-shift-invariance pin; 2-layer full model at MHA and GQA), the **MLA

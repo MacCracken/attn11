@@ -25,7 +25,9 @@
 # past EOF. The error codes are a distinct -60.. range (checkpoint uses ..-49).
 # Streaming is Linux-only (lseek); shard_open rejects the agnos target (-73).
 
+# token-shard magic, header field [0] ("ATTNSH01"; distinct from the checkpoint magic)
 fn SHARD_MAGIC(): i64 { return 0x4154544E53483031; }   # "ATTNSH01" (shard family)
+# count of fixed i64 header fields [0..8) that precede the base vocab
 fn SHARD_HDR(): i64 { return 8; }                       # fixed i64 header fields
 
 # ---- writer (--encode-shard) -----------------------------------------------
@@ -257,6 +259,11 @@ fn shard_open(path): i64 {
 fn STREAM_ENC_CHUNK(): i64 { return 1048576; }   # 1 MB raw bytes per read pass
 var g_stream_enc_chunk = 0;                       # 0 = STREAM_ENC_CHUNK(); >0 overrides (tests force tiny)
 fn _enc_chunk(): i64 { if (g_stream_enc_chunk > 0) { return g_stream_enc_chunk; } return STREAM_ENC_CHUNK(); }
+var g_stream_enc_prefix = 0;                      # 0 = MAX_CORPUS_BYTES(); >0 overrides (tests force tiny)
+fn _enc_prefix(): i64 {
+    if ((g_stream_enc_prefix > 0) && (g_stream_enc_prefix < MAX_CORPUS_BYTES())) { return g_stream_enc_prefix; }
+    return MAX_CORPUS_BYTES();
+}
 
 # loop-write `n` bytes of buf to fd; returns 0 or a negative error
 fn _enc_write(fd, buf, n): i64 {
@@ -269,18 +276,25 @@ fn _enc_write(fd, buf, n): i64 {
     return 0;
 }
 
+# stream-encode in_path into a token-shard at out_path in bounded RAM (learn_k BPE merges, 0 = byte-level);
+# writes <out>.tmp, fdatasyncs, renames. Returns tokens written or a negative error (-73 on agnos).
 fn shard_stream_encode(in_path, out_path, learn_k): i64 {
     #ifdef CYRIUS_TARGET_AGNOS
     return 0 - 73;     # streaming is Linux-only (no lseek in the frozen agnos ABI)
     #endif
     # --- pass 0: learn the tokenizer from a bounded prefix ---
-    var lbuf = alloc(MAX_CORPUS_BYTES());
+    var pcap = _enc_prefix();
+    var lbuf = alloc(pcap);
     if (lbuf == 0) { return 0 - 72; }
     var ifd = file_open(in_path, _O_RDONLY() | _O_NOFOLLOW(), 0);
     if (ifd < 0) { return ifd; }
+    # A special file (/dev/zero, a FIFO) never reaches EOF in pass 1, so it would
+    # stream into <out>.tmp until the disk filled (1.15.2 audit, LOW). A regular file
+    # reports its size through fstat and a special file reports 0, so refuse those.
+    if (_file_size(ifd, in_path) < 1) { file_close(ifd); return 0 - 75; }
     var ln = 0;
-    while (ln < MAX_CORPUS_BYTES()) {
-        var r = file_read(ifd, lbuf + ln, MAX_CORPUS_BYTES() - ln);
+    while (ln < pcap) {
+        var r = file_read(ifd, lbuf + ln, pcap - ln);
         if (r < 0) { file_close(ifd); return r; }
         if (r == 0) { break; }
         ln = ln + r;
@@ -343,6 +357,18 @@ fn shard_stream_encode(in_path, out_path, learn_k): i64 {
         if (rn < 0) { file_close(ofd); file_close(ifd); _unlink(tmp); return rn; }
         var avail = carry_len + rn;
         if (rn == 0) { done = 1; }
+        # The vocabulary is learned from the prefix only. A byte that never appears
+        # there has no id, and tok_encode would silently store id 0 for it (its
+        # prompt / held-out-eval fallback), corrupting the training shard with no
+        # error (1.15.2 audit, MEDIUM). Refuse the file instead (-74). Only the bytes
+        # read this round are checked; the carried ones already were.
+        var ui = carry_len;
+        while (ui < avail) {
+            if (load64(g_char2id + load8(raw + ui) * 8) < 0) {
+                file_close(ofd); file_close(ifd); _unlink(tmp); return 0 - 74;
+            }
+            ui = ui + 1;
+        }
         if (avail > 0) {
             var m = tok_encode(raw, avail, ids, width);
             var emit = m;

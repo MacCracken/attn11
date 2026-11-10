@@ -567,7 +567,8 @@ fn test_model_rope(): i64 {
         if (f64_gt(av, mxpos) == 1) { mxpos = av; }
         pi = pi + 1;
     }
-    assert(mxpos == f64_from(0), "rope: posemb receives exactly zero gradient (off-path)");
+    var fz0 = f64_from(0);   # exact +0.0 bit compare (not an f64-vs-int constant)
+    assert(mxpos == fz0, "rope: posemb receives exactly zero gradient (off-path)");
     return 0;
 }
 
@@ -3052,7 +3053,8 @@ fn test_ternary_quant(): i64 {
     var ok = 1; i = 0;
     while (i < K * N) {
         var av = f64_abs(load64(Weff + i * 8));
-        if ((av != gamma) && (av != f64_from(0))) { ok = 0; }
+        var fz0 = f64_from(0);   # exact +0.0 bit compare
+        if ((av != gamma) && (av != fz0)) { ok = 0; }
         i = i + 1;
     }
     assert(ok == 1, "ternary |W_eff| in {gamma, 0}");
@@ -3187,7 +3189,8 @@ fn test_ternary_matmul(): i64 {
         var ti = load64(t + i * 8); var ev = f64_from(0);
         if (ti == 1) { ev = gamma; }
         if (ti == (0 - 1)) { ev = f64_mul(gamma, f64_from(0 - 1)); }
-        if (f64_abs(f64_sub(load64(Weff + i * 8), ev)) != f64_from(0)) { bitok = 0; }
+        var fz0 = f64_from(0);   # exact +0.0 bit compare
+        if (f64_abs(f64_sub(load64(Weff + i * 8), ev)) != fz0) { bitok = 0; }
         i = i + 1;
     }
     assert(bitok == 1, "ternary signs * gamma == W_eff (value-exact)");
@@ -3683,8 +3686,300 @@ fn main(): i64 {
     test_hearing_fd();
     test_hearing_train();
     #endif
+    test_group("1.15.2 audit regressions");
+    test_ckpt_mtp_roundtrip();
+    test_lane_steps_no_alloc();
+    test_stream_encode_unseen_byte();
+    test_ckpt_payload_finite();
+    test_alloc_accounting_mtp_ternary();
+    test_xent_underflow_finite();
+    test_group("1.15.2 grad-check gap closures");
+    test_model_dropout_fd();
+    test_model_mtp3();
+    test_model_hybrid_moe();
 
     return assert_summary();
+}
+
+# ---- 1.15.2 P(-1) audit regressions ----------------------------------------
+# Registered dead-last (after every RNG-consuming group) so no earlier test's
+# shared-stream position moves.
+
+# MEDIUM: `--mtp N --save` wrote the whole g_NP (aux heads included) while the
+# loader's expected np has no MTP term, so every MTP image was rejected (-10).
+# The image must carry the base prefix and load back bit-for-bit.
+fn test_ckpt_mtp_roundtrip(): i64 {
+    var V = build_corpus();
+    g_mtp = 2;
+    model_init(V, 8, 4, 2, 2, 1, 0, f64_from(0), 7);
+    g_step = 3;
+    var npBase = _o_mtp(0);
+    assert(g_NP > npBase, "mtp model carries aux heads past the base params");
+    var snap = t_alloc(npBase); t_copy(snap, g_params, npBase);
+    var sz = ckpt_size();
+    var buf = alloc(sz);
+    ckpt_serialize(buf);
+    assert(load64(buf + 9 * 8) == npBase, "mtp checkpoint header carries the base np");
+    g_mtp = 1;                        # a --load builds the bare (N=1) model
+    var rc = ckpt_load_buf(buf, sz);
+    assert(rc == 0, "an --mtp checkpoint loads (was -10 through 1.15.1)");
+    assert(g_NP == npBase, "mtp checkpoint loads the base param count");
+    var mism = 0; var i = 0;
+    while (i < npBase) {
+        if (load64(g_params + i * 8) != load64(snap + i * 8)) { mism = mism + 1; }
+        i = i + 1;
+    }
+    assert(mism == 0, "mtp checkpoint round-trips the base params bit-for-bit");
+    return 0;
+}
+
+# MEDIUM: vis_bwd / hear_bwd t_alloc'd five backward buffers on EVERY step (the bump
+# allocator never frees), ~0.9 GiB peak RSS for one --vision / --hearing run. After
+# the first step sizes the scratch, further steps must allocate nothing.
+fn test_lane_steps_no_alloc(): i64 {
+    var G = 12; var c1 = 4; var c2 = 8; var ncls = 4; var B = 8;
+    var X = t_alloc(B * G * G);
+    var Y = alloc(B * 8);
+    var i = 0;
+    while (i < B) { store64(Y + i * 8, i % ncls); i = i + 1; }
+    vis_init(G, c1, c2, ncls, 7);
+    t_zero(vis_Gr, vis_NP); vis_fwd(X, Y, B, G, c1, c2, ncls); vis_bwd(X, Y, B, G, c1, c2, ncls);
+    var used = alloc_used();
+    var s = 0;
+    while (s < 3) {
+        t_zero(vis_Gr, vis_NP); vis_fwd(X, Y, B, G, c1, c2, ncls); vis_bwd(X, Y, B, G, c1, c2, ncls);
+        s = s + 1;
+    }
+    assert(alloc_used() == used, "vision fwd+bwd steps allocate nothing after the first");
+    #ifndef CYRIUS_ARCH_AARCH64
+    hear_init(G, c1, c2, ncls, 7);
+    t_zero(hear_Gr, hear_NP); hear_fwd(X, Y, B, G, c1, c2, ncls); hear_bwd(X, Y, B, G, c1, c2, ncls);
+    used = alloc_used();
+    s = 0;
+    while (s < 3) {
+        t_zero(hear_Gr, hear_NP); hear_fwd(X, Y, B, G, c1, c2, ncls); hear_bwd(X, Y, B, G, c1, c2, ncls);
+        s = s + 1;
+    }
+    assert(alloc_used() == used, "hearing fwd+bwd steps allocate nothing after the first");
+    #endif
+    return 0;
+}
+
+# MEDIUM: --stream-encode learns its vocabulary from a bounded prefix; a byte that
+# first appears after it used to be stored as id 0 with no error. It must fail (-74)
+# and leave no shard behind; a file whose bytes all occur in the prefix still encodes.
+fn test_stream_encode_unseen_byte(): i64 {
+    #ifndef CYRIUS_TARGET_AGNOS
+    g_stream = 0; g_data_w = 1;
+    var cpath = "/tmp/attn11-se-unseen.txt";
+    var spath = "/tmp/attn11-se-unseen.tsh";
+    var n = 40;
+    var txt = alloc(n);
+    var k = 0;
+    while (k < n) { store8(txt + k, 97 + (k % 3)); k = k + 1; }   # "abcabc..."
+    store8(txt + n - 2, 122);                                        # a 'z' past the prefix
+    assert(secure_write_atomic(cpath, txt, n) == n, "unseen: wrote input file");
+    g_stream_enc_prefix = 24; g_stream_enc_chunk = 7;
+    var nt = shard_stream_encode(cpath, spath, 0);
+    assert(nt == 0 - 74, "unseen: a byte absent from the vocab prefix is refused (-74), not mapped to id 0");
+    var probe = file_open(spath, _O_RDONLY(), 0);
+    assert(probe < 0, "unseen: a refused encode leaves no shard");
+    if (probe >= 0) { file_close(probe); }
+    store8(txt + n - 2, 97);                                         # every byte now occurs in the prefix
+    assert(secure_write_atomic(cpath, txt, n) == n, "unseen: rewrote input file");
+    nt = shard_stream_encode(cpath, spath, 0);
+    g_stream_enc_prefix = 0; g_stream_enc_chunk = 0;
+    assert(nt == n, "unseen: a file covered by its prefix vocab still encodes every byte");
+    _unlink(cpath); _unlink(spath);
+    #endif
+    return 0;
+}
+
+# LOW: the loader validated the header but not the payload. A negative Adam v
+# NaN'd the first step's sqrt, and a NaN/Inf param or moment loaded silently. Every
+# param and m must be finite and v finite and >= 0 (-50); a clean image still loads.
+fn test_ckpt_payload_finite(): i64 {
+    var V = build_corpus();
+    model_init(V, 8, 4, 2, 2, 1, 0, f64_from(0), 7);
+    var np = g_NP;
+    var sz = ckpt_size();
+    var good = alloc(sz); ckpt_serialize(good);
+    var pw = sz / 8 - 3 * np;                 # params, then m, then v, end the image
+    var bad = alloc(sz);
+    var i = 0;
+    i = 0; while (i < sz / 8) { store64(bad + i * 8, load64(good + i * 8)); i = i + 1; }
+    store64(bad + (pw + 2 * np + 5) * 8, f64_from(0 - 1));          # v[5] = -1.0
+    assert(ckpt_load_buf(bad, sz) == 0 - 50, "payload: a negative Adam v is refused (-50)");
+    store64(bad + (pw + 2 * np + 5) * 8, load64(good + (pw + 2 * np + 5) * 8));
+    store64(bad + (pw + 3) * 8, f64_div(f64_from(0), f64_from(0)));   # param[3] = NaN
+    assert(ckpt_load_buf(bad, sz) == 0 - 50, "payload: a NaN parameter is refused (-50)");
+    store64(bad + (pw + 3) * 8, load64(good + (pw + 3) * 8));
+    store64(bad + (pw + np + 1) * 8, f64_div(f64_from(1), f64_from(0)));  # m[1] = +Inf
+    assert(ckpt_load_buf(bad, sz) == 0 - 50, "payload: an infinite Adam m is refused (-50)");
+    assert(ckpt_load_buf(good, sz) == 0, "payload: a clean image still loads");
+    return 0;
+}
+
+# LOW: the 128 MB pre-flight left out the MTP scratch and the ternary g_qscratch, so
+# it under-predicted those models. With model_alloc_extra_bytes it must track the real
+# allocation as tightly as test_alloc_accounting pins the base model.
+fn test_alloc_accounting_mtp_ternary(): i64 {
+    # C = 64, T = 16 so each extra (MTP scratch ~35 KB, g_qscratch ~131 KB) dwarfs the
+    # 8 KiB slack — at tiny dims a dropped term hid inside it (a 1.15.2 mutant survived).
+    var used0 = alloc_used();
+    g_mtp = 3;
+    model_init(5, 64, 16, 4, 4, 2, 1, f64_from(0), 4);
+    var delta = alloc_used() - used0;
+    var predicted = model_alloc_bytes(5, 64, 16, 4, 4, 2, g_NP) + model_alloc_extra_bytes(5, 64, 16, 3, 0);
+    g_mtp = 1;
+    assert(delta >= predicted, "mtp: pre-flight never under-predicts model_init");
+    assert(delta <= predicted + 8192, "mtp: pre-flight tracks model_init (aux scratch counted)");
+    used0 = alloc_used();
+    g_ternary = 1;
+    model_init(5, 64, 16, 4, 4, 2, 1, f64_from(0), 4);
+    delta = alloc_used() - used0;
+    predicted = model_alloc_bytes(5, 64, 16, 4, 4, 2, g_NP) + model_alloc_extra_bytes(5, 64, 16, 1, 1);
+    g_ternary = 0;
+    assert(delta >= predicted, "ternary: pre-flight never under-predicts model_init");
+    assert(delta <= predicted + 8192, "ternary: pre-flight tracks model_init (g_qscratch counted)");
+    return 0;
+}
+
+# LOW: when the target's probability underflows to exactly 0 (logit gap > ~745) the
+# CE was -ln(0) = +inf and train() stopped. Both CE forwards now fall back to the
+# exact log-sum-exp form in that case only: logits {1000, 0}, target 1 -> exactly 1000.
+fn test_xent_underflow_finite(): i64 {
+    var lg = t_alloc(2); var pr = t_alloc(2); var tg = alloc(8); var mk = alloc(8);
+    store64(lg, f64_from(1000)); store64(lg + 8, f64_from(0));
+    store64(tg, 1); store64(mk, 1);
+    var l1 = softmax_xent_fwd(lg, tg, pr, 1, 2);
+    var f1000 = f64_from(1000);   # exact bit compare against an f64, not an int constant
+    assert(l1 == f1000, "xent: an underflowed target probability gives the exact finite loss");
+    var l2 = softmax_xent_masked_fwd(lg, tg, pr, mk, 1, 2);
+    assert(l2 == f1000, "masked xent: same exact finite loss");
+    store64(lg, f64_from(1)); store64(tg, 0);
+    var l3 = softmax_xent_fwd(lg, tg, pr, 1, 2);
+    var want = f64_neg(f64_ln(load64(pr)));
+    assert(l3 == want, "xent: an ordinary row still uses -ln(p_t), bit for bit");
+    return 0;
+}
+
+# ---- 1.15.2 grad-check gap closures (the core reviewer's backward <-> FD map) ----
+# FD helper for a model whose forward draws from the RNG (dropout p > 0): restore the
+# same stream state before EVERY forward, so each evaluation sees the identical mask
+# and the loss is a smooth function of the perturbed parameter.
+fn model_ng_rs(p, np, n, rs): i64 {
+    var eps = _eps(); var te = f64_mul(f64_from(2), eps); var i = 0;
+    while (i < n) {
+        var o = load64(p + i * 8);
+        store64(p + i * 8, f64_add(o, eps)); _rng_state = rs; var lp = model_forward();
+        store64(p + i * 8, f64_sub(o, eps)); _rng_state = rs; var lm = model_forward();
+        store64(p + i * 8, o); store64(np + i * 8, f64_div(f64_sub(lp, lm), te)); i = i + 1;
+    }
+    return 0;
+}
+
+# Non-vacuity guard for an FD check: maxrel is 0 when BOTH arrays are all zeros, so a
+# gradient that never reached a parameter would pass silently. Assert it did.
+fn _nonzero(a, n): i64 {
+    var i = 0;
+    while (i < n) { if ((load64(a + i * 8) & 0x7FFFFFFFFFFFFFFF) != 0) { return 1; } i = i + 1; }
+    return 0;
+}
+
+# GAP: dropout_bwd was FD-checked only as an op (p = 0.5); the full-model mask ->
+# branch wiring with p > 0 never was. p = 0.3, masks pinned by model_ng_rs.
+fn test_model_dropout_fd(): i64 {
+    var V = 5; var C = 4; var T = 3; var nh = 2; var NL = 2;
+    model_init(V, C, T, nh, nh, NL, 1, _lrc(3, 10), 31);
+    g_training = 1;
+    store64(A_tokens + 0, 1); store64(A_tokens + 8, 3); store64(A_tokens + 16, 0);
+    store64(A_targets + 0, 3); store64(A_targets + 8, 0); store64(A_targets + 16, 4);
+    var rs = _rng_state;
+    model_forward(); model_zero_grads(); model_backward();
+    var Cc = C * C; var n_tok = V * C;
+    var aWq0 = t_alloc(Cc); t_copy(aWq0, GL(0, _o_Wq()), Cc);
+    var aWo1 = t_alloc(Cc); t_copy(aWo1, GL(1, _o_Wo()), Cc);
+    var aTok = t_alloc(n_tok); t_copy(aTok, G_tokemb(), n_tok);
+    var aLnf = t_alloc(C); t_copy(aLnf, G_lnfg(), C);
+    var nWq0 = t_alloc(Cc); model_ng_rs(PL(0, _o_Wq()), nWq0, Cc, rs);
+    var nWo1 = t_alloc(Cc); model_ng_rs(PL(1, _o_Wo()), nWo1, Cc, rs);
+    var nTok = t_alloc(n_tok); model_ng_rs(P_tokemb(), nTok, n_tok, rs);
+    var nLnf = t_alloc(C); model_ng_rs(P_lnfg(), nLnf, C, rs);
+    # L0 dWq at the 1e-3 tier (as the hybrid checks): its maxrel is roundoff-dominated,
+    # not a wiring error. Swept in 1.15.2 it falls with a LARGER FD step (eps 1e-6 / 1e-5
+    # / 1e-4 / 1e-3 -> 1.7e-2 / 7.1e-4 / 1.1e-4 / 7.1e-6), the 1/eps signature of
+    # cancellation on a small element; a wrong mask path would be O(1) at every eps.
+    check("dropout p=0.3 model L0 dWq", aWq0, nWq0, Cc, 1000);
+    check("dropout p=0.3 model L1 dWo", aWo1, nWo1, Cc, 10000);
+    check("dropout p=0.3 model dtokemb", aTok, nTok, n_tok, 10000);
+    check("dropout p=0.3 model dlnf_g", aLnf, nLnf, C, 10000);
+    assert(_nonzero(aWq0, Cc) * _nonzero(aWo1, Cc) * _nonzero(aTok, n_tok) * _nonzero(aLnf, C) == 1,
+      "dropout FD: every checked gradient is non-zero (the checks are not vacuous)");
+    g_training = 0;
+    return 0;
+}
+
+# GAP: MTP was FD-checked only at g_mtp = 2, so aux head a >= 1's offsets into
+# g_mtp_h / probs / tgt / mask and P_mtp(a) never ran. N = 3: two aux heads.
+fn test_model_mtp3(): i64 {
+    var V = 5; var C = 4; var T = 3; var nh = 2; var NL = 2;
+    g_mtp = 3;
+    model_init(V, C, T, nh, nh, NL, 1, f64_from(0), 1);
+    g_training = 1;
+    store64(A_tokens + 0, 1); store64(A_tokens + 8, 3); store64(A_tokens + 16, 0);
+    store64(A_targets + 0, 3); store64(A_targets + 8, 0); store64(A_targets + 16, 4);
+    # head 0 (t+2): positions 0,1 in-window; head 1 (t+3): position 0 only
+    store64(g_mtp_tgt + 0, 2); store64(g_mtp_tgt + 8, 4); store64(g_mtp_tgt + 16, 0);
+    store64(g_mtp_mask + 0, 1); store64(g_mtp_mask + 8, 1); store64(g_mtp_mask + 16, 0);
+    store64(g_mtp_tgt + (T + 0) * 8, 1); store64(g_mtp_tgt + (T + 1) * 8, 0); store64(g_mtp_tgt + (T + 2) * 8, 0);
+    store64(g_mtp_mask + (T + 0) * 8, 1); store64(g_mtp_mask + (T + 1) * 8, 0); store64(g_mtp_mask + (T + 2) * 8, 0);
+    model_forward(); model_zero_grads(); model_backward();
+    var Cc = C * C; var n_tok = V * C;
+    var aM0 = t_alloc(Cc); t_copy(aM0, G_mtp(0), Cc);
+    var aM1 = t_alloc(Cc); t_copy(aM1, G_mtp(1), Cc);
+    var aTok = t_alloc(n_tok); t_copy(aTok, G_tokemb(), n_tok);
+    var aWq0 = t_alloc(Cc); t_copy(aWq0, GL(0, _o_Wq()), Cc);
+    var nM0 = t_alloc(Cc); model_ng(P_mtp(0), nM0, Cc);
+    var nM1 = t_alloc(Cc); model_ng(P_mtp(1), nM1, Cc);
+    var nTok = t_alloc(n_tok); model_ng(P_tokemb(), nTok, n_tok);
+    var nWq0 = t_alloc(Cc); model_ng(PL(0, _o_Wq()), nWq0, Cc);
+    check("mtp N=3 dW_mtp_0", aM0, nM0, Cc, 10000);
+    check("mtp N=3 dW_mtp_1 (second aux head)", aM1, nM1, Cc, 10000);
+    check("mtp N=3 dtokemb (tied + 2 aux)", aTok, nTok, n_tok, 10000);
+    check("mtp N=3 L0 dWq (trunk via both aux heads)", aWq0, nWq0, Cc, 10000);
+    assert(_nonzero(aM0, Cc) * _nonzero(aM1, Cc) == 1,
+      "mtp N=3: both aux-head gradients are non-zero (the checks are not vacuous)");
+    g_mtp = 1; g_training = 0;
+    return 0;
+}
+
+# GAP: the per-layer hybrid and MoE were each FD-checked, but never composed, though
+# the CLI builds it (--attn-kind lin --attn-every 2 --experts 4). mha / lin / mha
+# blocks, each MLP routed through 4 experts, top-2.
+fn test_model_hybrid_moe(): i64 {
+    var V = 5; var C = 8; var T = 3; var nh = 2; var NL = 3;
+    var kinds[24];
+    store64(&kinds + 0, 0); store64(&kinds + 8, 2); store64(&kinds + 16, 0);
+    model_init_full(V, C, T, nh, nh, NL, 1, f64_from(0), 29, 2, 0, 0, 0, 4, 2, &kinds, 0);
+    assert(g_layer_kind != 0, "hybrid+moe model built");
+    assert(g_num_experts == 4, "hybrid+moe experts installed");
+    store64(A_tokens + 0, 1); store64(A_tokens + 8, 3); store64(A_tokens + 16, 0);
+    store64(A_targets + 0, 3); store64(A_targets + 8, 0); store64(A_targets + 16, 4);
+    model_forward(); model_zero_grads(); model_backward();
+    var Cc = C * C; var n_tok = V * C;
+    var aWk1 = t_alloc(Cc); t_copy(aWk1, GL(1, _o_Wk()), Cc);   # lin layer
+    var aWq2 = t_alloc(Cc); t_copy(aWq2, GL(2, _o_Wq()), Cc);   # trailing mha layer
+    var aTok = t_alloc(n_tok); t_copy(aTok, G_tokemb(), n_tok);
+    var nWk1 = t_alloc(Cc); model_ng(PL(1, _o_Wk()), nWk1, Cc);
+    var nWq2 = t_alloc(Cc); model_ng(PL(2, _o_Wq()), nWq2, Cc);
+    var nTok = t_alloc(n_tok); model_ng(P_tokemb(), nTok, n_tok);
+    check("hybrid+moe L1(lin) dWk", aWk1, nWk1, Cc, 1000);
+    check("hybrid+moe L2(mha) dWq", aWq2, nWq2, Cc, 1000);
+    check("hybrid+moe dtokemb", aTok, nTok, n_tok, 1000);
+    assert(_nonzero(aWk1, Cc) * _nonzero(aWq2, Cc) == 1,
+      "hybrid+moe: the checked layer gradients are non-zero (the checks are not vacuous)");
+    return 0;
 }
 
 # Statement-call epilogue (not a `var` initializer) — see docs/architecture/002.

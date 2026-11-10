@@ -43,14 +43,17 @@ Not decisions (those live in [`../adr/`](../adr/)) and not guides (those live in
   width global before the corpus load, via width-generic accessors (`gd_ld`/`gd_st`,
   `_tw_ld`/`_tw_st`). Everything else (the `g_T`-sized batch buffers, the vocab-sized
   BPE tables) stays i64 — the asymmetry is deliberate. This removed the 8×/4× bloat
-  and raised `MAX_CORPUS_BYTES` 4 MB → 64 MB. **Affects**: `src/train.cyr` (`g_data`,
-  `corpus_set`, `bpe_learn`, `tok_encode`, the window samplers). Shipped 1.5.3 (X018).
+  and raised `MAX_CORPUS_BYTES` 4 MB → 64 MB. **Affects**: `lib/akshara.cyr` (`g_data`, `corpus_set`,
+  `bpe_learn`, `tok_encode`; the tokenizer layer moved there in 1.11.0) and `src/train.cyr` (the window
+  samplers). Shipped 1.5.3 (X018).
 - [007 — Streaming token shards](007-streaming-token-shards.md) — the RAM-independent
   large-corpus path: `--stream-corpus` samples windows by **lseek+read at offset** through a
   single 64 K-token chunk cache inside `gd_ld` (not `mmap` — the lib wrapper is x86_64-only and
   agnos has no file-backed mmap). Because `gd_ld` is the only corpus-token reader, the model /
   samplers are untouched and stream-vs-in-memory byte-identity is structural. **Affects**:
-  `src/stream.cyr`, `src/train.cyr` (`gd_ld`). Shipped 1.6.2.
+  `src/stream.cyr` and `lib/akshara.cyr` (`gd_ld`, `stream_tok`; extracted in 1.11.0), read through
+  `src/train.cyr`'s `tok_ld`, which since 1.15.2 range-checks every id against the vocabulary (a
+  shard's token payload is not validated at open). Shipped 1.6.2.
 
 > **The GPU backend notes (008–011) describe rosnet's `[lib.gpu]` backend** (`dist/rosnet-gpu.cyr`),
 > **extracted whole from attn11 at 1.10.0** (ADR 0017). They were written M18/M19 when the backend was

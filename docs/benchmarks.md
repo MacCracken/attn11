@@ -652,3 +652,32 @@ three flat rows are the ones that don't call rosnet's linear kernels: Adam, the 
 SIMD tied LM head (`head_fwd`), and the i64-add ternary matmul (+2.0 %). The gain grows with
 model width (`--preset` beats the default), as you'd expect from a matmul speed-up. 1.15.0's
 small-shape `linear_fwd` regression (+11.5 %) is gone. This row is now half its 6.7.9 cost.
+
+## 1.15.2 P(-1) sweep: two bit-identical speed-ups (decode skip, packed head backward)
+
+1.15.2 changes no toolchain or dependency. Its two optimizations keep every output's rounding
+sequence, and the 28-run golden suite is byte-identical to 1.15.1. The A/B compares the 1.15.1
+and 1.15.2 bench binaries on the same host (Cezanne): DCE builds, run alone and interleaved, two
+full passes each. The unchanged forward pass moved by −4 % in this session, so treat ±4–5 % as
+noise.
+
+| metric | 1.15.1 | 1.15.2 | Δ |
+|---|---:|---:|---:|
+| gen kv-cached (default) | 172 519 ns | 147 088 ns | **−14.7 %** |
+| gen tok/s cached (default) | 5 796 | 6 800 | +17.3 % |
+| gen kv-cached MQA / MLA latent / RoPE / MoE8 / lin / SSM | | | −15.5 / −11.3 / −10.6 / −12.5 / −13.9 / −9.1 % |
+| gen kv-cached `--preset` | 503 106 ns | 461 440 ns | −8.3 % |
+| gen uncached (default) | 1 023 391 ns | 1 010 904 ns | −1.2 % (unchanged path) |
+| fwd+bwd step (default) | 3.343 ms | 3.206 ms | −4.1 % (noise band) |
+| `model_backward` (default) | 2.070 ms | 1.981 ms | −4.3 % (noise band) |
+| `head_fwd` V768 C64 | 3.760 ms | 3.760 ms | 0.0 % |
+
+The kv-cached gain comes from rows that are never sampled. Prefill before the last prompt
+token, and the re-prime after each context shift (about one row per generated token, since the
+window slides by T/2), now only extend the caches and skip the last block's MLP, the final
+LayerNorm and the LM head.
+
+The head-backward packing (`f64v_scale` + `f64v_add` over C-wide rows) is small at the default
+V = 25 and large where the head dominates. A whole `--corpus <165 KB> --bpe 512 --steps 40` run
+(V = 652) takes **4.44 → 3.68 s, −17 %** (wall, min of 3; outputs identical). The bench has no
+head-backward row, which is why the step rows barely move.

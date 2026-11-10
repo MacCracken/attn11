@@ -104,42 +104,37 @@ include "src/hearing.cyr"  # the HEARING lane — the modality-axis hearing proo
 
 # ---- hyperparameters -------------------------------------------------------
 fn CFG_C(): i64 { return 32; }       # d_model
+# default context length T (frozen; --ctx / --preset override; see docs/STABILITY.md)
 fn CFG_T(): i64 { return 16; }       # context length
+# default attention head count (frozen; --heads / --preset override)
 fn CFG_NH(): i64 { return 4; }       # attention heads (head dim = C/NH)
+# default transformer block count (frozen; --layers / --preset override)
 fn CFG_NL(): i64 { return 3; }       # transformer blocks
+# PRNG seed for fresh-model init (frozen; rebuild to change)
 fn CFG_SEED(): i64 { return 1337; }
+# default total training steps, also the LR-schedule horizon (frozen; --steps overrides)
 fn CFG_STEPS(): i64 { return 2000; }
+# sequences per optimizer step (frozen; rebuild to change)
 fn CFG_BATCH(): i64 { return 16; }
+# training-log interval in steps (frozen; rebuild to change)
 fn CFG_LOG(): i64 { return 250; }
+# linear LR-warmup length in steps before the cosine decay (frozen)
 fn CFG_WARMUP(): i64 { return 100; }
+# base (peak) learning rate as f64 bits (frozen)
 fn CFG_LR(): i64 { return f64_div(f64_from(3), f64_from(1000)); }      # base 3e-3
+# cosine-schedule floor learning rate as f64 bits (frozen)
 fn CFG_MINLR(): i64 { return f64_div(f64_from(3), f64_from(10000)); }  # min 3e-4
+# global-norm gradient clip threshold as f64 bits (frozen)
 fn CFG_CLIP(): i64 { return f64_from(1); }                            # global-norm 1.0
+# 1 = attention projections carry biases (frozen default; rebuild to change)
 fn CFG_ATTN_BIAS(): i64 { return 1; }                                 # Q/K/V/O biases
+# residual dropout probability as f64 bits (frozen at 0.0)
 fn CFG_DROPOUT(): i64 { return f64_from(0); }                         # residual dropout (off; tiny corpus)
 
-fn _atoi(s): i64 {
-    if (s == 0) { return 0; }   # a value flag given as the last arg: argv() OOB
-    var v = 0; var i = 0; var neg = 0;
-    if (load8(s) == 45) { neg = 1; i = 1; }
-    while (load8(s + i) != 0) {
-        var c = load8(s + i);
-        # saturate at ~1e9 (> any real --steps or model dim, << i64 overflow):
-        # a garbage-huge arg can no longer wrap mod 2^64 to a plausible small or
-        # negative value. Downstream caps (model_config_ok, --bpe 1..512) then
-        # reject the saturated value cleanly (M8 audit 2026-06-11).
-        if ((c >= 48) && (c <= 57)) {
-            if (v < 1000000000) { v = v * 10 + (c - 48); }
-        }
-        i = i + 1;
-    }
-    if (neg == 1) { return 0 - v; }
-    return v;
-}
-
 # Kept in sync with the VERSION file (CI's docs job gates the match).
-fn CFG_VERSION(): i64 { return "1.15.1"; }
+fn CFG_VERSION(): i64 { return "1.15.2"; }
 
+# print the --help flag reference; returns 0 (every caller then exits)
 fn usage(): i64 {
     puts("attn11 — a from-scratch GPT-style transformer, trained, in Cyrius\n");
     puts("usage: attn11 [flags]   (no flags: train on the embedded corpus, then sample)\n");
@@ -193,6 +188,34 @@ fn _av(idx, flag): i64 {
     return argv(idx);
 }
 
+# Consume a value-flag's INTEGER argument, strictly: an optional '-' then one or more
+# decimal digits and nothing else. Through 1.15.1 the parser skipped any non-digit, so
+# `--steps 1e3` trained 13 steps, `--steps abc` meant 0 and `--heads 4x` meant 4, all
+# silently (1.15.2 audit). A malformed value now exits 1 with usage, as a missing one
+# (_av) does. Every well-formed value parses exactly as before, including the ~1e9
+# saturation (> any real --steps or model dim, << i64 overflow), which keeps a
+# garbage-huge value from wrapping so the downstream caps reject it (M8 audit).
+fn _ai(idx, flag): i64 {
+    var s = _av(idx, flag);
+    var v = 0; var i = 0; var neg = 0; var bad = 0;
+    if (load8(s) == 45) { neg = 1; i = 1; }
+    if (load8(s + i) == 0) { bad = 1; }                 # "" or a lone "-"
+    while (load8(s + i) != 0) {
+        var c = load8(s + i);
+        if ((c < 48) || (c > 57)) { bad = 1; }
+        elif (v < 1000000000) { v = v * 10 + (c - 48); }
+        i = i + 1;
+    }
+    if (bad == 1) {
+        puts("attn11: "); puts(flag); puts(" needs an integer, got '"); puts(s); puts("'\n");
+        usage(); sys_exit(1);
+    }
+    if (neg == 1) { return 0 - v; }
+    return v;
+}
+
+# CLI driver: parse flags (lane demos return early), then encode / load-or-init, train, save, eval, sample.
+# Returns the process exit code the epilogue below hands to sys_exit.
 fn main(): i64 {
     alloc_init();
     args_init();
@@ -220,6 +243,7 @@ fn main(): i64 {
     var cfg_mtp = 1;                                 # X043: --mtp N>1 = multi-token prediction (N-1 aux heads)
     var cfg_decode_steps = 0;                        # diffusion decode iterations (0 = default, resolved post-parse)
     var cfg_decode_sched = 0;                        # diffusion decode schedule: 0 = cosine (default), 1 = linear
+    var cfg_decode_set = 0;                          # 1 = --decode-steps or --decode-schedule was given
     var cfg_ternary = 0;                             # M16 (E6): 1 = BitNet-style ternary weights
     var i = 1;
     while (i < argc()) {
@@ -230,7 +254,7 @@ fn main(): i64 {
         elif (streq(a, "--stdin") == 1) { use_stdin = 1; }
         elif (streq(a, "--load") == 1) { i = i + 1; load_path = _av(i, a); }
         elif (streq(a, "--save") == 1) { i = i + 1; save_path = _av(i, a); }
-        elif (streq(a, "--steps") == 1) { i = i + 1; steps = _atoi(_av(i, a)); }
+        elif (streq(a, "--steps") == 1) { i = i + 1; steps = _ai(i, a); }
         elif (streq(a, "--gen-only") == 1) { gen_only = 1; }
         elif (streq(a, "--vision") == 1) { return vision_demo(600, 32, 1337); }
         elif (streq(a, "--vision-fd") == 1) { return vis_grad_check(); }
@@ -243,11 +267,11 @@ fn main(): i64 {
         elif (streq(a, "--gpu-tc") == 1) { g_gpu = 1; g_gpu_tc = 1; }
         #endif
         elif (streq(a, "--preset") == 1) { cfg_c = 64; cfg_t = 64; cfg_nh = 8; cfg_nl = 4; }
-        elif (streq(a, "--d-model") == 1) { i = i + 1; cfg_c = _atoi(_av(i, a)); }
-        elif (streq(a, "--ctx") == 1) { i = i + 1; cfg_t = _atoi(_av(i, a)); }
-        elif (streq(a, "--heads") == 1) { i = i + 1; cfg_nh = _atoi(_av(i, a)); }
-        elif (streq(a, "--kv-heads") == 1) { i = i + 1; cfg_nkv = _atoi(_av(i, a)); }
-        elif (streq(a, "--layers") == 1) { i = i + 1; cfg_nl = _atoi(_av(i, a)); }
+        elif (streq(a, "--d-model") == 1) { i = i + 1; cfg_c = _ai(i, a); }
+        elif (streq(a, "--ctx") == 1) { i = i + 1; cfg_t = _ai(i, a); }
+        elif (streq(a, "--heads") == 1) { i = i + 1; cfg_nh = _ai(i, a); }
+        elif (streq(a, "--kv-heads") == 1) { i = i + 1; cfg_nkv = _ai(i, a); }
+        elif (streq(a, "--layers") == 1) { i = i + 1; cfg_nl = _ai(i, a); }
         elif (streq(a, "--attn-kind") == 1) {
             i = i + 1; var ak = _av(i, a);
             if (streq(ak, "mha") == 1) { cfg_attn_kind = 0; }
@@ -256,7 +280,7 @@ fn main(): i64 {
             elif (streq(ak, "ssm") == 1) { cfg_attn_kind = 3; }
             else { puts("attn11: --attn-kind must be mha, mla, lin, or ssm\n"); return 1; }
         }
-        elif (streq(a, "--latent-dim") == 1) { i = i + 1; cfg_latent_dim = _atoi(_av(i, a)); }
+        elif (streq(a, "--latent-dim") == 1) { i = i + 1; cfg_latent_dim = _ai(i, a); }
         elif (streq(a, "--pos-kind") == 1) {
             i = i + 1; var pk = _av(i, a);
             if (streq(pk, "learned") == 1) { cfg_pos_kind = 0; }
@@ -264,12 +288,12 @@ fn main(): i64 {
             elif (streq(pk, "rope-decoupled") == 1) { cfg_pos_kind = 2; }
             else { puts("attn11: --pos-kind must be learned, rope, or rope-decoupled\n"); return 1; }
         }
-        elif (streq(a, "--rope-dim") == 1) { i = i + 1; cfg_rope_dim = _atoi(_av(i, a)); }
-        elif (streq(a, "--attn-every") == 1) { i = i + 1; cfg_attn_every = _atoi(_av(i, a)); }
-        elif (streq(a, "--experts") == 1) { i = i + 1; cfg_num_experts = _atoi(_av(i, a)); }
-        elif (streq(a, "--mtp") == 1) { i = i + 1; cfg_mtp = _atoi(_av(i, a)); }
-        elif (streq(a, "--expert-topk") == 1) { i = i + 1; cfg_expert_topk = _atoi(_av(i, a)); }
-        elif (streq(a, "--bpe") == 1) { use_bpe = 1; i = i + 1; bpe_k = _atoi(_av(i, a)); }
+        elif (streq(a, "--rope-dim") == 1) { i = i + 1; cfg_rope_dim = _ai(i, a); }
+        elif (streq(a, "--attn-every") == 1) { i = i + 1; cfg_attn_every = _ai(i, a); }
+        elif (streq(a, "--experts") == 1) { i = i + 1; cfg_num_experts = _ai(i, a); }
+        elif (streq(a, "--mtp") == 1) { i = i + 1; cfg_mtp = _ai(i, a); }
+        elif (streq(a, "--expert-topk") == 1) { i = i + 1; cfg_expert_topk = _ai(i, a); }
+        elif (streq(a, "--bpe") == 1) { use_bpe = 1; i = i + 1; bpe_k = _ai(i, a); }
         elif (streq(a, "--eval") == 1) { do_eval = 1; }
         elif (streq(a, "--eval-corpus") == 1) { i = i + 1; eval_corpus_path = _av(i, a); }
         elif (streq(a, "--encode-shard") == 1) { i = i + 1; encode_shard_path = _av(i, a); }
@@ -282,9 +306,9 @@ fn main(): i64 {
             else { puts("attn11: --objective must be ar or diffusion\n"); return 1; }
         }
         elif (streq(a, "--ternary") == 1) { cfg_ternary = 1; }
-        elif (streq(a, "--decode-steps") == 1) { i = i + 1; cfg_decode_steps = _atoi(_av(i, a)); }
+        elif (streq(a, "--decode-steps") == 1) { i = i + 1; cfg_decode_steps = _ai(i, a); cfg_decode_set = 1; }
         elif (streq(a, "--decode-schedule") == 1) {
-            i = i + 1; var ds = _av(i, a);
+            i = i + 1; var ds = _av(i, a); cfg_decode_set = 1;
             if (streq(ds, "cosine") == 1) { cfg_decode_sched = 0; }
             elif (streq(ds, "linear") == 1) { cfg_decode_sched = 1; }
             else { puts("attn11: --decode-schedule must be cosine or linear\n"); return 1; }
@@ -356,6 +380,14 @@ fn main(): i64 {
     # model_init's config gate sys_exit with a generic message (the fresh path).
     if ((cfg_rope_dim != 0) && (cfg_pos_kind != 2) && (load_path == 0)) {
         puts("attn11: --rope-dim requires --pos-kind rope-decoupled\n");
+        return 1;
+    }
+    # --latent-dim is the MLA latent width / the SSM state size (an SSM hybrid keeps
+    # attn-kind ssm). On mha/gqa/lin it was accepted, stored unused and serialized,
+    # and the loader rejects d_c != 0 for those kinds (-42), so the saved model could
+    # never be loaded (1.15.2 audit, MEDIUM). Reject it up front, as --rope-dim is.
+    if ((cfg_latent_dim != 0) && (cfg_attn_kind != 1) && (cfg_attn_kind != 3) && (load_path == 0)) {
+        puts("attn11: --latent-dim requires --attn-kind mla or ssm\n");
         return 1;
     }
     # MoE (M13): --experts N (1 = dense; >1 routes the MLP through N experts) and
@@ -434,7 +466,10 @@ fn main(): i64 {
         }
         if ((cfg_decode_steps < 1) || (cfg_decode_steps > cfg_t)) { cfg_decode_steps = cfg_t; }
     }
-    if ((cfg_decode_steps != 0) && (cfg_objective != 1) && (load_path == 0)) {
+    # Keyed on the flag being GIVEN: the old test read only cfg_decode_steps, so
+    # `--decode-schedule linear` (or `--decode-steps 0`) without --objective diffusion
+    # was silently accepted and ignored, though this message names both (1.15.2 audit).
+    if ((cfg_decode_set == 1) && (cfg_objective != 1) && (load_path == 0)) {
         puts("attn11: --decode-steps / --decode-schedule require --objective diffusion\n");
         return 1;
     }
@@ -501,7 +536,15 @@ fn main(): i64 {
         if (stream_corpus_path != 0) { puts("attn11: --stream-encode excludes --stream-corpus\n"); return 1; }
         var lk = 0; if (use_bpe == 1) { lk = bpe_k; }
         var sr = shard_stream_encode(corpus_path, encode_shard_path, lk);
-        if (sr < 0) { puts("attn11: stream-encode failed (code "); fmt_int(sr); puts(")\n"); return 1; }
+        if (sr < 0) {
+            puts("attn11: stream-encode failed (code "); fmt_int(sr); puts(")\n");
+            if (sr == 0 - 74) {
+                puts("attn11: the file has a byte that never appears in its first 64 MB, ");
+                puts("where the vocabulary is learned\n");
+            }
+            if (sr == 0 - 75) { puts("attn11: --stream-encode needs a regular, non-empty file\n"); }
+            return 1;
+        }
         puts("attn11: stream-encoded token-shard "); puts(encode_shard_path);
         puts(" (tokens "); fmt_int(sr);
         if (use_bpe == 1) { puts(", bpe merges "); fmt_int(g_bpe_nmerges); }
@@ -631,12 +674,13 @@ fn main(): i64 {
     _putc(10);
 
     # ---- train ----
+    var train_rc = 0;                                # train()'s -1 = stopped on a non-finite loss/grad
     if (gen_only == 0) {
         if (((g_stream == 0) && (g_data == 0)) || (g_datalen < g_T + 1)) {
             puts("attn11: no/short corpus (need >= ctx+1 bytes); skipping training\n");
         } else {
             puts("training:\n");
-            train(steps, steps, CFG_BATCH(), CFG_LR(), CFG_MINLR(), CFG_WARMUP(), CFG_CLIP(), CFG_LOG());
+            train_rc = train(steps, steps, CFG_BATCH(), CFG_LR(), CFG_MINLR(), CFG_WARMUP(), CFG_CLIP(), CFG_LOG());
         }
     }
 
@@ -645,6 +689,11 @@ fn main(): i64 {
     # must detect the write failure); eval + samples still print from the
     # in-memory model so output isn't lost.
     var rc = 0;
+    # A run that stopped on a non-finite loss/grad (train() == -1) also exits
+    # non-zero: the stop rolls the step back, so the model is the last COMPLETED step
+    # and is still saved below, but the run did not finish, and `attn11 --save x &&
+    # use x` must be able to tell (1.15.2 audit, LOW; it used to exit 0).
+    if (train_rc < 0) { rc = 1; }
     if (save_path != 0) {
         var sv = ckpt_save_file(save_path);
         if (sv < 0) { puts("attn11: checkpoint save failed (code "); fmt_int(sv); puts(")\n"); rc = 1; }

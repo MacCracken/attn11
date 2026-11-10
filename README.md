@@ -1,13 +1,15 @@
 # attn11
 
-> A from-scratch, dependency-free **GPT-style transformer — trained** — written in
+> A from-scratch **GPT-style transformer — trained** — with no third-party dependencies, written in
 > [Cyrius](https://github.com/MacCracken/cyrius), the AGNOS "assembly-up" systems
 > language where *everything is i64* and floating point is IEEE-754 `f64`
 > bit-patterns driven by `f64_*` builtins.
 
 No BLAS. No libc. No autodiff framework. The forward pass, the backward pass
 (hand-derived gradients), and the optimizer are all written by hand on raw
-`f64` arrays. The whole thing compiles to a single static ELF.
+`f64` arrays. The whole thing compiles to a single static ELF. The only
+dependencies are first-party AGNOS crates (tensor kernels, PRNG, tokenizer, FFT),
+pinned in `cyrius.lock`.
 
 ## What it does
 
@@ -28,7 +30,13 @@ an embedded corpus, then samples from it:
 - **Precision** — full `f64`, or opt-in **ternary** `{−1, 0, +1}` weights
   (`--ternary`, BitNet-style fake-quant with a straight-through estimator)
 - **Training** — hand-written backprop + **Adam**; loss printed as it descends
-- **Generation** — autoregressive (or diffusion) sampling from the trained weights
+- **Generation** — autoregressive (or diffusion) sampling from the trained weights,
+  KV-cached; opt-in **multi-token prediction** heads for training (`--mtp N`)
+- **Data** — embedded corpus, `--corpus` file / `--stdin`, or a pre-encoded **token shard**
+  streamed from disk without loading it into RAM (`--encode-shard`, `--stream-corpus`,
+  `--stream-encode`)
+- **Modality proofs** — the same CNN learns synthetic shapes (`--vision`) and synthetic
+  keyword audio through a fixed STFT + mel frontend (`--hearing`)
 - **Execution** — CPU by default (the reference oracle); opt-in **GPU** (`--gpu`, Linux / AMD GFX9)
   runs the f64 tensor ops on-device **bit-exact** via the **[rosnet](https://github.com/MacCracken/rosnet)**
   GPU backend layered on [mabda](https://github.com/MacCracken/mabda)'s native-AMD f64 SPIR-V — an
@@ -53,20 +61,22 @@ cyrius deps                               # resolve stdlib deps
 cyrius build src/main.cyr build/attn11    # compile to a static ELF
 ./build/attn11                            # train + sample
 ./build/attn11 --help                     # the full CLI
-cyrius test                               # grad checks + smoke tests
+cyrius test                               # the grad-check suite
+make smoke                                # hostile-CLI / corrupt-input smoke
 ```
 
 See [`docs/guides/getting-started.md`](docs/guides/getting-started.md) for the
 full CLI (`--corpus`, `--load`/`--save` checkpoints, `--preset`, `--bpe`, `--eval`,
 `--eval-corpus` (held-out cross-corpus eval), the objective/precision axes
-`--objective {ar,diffusion}` (with `--decode-steps`/`--decode-schedule`) and
+`--objective {ar,diffusion}` (with `--decode-steps`/`--decode-schedule`), `--mtp N` and
 `--ternary`, and the architecture axes `--attn-kind {mha,mla,lin,ssm}`, `--pos-kind
 {learned,rope,rope-decoupled}`, `--experts N` (MoE), `--attn-every K` (per-layer
 hybrid)) and [`docs/STABILITY.md`](docs/STABILITY.md) for the frozen surface.
 
 ## Model size
 
-The default config is intentionally tiny so it trains on CPU in seconds — see
+The default config is intentionally tiny so it trains on one CPU core in about a
+minute and a half (2,000 steps, ~40K parameters) — see
 [`docs/development/state.md`](docs/development/state.md) for the live
 hyperparameters (vocab, `d_model`, context, heads, layers).
 

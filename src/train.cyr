@@ -7,6 +7,24 @@
 # diffusion training reference.
 
 # ---- batch sampling --------------------------------------------------------
+# Every corpus token the model consumes (training windows, MTP targets, eval) is
+# loaded through `tok_ld`. An in-memory corpus holds ids < g_V by construction, but
+# a `--stream-corpus` shard's token PAYLOAD is not validated at open
+# (`shard_validate_buf` checks the header + tokenizer only), so a corrupt or hostile
+# shard could hand `embed_bwd` an id >= V: an out-of-bounds gradient WRITE, plus OOB
+# reads in `embed_fwd_n` / the CE target / `g_tok_len` (1.15.2 audit, HIGH). Fail
+# closed here instead: one compare per token loaded, off the per-element hot path.
+fn tok_ld(i): i64 {
+    var t = gd_ld(i);
+    if ((t < 0) || (t >= g_V)) {
+        puts("attn11: corpus token "); fmt_int(t); puts(" at index "); fmt_int(i);
+        puts(" is outside the vocabulary (V="); fmt_int(g_V);
+        puts(") -- corrupt or mismatched token shard\n");
+        sys_exit(1);
+    }
+    return t;
+}
+
 # X043: fill the (g_mtp-1) shifted target rows for the window starting at `s` — aux
 # head a predicts t+2+a; mask the tail positions whose target runs past the corpus.
 fn mtp_fill_targets(s): i64 {
@@ -18,7 +36,7 @@ fn mtp_fill_targets(s): i64 {
         while (t < T) {
             var idx = s + t + off;
             if (idx < g_datalen) {
-                store64(g_mtp_tgt + (a * T + t) * 8, gd_ld(idx));
+                store64(g_mtp_tgt + (a * T + t) * 8, tok_ld(idx));
                 store64(g_mtp_mask + (a * T + t) * 8, 1);
             } else {
                 store64(g_mtp_tgt + (a * T + t) * 8, 0);
@@ -42,8 +60,8 @@ fn sample_window(): i64 {
     else { s = s % span; }
     var t = 0;
     while (t < T) {
-        store64(A_tokens + t * 8, gd_ld(s + t));
-        store64(A_targets + t * 8, gd_ld(s + t + 1));
+        store64(A_tokens + t * 8, tok_ld(s + t));
+        store64(A_targets + t * 8, tok_ld(s + t + 1));
         t = t + 1;
     }
     if (g_mtp > 1) { mtp_fill_targets(s); }   # X043: shifted MTP targets for this window
@@ -87,7 +105,7 @@ fn sample_window_diffusion(): i64 {
     else { s = s % span; }
     var t = 0;
     while (t < T) {
-        var tok = gd_ld(s + t);
+        var tok = tok_ld(s + t);
         store64(A_tokens + t * 8, tok);
         store64(A_targets + t * 8, tok);
         t = t + 1;
@@ -187,6 +205,8 @@ fn train(run_until, total, batch, base_lr, min_lr, warmup, clip, log_every): i64
 var g_eval_nats = 0;    # f64 bits: total cross-entropy over all eval targets
 var g_eval_tokens = 0;  # targets evaluated
 var g_eval_bytes = 0;   # bytes those targets decode to
+# run the eval pass above into g_eval_nats/tokens/bytes; returns targets evaluated,
+# or -1 when no corpus is loaded or it is shorter than T+1 ids
 fn eval_corpus(): i64 {
     g_eval_nats = f64_from(0);
     g_eval_tokens = 0;
@@ -200,8 +220,8 @@ fn eval_corpus(): i64 {
     while (s + T + 1 <= g_datalen) {
         var t = 0;
         while (t < T) {
-            store64(A_tokens + t * 8, gd_ld(s + t));
-            var tgt = gd_ld(s + t + 1);
+            store64(A_tokens + t * 8, tok_ld(s + t));
+            var tgt = tok_ld(s + t + 1);
             store64(A_targets + t * 8, tgt);
             if (g_bpe_on == 1) { g_eval_bytes = g_eval_bytes + load64(g_tok_len + tgt * 8); }
             else { g_eval_bytes = g_eval_bytes + 1; }
@@ -246,7 +266,7 @@ fn eval_diffusion(pct): i64 {
     while (s + T <= g_datalen) {
         var t = 0;
         while (t < T) {
-            var tok = gd_ld(s + t);
+            var tok = tok_ld(s + t);
             store64(A_tokens + t * 8, tok);
             store64(A_targets + t * 8, tok);
             # evenly-spread k masks: position p is masked iff floor((p+1)k/T) steps
@@ -350,6 +370,8 @@ fn eval_corpus_buf(text, len): i64 {
     return rc;
 }
 
+# held-out eval from FILE `path` (<= MAX_CORPUS_BYTES, read via secure_read_file) through eval_corpus_buf;
+# returns its result, or -4 on alloc failure / the read's negative code (see the block above)
 fn eval_corpus_held(path): i64 {
     var buf = alloc(MAX_CORPUS_BYTES());
     if (buf == 0) { return 0 - 4; }
@@ -408,6 +430,7 @@ fn sample_logits_row(row, V, temp): i64 {
 # (full forward over the window for every token, identical semantics) backs
 # the bit-identity gate and the benchmark baseline.
 
+# tokens dropped per context shift when the window fills: max(1, g_T / 2)
 fn GEN_SHIFT(): i64 {
     var s = g_T / 2;
     if (s < 1) { s = 1; }
@@ -429,7 +452,8 @@ fn gen_prime(ids, n, cached): i64 {
     G_n = n;
     if (cached == 1) {
         var i = 0;
-        while (i < n) { model_fwd_row(load64(G_win + i * 8), i); i = i + 1; }
+        # only the last prompt row is sampled; the others just extend the caches
+        while (i < n) { model_fwd_row_n(load64(G_win + i * 8), i, (i == n - 1)); i = i + 1; }
     } else {
         gen_forward_window();
     }
@@ -463,7 +487,8 @@ fn gen_decode(ngen, temp, cached, out_ids, emit): i64 {
                 # re-prime: the kept tokens sit at new positions, so their
                 # cached K/V are stale — recompute the whole kept context
                 var i = 0;
-                while (i < keep) { model_fwd_row(load64(G_win + i * 8), i); i = i + 1; }
+                # (never sampled: the appended token below produces the logits)
+                while (i < keep) { model_fwd_row_n(load64(G_win + i * 8), i, 0); i = i + 1; }
             }
         }
         store64(G_win + G_n * 8, next);
@@ -564,6 +589,11 @@ fn gen_diffusion(prompt, plen, nsteps, sched, emit): i64 {
     } else {
         var pb = plen; if (pb > ENC_MAX()) { pb = ENC_MAX(); }
         var nids = tok_encode(prompt + plen - pb, pb, g_enc_buf, 8);
+        # tok_encode returns -1 only with no tokenizer or a corrupt merge count (not
+        # reachable today), but a negative p would start the mask loop below at q = -1
+        # and write A_mask[-1] / A_tokens[-1]. generate() already clamps; so does this
+        # (1.15.2 audit, LOW).
+        if (nids < 0) { nids = 0; }
         p = nids; if (p > T) { p = T; }
         var t2 = 0;
         while (t2 < p) {

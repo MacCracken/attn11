@@ -83,6 +83,13 @@ jobs:
             echo "  $name: ok"
           done
 
+      - name: CLI / corrupt-input smoke
+        # `make smoke` (rebuilds the DCE binary first): hostile and malformed CLI
+        # values, a shard with out-of-vocabulary token ids, --stream-encode on
+        # /dev/zero, save -> resume-from-stream. Every case must reject cleanly or
+        # succeed, never crash or hang. Local-only through 1.15.1 (1.15.2 audit).
+        run: make smoke
+
       - name: Benchmarks
         run: |
           for f in tests/*.bcyr; do

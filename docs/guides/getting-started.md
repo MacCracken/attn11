@@ -9,7 +9,8 @@ forward pass, hand-derived backprop, and Adam, all on raw `f64` arrays.
 cyrius deps                                # resolve stdlib deps
 cyrius build src/main.cyr build/attn11     # compile (static ELF)
 ./build/attn11                             # train on the embedded corpus, then sample
-cyrius test                                # gradient-check suite + smoke tests
+cyrius test                                # gradient-check suite
+make smoke                                 # hostile-CLI / corrupt-input smoke
 ```
 
 ## CLI
@@ -35,6 +36,7 @@ attn11 --pos-kind K          positions: learned (default), rope (coupled, mha/gq
 attn11 --rope-dim N          decoupled-RoPE channel width d_rope (even, 2..d_model; default ~hd/2)
 attn11 --experts N           MoE: N experts per block (1 = dense; >1 enables top-K routing, 1..256)
 attn11 --expert-topk K       active experts per token (default 2; 1..N)
+attn11 --mtp N               multi-token prediction: N-1 aux heads predict t+2..t+N (1 = off; 1..8)
 attn11 --bpe K               learn K BPE merges first (1..512; default is byte-level)
 attn11 --eval                print CE/token + bits-per-byte after training/save
 attn11 --eval-corpus P       held-out eval on a disjoint corpus via the loaded tokenizer
@@ -45,9 +47,18 @@ attn11 --objective O         training objective: ar (default) or diffusion (mask
 attn11 --ternary             BitNet-style ternary weights {-1,0,+1} (mha + dense + ar; STE backward)
 attn11 --decode-steps N      diffusion decode iterations (default = ctx)
 attn11 --decode-schedule S   diffusion unmask schedule: cosine (default) or linear
-attn11 --gpu                 run matmul + layernorm + Adam on the GPU (Linux/AMD; bit-exact; auto CPU fallback)
+attn11 --vision              the sight proof: a tiny CNN on synthetic shapes
+attn11 --vision-fd           the vision lane's end-to-end finite-difference gate only
+attn11 --hearing             the hearing proof: STFT + mel frontend -> the same CNN on synthetic audio (x86_64)
+attn11 --hearing-fd          the hearing lane's end-to-end finite-difference gate only
+attn11 --gpu                 matmul, layernorm (fwd + bwd), LM-head bwd, RoPE and Adam on the GPU (bit-exact; CPU fallback)
 attn11 --gpu-tc              also GELU + LM-head + attention (+ their backward) on GPU (implies --gpu; tolerance)
+attn11 --help, -h            show the help and exit
+attn11 --version             print the version and exit
 ```
+
+Integer values must be digits with an optional leading `-` (since 1.15.2): `--steps 1e3` is
+refused rather than read as 13, exactly as a value-flag with no value is.
 
 The GPU flags are an opt-in **execution target** (Linux / AMD GFX9), not a different model — a `--gpu`
 run is byte-identical to the default. See [`gpu.md`](gpu.md).
@@ -96,7 +107,10 @@ for a diffusion model (the `objective` field), and **v8** for a ternary model (t
 
 ## Layout
 
-- `src/main.cyr` — CLI + orchestration; `src/{tensor,fileio,ops,attn,model,train,persist}.cyr` — the model.
+- `src/main.cyr` — CLI + orchestration; `src/{tensor,fileio,ops,attn,attn_linear,attn_ssm,model,train,persist,stream}.cyr`
+  — the model, its sequence mixers, training, checkpoints and token shards; `src/{vision,hearing}.cyr` — the
+  modality lanes; `src/test.cyr` — the `[build].test` entry. The tokenizer and corpus layer is the `akshara`
+  library (`lib/akshara.cyr`).
 - `tests/attn11.tcyr` — gradient-check + persistence + robustness suite (`cyrius test`).
 - `tests/attn11.fcyr` — fuzz harness for the loaders.
 - `tests/attn11.bcyr` — benchmarks (`./scripts/bench-history.sh`).

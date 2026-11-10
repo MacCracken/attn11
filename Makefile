@@ -2,8 +2,9 @@
 
 check: fmt lint test        # the local CI gate (fmt-check + lint + x86 grad-checks)
 
-# Full release-cut gate: everything CI gates, locally, before tagging.
-# (aarch64 needs qemu; bench appends to bench-history.csv.)
+# Full release-cut gate, locally, before tagging: the build/test/fuzz/smoke half of
+# CI plus the aarch64 lane. CI also runs the AGNOS cross-build, the security scan and
+# the docs/version check. (aarch64 needs qemu; `make bench` appends to bench-history.csv.)
 release: fmt lint test aarch64 build fuzz smoke
 	@echo "release gate: fmt + lint + x86 test + aarch64/qemu + DCE build + fuzz + smoke all green"
 
@@ -80,7 +81,7 @@ aarch64:
 # any exit >= 128 here is a signal/crash and fails the gate.
 smoke: build
 	@echo "smoke: hostile CLI args must reject cleanly, never crash"
-	@for args in "--layers 100000 --attn-every 2" "--layers 129 --attn-every 2" "--layers 0 --attn-every 2" "--ternary --experts 4" "--ternary --objective diffusion" "--ternary --attn-kind ssm" "--objective bogus" "--objective rl"; do \
+	@for args in "--layers 100000 --attn-every 2" "--layers 129 --attn-every 2" "--layers 0 --attn-every 2" "--ternary --experts 4" "--ternary --objective diffusion" "--ternary --attn-kind ssm" "--objective bogus" "--objective rl" "--latent-dim 8" "--attn-kind lin --latent-dim 8" "--steps 1e3" "--heads 4x" "--decode-schedule linear"; do \
 	  ./build/attn11 $$args --gen-only >/dev/null 2>&1; rc=$$?; \
 	  if [ $$rc -ge 128 ]; then echo "smoke: CRASH (signal $$((rc-128))) on: $$args"; exit 1; fi; \
 	  if [ $$rc -eq 0 ]; then echo "smoke: expected rejection but succeeded on: $$args"; exit 1; fi; \
@@ -106,13 +107,21 @@ smoke: build
 	if [ $$? -ne 0 ]; then echo "smoke: --stream-encode (bpe) failed on a valid corpus"; exit 1; fi; \
 	./build/attn11 --stream-corpus /tmp/attn11-smoke-bpe.tsh --steps 3 >/dev/null 2>&1; \
 	if [ $$? -ne 0 ]; then echo "smoke: training from a --stream-encode bpe shard failed"; exit 1; fi; \
+	cp /tmp/attn11-smoke.tsh /tmp/attn11-smoke-bad.tsh; sz=$$(wc -c < /tmp/attn11-smoke-bad.tsh); \
+	printf '\377\377\377\377\377\377\377\377' | dd of=/tmp/attn11-smoke-bad.tsh bs=1 seek=$$((sz-8)) conv=notrunc 2>/dev/null; \
+	./build/attn11 --stream-corpus /tmp/attn11-smoke-bad.tsh --steps 1 --eval >/dev/null 2>&1; rc=$$?; \
+	if [ $$rc -ge 128 ]; then echo "smoke: CRASH (signal $$((rc-128))) on a shard with out-of-vocabulary token ids"; exit 1; fi; \
+	if [ $$rc -eq 0 ]; then echo "smoke: a shard with out-of-vocabulary token ids (0xFF payload) was accepted"; exit 1; fi; \
+	timeout 20 ./build/attn11 --stream-encode --corpus /dev/zero --encode-shard /tmp/attn11-smoke-z.tsh >/dev/null 2>&1; rc=$$?; \
+	if [ $$rc -eq 124 ]; then echo "smoke: --stream-encode on /dev/zero hangs (special file not refused)"; exit 1; fi; \
+	if [ $$rc -eq 0 ] || [ $$rc -ge 128 ]; then echo "smoke: --stream-encode on /dev/zero gave rc $$rc (want a clean rejection)"; exit 1; fi; \
 	for sa in "--stream-corpus /nonexistent/attn11-smoke.tsh" "--stream-corpus /tmp/attn11-smoke-corpus.txt" "--stream-corpus /tmp/attn11-smoke.tsh --corpus /tmp/attn11-smoke-corpus.txt" "--stream-corpus /tmp/attn11-smoke.tsh --bpe 8" "--stream-corpus /tmp/attn11-smoke-bpe.tsh --load /tmp/attn11-smoke.ckpt --steps 3" "--stream-encode --encode-shard /tmp/attn11-smoke-x.tsh" "--stream-encode --corpus /tmp/attn11-smoke-corpus.txt" "--stream-encode --stdin --corpus /tmp/attn11-smoke-corpus.txt --encode-shard /tmp/attn11-smoke-x.tsh"; do \
 	  ./build/attn11 $$sa --gen-only >/dev/null 2>&1; rc=$$?; \
 	  if [ $$rc -ge 128 ]; then echo "smoke: CRASH (signal $$((rc-128))) on: $$sa"; exit 1; fi; \
 	  if [ $$rc -eq 0 ]; then echo "smoke: expected rejection but succeeded on: $$sa"; exit 1; fi; \
 	done; \
-	rm -f /tmp/attn11-smoke-seed.txt /tmp/attn11-smoke-corpus.txt /tmp/attn11-smoke.tsh /tmp/attn11-smoke-bpe.tsh /tmp/attn11-smoke.ckpt /tmp/attn11-smoke-x.tsh; \
-	echo "smoke: ok (hostile args rejected; valid hybrid + ternary + stream + resume-from-stream + stream-encode; bad shard / vocab-mismatch / held-out eval error cleanly)"
+	rm -f /tmp/attn11-smoke-seed.txt /tmp/attn11-smoke-corpus.txt /tmp/attn11-smoke.tsh /tmp/attn11-smoke-bad.tsh /tmp/attn11-smoke-z.tsh /tmp/attn11-smoke-z.tsh.tmp /tmp/attn11-smoke-bpe.tsh /tmp/attn11-smoke.ckpt /tmp/attn11-smoke-x.tsh; \
+	echo "smoke: ok (hostile args rejected; valid hybrid + ternary + stream + resume-from-stream + stream-encode; bad shard / out-of-vocab shard ids / vocab-mismatch / held-out eval error cleanly)"
 
 clean:
 	rm -rf build/
