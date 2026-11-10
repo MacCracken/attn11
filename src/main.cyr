@@ -132,7 +132,7 @@ fn CFG_ATTN_BIAS(): i64 { return 1; }                                 # Q/K/V/O 
 fn CFG_DROPOUT(): i64 { return f64_from(0); }                         # residual dropout (off; tiny corpus)
 
 # Kept in sync with the VERSION file (CI's docs job gates the match).
-fn CFG_VERSION(): i64 { return "1.17.0"; }
+fn CFG_VERSION(): i64 { return "1.17.1"; }
 
 # print the --help flag reference; returns 0 (every caller then exits)
 fn usage(): i64 {
@@ -169,7 +169,10 @@ fn usage(): i64 {
     puts("  --warmup N      linear warmup steps before the cosine decay (default 100)\n");
     puts("  --clip F        global-norm gradient clip (default 1; 0 = off)\n");
     puts("  --seed N        PRNG seed for a fresh model (default 1337)\n");
-    puts("  --optim O       optimizer: adam (default) or muon (hidden matrices; mha + dense, CPU)\n");
+    puts("  --optim O       optimizer: adam (default), muon (hidden matrices; mha + dense), lion, or\n");
+    puts("                  sf-adam (schedule-free AdamW: warmup, then constant LR); all but adam CPU-only\n");
+    puts("  --init-std F    weight-init std (default 0.02; (0, 1])\n");
+    puts("  --no-resid-scale  init residual projections at --init-std (no GPT-2 1/sqrt(2*layers))\n");
     puts("  --expert-topk K active experts per token (default 2; 1..N)\n");
     puts("  --bpe K         learn K BPE merges first (1..512; byte-level is the default)\n");
     puts("  --eval          print CE/token + bits-per-byte after training/save\n");
@@ -318,7 +321,9 @@ fn main(): i64 {
     var cfg_lr = CFG_LR(); var cfg_minlr = CFG_MINLR(); var cfg_warmup = CFG_WARMUP();
     var cfg_clip = CFG_CLIP(); var cfg_seed = CFG_SEED(); var cfg_tdyn_set = 0;
     var cfg_seed_set = 0;
-    var cfg_optim = 0;                               # 1.17.0: 0 = adam (default), 1 = muon
+    var cfg_optim = 0;                               # 0 = adam, 1 = muon (1.17.0), 2 = lion, 3 = sf-adam (1.17.1)
+    var cfg_init_std = 0; var cfg_init_rscale = 1;  # 1.17.1: --init-std (0 = default 0.02), --no-resid-scale
+    var cfg_init_set = 0;                            # 1 = --init-std was given (so 0 is rejected, not the default)
     var cfg_decode_steps = 0;                        # diffusion decode iterations (0 = default, resolved post-parse)
     var cfg_decode_sched = 0;                        # diffusion decode schedule: 0 = cosine (default), 1 = linear
     var cfg_decode_set = 0;                          # 1 = --decode-steps or --decode-schedule was given
@@ -394,8 +399,12 @@ fn main(): i64 {
             i = i + 1; var op = _av(i, a);
             if (streq(op, "adam") == 1) { cfg_optim = 0; }
             elif (streq(op, "muon") == 1) { cfg_optim = 1; }
-            else { puts("attn11: --optim must be adam or muon\n"); return 1; }
+            elif (streq(op, "lion") == 1) { cfg_optim = 2; }
+            elif (streq(op, "sf-adam") == 1) { cfg_optim = 3; }
+            else { puts("attn11: --optim must be adam, muon, lion or sf-adam\n"); return 1; }
         }
+        elif (streq(a, "--init-std") == 1) { i = i + 1; cfg_init_std = _af(i, a); cfg_init_set = 1; }
+        elif (streq(a, "--no-resid-scale") == 1) { cfg_init_rscale = 0; }
         elif (streq(a, "--decode-steps") == 1) { i = i + 1; cfg_decode_steps = _ai(i, a); cfg_decode_set = 1; }
         elif (streq(a, "--decode-schedule") == 1) {
             i = i + 1; var ds = _av(i, a); cfg_decode_set = 1;
@@ -712,6 +721,12 @@ fn main(): i64 {
     if (cfg_warmup < 0) { puts("attn11: --warmup must be >= 0\n"); return 1; }
     if (cfg_seed < 0) { puts("attn11: --seed must be >= 0\n"); return 1; }
     if ((cfg_clip & 0x7FFFFFFFFFFFFFFF) == 0) { cfg_clip = 0x7FF0000000000000; }
+    if (cfg_init_set == 1) {
+        if (((cfg_init_std & 0x7FFFFFFFFFFFFFFF) == 0) || (f64_gt(cfg_init_std, f64_from(1)) == 1)) {
+            puts("attn11: --init-std must be in (0, 1]\n"); return 1;
+        }
+    }
+    g_init_std = cfg_init_std; g_init_rscale = cfg_init_rscale;   # read by a FRESH model's init only
     if ((cfg_seed_set == 1) && (load_path != 0)) {
         puts("attn11: --seed ignored; the checkpoint carries its RNG state\n");
     }
@@ -752,8 +767,14 @@ fn main(): i64 {
     }
     # 1.17.0: arm Muon on the final model (under --load the checkpoint's architecture wins,
     # so its limits are checked here, against the built model).
+    if ((cfg_optim != 0) && (g_gpu == 1)) {
+        puts("attn11: --optim muon/lion/sf-adam run on the CPU (not with --gpu)\n"); return 1;
+    }
+    if (cfg_optim == 2) { g_optim = 2; }
+    if (cfg_optim == 3) {
+        if (sf_init() < 0) { puts("attn11: --optim sf-adam: out of memory\n"); return 1; }
+    }
     if (cfg_optim == 1) {
-        if (g_gpu == 1) { puts("attn11: --optim muon runs on the CPU (not with --gpu)\n"); return 1; }
         var mr = muon_init();
         if (mr == 0 - 2) {
             puts("attn11: --optim muon needs dense mha blocks (no mla/lin/ssm, --experts, --attn-every, --ternary)\n");
@@ -815,6 +836,12 @@ fn main(): i64 {
         puts("  optim=muon(matrices="); fmt_int(g_muon_nmat);
         puts(", nesterov 0.95, ns5, rms 0.2; adam elsewhere)\n");
     }
+    if (g_optim == 2) { puts("  optim=lion(0.9, 0.99)\n"); }
+    if (g_optim == 3) { puts("  optim=sf-adam(0.9, 0.999; warmup then constant lr, x averaged)\n"); }
+    if ((cfg_init_set == 1) || (cfg_init_rscale == 0)) {
+        puts("  init: std="); _fprint_r(g_init_std_eff(), 4);
+        if (g_init_rscale == 0) { puts(" resid_scale=off\n"); } else { puts(" resid_scale=1/sqrt(2*layers)\n"); }
+    }
     if (g_curr_n > 0) {
         puts("  curriculum=rarity(ramp="); fmt_int(g_curr_n); puts(" steps, blocks="); fmt_int(g_curr_nb);
         puts(" of "); fmt_int(g_curr_bl); puts(" starts)\n");
@@ -831,6 +858,9 @@ fn main(): i64 {
             train_rc = train(steps, steps, CFG_BATCH(), cfg_lr, cfg_minlr, cfg_warmup, cfg_clip, CFG_LOG());
         }
     }
+
+    # 1.17.1: schedule-free trains at y; eval, save and sampling use the averaged x.
+    sf_finish();
 
     # ---- save ----
     # A failed --save sets a non-zero exit (a script's `attn11 --save x && use x`

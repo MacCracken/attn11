@@ -229,6 +229,21 @@ Training." arXiv:[2502.16982](https://arxiv.org/abs/2502.16982) — scaling the 
 by 0.2·√max(rows, cols) matches AdamW's update RMS, so both parameter groups share one LR.
 Used in: `src/model.cyr` (`muon_init`, `muon_ns5`, `_muon_adam_step`). See X046.
 
+### Lion (sign-of-momentum optimizer, X047)
+**Chen, X., Liang, C., Huang, D., Real, E., Wang, K., Liu, Y., Pham, H., Dong, X., Luong, T.,
+Hsieh, C.-J., Lu, Y., Le, Q. V. (2023).** "Symbolic Discovery of Optimization Algorithms."
+*NeurIPS 2023.* arXiv:[2302.06675](https://arxiv.org/abs/2302.06675) — every parameter moves by
+the LR in the direction of `sign(β1·m + (1−β1)·g)`, then `m ← β2·m + (1−β2)·g` (β1 0.9, β2 0.99);
+one state buffer, and a typical LR 3–10× below AdamW's. Used in: `src/model.cyr` (`_lion_step`).
+
+### Schedule-free AdamW (no LR decay; weight averaging, X048)
+**Defazio, A., Yang, X., Mehta, H., Mishchenko, K., Khaled, A., Cutkosky, A. (2024).** "The Road
+Less Scheduled." *NeurIPS 2024.* arXiv:[2405.15682](https://arxiv.org/abs/2405.15682) — replaces the
+LR schedule with an interpolation (y, where the gradient is taken) between an Adam-style base
+iterate z and its weighted average x (c_t = w_t / Σw, w = lr_max²), after a warmup to a constant
+LR. attn11 keeps x explicitly, so a checkpoint (x as params, z in the m slots) resumes bit-exactly.
+Used in: `src/model.cyr` (`sf_init`, `_sf_step`, `sf_finish`).
+
 ### Curriculum learning (easy-to-hard data order, X044)
 **Bengio, Y., Louradour, J., Collobert, R., Weston, J. (2009).** "Curriculum Learning."
 *ICML 2009.* doi:[10.1145/1553374.1553380](https://doi.org/10.1145/1553374.1553380) — training on

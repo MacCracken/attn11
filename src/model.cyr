@@ -28,6 +28,10 @@ var g_NL = 0;   # number of transformer blocks
 var g_NP = 0;   # total parameter count
 var g_attn_bias = 0;  # 1 = Q/K/V/O projections carry biases
 var g_dropout = 0;    # residual dropout probability (f64 bit pattern; 0 = off)
+var g_init_std = 0;   # 1.17.1 --init-std: weight-init std as f64 bits (0 = the default 0.02)
+var g_init_rscale = 1; # 1.17.1: 1 = GPT-2 1/sqrt(2*NL) residual-projection init scale, 0 = off
+# the weight-init std a fresh model uses (f64 bits): --init-std, or the default 0.02
+fn g_init_std_eff(): i64 { if (g_init_std != 0) { return g_init_std; } return f64_div(f64_from(2), f64_from(100)); }
 var g_training = 1;    # dropout active only when training
 var g_step = 0;        # completed Adam update count (for resume + checkpoints)
 
@@ -727,8 +731,10 @@ fn model_init_full(V, C, T, nh, nkv, NL, attn_bias, dropout, seed,
     # initialise weights
     rng_seed(seed);
     var std = f64_div(f64_from(2), f64_from(100));   # 0.02
+    if (g_init_std != 0) { std = g_init_std; }        # 1.17.1 --init-std (0 = this default)
     # GPT-2 residual-projection scaling: 1/sqrt(2*NL) (Radford et al. 2019, §2.3)
     var rstd = f64_div(std, f64_sqrt(f64_from(2 * NL)));
+    if (g_init_rscale == 0) { rstd = std; }            # 1.17.1 --no-resid-scale
     t_randn(P_tokemb(), V * C, std);
     t_randn(P_posemb(), T * C, std);
     var Ckv = _Ckv();
@@ -1658,6 +1664,8 @@ fn model_adam_step(lr, step): i64 {
     }
     #endif
     if (g_optim == 1) { return _muon_adam_step(lr, step); }   # 1.17.0 --optim muon (CPU only)
+    if (g_optim == 2) { return _lion_step(lr); }              # 1.17.1 --optim lion
+    if (g_optim == 3) { return _sf_step(lr, step); }          # 1.17.1 --optim sf-adam
     var b1 = f64_div(f64_from(9), f64_from(10));        # 0.9
     var b2 = f64_div(f64_from(999), f64_from(1000));    # 0.999
     var om1 = f64_div(f64_from(1), f64_from(10));       # 1-b1
@@ -1697,7 +1705,7 @@ fn model_adam_step(lr, step): i64 {
 #   so a checkpoint keeps its format and a resume with the same flag continues
 #   bit-for-bit. No weight decay, matching attn11's Adam.
 # - Dense MHA/GQA blocks only (no MLA/lin/ssm, MoE, hybrid or ternary), CPU only.
-var g_optim = 0;        # 0 = Adam (default), 1 = Muon on the hidden matrices
+var g_optim = 0;        # 0 = Adam (default), 1 = Muon on the hidden matrices, 2 = Lion, 3 = schedule-free AdamW
 var g_muon_mask = 0;    # g_NP bytes: 1 = the entry belongs to a Muon matrix
 var g_muon_nmat = 0;    # Muon matrices (6 per block)
 var g_muon_mats = 0;    # per matrix 3 i64: param offset, rows, cols
@@ -1863,6 +1871,125 @@ fn _muon_adam_step(lr, step): i64 {
             var pi = g_params + i * 8;
             store64(pi, f64_sub(load64(pi), f64_mul(lr, upd)));
         }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# ---- Lion (1.17.1, --optim lion; training dynamics #1, X047) ----------------
+# Source: X. Chen et al. (2023), "Symbolic Discovery of Optimization Algorithms"
+# (arXiv:2302.06675). Every parameter moves by exactly lr in the direction of
+# sign(b1*m + (1 - b1)*g), then m <- b2*m + (1 - b2)*g, with b1 = 0.9 and b2 = 0.99. The
+# momentum lives in g_adam_m; g_adam_v stays 0, so checkpoints keep their format. No
+# weight decay, matching attn11's Adam. sign(0) = 0, so a zero direction is no step.
+fn _lion_step(lr): i64 {
+    var b1 = f64_div(f64_from(9), f64_from(10));
+    var b2 = f64_div(f64_from(99), f64_from(100));
+    var om1 = f64_div(f64_from(1), f64_from(10));
+    var om2 = f64_div(f64_from(1), f64_from(100));
+    var i = 0;
+    while (i < g_NP) {
+        var g = load64(g_grads + i * 8);
+        var m = load64(g_adam_m + i * 8);
+        var c = f64_add(f64_mul(b1, m), f64_mul(om1, g));
+        var pi = g_params + i * 8;
+        if ((c & 0x7FFFFFFFFFFFFFFF) != 0) {
+            if (((c >> 63) & 1) == 1) { store64(pi, f64_add(load64(pi), lr)); }
+            else { store64(pi, f64_sub(load64(pi), lr)); }
+        }
+        store64(g_adam_m + i * 8, f64_add(f64_mul(b2, m), f64_mul(om2, g)));
+        i = i + 1;
+    }
+    return 0;
+}
+
+# ---- Schedule-free AdamW (1.17.1, --optim sf-adam; X048) --------------------
+# Source: A. Defazio et al. (2024), "The Road Less Scheduled" (arXiv:2405.15682). No LR
+# decay: after a linear warmup the LR is constant, and the schedule's job is done by
+# averaging. Three sequences, b1 = 0.9, b2 = 0.999, eps = 1e-8:
+#   z <- z - lr_t * g / (sqrt(v / (1 - b2^t)) + eps)        (the base Adam-style iterate)
+#   x <- (1 - c_t) x + c_t z,  c_t = w_t / sum_{i<=t} w_i,  w_t = (max_{i<=t} lr_i)^2
+#   y  = (1 - b1) z + b1 x                                   (where the gradient is taken)
+# g_params holds y while training and x after sf_finish (eval, save, sampling). A
+# checkpoint stores x as its params, z in the Adam m slots and v in the v slots, so its
+# format is unchanged; y is recomputed from (z, x) by the same expression, so a resume
+# with the same flag continues bit-for-bit. Matches the reference AdamWScheduleFree
+# (r = 0, weight_lr_power = 2) with weight decay 0.
+var g_sf_x = 0;          # g_NP f64: the averaged iterate x
+var g_sf_live = 0;       # 1 while g_params holds y (between sf_init and sf_finish)
+var g_sf_t = 0;          # steps folded into g_sf_wsum / g_sf_lrmax
+var g_sf_wsum = 0;       # f64: sum of w_i
+var g_sf_lrmax = 0;      # f64: max lr_i so far
+var g_sf_base = 0;       # f64: the base LR (set by train)
+var g_sf_warm = 0;       # warmup steps (set by train)
+
+# The schedule-free LR at step t: a linear warmup to `base`, then constant.
+fn sf_lr_at(t, warmup, base): i64 {
+    if (t < warmup) { return f64_mul(base, f64_div(f64_from(t), f64_from(warmup))); }
+    return base;
+}
+
+# Arm schedule-free AdamW on the current model. A fresh model (g_step == 0) starts with
+# z = x = y = the init; a resumed one has x in g_params and z in g_adam_m, and gets y
+# back. Returns 0, or -1 when the x buffer cannot be allocated.
+fn sf_init(): i64 {
+    g_sf_x = t_alloc(g_NP);
+    if (g_sf_x == 0) { return 0 - 1; }
+    t_copy(g_sf_x, g_params, g_NP);
+    if (g_step == 0) { t_copy(g_adam_m, g_params, g_NP); }
+    var b1 = f64_div(f64_from(9), f64_from(10));
+    var ob1 = f64_div(f64_from(1), f64_from(10));
+    var i = 0;
+    while (i < g_NP) {
+        store64(g_params + i * 8, f64_add(f64_mul(ob1, load64(g_adam_m + i * 8)), f64_mul(b1, load64(g_sf_x + i * 8))));
+        i = i + 1;
+    }
+    g_sf_t = 0; g_sf_wsum = f64_from(0); g_sf_lrmax = f64_from(0);
+    g_optim = 3; g_sf_live = 1;
+    return 0;
+}
+
+# Hand the averaged x back to g_params (for eval, save and sampling). Idempotent.
+fn sf_finish(): i64 {
+    if (g_sf_live == 1) { t_copy(g_params, g_sf_x, g_NP); g_sf_live = 0; }
+    return 0;
+}
+
+# Fold step t's LR lt into the running max and weight sum, in step order: a resume that
+# replays steps 1..t-1 (their LRs recomputed by sf_lr_at from train's base and warmup)
+# reaches the same bits as a run that never stopped.
+fn _sf_fold(t, lt): i64 {
+    if (f64_gt(lt, g_sf_lrmax) == 1) { g_sf_lrmax = lt; }
+    g_sf_wsum = f64_add(g_sf_wsum, f64_mul(g_sf_lrmax, g_sf_lrmax));
+    g_sf_t = t;
+    return 0;
+}
+
+# One schedule-free AdamW step at 1-based step t with this step's LR lr (from sf_lr_at).
+fn _sf_step(lr, t): i64 {
+    while (g_sf_t < t - 1) {                               # catch up after a resume
+        _sf_fold(g_sf_t + 1, sf_lr_at(g_sf_t + 1, g_sf_warm, g_sf_base));
+    }
+    _sf_fold(t, lr);                                       # this step: the LR it was given
+    var ck = f64_div(f64_mul(g_sf_lrmax, g_sf_lrmax), g_sf_wsum);
+    var ock = f64_sub(f64_from(1), ck);
+    var b1 = f64_div(f64_from(9), f64_from(10));
+    var ob1 = f64_div(f64_from(1), f64_from(10));
+    var b2 = f64_div(f64_from(999), f64_from(1000));
+    var om2 = f64_div(f64_from(1), f64_from(1000));
+    var eps = f64_div(f64_from(1), f64_from(100000000));
+    var bc2 = f64_sub(f64_from(1), f64_pow(b2, f64_from(t)));
+    var i = 0;
+    while (i < g_NP) {
+        var g = load64(g_grads + i * 8);
+        var v = f64_add(f64_mul(b2, load64(g_adam_v + i * 8)), f64_mul(om2, f64_mul(g, g)));
+        store64(g_adam_v + i * 8, v);
+        var gn = f64_div(g, f64_add(f64_sqrt(f64_div(v, bc2)), eps));
+        var z = f64_sub(load64(g_adam_m + i * 8), f64_mul(lr, gn));
+        store64(g_adam_m + i * 8, z);
+        var x = f64_add(f64_mul(ock, load64(g_sf_x + i * 8)), f64_mul(ck, z));
+        store64(g_sf_x + i * 8, x);
+        store64(g_params + i * 8, f64_add(f64_mul(ob1, z), f64_mul(b1, x)));
         i = i + 1;
     }
     return 0;

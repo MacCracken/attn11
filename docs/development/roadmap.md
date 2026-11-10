@@ -13,10 +13,13 @@
 
 ## Where we are
 
-> **Current (2026-11-09): v1.17.0.** Training dynamics (#1) is under way: **`--optim muon` beats
-> tuned Adam by 4.6 % held-out (X046)**, and `--lr`/`--min-lr`/`--warmup`/`--clip`/`--seed` are flags
-> (X045). The #3 lane closed at 1.16.0 (`--curriculum`, X044, null; `--mtp`, X043). **Next: the rest
-> of #1** (Lion, schedule-free, init, the Muon follow-ups), under
+> **Current (2026-11-09): v1.17.1.** Training dynamics (#1) is nearly done:
+> - **wins:** `--optim muon` −4.6 % held-out (X046), and `--init-std 0.08` −2.1 % with Adam (X049);
+> - **losses:** `--optim lion` +6.9 % (X047) and `--optim sf-adam` +2.6 % (X048);
+> - **tuning:** X045 tuned Adam with the knob flags.
+>
+> The #3 lane closed at 1.16.0 (`--curriculum`, X044, null; `--mtp`, X043). **Next:** the schedule
+> shape and batch size, then #2, the architecture variants. Both are under
 > [Training-science explorations](#training-science-explorations-parked--for-a-future-attn11-agent).
 > 1.11–1.15 were extractions (akshara, tarka), the vision/hearing lanes, the rupantara re-fold, the
 > toolchain moves to cyrius 6.7.18 and the 1.15.2 hardening sweep (see the CHANGELOG). The paragraph
@@ -693,8 +696,9 @@ for the native-AMD f64 route.
 > (`c4-24-trainA`/`heldB`, held-out bits/byte = the honest metric). Sequencing intent
 > (user, 2026-06-22): **#3 → #1**, which then inform the **#2 / #4** bets with data.
 > **Status (2026-11-09, 1.17.0):** #3 is done (MTP X043 and curriculum X044, both null-or-negative
-> at 52 K and kept behind their flags). **#1 is under way: Muon wins (X046, −4.6 %)**; X045 tuned the
-> Adam baseline. Lion / schedule-free / init remain.
+> at 52 K and kept behind their flags). **#1 is nearly done:** Muon wins (X046, −4.6 %), init 0.08
+> wins with Adam (X049, −2.1 %), and Lion (X047) and schedule-free (X048) lose. The schedule shape and
+> batch size remain.
 
 ### #3 — Objective / curriculum
 - **Multi-token prediction — DONE (X043; mechanism shipped at 1.10.1).** `--mtp N`:
@@ -735,8 +739,20 @@ for the native-AMD f64 route.
   - **Warmup and the floor:** warmup 400 is noise, and a lower floor is slightly worse.
   - **Clip:** off (`--clip 0`) is −0.42 % on 3 of 3 seeds, since the 1.0 clip binds almost every step.
   - **Open:** schedule *shape* (WSD / trapezoid vs cosine), batch size.
-- **Still open:** Lion, schedule-free, **init** (the 0.02 / GPT-2 residual-scale choices; needs an
-  `--init-std`-style flag). All pure-f64, no new infra.
+- **Lion — DONE, an honest negative (X047; `--optim lion`, 1.17.1):** +6.89 % at its best LR (3e-4),
+  the optimum bracketed by 1e-4 and 3e-3.
+- **Schedule-free AdamW — DONE, no win (X048; `--optim sf-adam`, 1.17.1):** a mean of +2.57 % over 3
+  seeds at its best LR (6e-3), with a 5 % seed spread. The cosine knows this short horizon. Worth
+  retrying on open-ended runs.
+- **Init — DONE, a win with Adam (X049; `--init-std`, `--no-resid-scale`, 1.17.1):** `--init-std 0.08`
+  is −2.07 % on 3 of 3 seeds. The optimum is ~0.45/√d_model at d_model 32, against GPT-2's 0.02 for
+  width 768. It does not stack with Muon (+0.06 %), and the residual scale is noise at 3 blocks.
+  - **Init follow-ups (parked):** a width-aware default (µP-style std ∝ 1/√d_model), which would be a
+    new opt-in, since the default is frozen; the init optimum at `--preset` width (64).
+- **#1 summary:** Muon −4.6 %, init 0.08 −2.1 % (Adam only), no clip −0.4 %, schedule-free +2.6 %,
+  Lion +6.9 %. **Remaining in #1:** the schedule *shape* (WSD vs cosine), batch size, and the Muon
+  follow-ups above. **Then #2, the architecture variants** (they should be compared under Muon,
+  the best optimizer found here).
 
 ### #2 — Architecture variants (matched compute; #1/#3 results inform the picks)
 - GQA/MQA (flag-driven via `--kv-heads`), sliding-window attention, SwiGLU vs GELU MLP,

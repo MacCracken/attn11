@@ -4,6 +4,112 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.17.1] - 2026-11-09
+
+Training dynamics (#1), the rest of the lane: two more optimizers, `--optim lion` and
+`--optim sf-adam` (schedule-free AdamW), and two init knobs, `--init-std` and `--no-resid-scale`, each
+with its experiment (X047–X049). **`--init-std 0.08` beats the 0.02 default by 2.07 % held-out on 3 of 3
+seeds** (X049). Lion loses by 6.9 % (X047), and schedule-free AdamW loses by 2.6 % on average (X048). Everything is additive: the no-flag run is
+byte-identical to 1.17.0, and the explicit defaults (`--optim adam --init-std 0.02`) reproduce it
+bit-for-bit. It also corrects the release record (below).
+
+### Added
+
+- **`--optim lion`** (Chen et al. 2023).
+  - **The update:** every parameter moves by exactly the LR against `sign(0.9·m + 0.1·g)`, then
+    `m ← 0.99·m + 0.01·g`.
+  - **Checkpoints unchanged:** `m` lives in the Adam `m` slots and `v` stays 0, so the format is the
+    same and a resume with the flag is bit-for-bit.
+  - **Scope:** any architecture, on the CPU (not with `--gpu`).
+- **`--optim sf-adam`, schedule-free AdamW** (Defazio et al. 2024).
+  - **The schedule:** after the warmup, the LR is constant (`--min-lr` is unused).
+  - **The state:** the gradient is taken at `y = 0.1·z + 0.9·x`, where `z` is the Adam-style base
+    iterate and `x` its average with weights `c_t = lr_max² / Σ lr_max²`. Eval, `--save` and sampling
+    use `x`.
+  - **Checkpoints unchanged:** a checkpoint stores `x` as its params, `z` in the `m` slots and `v` in
+    the `v` slots. On resume, `y` is rebuilt from `(z, x)` by the same expression, and the weight sum
+    is replayed in step order, so the resume is bit-for-bit.
+  - **Equivalence:** it matches the reference `AdamWScheduleFree` (r = 0, weight_lr_power = 2, no
+    weight decay). The reference keeps only `y` and `z`; attn11 keeps `x` explicitly, which costs one
+    more parameter-sized buffer.
+  - **Scope:** any architecture, on the CPU.
+- **`--init-std F` and `--no-resid-scale`** (fresh model only).
+  - `--init-std F` sets the weight-init std, default 0.02, in (0, 1].
+  - `--no-resid-scale` drops GPT-2's 1/√(2·layers) factor on the residual projections (`Wo`,
+    `Wproj`).
+  - An explicit `--init-std 0.02` is the default init, bit-for-bit. `--init-std 0` exits 1 rather
+    than meaning "default".
+- **Banner:** `optim=lion(…)` / `optim=sf-adam(…)` and `init: std=… resid_scale=…` lines print
+  only when those flags are given.
+
+### Experiments (`docs/development/experiments.md`)
+
+The X021 protocol: `--corpus c4-24-trainA --bpe 256 --steps 4000`, held-out bits/byte on
+`c4-24-heldB`, against Adam's 2.83681 / 2.82608 / 2.83581 at seeds 1337 / 1338 / 1339.
+
+- **X047, Lion: +6.89 % at its best LR, 3e-4.** The optimum is bracketed: 1e-4 is +17.5 %, 1e-3 +7.4 %
+  and 3e-3 +17.0 %. A sign step moves every parameter by the full LR, and this is the small-batch end.
+- **X048, schedule-free AdamW: a mean of +2.57 % at its best LR, 6e-3.**
+  - **Per seed:** +0.20 %, +5.20 %, +2.30 %.
+  - **No divergence;** the seed spread is 5 %, against Adam's 0.38 %.
+  - **Why it loses here:** the cosine knows the 4000-step horizon, and schedule-free's pitch, not
+    needing one, buys nothing on a short known run.
+- **X049, init std: 0.08 is −2.07 % on 3 of 3 seeds** (−2.16 / −2.01 / −2.03 %).
+  - **The sweep:** 0.01 +3.8 %, 0.04 −0.96 % (3 seeds: −0.86 %), 0.16 −0.2 %, 0.32 +6.2 %.
+  - **Why:** GPT-2's 0.02 is tuned for width 768, and the optimum here (d_model 32) is ~0.45/√d_model.
+  - **Two non-effects:** dropping the residual scale is noise (+0.14 %), and with Muon the larger
+    init does not stack (+0.06 %).
+- **Defaults unchanged** (Adam, init 0.02): the no-flag run is byte-identical by contract.
+
+### Tests
+
+- **`1.17.1 training dynamics: Lion, schedule-free, init`,** seven tests, 25 assertions,
+  registered last:
+  - **Lion, one step from a mixed-sign momentum:** every parameter moves by exactly ±lr (or not at
+    all), `m` and `v` are as specified, and most parameters moved. A resume is bit-for-bit, and Adam
+    differs.
+  - **Schedule-free:**
+    - the LR is linear in the warmup, then constant;
+    - a fresh model starts at z = x = the init;
+    - step 1's `z` is the bias-corrected step, `x = z` bit-for-bit (c = 1), and `g_params` holds `y`;
+    - step 2 averages `x = x₁/2 + z₂/2` (c = ½);
+    - `sf_finish` hands `x` back exactly once;
+    - a checkpointed resume reproduces `x` bit-for-bit, and Adam differs.
+  - **Learning:** in 60 steps on the embedded corpus, Lion cuts eval cross-entropy by more than 3 %
+    (it measures ~4 % at LR 1e-3) and schedule-free AdamW by more than 5 %.
+  - **Init:** an explicit 0.02 is the default bit-for-bit. `--init-std 0.01` gives a tok_emb RMS of
+    ~0.01 and a `Wo` RMS of ~0.005; with `--no-resid-scale`, `Wo` is ~0.01.
+- **Mutation run, in a scratch copy: 11 of 11 mutants killed.** The mutants are:
+  - Lion: a flipped sign, `m` updated with β1, `c` computed with β2;
+  - schedule-free: swapped `y` coefficients, no averaging, an off-by-one in the resume replay, no
+    bias correction, a no-op `sf_finish`, a decaying LR;
+  - init: the residual scale ignored, the std ignored.
+- **`make smoke`:**
+  - 5 new hostile cases (`--optim lion --gpu`, `--optim sf-adam --gpu`, `--init-std 0`, `--init-std 2`,
+    `--init-std x`);
+  - valid Lion, schedule-free (and its save → resume) and init runs;
+  - the explicit-defaults identity check now also passes `--init-std 0.02 --optim adam`.
+- **Suite:** x86_64 **1182/1182** (+25), aarch64/qemu **1175/1175**. Fuzz, bench, the AGNOS build,
+  `cyrius fmt --check` and `cyrius lint` (0 warnings) pass.
+
+### Verified — the no-flag path is byte-identical
+
+- **The golden suite is byte-identical to 1.17.0's** on every training, eval and sample line.
+- **One logged count differed:** in the `--gpu` run the device dispatch counter fell short (30 of 100
+  Adam steps on-device), and that step fell back to the bit-exact CPU path. The run shared the
+  machine with six training jobs. Rerun alone, both builds dispatch the full count (37,388 matmuls,
+  100 Adam steps), the same as 1.17.0.
+
+### Fixed
+
+- **The docs described a 1.15.4 that was never released.** The tags go 1.15.3 → 1.16.0 → 1.17.0, and
+  the akshara 1.1.3 → 1.3.1 bump, first written up as "1.15.4", shipped inside 1.16.0 (the 1.16.0
+  tag pins akshara 1.3.1; 1.15.3 pins 1.1.3).
+  - **CHANGELOG:** the `[1.15.4]` entry is folded into `[1.16.0]`, under its Changed section.
+  - **The other references:** `docs/development/state.md`, `docs/benchmarks.md`,
+    `docs/audit/2026-11-09-audit.md`, the `cyrius.cyml` comment and the `src/train.cyr` comment now
+    say 1.16.0.
+
 ## [1.17.0] - 2026-11-09
 
 Training dynamics (#1), first rung: **Muon beats tuned Adam by 4.6 % held-out bits/byte** at 52 K
@@ -108,8 +214,50 @@ The one differing line is the output path `--encode-shard` prints.
 ## [1.16.0] - 2026-11-09
 
 The training-science #3 lane's second thread: an easy-to-hard curriculum, `--curriculum N`, and its
-matched experiment X044, **a null result at 52 K params**. The flag is additive and off by default,
-and the no-flag run is byte-identical to 1.15.4.
+matched experiment X044, **a null result at 52 K params**. It also moves onto **akshara 1.3.1**, which
+closes the `stream_tok` issue attn11's 1.15.2 audit filed upstream. Both are byte-identical to 1.15.3
+without the new flag. (No 1.15.4 was tagged: the akshara bump, first written up as one, ships here.)
+
+### Changed
+
+- **`[deps.akshara]` `1.1.3` → `1.3.1`.**
+  - 1.2.0: `bpe_learn`'s argmax reads a per-row cache. 1.3.0: `tok_encode` merges by rank for inputs
+    up to 8 KiB. akshara gates both on producing the same ids, and attn11's runs confirm it (below).
+  - 1.3.1: `stream_tok` checks every chunk it reads against the installed tokenizer's vocabulary,
+    and fails with `akshara: shard token id out of vocabulary -- corrupt shard` (exit 1) before
+    returning any id from that chunk. That closes
+    [the issue](https://github.com/MacCracken/akshara/blob/main/docs/development/issues/2026-11-09-stream-tok-unchecked-ids.md)
+    filed in 1.15.2. It needs the shard's tokenizer installed before the first read, which
+    `shard_open` already does.
+  - **The lock:** `cyrius.lock` was regenerated. Against 1.15.3's it differs in exactly two lines,
+    akshara's commit and its file hash. `deps --verify` passes 119/0, `--locked` is clean, and
+    `lib/akshara.cyr` is byte-identical to akshara's `dist/akshara.cyr` at the tag.
+- **`tok_ld` stays.** A corrupt shard now stops in akshara first, so `make smoke`'s out-of-vocabulary
+  shard exits 1 with akshara's message instead of attn11's. attn11's check still bounds every token
+  by the *model's* `g_V` on every path, streamed or not. Its comment says so now.
+
+#### Verified — the akshara bump is byte-identical
+
+- **The golden suite, 28 runs plus the checkpoint and shard they write, is byte-identical** to the
+  1.15.3 build's: every mixer and objective, `--mtp`, `--ternary`, `--bpe 64`, `--preset`, `--gpu`,
+  vision and hearing, save → resume, `--encode-shard` → `--stream-corpus`. The one differing line
+  is the output path `--encode-shard` prints.
+- **The BPE shard paths are identical too:** an `--encode-shard` and a `--stream-encode` BPE shard,
+  a 100-step `--stream-corpus` run from the BPE shard, and the X021 protocol's 4 MB `--bpe 256`
+  learn, compared through the checkpoint it writes.
+- **Suite, on the akshara bump alone** (before the curriculum tests): x86_64 1117/1117,
+  aarch64/qemu 1110/1110. The fuzz harness, `make smoke` and `cyrius lint` (0 warnings) pass.
+
+#### Performance — akshara 1.3.1
+
+Wall time of a `--steps 0 --gen-only` startup, both builds, 5 interleaved runs, medians:
+
+| corpus, merges | 1.15.3 | akshara 1.3.1 | Δ |
+|---|---:|---:|---:|
+| 64 KiB, `--bpe 512` | 264 ms | 122 ms | **−54 %** (akshara's cached argmax) |
+| 4 MB (`c4-24-trainA`), `--bpe 256` | 2.30 s | 2.26 s | −1.7 % (noise; the O(n) merge pass dominates) |
+
+Training steps run no akshara code, so they are unchanged.
 
 ### Added
 
@@ -187,7 +335,8 @@ closed and **#1, training dynamics, is next**.
 
 ### Verified — the no-flag path is byte-identical
 
-The golden suite, 28 runs plus the checkpoint and shard they write, is byte-identical to 1.15.4's.
+The golden suite, 28 runs plus the checkpoint and shard they write, is byte-identical with the
+curriculum off to the akshara-1.3.1 build's, and that build's to 1.15.3's.
 The one differing line is the output path `--encode-shard` prints.
 
 ### Docs
@@ -198,52 +347,6 @@ The one differing line is the output path `--encode-shard` prints.
   - its "Where we are" now leads with the current state;
   - the `file_seek` item is ticked (done in 1.15.2);
   - the cmdit section's `--decode-schedule` note is marked fixed (1.15.2).
-
-## [1.15.4] - 2026-11-09
-
-onto akshara 1.3.1, which closes the `stream_tok` issue attn11's 1.15.2 audit filed upstream. Every
-output is byte-identical to 1.15.3's.
-
-### Changed
-
-- **`[deps.akshara]` `1.1.3` → `1.3.1`.**
-  - 1.2.0: `bpe_learn`'s argmax reads a per-row cache. 1.3.0: `tok_encode` merges by rank for inputs
-    up to 8 KiB. akshara gates both on producing the same ids, and attn11's runs confirm it (below).
-  - 1.3.1: `stream_tok` checks every chunk it reads against the installed tokenizer's vocabulary,
-    and fails with `akshara: shard token id out of vocabulary -- corrupt shard` (exit 1) before
-    returning any id from that chunk. That closes
-    [the issue](https://github.com/MacCracken/akshara/blob/main/docs/development/issues/2026-11-09-stream-tok-unchecked-ids.md)
-    filed in 1.15.2. It needs the shard's tokenizer installed before the first read, which
-    `shard_open` already does.
-  - **The lock:** `cyrius.lock` was regenerated. Against 1.15.3's it differs in exactly two lines,
-    akshara's commit and its file hash. `deps --verify` passes 119/0, `--locked` is clean, and
-    `lib/akshara.cyr` is byte-identical to akshara's `dist/akshara.cyr` at the tag.
-- **`tok_ld` stays.** A corrupt shard now stops in akshara first, so `make smoke`'s out-of-vocabulary
-  shard exits 1 with akshara's message instead of attn11's. attn11's check still bounds every token
-  by the *model's* `g_V` on every path, streamed or not. Its comment says so now.
-
-### Verified — byte-identical
-
-- **The golden suite, 28 runs plus the checkpoint and shard they write, is byte-identical** to the
-  1.15.3 build's: every mixer and objective, `--mtp`, `--ternary`, `--bpe 64`, `--preset`, `--gpu`,
-  vision and hearing, save → resume, `--encode-shard` → `--stream-corpus`. The one differing line
-  is the output path `--encode-shard` prints.
-- **The BPE shard paths are identical too:** an `--encode-shard` and a `--stream-encode` BPE shard,
-  a 100-step `--stream-corpus` run from the BPE shard, and the X021 protocol's 4 MB `--bpe 256`
-  learn, compared through the checkpoint it writes.
-- **Suite:** x86_64 1117/1117, aarch64/qemu 1110/1110. The fuzz harness, `make smoke` and
-  `cyrius lint` (0 warnings) pass.
-
-### Performance
-
-Wall time of a `--steps 0 --gen-only` startup, both builds, 5 interleaved runs, medians:
-
-| corpus, merges | 1.15.3 | 1.15.4 | Δ |
-|---|---:|---:|---:|
-| 64 KiB, `--bpe 512` | 264 ms | 122 ms | **−54 %** (akshara's cached argmax) |
-| 4 MB (`c4-24-trainA`), `--bpe 256` | 2.30 s | 2.26 s | −1.7 % (noise; the O(n) merge pass dominates) |
-
-Training steps run no akshara code, so they are unchanged.
 
 ## [1.15.3] - 2026-11-09
 

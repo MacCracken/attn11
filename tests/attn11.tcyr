@@ -3790,6 +3790,14 @@ fn main(): i64 {
     test_muon_step_split();
     test_muon_resume();
     test_muon_learns();
+    test_group("1.17.1 training dynamics: Lion, schedule-free, init");
+    test_lion_step();
+    test_lion_resume();
+    test_sf_lr();
+    test_sf_init_and_step();
+    test_sf_resume();
+    test_opt_learns();
+    test_init_std();
 
     return assert_summary();
 }
@@ -4484,6 +4492,238 @@ fn test_muon_learns(): i64 {
     assert(f64_lt(g_eval_nats, f64_mul(before, f64_div(f64_from(95), f64_from(100)))) == 1,
       "muon: 60 steps cut eval cross-entropy by more than 5% (Adam: ~8%)");
     g_optim = 0;
+    return 0;
+}
+
+# ---- 1.17.1 training dynamics: Lion, schedule-free AdamW, init (X047-X049) --
+# Registered dead-last, after every RNG-consuming group.
+
+# one forward/backward on a fixed 4-token window into g_grads
+fn _opt_grads(): i64 {
+    store64(A_tokens + 0, 1); store64(A_tokens + 8, 3); store64(A_tokens + 16, 0); store64(A_tokens + 24, 2);
+    store64(A_targets + 0, 3); store64(A_targets + 8, 0); store64(A_targets + 16, 2); store64(A_targets + 24, 1);
+    model_zero_grads(); model_forward(); model_backward();
+    return 0;
+}
+
+# Lion, one step from a nonzero momentum: every parameter moves by exactly lr against
+# sign(0.9 m + 0.1 g) (or stays when that is 0), m becomes 0.99 m + 0.01 g, v stays 0.
+fn test_lion_step(): i64 {
+    var V = build_corpus();
+    model_init(V, 8, 4, 2, 2, 1, 1, f64_from(0), 21);
+    _opt_grads();
+    var np = g_NP;
+    var i = 0;
+    while (i < np) {
+        var q = f64_div(f64_from((i % 7) - 3), f64_from(1000));    # a momentum of mixed signs, incl. 0
+        store64(g_adam_m + i * 8, q);
+        i = i + 1;
+    }
+    var p0 = t_alloc(np); t_copy(p0, g_params, np);
+    var m0 = t_alloc(np); t_copy(m0, g_adam_m, np);
+    var lr = f64_div(f64_from(1), f64_from(1000));
+    g_optim = 2; model_adam_step(lr, 1); g_optim = 0;
+    var step_ok = 1; var mom_ok = 1; var v_ok = 1; var moved = 0;
+    var b1 = f64_div(f64_from(9), f64_from(10)); var om1 = f64_div(f64_from(1), f64_from(10));
+    var b2 = f64_div(f64_from(99), f64_from(100)); var om2 = f64_div(f64_from(1), f64_from(100));
+    i = 0;
+    while (i < np) {
+        var g = load64(g_grads + i * 8); var m = load64(m0 + i * 8); var w = load64(p0 + i * 8);
+        var c = f64_add(f64_mul(b1, m), f64_mul(om1, g));
+        var want = w;
+        if ((c & 0x7FFFFFFFFFFFFFFF) != 0) {
+            if (((c >> 63) & 1) == 1) { want = f64_add(w, lr); } else { want = f64_sub(w, lr); }
+            moved = moved + 1;
+        }
+        if (load64(g_params + i * 8) != want) { step_ok = 0; }
+        if (load64(g_adam_m + i * 8) != f64_add(f64_mul(b2, m), f64_mul(om2, g))) { mom_ok = 0; }
+        if (load64(g_adam_v + i * 8) != 0) { v_ok = 0; }
+        i = i + 1;
+    }
+    assert(step_ok == 1, "lion: each parameter moves by exactly lr against sign(0.9 m + 0.1 g)");
+    assert(mom_ok == 1, "lion: m <- 0.99 m + 0.01 g");
+    assert(v_ok == 1, "lion: v stays 0 (checkpoint format unchanged)");
+    assert(moved > np / 2, "lion: most parameters moved (the check is not vacuous)");
+    return 0;
+}
+
+# Lion resume: train(24) == train(9) -> checkpoint -> train(24), bit-for-bit; Adam differs.
+fn test_lion_resume(): i64 {
+    var V = build_corpus();
+    var lr = _lrc(1, 1000); var minl = _lrc(1, 10000); var clip = f64_from(1);
+    model_init(V, 8, 4, 2, 2, 2, 0, f64_from(0), 7);
+    g_optim = 2; train(24, 24, 4, lr, minl, 5, clip, 1000000000);
+    var np = g_NP; var snapA = t_alloc(np); t_copy(snapA, g_params, np);
+    model_init(V, 8, 4, 2, 2, 2, 0, f64_from(0), 7);
+    train(9, 24, 4, lr, minl, 5, clip, 1000000000);
+    var sz = ckpt_size(); var buf = alloc(sz); ckpt_serialize(buf);
+    model_init(V, 8, 4, 2, 2, 2, 0, f64_from(0), 999);
+    var rc = ckpt_load_buf(buf, sz);
+    train(24, 24, 4, lr, minl, 5, clip, 1000000000);
+    var mism = 0; var i = 0;
+    while (i < np) { if (load64(g_params + i * 8) != load64(snapA + i * 8)) { mism = mism + 1; } i = i + 1; }
+    assert((rc == 0) && (mism == 0), "lion resume: params reproduce bit-for-bit");
+    g_optim = 0;
+    model_init(V, 8, 4, 2, 2, 2, 0, f64_from(0), 7);
+    train(24, 24, 4, lr, minl, 5, clip, 1000000000);
+    var diff = 0; i = 0;
+    while (i < np) { if (load64(g_params + i * 8) != load64(snapA + i * 8)) { diff = diff + 1; } i = i + 1; }
+    assert(diff > 0, "lion resume: Lion and Adam train different params (not vacuous)");
+    return 0;
+}
+
+# The schedule-free LR: linear warmup, then constant (no decay, no floor).
+fn test_sf_lr(): i64 {
+    var base = _lrc(3, 1000);
+    var half = f64_mul(base, f64_div(f64_from(50), f64_from(100)));
+    var got50 = sf_lr_at(50, 100, base);
+    assert(got50 == half, "sf lr: warmup is linear");
+    assert((sf_lr_at(100, 100, base) == base) && (sf_lr_at(5000, 100, base) == base), "sf lr: constant after warmup");
+    assert(sf_lr_at(7, 0, base) == base, "sf lr: warmup 0 starts at base");
+    return 0;
+}
+
+# sf_init on a fresh model: z = x = the init, and y = 0.1 z + 0.9 x. After step 1 (c = 1)
+# x equals z bit-for-bit; sf_finish hands x back to g_params and is idempotent.
+fn test_sf_init_and_step(): i64 {
+    var V = build_corpus();
+    model_init(V, 8, 4, 2, 2, 1, 1, f64_from(0), 23);
+    var np = g_NP; var p0 = t_alloc(np); t_copy(p0, g_params, np);
+    assert(sf_init() == 0, "sf: armed");
+    var init_ok = 1; var i = 0;
+    while (i < np) {
+        if ((load64(g_adam_m + i * 8) != load64(p0 + i * 8)) || (load64(g_sf_x + i * 8) != load64(p0 + i * 8))) { init_ok = 0; }
+        i = i + 1;
+    }
+    assert(init_ok == 1, "sf: a fresh model starts with z = x = the init");
+    _opt_grads();
+    var lr = _lrc(3, 1000);
+    model_adam_step(lr, 1);
+    # step 1, by hand: v = 0.001 g^2, z = init - lr * g / (sqrt(v / (1 - 0.999)) + 1e-8)
+    var b2 = f64_div(f64_from(999), f64_from(1000)); var om2 = f64_div(f64_from(1), f64_from(1000));
+    var bc2 = f64_sub(f64_from(1), f64_pow(b2, f64_from(1)));
+    var eps = f64_div(f64_from(1), f64_from(100000000));
+    var z_ok = 1; i = 0;
+    while (i < np) {
+        var g = load64(g_grads + i * 8);
+        var v = f64_add(f64_mul(b2, f64_from(0)), f64_mul(om2, f64_mul(g, g)));
+        var zw = f64_sub(load64(p0 + i * 8), f64_mul(lr, f64_div(g, f64_add(f64_sqrt(f64_div(v, bc2)), eps))));
+        if (load64(g_adam_m + i * 8) != zw) { z_ok = 0; }
+        i = i + 1;
+    }
+    assert(z_ok == 1, "sf: step 1's z is the bias-corrected Adam-style step from the init");
+    var x_ok = 1; var y_ok = 1; var moved = 0;
+    var ob1 = f64_div(f64_from(1), f64_from(10)); var b1 = f64_div(f64_from(9), f64_from(10));
+    i = 0;
+    while (i < np) {
+        var z = load64(g_adam_m + i * 8); var x = load64(g_sf_x + i * 8);
+        if (x != z) { x_ok = 0; }
+        if (load64(g_params + i * 8) != f64_add(f64_mul(ob1, z), f64_mul(b1, x))) { y_ok = 0; }
+        if (z != load64(p0 + i * 8)) { moved = moved + 1; }
+        i = i + 1;
+    }
+    assert(x_ok == 1, "sf: after step 1 (c = 1) x == z bit-for-bit");
+    assert(y_ok == 1, "sf: g_params holds y = 0.1 z + 0.9 x while training");
+    assert(moved > np / 2, "sf: step 1 moved z (the check is not vacuous)");
+    # step 2 at the same LR: c = lr^2 / (2 lr^2) = 1/2, so x = x1/2 + z2/2
+    var x1 = t_alloc(np); t_copy(x1, g_sf_x, np);
+    _opt_grads();
+    model_adam_step(lr, 2);
+    var hf = f64_div(f64_from(1), f64_from(2));
+    var avg_ok = 1; i = 0;
+    while (i < np) {
+        var xw = f64_add(f64_mul(hf, load64(x1 + i * 8)), f64_mul(hf, load64(g_adam_m + i * 8)));
+        if (load64(g_sf_x + i * 8) != xw) { avg_ok = 0; }
+        i = i + 1;
+    }
+    assert(avg_ok == 1, "sf: step 2 averages x = x1/2 + z2/2 (c = 1/2 at a constant LR)");
+    sf_finish();
+    var fin_ok = 1; i = 0;
+    while (i < np) { if (load64(g_params + i * 8) != load64(g_sf_x + i * 8)) { fin_ok = 0; } i = i + 1; }
+    var f7 = f64_from(7);
+    store64(g_sf_x, f7); sf_finish();
+    var p_first = load64(g_params);
+    assert((fin_ok == 1) && (p_first != f7), "sf: sf_finish hands x back, once");
+    g_optim = 0;
+    return 0;
+}
+
+# Schedule-free resume: train(24) then finish == train(9), finish, checkpoint (x, z, v),
+# reload, re-arm (y rebuilt, the weight sum replayed), train(24), finish — bit-for-bit.
+fn test_sf_resume(): i64 {
+    var V = build_corpus();
+    var lr = _lrc(3, 1000); var minl = _lrc(3, 10000); var clip = f64_from(1);
+    model_init(V, 8, 4, 2, 2, 2, 0, f64_from(0), 7);
+    sf_init(); train(24, 24, 4, lr, minl, 5, clip, 1000000000); sf_finish();
+    var np = g_NP; var snapA = t_alloc(np); t_copy(snapA, g_params, np);
+    g_optim = 0;
+    model_init(V, 8, 4, 2, 2, 2, 0, f64_from(0), 7);
+    sf_init(); train(9, 24, 4, lr, minl, 5, clip, 1000000000); sf_finish();
+    var sz = ckpt_size(); var buf = alloc(sz); ckpt_serialize(buf);
+    g_optim = 0;
+    model_init(V, 8, 4, 2, 2, 2, 0, f64_from(0), 999);
+    var rc = ckpt_load_buf(buf, sz);
+    sf_init(); train(24, 24, 4, lr, minl, 5, clip, 1000000000); sf_finish();
+    var mism = 0; var i = 0;
+    while (i < np) { if (load64(g_params + i * 8) != load64(snapA + i * 8)) { mism = mism + 1; } i = i + 1; }
+    assert((rc == 0) && (mism == 0), "sf resume: x reproduces bit-for-bit across a checkpoint");
+    g_optim = 0;
+    model_init(V, 8, 4, 2, 2, 2, 0, f64_from(0), 7);
+    train(24, 24, 4, lr, minl, 5, clip, 1000000000);
+    var diff = 0; i = 0;
+    while (i < np) { if (load64(g_params + i * 8) != load64(snapA + i * 8)) { diff = diff + 1; } i = i + 1; }
+    assert(diff > 0, "sf resume: schedule-free and Adam train different params (not vacuous)");
+    return 0;
+}
+
+# Both learn on the embedded corpus in 60 steps: Lion (lr 1e-3) cuts eval cross-entropy
+# ~4% (bar 3%), schedule-free AdamW more than 5%.
+fn test_opt_learns(): i64 {
+    var V = build_corpus();
+    model_init(V, 8, 4, 2, 2, 2, 0, f64_from(0), 13);
+    eval_corpus(); var b0 = g_eval_nats;
+    g_optim = 2; train(60, 60, 4, _lrc(1, 1000), _lrc(1, 10000), 5, f64_from(1), 1000000000); g_optim = 0;
+    eval_corpus();
+    var cut = f64_mul(b0, f64_div(f64_from(95), f64_from(100)));
+    var cut3 = f64_mul(b0, f64_div(f64_from(97), f64_from(100)));   # Lion at 1e-3 cuts ~4% here
+    assert(f64_lt(g_eval_nats, cut3) == 1, "lion: 60 steps cut eval cross-entropy by more than 3%");
+    model_init(V, 8, 4, 2, 2, 2, 0, f64_from(0), 13);
+    sf_init(); train(60, 60, 4, _lrc(3, 1000), _lrc(3, 10000), 5, f64_from(1), 1000000000); sf_finish();
+    g_optim = 0;
+    eval_corpus();
+    assert(f64_lt(g_eval_nats, cut) == 1, "sf-adam: 60 steps cut eval cross-entropy by more than 5%");
+    return 0;
+}
+
+# rms of n f64 at p
+fn _rms(p, n): i64 {
+    var s2 = f64_from(0); var i = 0;
+    while (i < n) { var x = load64(p + i * 8); s2 = f64_add(s2, f64_mul(x, x)); i = i + 1; }
+    return f64_sqrt(f64_div(s2, f64_from(n)));
+}
+
+# --init-std scales the init (an explicit 0.02 is the default, bit-for-bit) and
+# --no-resid-scale drops the GPT-2 1/sqrt(2*NL) factor on the residual projections.
+fn test_init_std(): i64 {
+    var V = 40; var C = 32; var NL = 2;
+    model_init(V, C, 4, 4, 4, NL, 0, f64_from(0), 31);
+    var np = g_NP; var d0 = t_alloc(np); t_copy(d0, g_params, np);
+    g_init_std = f64_div(f64_from(2), f64_from(100));
+    model_init(V, C, 4, 4, 4, NL, 0, f64_from(0), 31);
+    var same = 1; var i = 0;
+    while (i < np) { if (load64(g_params + i * 8) != load64(d0 + i * 8)) { same = 0; } i = i + 1; }
+    assert(same == 1, "init: an explicit --init-std 0.02 is the default init, bit-for-bit");
+    g_init_std = f64_div(f64_from(1), f64_from(100));
+    model_init(V, C, 4, 4, 4, NL, 0, f64_from(0), 31);
+    var r = _rms(P_tokemb(), V * C);
+    assert((f64_gt(r, _lrc(8, 1000)) == 1) && (f64_lt(r, _lrc(12, 1000)) == 1), "init: --init-std 0.01 gives tok_emb RMS ~0.01");
+    var ro = _rms(PL(0, _o_Wo()), C * C);
+    assert((f64_gt(ro, _lrc(4, 1000)) == 1) && (f64_lt(ro, _lrc(6, 1000)) == 1), "init: Wo RMS ~0.01/sqrt(2*NL) = 0.005");
+    g_init_rscale = 0;
+    model_init(V, C, 4, 4, 4, NL, 0, f64_from(0), 31);
+    ro = _rms(PL(0, _o_Wo()), C * C);
+    assert((f64_gt(ro, _lrc(8, 1000)) == 1) && (f64_lt(ro, _lrc(12, 1000)) == 1), "init: --no-resid-scale gives Wo RMS ~0.01");
+    g_init_std = 0; g_init_rscale = 1;
     return 0;
 }
 

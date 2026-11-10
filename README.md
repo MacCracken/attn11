@@ -70,7 +70,7 @@ full CLI (`--corpus`, `--load`/`--save` checkpoints, `--preset`, `--bpe`, `--eva
 `--eval-corpus` (held-out cross-corpus eval), the objective/precision axes
 `--objective {ar,diffusion}` (with `--decode-steps`/`--decode-schedule`), `--mtp N`,
 `--curriculum N` (easy-to-hard data order) and `--ternary`, the training knobs `--lr`/`--min-lr`/
-`--warmup`/`--clip`/`--seed` and `--optim {adam,muon}`, and the architecture axes `--attn-kind {mha,mla,lin,ssm}`, `--pos-kind
+`--warmup`/`--clip`/`--seed`, `--optim {adam,muon,lion,sf-adam}` and `--init-std`/`--no-resid-scale`, and the architecture axes `--attn-kind {mha,mla,lin,ssm}`, `--pos-kind
 {learned,rope,rope-decoupled}`, `--experts N` (MoE), `--attn-every K` (per-layer
 hybrid)) and [`docs/STABILITY.md`](docs/STABILITY.md) for the frozen surface.
 

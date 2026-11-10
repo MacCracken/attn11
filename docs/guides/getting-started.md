@@ -42,7 +42,11 @@ attn11 --lr F / --min-lr F   peak LR / cosine floor (defaults 3e-3 / 3e-4; decim
 attn11 --warmup N            linear warmup steps (default 100)
 attn11 --clip F              global-norm gradient clip (default 1; 0 = off)
 attn11 --seed N              PRNG seed for a fresh model (default 1337)
-attn11 --optim O             adam (default) or muon (Newton-Schulz on the hidden matrices; mha + dense, CPU)
+attn11 --optim O             adam (default), muon (Newton-Schulz on the hidden matrices; mha + dense),
+                             lion (sign of interpolated momentum), or sf-adam (schedule-free AdamW:
+                             warmup, then constant LR, averaged weights); all but adam run on the CPU
+attn11 --init-std F          weight-init std (default 0.02)
+attn11 --no-resid-scale      init residual projections at --init-std (drop GPT-2's 1/sqrt(2*layers))
 attn11 --bpe K               learn K BPE merges first (1..512; default is byte-level)
 attn11 --eval                print CE/token + bits-per-byte after training/save
 attn11 --eval-corpus P       held-out eval on a disjoint corpus via the loaded tokenizer

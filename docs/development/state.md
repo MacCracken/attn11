@@ -5,6 +5,16 @@
 
 ## Version
 
+**1.17.1** — *training dynamics #1: Lion, schedule-free AdamW, init* (2026-11-09).
+- **What changed:** `--optim lion`, `--optim sf-adam` (schedule-free AdamW), `--init-std F` and
+  `--no-resid-scale`. Also a release-record fix: no 1.15.4 was tagged, and its akshara 1.3.1 bump is
+  now recorded under 1.16.0.
+- **Results:** `--init-std 0.08` is **−2.07 %** held-out on 3 of 3 seeds with Adam (X049), but does
+  not stack with Muon. Lion is +6.9 % (X047). Schedule-free is +2.6 % on average, with a 5 % seed
+  spread (X048).
+- **Same results without the flags:** the golden suite is byte-identical to 1.17.0's.
+- **Suite:** **1182** on x86_64 and **1175** on aarch64 (+25).
+
 **1.17.0** — *training dynamics #1: Muon, and the knob flags* (2026-11-09).
 - **What changed:** `--optim muon` (Newton–Schulz-orthogonalized Nesterov momentum on the hidden
   matrices, Adam elsewhere), and `--lr`/`--min-lr`/`--warmup`/`--clip`/`--seed` as flags.
@@ -23,18 +33,11 @@
   (paired mean +0.20 % held-out bits/byte over 3 seeds); over the whole run it is +0.67 % worse; the
   hardest-first control is no worse. Kept behind the flag; the roadmap's #3 lane is closed and **#1,
   training dynamics, is next**.
-- **Same results without the flag:** the golden suite is byte-identical to 1.15.4's.
+- **Also onto akshara 1.3.1** (1.1.3 before): `stream_tok` now checks every chunk against the installed
+  vocabulary, closing the issue the 1.15.2 audit filed upstream; `tok_ld` stays as the model-`g_V` bound.
+  A 64 KiB `--bpe 512` startup is 264 → 122 ms; training is unchanged. (No 1.15.4 was tagged.)
+- **Same results without the flag:** the golden suite is byte-identical to 1.15.3's.
 - **Suite:** **1139** on x86_64 and **1132** on aarch64 (+22).
-
-**1.15.4** — *onto akshara 1.3.1* (2026-11-09).
-- **What changed:** `[deps.akshara]` 1.1.3 → 1.3.1. Its `stream_tok` now checks every chunk it reads
-  against the installed vocabulary, closing the issue the 1.15.2 audit filed upstream; `tok_ld` stays
-  as the model-`g_V` bound.
-- **Same results:** the 28-run golden suite, its checkpoint and shard, and the BPE shard paths are
-  byte-identical to 1.15.3's.
-- **Speed:** a 64 KiB `--bpe 512` startup is 264 → 122 ms (akshara's cached `bpe_learn` argmax);
-  the 4 MB `--bpe 256` learn and the training step are unchanged.
-- **Suite:** **1117** on x86_64 and **1110** on aarch64 (unchanged).
 
 **1.15.3** — *the GELU tanh cache* (2026-11-09).
 - **What changed:** onto rupantara 0.6.1. Its `ru_gelu_fwd_t` hands the training forward's tanh to
@@ -1353,11 +1356,18 @@ checkpoint vs Linux at fixed CPU — `scripts/agnos-smoke.sh`):
   held-out vs Adam**.
 - **Training-dynamics flags** (1.17.0): `--lr`, `--min-lr`, `--warmup`, `--clip` (0 = off), `--seed`;
   the defaults are the frozen `CFG_*` values, bit-for-bit (`_af` parses decimals exactly).
+- **Lion and schedule-free AdamW** (1.17.1, `--optim lion` / `--optim sf-adam`, X047 / X048): Lion
+  steps every parameter by ±lr against `sign(0.9 m + 0.1 g)`; schedule-free trains at
+  `y = 0.1 z + 0.9 x` with warmup then a constant LR, and evaluates, saves and samples the averaged
+  `x`. Both reuse the m/v slots, so checkpoints are unchanged and resume is bit-for-bit. Any
+  architecture, CPU only. Neither beats Adam here.
+- **Init knobs** (1.17.1, `--init-std F`, `--no-resid-scale`, X049): the weight-init std (default
+  0.02) and GPT-2's 1/√(2·layers) residual-projection factor; `--init-std 0.08` is −2.07 % with Adam.
 - CLI: `--corpus --stdin --load --save --steps --gen-only --preset --heads
   --kv-heads --layers --attn-kind --latent-dim --attn-every --pos-kind --rope-dim
   --experts --expert-topk --bpe --eval --eval-corpus --encode-shard --stream-encode
   --stream-corpus --objective --decode-steps --decode-schedule --ternary --curriculum --lr
-  --min-lr --warmup --clip --seed --optim`
+  --min-lr --warmup --clip --seed --optim --init-std --no-resid-scale`
   (`--attn-kind` takes `mha`/`mla`/`lin`/`ssm`; `--latent-dim` is the MLA latent /
   SSM state size; `--attn-every K` builds the per-layer hybrid over the `--attn-kind`
   base; `--objective` takes `ar`/`diffusion` — `diffusion` adds `--decode-steps` /
@@ -1405,7 +1415,8 @@ learned-abs) swaps the softmax core for the gated retention recurrence —
 parameter-free (same 39 488 params as MHA), and the decode cache becomes the
 constant `nh·hd²` state instead of a T-growing K/V. Since 1.17.0 the optimizer row's knobs are
 flags too: `--lr`/`--min-lr`/`--warmup`/`--clip`/`--seed` (defaults unchanged, bit-for-bit) and
-`--optim muon` (X046: −4.6 % held-out vs Adam).
+`--optim muon` (X046: −4.6 % held-out vs Adam), plus `--optim lion|sf-adam` and
+`--init-std`/`--no-resid-scale` (1.17.1; X049: `--init-std 0.08` −2.1 % with Adam).
 
 ## Source (`src/`, 14 files, ~7,700 lines at 1.15.2)
 
@@ -1519,8 +1530,9 @@ flags too: `--lr`/`--min-lr`/`--warmup`/`--clip`/`--seed` (defaults unchanged, b
 
 ## Tests
 
-- `tests/attn11.tcyr` — **1157 checks** on x86_64, 1150 on aarch64 (1.17.0: +18 for Muon;
-  1139 / 1132 at 1.16.0, +22 for the curriculum; 1117 / 1110 at 1.15.3–1.15.4, +12 for the GELU tanh cache; 1105 / 1098 at 1.15.2; the
+- `tests/attn11.tcyr` — **1182 checks** on x86_64, 1175 on aarch64 (1.17.1: +25 for Lion,
+  schedule-free and init; 1157 / 1150 at 1.17.0, +18 for Muon;
+  1139 / 1132 at 1.16.0, +22 for the curriculum; 1117 / 1110 at 1.15.3, +12 for the GELU tanh cache; 1105 / 1098 at 1.15.2; the
   x86-only hearing lane accounts for the difference): finite-difference gradient checks
   (every op incl. dropout; attention at head dims 6/8/10 and GQA/MQA at
   `nkv ∈ {1, 2, nh}` incl. `dWk`/`dWv`/`dbv`; the `|dbk| ≈ 0`
@@ -1628,7 +1640,7 @@ Direct (declared in `cyrius.cyml`):
   assert, bench, math, ganita, args, hashmap, tagged, fnptr, mmap, dynlib, sakshi,
   thread, sankoch, **mabda** (the bundled GPU foundation, 4.2.0 at 6.7.18 — a
   stdlib leaf since 1.14.4, no longer a `[deps.mabda]` git dep)
-- **[akshara](https://github.com/MacCracken/akshara) 1.3.1** (1.15.4; 1.1.3 through 1.15.3) —
+- **[akshara](https://github.com/MacCracken/akshara) 1.3.1** (1.16.0; 1.1.3 through 1.15.3) —
   corpus + byte/BPE tokenizer data layer (1.11.0 extraction); since 1.3.1 `stream_tok` fails loud on
   a shard id outside the installed vocabulary
 - **[tyche](https://github.com/MacCracken/tyche) 1.2.2** — deterministic

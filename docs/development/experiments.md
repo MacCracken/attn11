@@ -2006,3 +2006,111 @@ Reproduce:
       ./build/attn11 $P --seed $S --clip 0               # Adam, no clip
       ./build/attn11 $P --seed $S --optim muon --lr 1e-2 # Muon
     done
+
+## X047 — Lion loses to Adam at tiny scale (honest negative) (training dynamics #1, v1.17.1, 2026-11-09)
+
+**Result — Lion is 6.9 % worse than default Adam at its best LR.** 1.17.1's `--optim lion` (Chen et
+al. 2023: a ±LR step for every parameter against `sign(0.9·m + 0.1·g)`) was swept over four LRs
+bracketing its optimum. None comes close to Adam (2.83681) or Muon (2.70234, X046).
+
+**Protocol (X021):** `--corpus c4-24-trainA --bpe 256 --steps 4000 --eval --eval-corpus c4-24-heldB`,
+seed 1337, 52,768 params, the cosine schedule with `--min-lr` at a tenth of `--lr`.
+
+| `--optim lion` | own bits/byte | held-out | Δ vs Adam |
+|---|---:|---:|---:|
+| `--lr 1e-4 --min-lr 1e-5` | 3.30669 | 3.33216 | +17.46 % |
+| `--lr 3e-4 --min-lr 3e-5` | 3.00249 | **3.03240** | **+6.89 %** |
+| `--lr 1e-3 --min-lr 1e-4` | 3.01675 | 3.04751 | +7.43 % |
+| `--lr 3e-3` | 3.29004 | 3.31799 | +16.96 % |
+
+**Reading it.** The optimum is bracketed (3e-4 to 1e-3, both ~7 % behind), and the gap is 18× the
+baseline's seed spread (0.38 %, X044), so one seed suffices. A sign update moves every parameter by
+the full LR every step, including the many with tiny, noisy gradients. Chen et al. report its advantage
+growing with batch size, and 16 windows of 16 tokens is the small-batch end. **Kept as an opt-in flag; no
+default change.**
+
+## X048 — schedule-free AdamW ties cosine Adam at one seed, loses on average (training dynamics #1, v1.17.1, 2026-11-09)
+
+**Result — no win, and a wide seed spread.** 1.17.1's `--optim sf-adam` (Defazio et al. 2024:
+warmup then a constant LR, with the weights averaged instead of the LR decayed) matches the tuned
+cosine Adam at seed 1337. On the next two seeds it is 2–5 % worse.
+
+**Protocol:** as X047. Seed 1337 LR sweep, held-out:
+
+| `--optim sf-adam` | own | held-out | Δ vs Adam |
+|---|---:|---:|---:|
+| `--lr 3e-3` | 2.85725 | 2.88842 | +1.82 % |
+| `--lr 6e-3` | 2.80929 | **2.84244** | +0.20 % |
+| `--lr 1e-2` | 2.82151 | 2.85302 | +0.57 % |
+
+Confirmed at `--lr 6e-3`, paired with Adam at each seed:
+
+| seed | Adam | sf-adam | Δ |
+|---|---:|---:|---:|
+| 1337 | 2.83681 | 2.84244 | +0.20 % |
+| 1338 | 2.82608 | 2.97310 | +5.20 % |
+| 1339 | 2.83581 | 2.90112 | +2.30 % |
+| mean | 2.83290 | 2.90555 | **+2.57 %** |
+
+**Reading it.**
+1. **No divergence.** The logged losses descend on every seed, with no spikes or blow-ups. The arms
+   simply end in different places: the seed spread is 5.0 %, against Adam's 0.38 %.
+2. **The horizon favours the cosine here.** 4000 steps is half an epoch. A cosine schedule that knows
+   the horizon decays to its floor exactly at the end, while schedule-free trains at the full LR
+   throughout and relies on the average catching up. Its pitch is not needing the horizon, and with a
+   known, short one that is no advantage.
+3. **Kept as an opt-in flag.** It is correct (the reference update, bit-exact resume) and needs no
+   horizon. Worth retrying on runs whose length is open-ended.
+
+## X049 — the 0.02 init is 4× too small for d_model 32; 0.08 is 2.1 % better (training dynamics #1, v1.17.1, 2026-11-09)
+
+**Result — a win with Adam, consistent across seeds.** GPT-2's 0.02 weight-init std (tuned at width
+768) is too small at attn11's d_model of 32. 1.17.1's `--init-std 0.08` cuts held-out bits/byte by
+**2.07 % on 3 of 3 seeds**, and the sweep has a clear optimum. It does **not** stack with Muon. GPT-2's
+residual-projection scaling makes no difference either way.
+
+**Protocol (X021):** `--corpus c4-24-trainA --bpe 256 --steps 4000 --eval --eval-corpus c4-24-heldB`,
+Adam at its defaults, 52,768 params. The init flags change only the initial weights.
+
+The std sweep, seed 1337, held-out against the 0.02 default (2.83681):
+
+| `--init-std` | own | held-out | Δ |
+|---|---:|---:|---:|
+| 0.01 | 2.91387 | 2.94392 | +3.78 % |
+| 0.02 (default) | 2.80388 | 2.83681 | — |
+| 0.04 | 2.77604 | 2.80964 | −0.96 % |
+| **0.08** | 2.74010 | **2.77543** | **−2.16 %** |
+| 0.16 | 2.79804 | 2.83132 | −0.19 % |
+| 0.32 | 2.98166 | 3.01248 | +6.19 % |
+| 0.02, `--no-resid-scale` | 2.80688 | 2.84085 | +0.14 % (noise) |
+
+Seeds, paired with Adam's default init:
+
+| seed | 0.02 | 0.04 | 0.08 |
+|---|---:|---:|---:|
+| 1337 | 2.83681 | 2.80964 (−0.96 %) | 2.77543 (−2.16 %) |
+| 1338 | 2.82608 | 2.81008 (−0.57 %) | 2.76915 (−2.01 %) |
+| 1339 | 2.83581 | 2.80574 (−1.06 %) | 2.77813 (−2.03 %) |
+| mean | 2.83290 | 2.80849 (**−0.86 %**) | 2.77424 (**−2.07 %**) |
+
+With Muon (`--optim muon --lr 1e-2`, seed 1337): 2.70234 at 0.02, 2.70389 at 0.08 (+0.06 %).
+
+**Reading it.**
+1. **The optimum sits near 0.08,** between 0.04 and 0.16. That is about 0.45/√d_model at d_model 32.
+   The 0.02 default is GPT-2's value for width 768, where 1/√768 = 0.036. A fixed std does not
+   transfer down in width, which is the problem width-aware inits (µP-style) address.
+2. **The gain is tight.** −2.16 / −2.01 / −2.03 %: its spread across seeds is under 0.15 %, against a
+   5× larger mean effect. The residual-scale factor is noise at 3 blocks, where 1/√6 ≈ 0.41.
+3. **It does not stack with Muon.** Muon orthogonalizes each hidden matrix's update, so the
+   matrices' starting scale matters less to it. Its −4.7 % already covers what the larger init buys
+   Adam.
+4. **Default unchanged.** The no-flag run is byte-identical by contract. For Adam at this width the
+   recommended setting is `--init-std 0.08`; with `--optim muon` it does not matter.
+
+**Training dynamics (#1), where it stands:** Muon −4.6 % (X046), init 0.08 −2.1 % (X049), no clip
+−0.4 % (X045), schedule-free +2.6 % (X048), Lion +6.9 % (X047). Reproduce:
+
+    P="--corpus data/c4-24-trainA.txt --bpe 256 --steps 4000 --eval --eval-corpus data/c4-24-heldB.txt"
+    for S in 1337 1338 1339; do ./build/attn11 $P --seed $S --init-std 0.08; done
+    ./build/attn11 $P --optim lion --lr 3e-4 --min-lr 3e-5
+    for S in 1337 1338 1339; do ./build/attn11 $P --seed $S --optim sf-adam --lr 6e-3; done

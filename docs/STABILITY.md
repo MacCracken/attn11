@@ -74,7 +74,8 @@ and passing them explicitly reproduces the no-flag run bit-for-bit); the rest ne
 | LR warmup | 100 | `--warmup` (1.17.0) |
 | LR (base → min) | 3e-3 → 3e-4, cosine | `--lr`, `--min-lr` (1.17.0) |
 | grad-clip (global-norm) | 1.0 | `--clip` (1.17.0; `0` = off) |
-| optimizer | Adam (0.9, 0.999, 1e-8; no weight decay) | `--optim muon` (1.17.0) |
+| optimizer | Adam (0.9, 0.999, 1e-8; no weight decay) | `--optim muon` (1.17.0), `lion`, `sf-adam` (1.17.1) |
+| weight-init std | 0.02, residual projections ÷ √(2·layers) | `--init-std`, `--no-resid-scale` (1.17.1; fresh model only) |
 | attention bias | on | — (rebuild) |
 | residual dropout | 0.0 | — (rebuild) |
 
